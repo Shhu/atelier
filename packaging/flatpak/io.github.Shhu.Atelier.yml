@@ -1,0 +1,36 @@
+# Local Flatpak package of Atelier, from the already built binary
+# (cargo build --release). To build: see build.sh.
+app-id: io.github.Shhu.Atelier
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+command: atelier
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  # X11 too: the image clipboard goes through X11 (XWayland).
+  - --socket=x11
+  - --device=dri
+  # Downloads the AI model for Select Subject.
+  - --share=network
+  # Open and save images.
+  - --filesystem=home
+modules:
+  - name: atelier
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 atelier /app/bin/atelier
+      - install -Dm644 io.github.Shhu.Atelier.desktop /app/share/applications/io.github.Shhu.Atelier.desktop
+      - install -Dm644 io.github.Shhu.Atelier.svg /app/share/icons/hicolor/scalable/apps/io.github.Shhu.Atelier.svg
+      - install -Dm644 io.github.Shhu.Atelier.metainfo.xml /app/share/metainfo/io.github.Shhu.Atelier.metainfo.xml
+    sources:
+      - type: file
+        path: ../../target/release/atelier
+        dest-filename: atelier
+      - type: file
+        path: io.github.Shhu.Atelier.desktop
+      - type: file
+        path: ../../assets/icon.svg
+        dest-filename: io.github.Shhu.Atelier.svg
+      - type: file
+        path: io.github.Shhu.Atelier.metainfo.xml

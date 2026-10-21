@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.Shhu.Atelier</id>
+  <name>Atelier</name>
+  <summary>Image editor with layers and cutouts</summary>
+  <summary xml:lang="fr">Éditeur d'image avec calques et détourage</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <description>
+    <p>Image editor: layers, brush, text, adjustments (levels, curves,
+    hue/saturation…), pixel-accurate selections, magic wand, magnetic lasso
+    and AI subject selection, run locally.</p>
+    <p xml:lang="fr">Éditeur d'image : calques, pinceau, texte, réglages (niveaux, courbes,
+    teinte/saturation…), sélections au pixel près, baguette magique, lasso
+    magnétique et détourage du sujet par IA, exécuté en local.</p>
+  </description>
+  <launchable type="desktop-id">io.github.Shhu.Atelier.desktop</launchable>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.3.1" date="2026-10-19"/>
+    <release version="0.3.0" date="2026-10-18"/>
+    <release version="0.2.0" date="2026-10-18"/>
+    <release version="0.1.0" date="2026-10-13"/>
+  </releases>
+</component>

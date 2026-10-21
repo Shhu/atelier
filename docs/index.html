@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atelier — image editor</title>
+<meta name="description" content="Atelier: a light, fast image editor with layers, adjustments and local AI selection. Familiar shortcuts, English and French.">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--bg0:#121315;--bg1:#18191C;--bg2:#1F2024;--bg3:#27292E;--ln:#2D2F35;--tx:#ECEDEF;--mu:#A3A6AF;--fa:#8A8E98;--ac:#2F6BE0;--act:#A1BCF1;--acs:rgba(47,107,224,.18)}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg0);color:var(--tx);font:16px/1.55 'Geist',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:inherit}
+.wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+header{position:sticky;top:0;z-index:10;background:rgba(18,19,21,.85);backdrop-filter:blur(10px);border-bottom:1px solid var(--ln)}
+header .wrap{display:flex;align-items:center;gap:24px;height:60px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:17px;text-decoration:none}
+.brand img{width:28px;height:28px}
+nav{display:flex;gap:4px;margin-left:auto}
+nav a{color:var(--mu);text-decoration:none;font-size:14px;padding:6px 10px;border-radius:6px}
+nav a:hover{color:var(--tx);background:var(--bg3)}
+.lang{display:flex;padding:2px;border-radius:7px;background:var(--bg1);border:1px solid var(--ln)}
+.lang button{font:500 12px 'Geist Mono',monospace;color:var(--mu);background:none;border:0;padding:4px 8px;border-radius:5px;cursor:pointer}
+.lang button[aria-pressed=true]{background:var(--bg3);color:var(--tx)}
+.hero{padding:88px 0 40px;text-align:center}
+.hero img.logo{width:84px;height:84px;margin-bottom:22px}
+h1{font-size:clamp(36px,6vw,58px);line-height:1.08;letter-spacing:-.02em;margin:0 0 18px;font-weight:700}
+.lead{font-size:clamp(17px,2.2vw,20px);color:var(--mu);max-width:680px;margin:0 auto 34px}
+.cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:10px;height:46px;padding:0 20px;border-radius:9px;font-weight:600;font-size:15px;text-decoration:none;border:1px solid var(--ln);background:var(--bg3)}
+.btn:hover{background:#2F3238}
+.btn.pri{background:var(--ac);border-color:transparent;color:#fff}
+.btn.pri:hover{filter:brightness(1.1)}
+.btn small{font:500 12px 'Geist Mono',monospace;opacity:.75}
+.meta{margin-top:14px;font-size:13px;color:var(--fa)}
+.shot{margin:56px auto 0;border-radius:12px;overflow:hidden;border:1px solid var(--ln);box-shadow:0 30px 80px rgba(0,0,0,.6)}
+.shot img{display:block;width:100%;height:auto}
+section{padding:72px 0}
+h2{font-size:clamp(26px,3.6vw,36px);letter-spacing:-.015em;margin:0 0 12px}
+.sub{color:var(--mu);margin:0 0 36px;max-width:640px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}
+.card{background:var(--bg2);border:1px solid var(--ln);border-radius:12px;padding:20px}
+.card .ic{width:36px;height:36px;border-radius:9px;background:var(--acs);color:var(--act);display:flex;align-items:center;justify-content:center;margin-bottom:14px}
+.card h3{margin:0 0 6px;font-size:16px}
+.card p{margin:0;color:var(--mu);font-size:14.5px}
+.ai{display:grid;grid-template-columns:1fr 1fr;gap:28px;align-items:center}
+.ai .shot{margin:0}
+.ai ul{padding:0;margin:0;list-style:none;display:grid;gap:12px}
+.ai li{display:flex;gap:10px;color:var(--mu)}
+.ai li b{color:var(--tx);font-weight:600}
+.ai li::before{content:"";flex:none;width:6px;height:6px;border-radius:50%;background:var(--ac);margin-top:10px}
+.gallery{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+.gallery figure{margin:0}
+.gallery .shot{margin:0}
+.gallery figcaption{color:var(--fa);font-size:14px;margin-top:10px}
+.dl{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.dl .card{display:flex;flex-direction:column;gap:12px}
+.dl .card p{flex:1}
+kbd{font:500 12px 'Geist Mono',monospace;padding:1px 6px;border-radius:4px;border:1px solid #34363D;background:var(--bg1);color:var(--mu)}
+footer{border-top:1px solid var(--ln);padding:28px 0 40px;color:var(--fa);font-size:14px}
+footer .wrap{display:flex;gap:16px;flex-wrap:wrap;justify-content:space-between}
+[hidden]{display:none!important}
+html:not([lang=en]) [data-lang=en],html:not([lang=fr]) [data-lang=fr]{display:none!important}
+@media (max-width:820px){.ai,.gallery{grid-template-columns:1fr}nav a{display:none}}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <a class="brand" href="#"><img src="icon.svg" alt="">Atelier</a>
+    <nav>
+      <a href="#features"><span data-lang="en">Features</span><span data-lang="fr">Fonctionnalités</span></a>
+      <a href="#ai"><span data-lang="en">AI</span><span data-lang="fr">IA</span></a>
+      <a href="#download"><span data-lang="en">Download</span><span data-lang="fr">Télécharger</span></a>
+    </nav>
+    <div class="lang" role="group" aria-label="Language">
+      <button data-set="en" aria-pressed="false">EN</button>
+      <button data-set="fr" aria-pressed="false">FR</button>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="wrap hero">
+    <img class="logo" src="icon.svg" alt="">
+    <h1 data-lang="en">A light image editor,<br>with familiar shortcuts</h1>
+    <h1 data-lang="fr">Un éditeur d'images léger,<br>aux raccourcis familiers</h1>
+    <p class="lead" data-lang="en">Layers, retouching, type, vectors and color management, with the shortcuts you already know. The AI runs on your computer: no image ever leaves it.</p>
+    <p class="lead" data-lang="fr">Calques, retouche, texte, vectoriel et gestion des couleurs, avec les raccourcis que vous connaissez déjà. L'IA tourne sur votre ordinateur : aucune image n'en sort.</p>
+    <div class="cta">
+      <a class="btn pri" href="https://github.com/Shhu/atelier-releases/releases/latest/download/atelier.exe" data-asset="atelier.exe">
+        <span data-lang="en">Download for Windows</span><span data-lang="fr">Télécharger pour Windows</span>
+        <small class="size"></small>
+      </a>
+      <a class="btn" href="https://github.com/Shhu/atelier-releases/releases/latest/download/atelier.flatpak" data-asset="atelier.flatpak">
+        <span data-lang="en">Linux (Flatpak)</span><span data-lang="fr">Linux (Flatpak)</span>
+        <small class="size"></small>
+      </a>
+      <a class="btn" href="https://github.com/Shhu/atelier-releases/releases/latest/download/atelier-macos.dmg" data-asset="atelier-macos.dmg" hidden>
+        <span data-lang="en">macOS (experimental)</span><span data-lang="fr">macOS (expérimental)</span>
+        <small class="size"></small>
+      </a>
+    </div>
+    <p class="meta"><span class="version"></span><span data-lang="en">Windows 10 and 11, 64-bit · a single file, nothing to install</span><span data-lang="fr">Windows 10 et 11, 64 bits · un seul fichier, rien à installer</span></p>
+    <div class="shot"><img data-shot="objsel" alt="Atelier" width="1600" height="1250"></div>
+  </div>
+
+  <section id="features">
+    <div class="wrap">
+      <h2 data-lang="en">From quick fixes to full projects</h2>
+      <h2 data-lang="fr">De la retouche rapide au projet complet</h2>
+      <p class="sub" data-lang="en">Non-destructive layers, retouching, vectors, type and color management, in a single light application.</p>
+      <p class="sub" data-lang="fr">Calques non destructifs, retouche, vectoriel, texte et gestion des couleurs, dans une seule application légère.</p>
+      <div class="grid">
+        <div class="card"><div class="ic">◫</div>
+          <h3 data-lang="en">Non-destructive layers</h3><h3 data-lang="fr">Calques non destructifs</h3>
+          <p data-lang="en">Masks, clipping, groups, adjustment and fill layers, every blend mode, layer styles, smart objects and smart filters.</p>
+          <p data-lang="fr">Masques, écrêtage, groupes, calques de réglage et de remplissage, tous les modes de fusion, styles de calque, objets et filtres dynamiques.</p></div>
+        <div class="card"><div class="ic">◐</div>
+          <h3 data-lang="en">Adjustments and RAW</h3><h3 data-lang="fr">Réglages et RAW</h3>
+          <p data-lang="en">Levels, Curves, Hue/Saturation and more, a RAW development filter in linear light, DNG files, filters and Liquify.</p>
+          <p data-lang="fr">Niveaux, Courbes, Teinte/Saturation et plus, un filtre de développement RAW en lumière linéaire, les fichiers DNG, les filtres et la Fluidité.</p></div>
+        <div class="card"><div class="ic">✚</div>
+          <h3 data-lang="en">Retouching</h3><h3 data-lang="fr">Retouche</h3>
+          <p data-lang="en">Clone Stamp, Healing and Spot Healing brushes, Patch, Content-Aware Fill, a full brush engine with pen pressure.</p>
+          <p data-lang="fr">Tampon de duplication, correcteurs, pièce, remplissage d'après le contenu, un moteur de pinceaux complet avec la pression du stylet.</p></div>
+        <div class="card"><div class="ic">⬚</div>
+          <h3 data-lang="en">Selections and transforms</h3><h3 data-lang="fr">Sélections et transformations</h3>
+          <p data-lang="en">Marquees, lassos, magic wand, Color Range, Select and Mask, Quick Mask; distort, perspective and warp.</p>
+          <p data-lang="fr">Rectangle, ellipse, lassos, baguette magique, plage de couleurs, sélectionner et masquer, masque rapide ; torsion, perspective et déformation.</p></div>
+        <div class="card"><div class="ic">T</div>
+          <h3 data-lang="en">Type and vectors</h3><h3 data-lang="fr">Texte et vectoriel</h3>
+          <p data-lang="en">Point and paragraph text typed on the canvas, character and paragraph settings, Pen tool, paths and shape layers.</p>
+          <p data-lang="fr">Texte de point et de paragraphe saisi sur l'image, réglages caractère et paragraphe, plume, tracés et calques de forme.</p></div>
+        <div class="card"><div class="ic">⧉</div>
+          <h3 data-lang="en">Files, color and automation</h3><h3 data-lang="fr">Fichiers, couleur et automatisation</h3>
+          <p data-lang="en">PSD import and export, ICC color management with soft proofing and CMYK export, artboards, actions and batch processing.</p>
+          <p data-lang="fr">Import et export PSD, gestion des couleurs ICC avec épreuve écran et export CMJN, plans de travail, scripts et traitement par lots.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="ai">
+    <div class="wrap ai">
+      <div>
+        <h2 data-lang="en">AI that stays at home</h2>
+        <h2 data-lang="fr">Une IA qui reste chez vous</h2>
+        <p class="sub" data-lang="en">The models are downloaded once, on first use, and run on your graphics card when it can (DirectML), otherwise on the processor.</p>
+        <p class="sub" data-lang="fr">Les modèles se téléchargent une fois, au premier usage, et tournent sur votre carte graphique quand elle le peut (DirectML), sinon sur le processeur.</p>
+        <ul data-lang="en">
+          <li><span><b>Object Selection</b> — hover an object to see it, click to select it, or draw a rectangle around it (SAM 2.1).</span></li>
+          <li><span><b>Select Subject</b> and <b>Remove Background</b> in one click (BiRefNet).</span></li>
+          <li><span><b>Content-Aware Fill</b> with an optional inpainting model (LaMa) for large areas.</span></li>
+          <li><span><b>AI Models</b> window: what is installed, its size, where it runs, delete it anytime.</span></li>
+        </ul>
+        <ul data-lang="fr">
+          <li><span><b>Sélection d'objet</b> — survolez un objet pour le voir, cliquez pour le sélectionner, ou tracez un rectangle autour (SAM 2.1).</span></li>
+          <li><span><b>Sélectionner le sujet</b> et <b>Supprimer l'arrière-plan</b> en un clic (BiRefNet).</span></li>
+          <li><span><b>Remplissage d'après le contenu</b> avec un modèle de reconstruction optionnel (LaMa) pour les grandes zones.</span></li>
+          <li><span>Fenêtre <b>Modèles d'IA</b> : ce qui est installé, sa taille, où il tourne, à supprimer quand vous voulez.</span></li>
+        </ul>
+      </div>
+      <div class="shot"><img data-shot="models" alt="" width="700" height="620"></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <div class="gallery">
+        <figure><div class="shot"><img data-shot="curves" alt="" width="1600" height="1250" loading="lazy"></div>
+          <figcaption data-lang="en">Curves, with histogram and live preview</figcaption>
+          <figcaption data-lang="fr">Courbes, avec histogramme et aperçu en direct</figcaption></figure>
+        <figure><div class="shot"><img data-shot="palette" alt="" width="1600" height="1250" loading="lazy"></div>
+          <figcaption data-lang="en">The command palette (Ctrl K)</figcaption>
+          <figcaption data-lang="fr">La palette de commandes (Ctrl K)</figcaption></figure>
+      </div>
+    </div>
+  </section>
+
+  <section id="download">
+    <div class="wrap">
+      <h2 data-lang="en">Download</h2>
+      <h2 data-lang="fr">Télécharger</h2>
+      <p class="sub" data-lang="en">Free. Atelier is in English and French and follows your system's language.</p>
+      <p class="sub" data-lang="fr">Gratuit. Atelier est en français et en anglais, et suit la langue de votre système.</p>
+      <div class="dl">
+        <div class="card">
+          <h3>Windows</h3>
+          <p data-lang="en">Windows 10 and 11, 64-bit. A single .exe: download it and run it.</p>
+          <p data-lang="fr">Windows 10 et 11, 64 bits. Un seul .exe : téléchargez-le et lancez-le.</p>
+          <a class="btn pri" href="https://github.com/Shhu/atelier-releases/releases/latest/download/atelier.exe" data-asset="atelier.exe"><span data-lang="en">Download .exe</span><span data-lang="fr">Télécharger le .exe</span><small class="size"></small></a>
+        </div>
+        <div class="card">
+          <h3>Linux</h3>
+          <p data-lang="en">Flatpak bundle: <kbd>flatpak install atelier.flatpak</kbd></p>
+          <p data-lang="fr">Paquet Flatpak : <kbd>flatpak install atelier.flatpak</kbd></p>
+          <a class="btn" href="https://github.com/Shhu/atelier-releases/releases/latest/download/atelier.flatpak" data-asset="atelier.flatpak"><span data-lang="en">Download Flatpak</span><span data-lang="fr">Télécharger le Flatpak</span><small class="size"></small></a>
+        </div>
+        <div class="card" data-asset="atelier-macos.dmg" hidden>
+          <h3><span data-lang="en">macOS — experimental</span><span data-lang="fr">macOS — expérimental</span></h3>
+          <p data-lang="en">Macs with Apple silicon (M1 and later), macOS 11 or later. Not tested on a Mac yet, and not signed by Apple: the first time, right-click Atelier in Applications, then Open.</p>
+          <p data-lang="fr">Mac à puce Apple (M1 et suivants), macOS 11 ou plus récent. Pas encore testé sur un Mac, et non signé par Apple : la première fois, clic droit sur Atelier dans Applications, puis Ouvrir.</p>
+          <a class="btn" href="https://github.com/Shhu/atelier-releases/releases/latest/download/atelier-macos.dmg"><span data-lang="en">Download .dmg</span><span data-lang="fr">Télécharger le .dmg</span><small class="size"></small></a>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Atelier <span class="tag"></span></span>
+    <span data-lang="en">Made with Rust and egui · AI by SAM 2.1 (Meta) and BiRefNet</span>
+    <span data-lang="fr">Fait avec Rust et egui · IA : SAM 2.1 (Meta) et BiRefNet</span>
+  </div>
+</footer>
+
+<script>
+// Language: the one chosen here, else the browser's (French or English).
+const saved = (() => { try { return localStorage.getItem('lang'); } catch { return null; } })();
+const browser = (navigator.language || 'en').toLowerCase().startsWith('fr') ? 'fr' : 'en';
+function setLang(l) {
+  document.documentElement.lang = l;
+  document.querySelectorAll('.lang button').forEach(b => b.setAttribute('aria-pressed', b.dataset.set === l));
+  document.querySelectorAll('img[data-shot]').forEach(img => { img.src = `shots/${l}-${img.dataset.shot}.webp`; });
+  try { localStorage.setItem('lang', l); } catch {}
+}
+document.querySelectorAll('.lang button').forEach(b => b.addEventListener('click', () => setLang(b.dataset.set)));
+setLang(saved === 'fr' || saved === 'en' ? saved : browser);
+
+// Version and file sizes of the latest release (public downloads repository).
+// The macOS version is only built for some releases: its buttons take the
+// newest release that has it, and show its version when it is an older one.
+fetch('https://api.github.com/repos/Shhu/atelier-releases/releases?per_page=30')
+  .then(r => r.ok ? r.json() : null).then(list => {
+  const releases = (list || []).filter(r => !r.draft && !r.prerelease);
+  if (!releases.length) return;
+  const latest = releases[0].tag_name;
+  document.querySelectorAll('.version').forEach(e => { e.textContent = latest + ' · '; });
+  document.querySelectorAll('.tag').forEach(e => { e.textContent = latest; });
+  document.querySelectorAll('[data-asset]').forEach(el => {
+    const name = el.dataset.asset;
+    const release = releases.find(r => r.assets.some(a => a.name === name));
+    if (!release) { el.style.display = 'none'; return; }
+    const asset = release.assets.find(a => a.name === name);
+    el.hidden = false;
+    const link = el.matches('a') ? el : el.querySelector('a.btn');
+    if (link) link.href = asset.browser_download_url;
+    const older = release.tag_name !== latest ? ` · ${release.tag_name}` : '';
+    el.querySelectorAll('.size').forEach(e => { e.textContent = `${Math.round(asset.size / 1e6)} MB${older}`; });
+  });
+}).catch(() => {});
+</script>
+</body>
+</html>

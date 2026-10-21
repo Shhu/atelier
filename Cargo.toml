@@ -1,0 +1,79 @@
+[package]
+name = "atelier"
+version = "0.3.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A light image editor with familiar shortcuts"
+repository = "https://github.com/Shhu/atelier"
+build = "build.rs"
+
+[dependencies]
+arboard = { version = "3.6", default-features = false, features = ["image-data"] }
+cosmic-text = "0.19.0"
+eframe = "0.36.2"
+egui-phosphor = "0.14"
+image = "0.25.10"
+# Checks the downloaded model.
+sha2 = "=0.11.0"
+# Native .atelier documents: a zip of a JSON manifest and one PNG per layer.
+# (Deflate through flate2's Rust backend, which png already enables.)
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+# PSD files: their ZIP-compressed channels (flate2 is already built for zip).
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+rfd = { version = "0.17.2", default-features = false, features = ["gtk3"] }
+# Downloads the model on first use.
+ureq = "3.4.2"
+# Path rasterization (exact-area anti-aliasing, strokes with caps, joins
+# and dashes) for paths and shape layers: already built for the text
+# (cosmic-text → swash → zeno), so no new crate.
+zeno = "0.3.3"
+# UI translations (Fluent files in locales/) and system language.
+fluent-bundle = "0.16"
+sys-locale = "0.3"
+# Color management (profile conversions, CMYK, soft proofing, gamut
+# warning): Little CMS, its C sources built in (never the system's).
+lcms2 = { version = "6.2", features = ["static"] }
+# CMYK JPEG (Adobe marker), which `image` doesn't write.
+jpeg-encoder = "0.7"
+# TIFF export, RGB or CMYK with its profile (already built for `image`).
+tiff = "0.11"
+# CMYK JPEGs read as their inks, to convert them with their profile
+# (`image` gives them as approximate RGB; already built for it).
+zune-jpeg = "0.5"
+zune-core = "0.5"
+
+# The monitor's profile, published by the desktop on the X root window.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"
+
+# AI subject selection (BiRefNet model), run locally by ONNX Runtime.
+# On Windows, ONNX Runtime (with DirectML, for the GPU) is embedded in the .exe
+# and loaded on demand (see build.rs): a single file to distribute. Elsewhere,
+# it is linked statically.
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "directml", "api-24"] }
+
+[target.'cfg(not(windows))'.dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-native", "api-24"] }
+
+# Image processing is very slow unoptimized: optimize even in dev builds.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }
+epaint_default_fonts = "0.36.2"
+# Checks the translation files.
+fluent-syntax = "0.12"
+ttf-parser = "0.25"
+# Reads back the CMYK JPEGs as they are (`image` converts them to RGB).
+jpeg-decoder = "0.3"
+
+[build-dependencies]
+# Icon of the Windows .exe.
+winresource = "0.1"

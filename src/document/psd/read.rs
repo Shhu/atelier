@@ -1,0 +1,1135 @@
+//! Reading: the file's sections, the channels of each layer decoded to 8
+//! bits, then the Atelier document built from them.
+
+use std::io::Read as _;
+use std::path::Path;
+use std::sync::Arc;
+
+use image::{GrayImage, RgbaImage};
+
+use super::bytes::{Reader, Result, unpack_row};
+use super::descriptor::Descriptor;
+use super::{Imported, adjust, artboard, blend_of, effects, vector};
+use crate::document::file_io::check_size;
+use crate::document::native::par_map;
+use crate::document::{BlendMode, Channel, Document, FileError, LayerKind, Mask};
+use crate::guides::{Guide, Orientation};
+use crate::i18n::t;
+
+/// Color modes.
+const BITMAP: u16 = 0;
+const GRAYSCALE: u16 = 1;
+const INDEXED: u16 = 2;
+const RGB: u16 = 3;
+const CMYK: u16 = 4;
+const MULTICHANNEL: u16 = 7;
+const DUOTONE: u16 = 8;
+const LAB: u16 = 9;
+
+struct Header {
+    /// PSB (version 2): larger lengths in places.
+    big: bool,
+    channels: u16,
+    width: u32,
+    height: u32,
+    depth: u16,
+    mode: u16,
+    /// Color profile (from the resources), the CMYK and gray pixels'.
+    icc: Option<Vec<u8>>,
+}
+
+fn header(r: &mut Reader) -> Result<Header> {
+    if r.bytes(4)? != b"8BPS" {
+        return Err(FileError::NotPsd);
+    }
+    let big = match r.u16()? {
+        1 => false,
+        2 => true,
+        _ => return Err(FileError::Damaged),
+    };
+    r.skip(6)?;
+    let channels = r.u16()?;
+    let height = r.u32()?;
+    let width = r.u32()?;
+    let depth = r.u16()?;
+    let mode = r.u16()?;
+    if channels == 0 || ![1, 8, 16, 32].contains(&depth) {
+        return Err(FileError::Damaged);
+    }
+    Ok(Header {
+        big,
+        channels,
+        width,
+        height,
+        depth,
+        mode,
+        icc: None,
+    })
+}
+
+/// Color channels of a mode (before the alpha channels).
+fn color_channels(mode: u16) -> usize {
+    match mode {
+        RGB | LAB => 3,
+        CMYK => 4,
+        _ => 1,
+    }
+}
+
+/// Image resources Atelier uses.
+#[derive(Default)]
+struct Resources {
+    icc: Option<Vec<u8>>,
+    alpha_names: Vec<String>,
+    /// Identifiers of the alpha channels.
+    alpha_ids: Vec<u32>,
+    /// Index of the active layer's record.
+    target_layer: Option<usize>,
+    guides: Vec<Guide>,
+    global_angle: Option<f64>,
+    /// JPEG preview.
+    thumbnail: Option<Vec<u8>>,
+}
+
+fn resources(r: &mut Reader) -> Result<Resources> {
+    let mut out = Resources::default();
+    let mut ascii_names = Vec::new();
+    while r.remaining() >= 12 && r.bytes(4)? == b"8BIM" {
+        let id = r.u16()?;
+        r.pascal(2)?;
+        let len = r.u32()? as usize;
+        let mut d = r.sub(len)?;
+        r.skip(len % 2)?;
+        match id {
+            1039 => out.icc = Some(d.bytes(len)?.to_vec()),
+            1006 => {
+                while d.remaining() > 0 {
+                    ascii_names.push(mac_roman(d.pascal(1)?));
+                }
+            }
+            1045 => {
+                while d.remaining() >= 4 {
+                    out.alpha_names.push(d.unicode()?);
+                }
+            }
+            1053 => {
+                while d.remaining() >= 4 {
+                    out.alpha_ids.push(d.u32()?);
+                }
+            }
+            1024 => out.target_layer = Some(d.u16()? as usize),
+            1032 => {
+                d.skip(12)?;
+                let n = d.u32()? as usize;
+                for _ in 0..n.min(d.remaining() / 5) {
+                    let at = d.i32()? as f32 / 32.0;
+                    let orientation = match d.u8()? {
+                        0 => Orientation::Vertical,
+                        _ => Orientation::Horizontal,
+                    };
+                    out.guides.push(Guide::new(orientation, at));
+                }
+            }
+            1037 => out.global_angle = Some(d.i32()? as f64),
+            // Format (1: JPEG), sizes…, then the JFIF data.
+            1036 if len > 28 && d.u32()? == 1 => {
+                d.skip(24)?;
+                out.thumbnail = Some(d.bytes(len - 28)?.to_vec());
+            }
+            _ => {}
+        }
+    }
+    if out.alpha_names.is_empty() {
+        out.alpha_names = ascii_names;
+    }
+    Ok(out)
+}
+
+/// Text in the Mac OS Roman encoding (Pascal strings).
+pub(super) fn mac_roman(bytes: &[u8]) -> String {
+    const HIGH: &str = "ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø\
+                        ¿¡¬√ƒ≈∆«»…\u{a0}ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›ﬁﬂ‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔ\u{f8ff}\
+                        ÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ";
+    let high: Vec<char> = HIGH.chars().collect();
+    bytes
+        .iter()
+        .map(|&b| match b {
+            0..=127 => b as char,
+            _ => high.get(b as usize - 128).copied().unwrap_or('?'),
+        })
+        .collect()
+}
+
+/// A layer record, with its channels' data.
+struct Record<'a> {
+    /// Top, left, bottom, right.
+    rect: [i32; 4],
+    blend: [u8; 4],
+    opacity: u8,
+    clipped: bool,
+    hidden: bool,
+    /// Blend If ranges other than the full ones.
+    blend_if: bool,
+    mask: Option<MaskData>,
+    name: String,
+    blocks: Vec<([u8; 4], &'a [u8])>,
+    /// By channel id, compression first.
+    channels: Vec<(i16, &'a [u8])>,
+}
+
+impl Record<'_> {
+    fn block(&self, key: &[u8; 4]) -> Option<&[u8]> {
+        self.blocks.iter().find(|(k, _)| k == key).map(|(_, d)| *d)
+    }
+
+    /// The vector mask's block.
+    fn vector_mask(&self) -> Option<&[u8]> {
+        self.block(b"vmsk").or_else(|| self.block(b"vsms"))
+    }
+
+    fn user_mask(&self) -> Option<UserMask> {
+        self.mask?.user(self.vector_mask().is_some())
+    }
+}
+
+/// Width and height of a top, left, bottom, right rectangle.
+fn size([top, left, bottom, right]: [i32; 4]) -> (u32, u32) {
+    let side = |a: i32, b: i32| (b as i64 - a as i64).clamp(0, u32::MAX as i64) as u32;
+    (side(left, right), side(top, bottom))
+}
+
+#[derive(Clone, Copy)]
+struct MaskData {
+    /// The mask of channel -2: its box (top, left, bottom, right), value
+    /// outside it, flags.
+    rect: [i32; 4],
+    default: u8,
+    flags: u8,
+    /// Channel -3's, when there is one.
+    real: Option<([i32; 4], u8, u8)>,
+    density: Option<u8>,
+    feather: Option<f64>,
+    vector_density: Option<u8>,
+    vector_feather: Option<f64>,
+}
+
+/// The pixel mask the user made: its channel, box, default value, and
+/// whether it is off.
+struct UserMask {
+    channel: i16,
+    rect: [i32; 4],
+    default: u8,
+    disabled: bool,
+}
+
+impl MaskData {
+    /// The pixel mask, as Photoshop stores it next to a vector mask: when
+    /// channel -2 holds the vector mask's rendering ("came from rendering
+    /// other data"), the user's is channel -3, if any.
+    fn user(&self, vector: bool) -> Option<UserMask> {
+        let disabled = self.flags & 2 != 0;
+        match self.real {
+            Some((rect, default, flags)) => Some(UserMask {
+                channel: -3,
+                rect,
+                default,
+                disabled: disabled || flags & 2 != 0,
+            }),
+            None if vector && self.flags & 8 != 0 => None,
+            None => Some(UserMask {
+                channel: -2,
+                rect: self.rect,
+                default: self.default,
+                disabled,
+            }),
+        }
+    }
+}
+
+/// Keys of the tagged blocks whose length takes 8 bytes in a PSB.
+const BIG_KEYS: [&[u8; 4]; 13] = [
+    b"LMsk", b"Lr16", b"Lr32", b"Layr", b"Mt16", b"Mt32", b"Mtrn", b"Alph", b"FMsk", b"lnk2",
+    b"FEid", b"FXid", b"PxSD",
+];
+
+fn tagged_blocks<'a>(r: &mut Reader<'a>, big: bool) -> Result<Vec<([u8; 4], &'a [u8])>> {
+    let mut blocks = Vec::new();
+    while r.remaining() >= 12 {
+        let mut peek = r.clone();
+        let sig = peek.bytes(4)?;
+        if sig != b"8BIM" && sig != b"8B64" {
+            break;
+        }
+        r.skip(4)?;
+        let key = r.tag()?;
+        let len = r.len(big && BIG_KEYS.contains(&&key))?;
+        blocks.push((key, r.bytes(len)?));
+    }
+    Ok(blocks)
+}
+
+/// The records of a layer info section, then their channels' data; and
+/// the layer count's sign (negative: the merged image's first alpha
+/// channel is its transparency).
+fn layer_info<'a>(r: &mut Reader<'a>, big: bool) -> Result<(Vec<Record<'a>>, bool)> {
+    let count = r.i16()?;
+    let mut records = Vec::new();
+    let mut lengths = Vec::new();
+    for _ in 0..count.unsigned_abs() {
+        let (rec, lens) = record(r, big)?;
+        records.push(rec);
+        lengths.push(lens);
+    }
+    for (rec, lens) in records.iter_mut().zip(lengths) {
+        for (id, len) in lens {
+            rec.channels.push((id, r.bytes(len)?));
+        }
+    }
+    Ok((records, count < 0))
+}
+
+fn record<'a>(r: &mut Reader<'a>, big: bool) -> Result<(Record<'a>, Vec<(i16, usize)>)> {
+    let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+    let n = r.u16()? as usize;
+    if n > 56 {
+        return Err(FileError::Damaged);
+    }
+    let mut lengths = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id = r.i16()?;
+        lengths.push((id, r.len(big)?));
+    }
+    if r.bytes(4)? != b"8BIM" {
+        return Err(FileError::Damaged);
+    }
+    let blend = r.tag()?;
+    let opacity = r.u8()?;
+    let clipped = r.u8()? != 0;
+    let flags = r.u8()?;
+    r.u8()?;
+    let extra = r.u32()? as usize;
+    let mut x = r.sub(extra)?;
+    let mask_len = x.u32()? as usize;
+    let has_real = lengths.iter().any(|(id, _)| *id == -3);
+    let mask = (mask_len > 0)
+        .then(|| mask_data(&mut x.sub(mask_len)?, mask_len, has_real))
+        .transpose()?;
+    let ranges = x.u32()? as usize;
+    let blend_if = x
+        .bytes(ranges)?
+        .chunks_exact(4)
+        .any(|r| r != [0, 0, 255, 255]);
+    let mut name = mac_roman(x.pascal(4)?);
+    let blocks = tagged_blocks(&mut x, big)?;
+    if let Some((_, d)) = blocks.iter().find(|(k, _)| k == b"luni") {
+        name = Reader::new(d).unicode()?;
+    }
+    let rec = Record {
+        rect,
+        blend,
+        opacity,
+        clipped,
+        hidden: flags & 2 != 0,
+        blend_if,
+        mask,
+        name,
+        blocks,
+        channels: Vec::with_capacity(n),
+    };
+    Ok((rec, lengths))
+}
+
+fn mask_data(r: &mut Reader, len: usize, has_real: bool) -> Result<MaskData> {
+    let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+    let default = r.u8()?;
+    let flags = r.u8()?;
+    let mut m = MaskData {
+        rect,
+        default,
+        flags,
+        real: None,
+        density: None,
+        feather: None,
+        vector_density: None,
+        vector_feather: None,
+    };
+    // As Photoshop writes it: the real mask (only with its channel), then
+    // the parameters.
+    if has_real && len >= 36 {
+        let flags = r.u8()?;
+        let default = r.u8()?;
+        m.real = Some(([r.i32()?, r.i32()?, r.i32()?, r.i32()?], default, flags));
+    }
+    if flags & 16 != 0 && r.remaining() > 0 {
+        let params = r.u8()?;
+        if params & 1 != 0 {
+            m.density = Some(r.u8()?);
+        }
+        if params & 2 != 0 {
+            m.feather = Some(r.f64()?);
+        }
+        if params & 4 != 0 {
+            m.vector_density = Some(r.u8()?);
+        }
+        if params & 8 != 0 {
+            m.vector_feather = Some(r.f64()?);
+        }
+    }
+    Ok(m)
+}
+
+/// The samples of a channel decoded to 8 bits (`color`: a color channel,
+/// which 32 bits store linear).
+fn decode(data: &[u8], (w, h): (u32, u32), depth: u16, big: bool, color: bool) -> Result<Vec<u8>> {
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 {
+        return Ok(Vec::new());
+    }
+    let mut r = Reader::new(data);
+    let compression = r.u16()?;
+    let row = (w * depth as usize).div_ceil(8);
+    let raw = decompress(&mut r, compression, row, h, depth, big)?;
+    Ok(to_8_bits(&raw, w, h, depth, color))
+}
+
+/// The samples of a channel, uncompressed (`row` bytes per row).
+fn decompress(
+    r: &mut Reader,
+    compression: u16,
+    row: usize,
+    h: usize,
+    depth: u16,
+    big: bool,
+) -> Result<Vec<u8>> {
+    let size = row.checked_mul(h).ok_or(FileError::Damaged)?;
+    match compression {
+        0 => Ok(r.bytes(size)?.to_vec()),
+        1 => {
+            let mut counts = Vec::with_capacity(h);
+            for _ in 0..h {
+                counts.push(if big {
+                    r.u32()? as usize
+                } else {
+                    r.u16()? as usize
+                });
+            }
+            let mut out = vec![0; size];
+            for (y, n) in counts.into_iter().enumerate() {
+                unpack_row(r.bytes(n)?, &mut out[y * row..(y + 1) * row])?;
+            }
+            Ok(out)
+        }
+        2 | 3 => {
+            let mut out = Vec::with_capacity(size);
+            flate2::read::ZlibDecoder::new(r.bytes(r.remaining())?)
+                .take(size as u64)
+                .read_to_end(&mut out)
+                .map_err(|_| FileError::Damaged)?;
+            if out.len() != size {
+                return Err(FileError::Damaged);
+            }
+            if compression == 3 {
+                unpredict(&mut out, row, depth);
+            }
+            Ok(out)
+        }
+        _ => Err(FileError::Damaged),
+    }
+}
+
+/// Undoes the prediction of "ZIP with prediction": deltas along each row
+/// (of 16-bit values for 16 bits; of bytes split in four planes for 32).
+fn unpredict(data: &mut [u8], row: usize, depth: u16) {
+    for line in data.chunks_exact_mut(row) {
+        match depth {
+            16 => {
+                let mut prev = 0u16;
+                for v in line.chunks_exact_mut(2) {
+                    let x = u16::from_be_bytes([v[0], v[1]]).wrapping_add(prev);
+                    v.copy_from_slice(&x.to_be_bytes());
+                    prev = x;
+                }
+            }
+            _ => {
+                for i in 1..line.len() {
+                    line[i] = line[i].wrapping_add(line[i - 1]);
+                }
+                if depth == 32 {
+                    let n = line.len() / 4;
+                    let planes = line.to_vec();
+                    for i in 0..n {
+                        for b in 0..4 {
+                            line[i * 4 + b] = planes[b * n + i];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn to_8_bits(raw: &[u8], w: usize, h: usize, depth: u16, color: bool) -> Vec<u8> {
+    match depth {
+        8 => raw.to_vec(),
+        16 => raw
+            .chunks_exact(2)
+            .map(|c| ((u16::from_be_bytes([c[0], c[1]]) as u32 + 128) / 257) as u8)
+            .collect(),
+        32 => raw
+            .chunks_exact(4)
+            .map(|c| {
+                let v = f32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+                let v = if v.is_finite() {
+                    v.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let v = if color { srgb_of_linear(v) } else { v };
+                (v * 255.0).round() as u8
+            })
+            .collect(),
+        // Bitmap: 1 is black.
+        _ => {
+            let row = w.div_ceil(8);
+            let mut out = Vec::with_capacity(w * h);
+            for y in 0..h {
+                for x in 0..w {
+                    let bit = (raw[y * row + x / 8] >> (7 - x % 8)) & 1;
+                    out.push(if bit == 1 { 0 } else { 255 });
+                }
+            }
+            out
+        }
+    }
+}
+
+fn srgb_of_linear(c: f32) -> f32 {
+    if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// A mode's color planes (and alpha, opaque if `None`) to RGBA; CMYK and
+/// gray through the file's profile (see `color::to_srgb`).
+fn to_rgba(
+    header: &Header,
+    (w, h): (u32, u32),
+    color: &[&[u8]],
+    alpha: Option<&[u8]>,
+    palette: &[u8],
+) -> RgbaImage {
+    let mode = header.mode;
+    let n = w as usize * h as usize;
+    let at = |plane: usize, i: usize| {
+        color
+            .get(plane)
+            .map_or(0, |p| p.get(i).copied().unwrap_or(0))
+    };
+    let managed = match mode {
+        // Stored inverted: 255 is no ink.
+        CMYK => {
+            let inks: Vec<u8> = (0..n)
+                .flat_map(|i| (0..4).map(move |c| 255 - at(c, i)))
+                .collect();
+            crate::document::color::to_srgb(&inks, true, header.icc.as_deref())
+        }
+        GRAYSCALE => {
+            let gray: Vec<u8> = (0..n).map(|i| at(0, i)).collect();
+            crate::document::color::to_srgb(&gray, false, header.icc.as_deref())
+        }
+        _ => None,
+    };
+    let mut out = vec![0u8; n * 4];
+    for (i, px) in out.chunks_exact_mut(4).enumerate() {
+        let [r, g, b] = match mode {
+            _ if let Some(rgb) = &managed => [rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]],
+            RGB => [at(0, i), at(1, i), at(2, i)],
+            CMYK => {
+                // Stored inverted: 255 is no ink.
+                let k = at(3, i) as u32;
+                let f = |c: u8| ((c as u32 * k + 127) / 255) as u8;
+                [f(at(0, i)), f(at(1, i)), f(at(2, i))]
+            }
+            LAB => {
+                let l = at(0, i) as f32 * 100.0 / 255.0;
+                let (a, b) = (at(1, i) as f32 - 128.0, at(2, i) as f32 - 128.0);
+                crate::color::to_u8(crate::color::lab_to_rgb([l, a, b]))
+            }
+            INDEXED => {
+                let k = at(0, i) as usize;
+                let c = |j: usize| palette.get(j * 256 + k).copied().unwrap_or(0);
+                [c(0), c(1), c(2)]
+            }
+            _ => [at(0, i); 3],
+        };
+        let a = alpha.map_or(255, |p| p.get(i).copied().unwrap_or(0));
+        px.copy_from_slice(&[r, g, b, a]);
+    }
+    RgbaImage::from_raw(w, h, out).expect("matching size")
+}
+
+/// The decoded image and mask of a record.
+struct Decoded {
+    image: RgbaImage,
+    /// Pixel mask: (image, origin) in the canvas.
+    mask: Option<(GrayImage, (i64, i64))>,
+}
+
+fn decode_record(rec: &Record, h: &Header, palette: &[u8]) -> Result<Decoded> {
+    let (w, ht) = size(rec.rect);
+    let n = color_channels(h.mode);
+    let plane = |id: i16, rect: [i32; 4], color: bool| -> Result<Option<Vec<u8>>> {
+        rec.channels
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, data)| decode(data, size(rect), h.depth, h.big, color))
+            .transpose()
+    };
+    let mut colors = Vec::with_capacity(n);
+    for c in 0..n as i16 {
+        colors.push(plane(c, rec.rect, true)?.unwrap_or_default());
+    }
+    let alpha = plane(-1, rec.rect, false)?;
+    let refs: Vec<&[u8]> = colors.iter().map(Vec::as_slice).collect();
+    let image = to_rgba(h, (w, ht), &refs, alpha.as_deref(), palette);
+    let mask = match rec.user_mask() {
+        Some(m) => {
+            let (mw, mh) = size(m.rect);
+            plane(m.channel, m.rect, false)?.map(|p| {
+                let image = GrayImage::from_raw(mw, mh, p).filter(|_| mw * mh > 0);
+                let origin = (m.rect[1] as i64, m.rect[0] as i64);
+                (image.unwrap_or_else(|| GrayImage::new(0, 0)), origin)
+            })
+        }
+        None => None,
+    };
+    Ok(Decoded { image, mask })
+}
+
+/// What had to be simplified, by kind, with the layers concerned.
+#[derive(Default)]
+struct Notes {
+    lines: Vec<String>,
+    text: Vec<String>,
+    smart: Vec<String>,
+    vector: Vec<String>,
+    shapes: Vec<String>,
+    dropped: Vec<String>,
+    styles: Vec<String>,
+}
+
+impl Notes {
+    fn finish(mut self) -> Vec<String> {
+        // A layer is named once per kind.
+        self.styles.dedup();
+        let list = |names: &[String]| {
+            const SHOWN: usize = 3;
+            let mut s = names
+                .iter()
+                .take(SHOWN)
+                .map(|n| format!("“{n}”"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if names.len() > SHOWN {
+                s.push('…');
+            }
+            s
+        };
+        let groups = [
+            (
+                &self.text,
+                t!("xchg-psd-note-text", names = list(&self.text)),
+            ),
+            (
+                &self.smart,
+                t!("xchg-psd-note-smart", names = list(&self.smart)),
+            ),
+            (
+                &self.vector,
+                t!("xchg-psd-note-vector", names = list(&self.vector)),
+            ),
+            (
+                &self.shapes,
+                t!("xchg-psd-note-shapes", names = list(&self.shapes)),
+            ),
+            (
+                &self.styles,
+                t!("xchg-psd-note-styles", names = list(&self.styles)),
+            ),
+            (
+                &self.dropped,
+                t!("xchg-psd-note-dropped", names = list(&self.dropped)),
+            ),
+        ];
+        for (names, line) in groups {
+            if !names.is_empty() {
+                self.lines.push(line);
+            }
+        }
+        self.lines
+    }
+}
+
+/// Everything read from the file.
+struct File<'a> {
+    header: Header,
+    resources: Resources,
+    palette: Vec<u8>,
+    records: Vec<Record<'a>>,
+    /// The merged image's first alpha channel is its transparency.
+    merged_alpha: bool,
+    /// The merged image's data (compression first).
+    image_data: &'a [u8],
+}
+
+fn parse(data: &[u8]) -> Result<File<'_>> {
+    let mut r = Reader::new(data);
+    let mut header = header(&mut r)?;
+    let n = r.u32()? as usize;
+    let palette = r.bytes(n)?.to_vec();
+    let n = r.u32()? as usize;
+    let resources = resources(&mut r.sub(n)?)?;
+    header.icc = resources.icc.clone();
+    let big = header.big;
+    let n = r.len(big)?;
+    let mut lm = r.sub(n)?;
+    let image_data = r.bytes(r.remaining())?;
+    let (mut records, mut merged_alpha) = (Vec::new(), false);
+    let mut global = Vec::new();
+    if lm.remaining() > 0 {
+        let n = lm.len(big)?;
+        let mut info = lm.sub(n)?;
+        if n > 0 {
+            (records, merged_alpha) = layer_info(&mut info, big)?;
+        }
+        if lm.remaining() >= 4 {
+            let n = lm.u32()? as usize;
+            lm.skip(n)?;
+        }
+        // Global tagged blocks, aligned to 4 bytes.
+        while lm.remaining() >= 12 {
+            let mut blocks = tagged_blocks(&mut lm, big)?;
+            if blocks.is_empty() {
+                lm.skip(1)?;
+            }
+            for (_, data) in &blocks {
+                lm.skip((4 - data.len() % 4) % 4).ok();
+            }
+            global.append(&mut blocks);
+        }
+    }
+    // 16 and 32 bits: the layers are in a global block.
+    if records.is_empty()
+        && let Some((_, block)) = global.iter().find(|(k, _)| k == b"Lr16" || k == b"Lr32")
+    {
+        (records, merged_alpha) = layer_info(&mut Reader::new(block), big)?;
+    }
+    merged_alpha |= global
+        .iter()
+        .any(|(k, _)| matches!(k, b"Mtrn" | b"Mt16" | b"Mt32"));
+    Ok(File {
+        header,
+        resources,
+        palette,
+        records,
+        merged_alpha,
+        image_data,
+    })
+}
+
+/// The merged image's channels `wanted` (by index), decoded.
+fn merged_planes(f: &File, wanted: &[usize]) -> Result<Vec<Vec<u8>>> {
+    let h = &f.header;
+    let (w, ht) = (h.width as usize, h.height as usize);
+    let row = (w * h.depth as usize).div_ceil(8);
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut r = Reader::new(f.image_data);
+    let compression = r.u16()?;
+    let channels = h.channels as usize;
+    let planes: Vec<Vec<u8>> = match compression {
+        1 => {
+            let mut counts = Vec::with_capacity(channels * ht);
+            for _ in 0..channels * ht {
+                counts.push(if h.big {
+                    r.u32()? as usize
+                } else {
+                    r.u16()? as usize
+                });
+            }
+            let mut planes = Vec::new();
+            for c in 0..channels {
+                let rows = &counts[c * ht..(c + 1) * ht];
+                let total: usize = rows.iter().sum();
+                let data = r.bytes(total)?;
+                if !wanted.contains(&c) {
+                    planes.push(Vec::new());
+                    continue;
+                }
+                let mut raw = vec![0; row * ht];
+                let mut at = 0;
+                for (y, &n) in rows.iter().enumerate() {
+                    unpack_row(&data[at..at + n], &mut raw[y * row..(y + 1) * row])?;
+                    at += n;
+                }
+                planes.push(raw);
+            }
+            planes
+        }
+        _ => {
+            let all = decompress(&mut r, compression, row, ht * channels, h.depth, h.big)?;
+            all.chunks(row * ht).map(<[u8]>::to_vec).collect()
+        }
+    };
+    let color = color_channels(h.mode);
+    Ok(wanted
+        .iter()
+        .map(|&c| {
+            planes
+                .get(c)
+                .map_or_else(Vec::new, |p| to_8_bits(p, w, ht, h.depth, c < color))
+        })
+        .collect())
+}
+
+/// Reads a Photoshop document from its bytes.
+pub(super) fn document(data: &[u8]) -> Result<Imported> {
+    let f = parse(data)?;
+    let h = &f.header;
+    check_size(h.width, h.height)?;
+    if h.mode == MULTICHANNEL && h.channels < 3 {
+        return Err(FileError::NotPsd);
+    }
+    let mut notes = Notes::default();
+    if h.depth != 8 {
+        notes.lines.push(t!("xchg-psd-note-depth", bits = h.depth));
+    }
+    let mode_name = match h.mode {
+        BITMAP => Some(t!("xchg-psd-mode-bitmap")),
+        GRAYSCALE => Some(t!("xchg-psd-mode-grayscale")),
+        INDEXED => Some(t!("xchg-psd-mode-indexed")),
+        CMYK => Some(t!("xchg-psd-mode-cmyk")),
+        MULTICHANNEL => Some(t!("xchg-psd-mode-multichannel")),
+        DUOTONE => Some(t!("xchg-psd-mode-duotone")),
+        LAB => Some(t!("xchg-psd-mode-lab")),
+        _ => None,
+    };
+    if let Some(mode) = mode_name {
+        notes.lines.push(t!("xchg-psd-note-mode", mode = mode));
+    }
+    let mut doc = Document::new(RgbaImage::new(0, 0), None);
+    doc.layers.clear();
+    doc.canvas = (h.width, h.height);
+    let canvas = (h.width, h.height);
+
+    // Layers, decoded on all the cores.
+    let (decoded, ()) = par_map(&f.records, |rec| decode_record(rec, h, &f.palette), || ());
+    let mut target = None;
+    let mut depth = 0u32;
+    for (i, (rec, decoded)) in f.records.iter().zip(decoded).enumerate() {
+        let divider = rec.block(b"lsct").or_else(|| rec.block(b"lsdk"));
+        let section = divider.map_or(Ok(0), |d| Reader::new(d).u32())?;
+        if section == 3 {
+            depth += 1;
+            continue;
+        }
+        let Decoded { image, mask } = decoded?;
+        let mut layer = doc.make_layer(
+            rec.name.clone(),
+            image,
+            (rec.rect[1] as i64, rec.rect[0] as i64),
+        );
+        layer.blend = blend_of(&rec.blend);
+        if section == 1 || section == 2 {
+            depth = depth.saturating_sub(1);
+            layer.kind = LayerKind::Group {
+                expanded: section == 1,
+            };
+            layer.replace_pixels(RgbaImage::new(0, 0));
+            layer.offset = (0, 0);
+            if let Some(d) = divider.filter(|d| d.len() >= 12) {
+                layer.blend = blend_of(&d[8..12]);
+            }
+            let board = [b"artb", b"artd", b"abdd"]
+                .iter()
+                .find_map(|k| rec.block(k))
+                .filter(|_| depth == 0)
+                .and_then(artboard::read);
+            if let Some((r, a)) = board {
+                layer.offset = (r.x, r.y);
+                layer.artboard = Some(a);
+            }
+        } else {
+            match adjust::read(&rec.blocks) {
+                Some(Ok(kind)) => {
+                    layer.kind = kind;
+                    layer.replace_pixels(RgbaImage::new(0, 0));
+                    layer.offset = (0, 0);
+                }
+                Some(Err(())) => {
+                    notes.dropped.push(rec.name.clone());
+                    continue;
+                }
+                None => {}
+            }
+        }
+        if layer.blend == BlendMode::PassThrough && !layer.is_group() {
+            layer.blend = BlendMode::Normal;
+        }
+        layer.depth = depth;
+        layer.visible = !rec.hidden;
+        layer.opacity = rec.opacity as f32 / 255.0;
+        if let Some(mut d) = rec.block(b"iOpa").map(Reader::new) {
+            layer.fill = d.u8()? as f32 / 255.0;
+        }
+        layer.clipped = rec.clipped && !layer.is_group();
+        // A group's fill opacity acts on what it holds, as its opacity
+        // does (without knockout): Atelier's groups only have the latter.
+        if layer.is_group() {
+            layer.opacity *= layer.fill;
+            layer.fill = 1.0;
+        }
+        if let Some(mut d) = rec.block(b"lspf").map(Reader::new) {
+            let lock = d.u32()?;
+            layer.locked = lock & 0x8000_0000 != 0 || lock & 6 == 6;
+        }
+        // Shape strokes; knockout and Blend If (Blending Options).
+        if rec.block(b"vstk").is_some() {
+            notes.shapes.push(rec.name.clone());
+        }
+        let knockout = rec
+            .block(b"knko")
+            .is_some_and(|d| d.first().is_some_and(|&k| k != 0));
+        if knockout || rec.blend_if {
+            notes.styles.push(rec.name.clone());
+        }
+        if layer.has_pixels() {
+            if rec.block(b"TySh").is_some() {
+                notes.text.push(rec.name.clone());
+            }
+            if [b"SoLd", b"PlLd", b"SoLE"]
+                .iter()
+                .any(|k| rec.block(k).is_some())
+            {
+                notes.smart.push(rec.name.clone());
+            }
+        }
+        // Layer styles: those Atelier has, on the pixel layers.
+        let fx = rec
+            .block(b"lmfx")
+            .or_else(|| rec.block(b"lfx2"))
+            .or_else(|| rec.block(b"lfxs"))
+            .and_then(|d| {
+                let mut r = Reader::new(d);
+                r.skip(8).ok()?;
+                Descriptor::read(&mut r).ok()
+            });
+        if let Some(fx) = fx {
+            let angle = f.resources.global_angle.unwrap_or(120.0);
+            let (effects, simplified) = effects::read(&fx, angle);
+            // Atelier has styles on pixel layers only.
+            if simplified || (!layer.has_pixels() && effects.any()) {
+                notes.styles.push(rec.name.clone());
+            }
+            if layer.has_pixels() {
+                layer.effects = effects;
+            }
+        }
+        // Masks: the pixel mask and the vector mask rasterized, multiplied.
+        let pixel = mask
+            .zip(rec.user_mask())
+            .zip(rec.mask)
+            .map(|(((image, origin), u), md)| {
+                let mut m = Mask::new(image, origin, u.default, layer.offset);
+                m.enabled = !u.disabled;
+                m.density = md.density.map_or(1.0, |d| d as f32 / 255.0);
+                m.feather = md.feather.map_or(0.0, |f| f.clamp(0.0, 1000.0) as f32);
+                m
+            });
+        let vector = match rec.vector_mask() {
+            Some(v) => vector::rasterize(v, canvas)?,
+            None => None,
+        };
+        layer.mask = match (pixel, vector) {
+            (pixel, None) => pixel,
+            (pixel, Some(coverage)) => {
+                if layer.has_pixels() || pixel.is_some() {
+                    notes.vector.push(rec.name.clone());
+                }
+                let md = rec.mask;
+                let mut v = Mask::new(coverage, (0, 0), 0, layer.offset);
+                v.density = md
+                    .and_then(|m| m.vector_density)
+                    .map_or(1.0, |d| d as f32 / 255.0);
+                v.feather = md
+                    .and_then(|m| m.vector_feather)
+                    .map_or(0.0, |f| f.clamp(0.0, 1000.0) as f32);
+                Some(combine(
+                    &v,
+                    pixel.as_ref().filter(|m| m.enabled),
+                    canvas,
+                    layer.offset,
+                ))
+            }
+        };
+        if f.resources.target_layer == Some(i) {
+            target = Some(doc.layers.len());
+        }
+        doc.layers.push(layer);
+    }
+    doc.fix_depths();
+    // A clipped layer needs one below it, in its group.
+    for i in 0..doc.layers.len() {
+        let below = i.checked_sub(1).map(|j| doc.layers[j].depth);
+        if below.is_none_or(|d| d < doc.layers[i].depth) {
+            doc.layers[i].clipped = false;
+        }
+    }
+
+    // Alpha channels: after the color channels (and the merged
+    // transparency).
+    let color = color_channels(h.mode);
+    let first_alpha =
+        color + usize::from(f.merged_alpha || f.records.is_empty() && has_transparency(&f));
+    let flat = doc.layers.is_empty();
+    let mut wanted: Vec<usize> = (first_alpha..h.channels as usize).collect();
+    if flat {
+        wanted.extend(0..first_alpha.min(h.channels as usize));
+    }
+    // A damaged merged image only costs the alpha channels when there are
+    // layers.
+    let planes = match merged_planes(&f, &wanted) {
+        Ok(planes) => planes,
+        Err(_) if !flat => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let alpha_count = h.channels as usize - first_alpha.min(h.channels as usize);
+    for (k, plane) in planes.iter().take(alpha_count).enumerate() {
+        let name = f
+            .resources
+            .alpha_names
+            .get(k)
+            .cloned()
+            .unwrap_or_else(|| t!("xchg-psd-alpha-name", number = k + 1));
+        if let Some(mask) = GrayImage::from_raw(h.width, h.height, plane.clone()) {
+            doc.channels.push(Channel {
+                name,
+                mask: Arc::new(mask),
+            });
+        }
+    }
+    if flat {
+        let p = &planes[alpha_count..];
+        let refs: Vec<&[u8]> = p[..color.min(p.len())].iter().map(Vec::as_slice).collect();
+        let alpha = (first_alpha > color)
+            .then(|| p.get(color).map(Vec::as_slice))
+            .flatten();
+        let mut image = to_rgba(h, canvas, &refs, alpha, &f.palette);
+        if alpha.is_some() {
+            unmatte(&mut image);
+        }
+        let layer = doc.make_layer(t!("doc-background-layer-name"), image, (0, 0));
+        doc.layers.push(layer);
+    }
+    doc.active = target.unwrap_or(doc.layers.len() - 1);
+    doc.guides = f.resources.guides;
+    // With artboards, the canvas is their box (Photoshop's also reaches
+    // the origin).
+    doc.fit_artboards();
+    // CMYK and Lab pixels are read in sRGB.
+    doc.icc_profile = match h.mode {
+        CMYK | LAB => Some(crate::cms::srgb().icc().to_vec()),
+        mode => crate::document::color::rgb_profile(f.resources.icc, matches!(mode, RGB | INDEXED)),
+    }
+    .map(Arc::new);
+    doc.modified = false;
+    Ok(Imported {
+        doc,
+        notes: notes.finish(),
+    })
+}
+
+/// A flat file's extra channel is its transparency unless the alpha
+/// channels are named as such.
+fn has_transparency(f: &File) -> bool {
+    let color = color_channels(f.header.mode);
+    f.header.channels as usize > color
+        && f.resources.alpha_names.len() < f.header.channels as usize - color
+}
+
+/// The merged image with transparency is matted against white: its colors
+/// get theirs back.
+fn unmatte(image: &mut RgbaImage) {
+    for p in image.pixels_mut() {
+        let a = p.0[3] as u32;
+        if a == 0 {
+            p.0 = [0; 4];
+        } else if a < 255 {
+            for c in &mut p.0[..3] {
+                let v = (*c as i32 - (255 - a) as i32).max(0) as u32;
+                *c = ((v * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+}
+
+/// One mask over the canvas: the vector mask `v` times the pixel mask, each
+/// with its density and feather.
+fn combine(v: &Mask, pixel: Option<&Mask>, (w, h): (u32, u32), offset: (i64, i64)) -> Mask {
+    let image = GrayImage::from_fn(w, h, |x, y| {
+        let (x, y) = (x as i64, y as i64);
+        let p = pixel.map_or(1.0, |m| m.value_at(x, y, offset));
+        image::Luma([(v.value_at(x, y, offset) * p * 255.0).round() as u8])
+    });
+    Mask::new(image, (0, 0), 0, offset)
+}
+
+/// Canvas size of a Photoshop document, from its header.
+pub fn canvas_size(path: &Path) -> Option<(u32, u32)> {
+    let mut head = [0u8; 26];
+    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+    let h = header(&mut Reader::new(&head)).ok()?;
+    Some((h.width, h.height))
+}
+
+/// Preview of a Photoshop document: its thumbnail resource, else its
+/// merged image.
+pub fn thumbnail_of(path: &Path) -> Option<RgbaImage> {
+    let data = std::fs::read(path).ok()?;
+    let f = parse(&data).ok()?;
+    if let Some(jpeg) = &f.resources.thumbnail
+        && let Ok(image) = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
+    {
+        return Some(image.into_rgba8());
+    }
+    let color = color_channels(f.header.mode);
+    let wanted: Vec<usize> = (0..color).collect();
+    let planes = merged_planes(&f, &wanted).ok()?;
+    let refs: Vec<&[u8]> = planes.iter().map(Vec::as_slice).collect();
+    let size = (f.header.width, f.header.height);
+    Some(to_rgba(&f.header, size, &refs, None, &f.palette))
+}
+
+/// The merged image of a file (tests).
+#[cfg(test)]
+pub(super) fn merged_image(data: &[u8]) -> Option<RgbaImage> {
+    let f = parse(data).ok()?;
+    let color = color_channels(f.header.mode);
+    let alpha = f.merged_alpha || f.records.is_empty() && has_transparency(&f);
+    let mut wanted: Vec<usize> = (0..color).collect();
+    if alpha {
+        wanted.push(color);
+    }
+    let planes = merged_planes(&f, &wanted).ok()?;
+    let refs: Vec<&[u8]> = planes[..color].iter().map(Vec::as_slice).collect();
+    let size = (f.header.width, f.header.height);
+    let transparency = alpha.then(|| planes[color].as_slice());
+    let mut image = to_rgba(&f.header, size, &refs, transparency, &f.palette);
+    if alpha {
+        unmatte(&mut image);
+    }
+    Some(image)
+}

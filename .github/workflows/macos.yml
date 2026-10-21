@@ -1,0 +1,62 @@
+# macOS version of a release, built only on demand (there is no Mac to
+# build it locally): packaging/macos/publish.sh starts it for a tag, waits,
+# and attaches the .dmg it produces to the public release.
+name: macOS build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build (e.g. v0.3.0)
+        required: true
+      skip_tests:
+        description: Skip the tests (only for a tag whose tests are known to be wrong on macOS)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      # Packaging scripts from this workflow's own revision: older tags may
+      # predate them.
+      - uses: actions/checkout@v4
+        with:
+          path: packaging-current
+      - name: Targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        if: ${{ !inputs.skip_tests }}
+        run: cargo test --locked
+      - name: Build for Apple silicon
+        run: cargo build --release --locked --target aarch64-apple-darwin
+      # Intel Macs: ONNX Runtime has no prebuilt build for them (checked with
+      # ort 2.0.0-rc.13); kept in case a later version adds it.
+      - name: Build for Intel
+        id: intel
+        continue-on-error: true
+        run: cargo build --release --locked --target x86_64-apple-darwin
+      - name: App and disk image
+        run: |
+          arm=target/aarch64-apple-darwin/release/atelier
+          intel=target/x86_64-apple-darwin/release/atelier
+          if [ "${{ steps.intel.outcome }}" = success ]; then
+            lipo -create "$arm" "$intel" -output atelier
+          else
+            cp "$arm" atelier
+          fi
+          lipo -info atelier
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          packaging-current/packaging/macos/bundle.sh "$PWD/atelier" "$version" "$PWD/atelier-macos.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atelier-macos
+          path: atelier-macos.dmg
+          retention-days: 7
