@@ -1289,12 +1289,17 @@ mod tests {
         assert!(doc.add_mask(crate::document::NewMask::RevealAll, None));
         assert!(doc.mask_targeted());
         app.run(Action::Filter(FilterKind::Clouds));
-        settle(&mut h, applied);
+        // Clouds in the mask (the filter may not have started yet when the
+        // first frames run, under a loaded test machine).
+        let clouds = |app: &AtelierApp| {
+            let doc = app.doc.as_ref().unwrap();
+            let mask = doc.active_layer().mask.as_ref().expect("mask kept");
+            let values: std::collections::HashSet<u8> =
+                mask.image().pixels().map(|p| p.0[0]).collect();
+            values.len() > 10
+        };
+        settle(&mut h, |app| applied(app) && clouds(app));
         assert_eq!(pixels(&h), original);
-        let doc = h.state().doc.as_ref().unwrap();
-        let mask = doc.active_layer().mask.as_ref().expect("mask kept");
-        let values: std::collections::HashSet<u8> = mask.image().pixels().map(|p| p.0[0]).collect();
-        assert!(values.len() > 10, "clouds in the mask");
     }
 
     #[test]

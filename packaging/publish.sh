@@ -1,7 +1,8 @@
 #!/bin/sh
 # Publishes a version of Atelier from this computer (no CI): builds the
-# Windows .exe and the Flatpak, tags the sources, and creates the GitHub
-# release with them, where the website's download buttons point. The website itself (docs/) is served by GitHub Pages from
+# Windows .exe and the Flatpak, tags the sources, creates the GitHub release
+# with them, where the website's download buttons point, and updates the
+# shu-app.com Flatpak repository. The website itself (docs/) is served by GitHub Pages from
 # main, so pushing main publishes it.
 # Usage: packaging/publish.sh notes.md   (version taken from Cargo.toml)
 set -e
@@ -29,4 +30,10 @@ git push origin main "$tag"
 gh release create "$tag" "$out/atelier.exe" "$out/atelier.flatpak" \
     --repo Shhu/atelier --title "Atelier $version" --notes-file "$notes"
 echo "Published: https://github.com/Shhu/atelier/releases/tag/$tag"
+# The shu-app.com Flatpak repository (shared with the author's other apps)
+# takes the new bundle; the release stands even if this fails.
+shared="$HOME/dev/shu-app/flatpak/publish.sh"
+if [ -x "$shared" ]; then
+    "$shared" || echo "Flatpak repository not updated: run $shared again" >&2
+fi
 echo "macOS version too? packaging/macos/publish.sh $tag"

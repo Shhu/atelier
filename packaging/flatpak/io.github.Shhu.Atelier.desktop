@@ -1,10 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=Atelier
-Comment=Image editor: layers, retouching, cutouts
-Comment[fr]=Éditeur d'image : calques, retouches, détourage
+Comment=Edit images with layers, retouching tools and local AI
+Comment[fr]=Retouchez vos images avec calques, outils de retouche et IA locale
 Exec=atelier %f
 Icon=io.github.Shhu.Atelier
 Terminal=false
 Categories=Graphics;2DGraphics;RasterGraphics;
-MimeType=image/png;image/jpeg;image/webp;image/bmp;image/gif;image/tiff;
+MimeType=image/png;image/jpeg;image/webp;image/bmp;image/gif;image/tiff;image/vnd.adobe.photoshop;image/x-adobe-dng;
+Keywords=image;photo;editor;layers;retouch;paint;psd;raw;

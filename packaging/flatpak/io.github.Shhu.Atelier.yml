@@ -1,9 +1,13 @@
-# Local Flatpak package of Atelier, from the already built binary
-# (cargo build --release). To build: see build.sh.
+# Flatpak of Atelier, built from the working tree, from source and without
+# network access: the Rust crates come from cargo-sources.json (made by
+# flatpak-cargo-generator from Cargo.lock, see build.sh), ONNX Runtime from
+# Microsoft's release for the architecture.
 app-id: io.github.Shhu.Atelier
 runtime: org.gnome.Platform
 runtime-version: '51'
 sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
 command: atelier
 finish-args:
   - --share=ipc
@@ -11,26 +15,61 @@ finish-args:
   # X11 too: the image clipboard goes through X11 (XWayland).
   - --socket=x11
   - --device=dri
-  # Downloads the AI model for Select Subject.
+  # Downloads the AI models, when the user asks for them.
   - --share=network
-  # Open and save images.
-  - --filesystem=home
+  # Images opened, saved and placed by path (recent files, linked files,
+  # drag and drop); anything else goes through the file chooser portal.
+  - --filesystem=xdg-pictures
+  - --filesystem=xdg-documents
+  - --filesystem=xdg-download
+  - --filesystem=xdg-desktop
 modules:
-  - name: atelier
+  # AI features (object selection, background removal, content-aware fill).
+  - name: onnxruntime
     buildsystem: simple
     build-commands:
-      - install -Dm755 atelier /app/bin/atelier
-      - install -Dm644 io.github.Shhu.Atelier.desktop /app/share/applications/io.github.Shhu.Atelier.desktop
-      - install -Dm644 io.github.Shhu.Atelier.svg /app/share/icons/hicolor/scalable/apps/io.github.Shhu.Atelier.svg
-      - install -Dm644 io.github.Shhu.Atelier.metainfo.xml /app/share/metainfo/io.github.Shhu.Atelier.metainfo.xml
+      - install -d /app/lib
+      - cp -a lib/libonnxruntime.so* /app/lib/
+      - install -Dm644 LICENSE /app/share/licenses/io.github.Shhu.Atelier/onnxruntime-LICENSE
+      - install -Dm644 ThirdPartyNotices.txt /app/share/licenses/io.github.Shhu.Atelier/onnxruntime-ThirdPartyNotices.txt
     sources:
-      - type: file
-        path: ../../target/release/atelier
-        dest-filename: atelier
-      - type: file
-        path: io.github.Shhu.Atelier.desktop
-      - type: file
-        path: ../../assets/icon.svg
-        dest-filename: io.github.Shhu.Atelier.svg
-      - type: file
-        path: io.github.Shhu.Atelier.metainfo.xml
+      - type: archive
+        only-arches: [x86_64]
+        url: https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz
+        sha256: a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407
+      - type: archive
+        only-arches: [aarch64]
+        url: https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-aarch64-1.28.0.tgz
+        sha256: e15ff8b5d85afe6c144d97c6fd432254bf76a219daaf17658087d6ecb3e8f0bb
+
+  - name: atelier
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/atelier/cargo
+        CARGO_NET_OFFLINE: 'true'
+        # Links to the ONNX Runtime above instead of downloading one.
+        ORT_LIB_LOCATION: /app/lib
+        ORT_PREFER_DYNAMIC_LINK: '1'
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo --offline build --release --verbose
+      - install -Dm755 target/release/atelier /app/bin/atelier
+      - install -Dm644 packaging/flatpak/io.github.Shhu.Atelier.desktop /app/share/applications/io.github.Shhu.Atelier.desktop
+      - install -Dm644 assets/icon.svg /app/share/icons/hicolor/scalable/apps/io.github.Shhu.Atelier.svg
+      - install -Dm644 packaging/flatpak/io.github.Shhu.Atelier.metainfo.xml /app/share/metainfo/io.github.Shhu.Atelier.metainfo.xml
+      - install -Dm644 -t /app/share/licenses/io.github.Shhu.Atelier LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - .git
+          - .claude
+          - packaging/flatpak/build
+          - packaging/flatpak/repo
+          - packaging/flatpak/.flatpak-builder
+          - packaging/flatpak/atelier.flatpak
+          - packaging/windows/runtime
+      - cargo-sources.json

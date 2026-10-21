@@ -2,23 +2,89 @@
 <component type="desktop-application">
   <id>io.github.Shhu.Atelier</id>
   <name>Atelier</name>
-  <summary>Image editor with layers and cutouts</summary>
-  <summary xml:lang="fr">Éditeur d'image avec calques et détourage</summary>
+  <summary>Edit images with layers and local AI</summary>
+  <summary xml:lang="fr">Retouchez vos images, calques et IA locale</summary>
+  <developer id="io.github.shhu">
+    <name>Shhu</name>
+  </developer>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
   <description>
-    <p>Image editor: layers, brush, text, adjustments (levels, curves,
-    hue/saturation…), pixel-accurate selections, magic wand, magnetic lasso
-    and AI subject selection, run locally.</p>
-    <p xml:lang="fr">Éditeur d'image : calques, pinceau, texte, réglages (niveaux, courbes,
-    teinte/saturation…), sélections au pixel près, baguette magique, lasso
-    magnétique et détourage du sujet par IA, exécuté en local.</p>
+    <p>Atelier is an image editor with the shortcuts and behaviors image
+    professionals already know, in English and French.</p>
+    <p xml:lang="fr">Atelier est un éditeur d'images aux raccourcis et aux
+    comportements que les professionnels de l'image connaissent déjà, en
+    français et en anglais.</p>
+    <ul>
+      <li>Non-destructive layers: masks, clipping, groups, adjustment and fill layers, blend modes, layer styles, smart objects and smart filters</li>
+      <li xml:lang="fr">Calques non destructifs : masques, écrêtage, groupes, calques de réglage et de remplissage, modes de fusion, styles de calque, objets et filtres dynamiques</li>
+      <li>Retouching: clone stamp, healing brushes, patch, content-aware fill, a brush engine with pen pressure</li>
+      <li xml:lang="fr">Retouche : tampon de duplication, correcteurs, pièce, remplissage d'après le contenu, moteur de pinceaux avec la pression du stylet</li>
+      <li>Selections: marquees, lassos, magic wand, color range, select and mask, quick mask, and AI object selection</li>
+      <li xml:lang="fr">Sélections : rectangle, ellipse, lassos, baguette magique, plage de couleurs, sélectionner et masquer, masque rapide, et sélection d'objet par IA</li>
+      <li>Transforms: skew, distort, perspective and warp; filters and liquify</li>
+      <li xml:lang="fr">Transformations : inclinaison, torsion, perspective et déformation ; filtres et fluidité</li>
+      <li>Type and vectors: paragraph text typed on the canvas, pen tool, paths and shape layers</li>
+      <li xml:lang="fr">Texte et vectoriel : texte de paragraphe saisi sur l'image, plume, tracés et calques de forme</li>
+      <li>Color management with soft proofing and CMYK export, RAW development, PSD import and export, actions and batch processing</li>
+      <li xml:lang="fr">Gestion des couleurs avec épreuve écran et export CMJN, développement RAW, import et export PSD, scripts et traitement par lots</li>
+    </ul>
+    <p>The AI models run on your computer: they are downloaded only when you
+    ask for them, and no image ever leaves your computer.</p>
+    <p xml:lang="fr">Les modèles d'IA tournent sur votre ordinateur : ils ne
+    sont téléchargés que si vous le demandez, et aucune image n'en sort.</p>
   </description>
   <launchable type="desktop-id">io.github.Shhu.Atelier.desktop</launchable>
+  <url type="homepage">https://shu-app.com/atelier/</url>
+  <url type="bugtracker">https://github.com/Shhu/atelier/issues</url>
+  <url type="vcs-browser">https://github.com/Shhu/atelier</url>
+  <branding>
+    <color type="primary" scheme_preference="light">#a9c2f0</color>
+    <color type="primary" scheme_preference="dark">#1a3a7a</color>
+  </branding>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Layers with masks, adjustments and layer styles</caption>
+      <image>https://raw.githubusercontent.com/Shhu/atelier/v0.3.2/docs/screenshots/layers.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Curves with histogram and live preview</caption>
+      <image>https://raw.githubusercontent.com/Shhu/atelier/v0.3.2/docs/screenshots/curves.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Pen tool, paths and shape layers</caption>
+      <image>https://raw.githubusercontent.com/Shhu/atelier/v0.3.2/docs/screenshots/vector.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>History and Channels panels</caption>
+      <image>https://raw.githubusercontent.com/Shhu/atelier/v0.3.2/docs/screenshots/history.png</image>
+    </screenshot>
+  </screenshots>
   <content_rating type="oars-1.1"/>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>tablet</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
   <releases>
-    <release version="0.3.1" date="2026-10-19"/>
-    <release version="0.3.0" date="2026-10-18"/>
+    <release version="0.3.2" date="2026-10-21">
+      <description>
+        <p>The Flatpak is built from source and installs from the shu-app.com repository, with automatic updates.</p>
+      </description>
+    </release>
+    <release version="0.3.1" date="2026-10-19">
+      <description>
+        <p>The menu of a tool group stays open after a long press; the History and Actions panels can be resized.</p>
+      </description>
+    </release>
+    <release version="0.3.0" date="2026-10-18">
+      <description>
+        <p>Non-destructive layers, retouching tools, transforms, type and vectors, PSD files, color management, smart objects, liquify, actions, RAW development and artboards.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-10-18"/>
     <release version="0.1.0" date="2026-10-13"/>
   </releases>

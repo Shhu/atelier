@@ -3233,8 +3233,7 @@ mod tests {
                         *p = image::Rgba([230, 230, 230, 255]);
                     }
                 }
-                let mut doc =
-                    Document::new(logo, Some("logo.webp".into()));
+                let mut doc = Document::new(logo, Some("logo.webp".into()));
                 doc.resize_canvas(-211, -208, 512, 512);
                 doc.modified = true;
                 if std::env::var("ATELIER_FX").is_ok() {
