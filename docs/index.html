@@ -92,15 +92,15 @@ html:not([lang=en]) [data-lang=en],html:not([lang=fr]) [data-lang=fr]{display:no
     <p class="lead" data-lang="en">Layers, retouching, type, vectors and color management, with the shortcuts you already know. The AI runs on your computer: no image ever leaves it.</p>
     <p class="lead" data-lang="fr">Calques, retouche, texte, vectoriel et gestion des couleurs, avec les raccourcis que vous connaissez déjà. L'IA tourne sur votre ordinateur : aucune image n'en sort.</p>
     <div class="cta">
-      <a class="btn pri" href="https://github.com/Shhu/atelier-releases/releases/latest/download/atelier.exe" data-asset="atelier.exe">
+      <a class="btn pri" href="https://github.com/Shhu/atelier/releases/latest/download/atelier.exe" data-asset="atelier.exe">
         <span data-lang="en">Download for Windows</span><span data-lang="fr">Télécharger pour Windows</span>
         <small class="size"></small>
       </a>
-      <a class="btn" href="https://github.com/Shhu/atelier-releases/releases/latest/download/atelier.flatpak" data-asset="atelier.flatpak">
+      <a class="btn" href="https://github.com/Shhu/atelier/releases/latest/download/atelier.flatpak" data-asset="atelier.flatpak">
         <span data-lang="en">Linux (Flatpak)</span><span data-lang="fr">Linux (Flatpak)</span>
         <small class="size"></small>
       </a>
-      <a class="btn" href="https://github.com/Shhu/atelier-releases/releases/latest/download/atelier-macos.dmg" data-asset="atelier-macos.dmg" hidden>
+      <a class="btn" href="https://github.com/Shhu/atelier/releases/latest/download/atelier-macos.dmg" data-asset="atelier-macos.dmg" hidden>
         <span data-lang="en">macOS (experimental)</span><span data-lang="fr">macOS (expérimental)</span>
         <small class="size"></small>
       </a>
@@ -192,19 +192,19 @@ html:not([lang=en]) [data-lang=en],html:not([lang=fr]) [data-lang=fr]{display:no
           <h3>Windows</h3>
           <p data-lang="en">Windows 10 and 11, 64-bit. A single .exe: download it and run it.</p>
           <p data-lang="fr">Windows 10 et 11, 64 bits. Un seul .exe : téléchargez-le et lancez-le.</p>
-          <a class="btn pri" href="https://github.com/Shhu/atelier-releases/releases/latest/download/atelier.exe" data-asset="atelier.exe"><span data-lang="en">Download .exe</span><span data-lang="fr">Télécharger le .exe</span><small class="size"></small></a>
+          <a class="btn pri" href="https://github.com/Shhu/atelier/releases/latest/download/atelier.exe" data-asset="atelier.exe"><span data-lang="en">Download .exe</span><span data-lang="fr">Télécharger le .exe</span><small class="size"></small></a>
         </div>
         <div class="card">
           <h3>Linux</h3>
           <p data-lang="en">Flatpak bundle: <kbd>flatpak install atelier.flatpak</kbd></p>
           <p data-lang="fr">Paquet Flatpak : <kbd>flatpak install atelier.flatpak</kbd></p>
-          <a class="btn" href="https://github.com/Shhu/atelier-releases/releases/latest/download/atelier.flatpak" data-asset="atelier.flatpak"><span data-lang="en">Download Flatpak</span><span data-lang="fr">Télécharger le Flatpak</span><small class="size"></small></a>
+          <a class="btn" href="https://github.com/Shhu/atelier/releases/latest/download/atelier.flatpak" data-asset="atelier.flatpak"><span data-lang="en">Download Flatpak</span><span data-lang="fr">Télécharger le Flatpak</span><small class="size"></small></a>
         </div>
         <div class="card" data-asset="atelier-macos.dmg" hidden>
           <h3><span data-lang="en">macOS — experimental</span><span data-lang="fr">macOS — expérimental</span></h3>
           <p data-lang="en">Macs with Apple silicon (M1 and later), macOS 11 or later. Not tested on a Mac yet, and not signed by Apple: the first time, right-click Atelier in Applications, then Open.</p>
           <p data-lang="fr">Mac à puce Apple (M1 et suivants), macOS 11 ou plus récent. Pas encore testé sur un Mac, et non signé par Apple : la première fois, clic droit sur Atelier dans Applications, puis Ouvrir.</p>
-          <a class="btn" href="https://github.com/Shhu/atelier-releases/releases/latest/download/atelier-macos.dmg"><span data-lang="en">Download .dmg</span><span data-lang="fr">Télécharger le .dmg</span><small class="size"></small></a>
+          <a class="btn" href="https://github.com/Shhu/atelier/releases/latest/download/atelier-macos.dmg"><span data-lang="en">Download .dmg</span><span data-lang="fr">Télécharger le .dmg</span><small class="size"></small></a>
         </div>
       </div>
     </div>
@@ -232,10 +232,10 @@ function setLang(l) {
 document.querySelectorAll('.lang button').forEach(b => b.addEventListener('click', () => setLang(b.dataset.set)));
 setLang(saved === 'fr' || saved === 'en' ? saved : browser);
 
-// Version and file sizes of the latest release (public downloads repository).
+// Version and file sizes of the latest release.
 // The macOS version is only built for some releases: its buttons take the
 // newest release that has it, and show its version when it is an older one.
-fetch('https://api.github.com/repos/Shhu/atelier-releases/releases?per_page=30')
+fetch('https://api.github.com/repos/Shhu/atelier/releases?per_page=30')
   .then(r => r.ok ? r.json() : null).then(list => {
   const releases = (list || []).filter(r => !r.draft && !r.prerelease);
   if (!releases.length) return;

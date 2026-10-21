@@ -10,7 +10,7 @@ tag=$1
 skip_tests=false
 [ "$2" = "--skip-tests" ] && skip_tests=true
 [ -n "$tag" ] || { echo "Usage: $0 vX.Y.Z"; exit 1; }
-gh release view "$tag" --repo Shhu/atelier-releases > /dev/null 2>&1 ||
+gh release view "$tag" --repo Shhu/atelier > /dev/null 2>&1 ||
     { echo "$tag is not published yet: run packaging/publish.sh first"; exit 1; }
 
 before=$(gh run list --repo Shhu/atelier --workflow macos.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')
@@ -25,5 +25,5 @@ gh run watch "$run" --repo Shhu/atelier --exit-status
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 gh run download "$run" --repo Shhu/atelier --name atelier-macos --dir "$out"
-gh release upload "$tag" "$out/atelier-macos.dmg" --repo Shhu/atelier-releases --clobber
+gh release upload "$tag" "$out/atelier-macos.dmg" --repo Shhu/atelier --clobber
 echo "macOS version added to $tag"
