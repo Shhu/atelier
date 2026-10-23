@@ -72,6 +72,14 @@ fn main() -> eframe::Result {
     // The GPU's real limits, not egui's fixed 8192 px textures (more than
     // some GPUs have): images are split into textures of that size at most.
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        // On Windows, Direct3D 12 rather than Vulkan: with Vulkan, resizing
+        // the window can leave its surface stuck at the old size (seen on
+        // NVIDIA). OpenGL stays as a last resort for GPUs without D3D12.
+        #[cfg(windows)]
+        {
+            setup.instance_descriptor.backends =
+                eframe::wgpu::Backends::DX12 | eframe::wgpu::Backends::GL;
+        }
         let descriptor = std::sync::Arc::clone(&setup.device_descriptor);
         setup.device_descriptor = std::sync::Arc::new(move |adapter| {
             let mut descriptor = descriptor(adapter);
