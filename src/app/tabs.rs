@@ -2,6 +2,7 @@
 //! the others are set aside with their own view, selection and textures.
 
 use super::*;
+use crate::document::{HISTORY_BUDGET, TOTAL_HISTORY_BUDGET};
 
 /// A document in a background tab, with what belongs to it.
 pub(super) struct ParkedDoc {
@@ -100,6 +101,7 @@ impl AtelierApp {
     fn park(&mut self) -> Option<ParkedDoc> {
         self.doc.as_ref()?;
         self.commit_pending();
+        self.sync_selection();
         self.leave_select_modes();
         self.adjust = None;
         self.transparency = None;
@@ -124,7 +126,7 @@ impl AtelierApp {
         // Caches and gestures of the document that leaves.
         self.stroke = None;
         self.stroke_dirty = None;
-        self.canvas_view = None;
+        // The view stays: kept for the document's return (see `CanvasView`).
         self.lifted = None;
         self.blend_preview = None;
         self.mask_view = false;
@@ -159,5 +161,25 @@ impl AtelierApp {
         self.pan = p.pan;
         self.fit_pending = p.fit_pending;
         self.reset_pending();
+    }
+
+    /// The histories of all open documents together stay within
+    /// [`TOTAL_HISTORY_BUDGET`]: the active one keeps its own budget, the
+    /// documents set aside share what is left and lose their oldest steps.
+    pub(super) fn trim_histories(&mut self) {
+        let key = self
+            .doc
+            .as_ref()
+            .map(|d| (d.uid(), d.history_step(), self.parked.len()));
+        if self.parked.is_empty() || key == self.history.budget_key {
+            return;
+        }
+        self.history.budget_key = key;
+        let used = self.doc.as_ref().map_or(0, Document::history_bytes);
+        let left = TOTAL_HISTORY_BUDGET.saturating_sub(used.min(HISTORY_BUDGET));
+        let share = left / self.parked.len();
+        for p in &mut self.parked {
+            p.doc.trim_history(share);
+        }
     }
 }

@@ -177,6 +177,8 @@ pub struct Stroke {
     /// Tip coverage of the current dab, row by row over its rectangle.
     scratch: Vec<f32>,
     dabs: usize,
+    /// The area the dabs reached so far.
+    touched: Option<DirtyRect>,
 }
 
 impl Stroke {
@@ -201,12 +203,37 @@ impl Stroke {
             clone: None,
             scratch: Vec::new(),
             dabs: 0,
+            touched: None,
         }
     }
 
     /// Whether the stroke has changed any pixel so far.
     pub fn painted(&self) -> bool {
         self.painted
+    }
+
+    /// Whether `image`, the stroke's target, differs from the pixels before
+    /// the stroke where the dabs reached, or `margin` pixels around (a
+    /// stroke can cover pixels without changing them: a transparent clone
+    /// source, eraser on empty pixels…).
+    pub fn changes(&self, image: &RgbaImage, margin: u32) -> bool {
+        if std::ptr::eq(image, &*self.base) {
+            return false;
+        }
+        let Some(r) = self.touched else {
+            return false;
+        };
+        if image.dimensions() != self.base.dimensions() {
+            return true;
+        }
+        let (w, h) = image.dimensions();
+        let (x0, y0) = (r.x.saturating_sub(margin), r.y.saturating_sub(margin));
+        let (x1, y1) = ((r.x + r.w + margin).min(w), (r.y + r.h + margin).min(h));
+        let (a, b) = (image.as_raw(), self.base.as_raw());
+        (y0..y1).any(|y| {
+            let (from, to) = (((y * w + x0) * 4) as usize, ((y * w + x1) * 4) as usize);
+            a[from..to] != b[from..to]
+        })
     }
 
     /// Number of dabs placed.
@@ -426,6 +453,7 @@ impl Stroke {
         self.dabs += 1;
         if let Some(r) = changed {
             *dirty = Some(dirty.map_or(r, |d| d.union(r)));
+            self.touched = Some(self.touched.map_or(r, |d| d.union(r)));
         }
     }
 
@@ -618,9 +646,11 @@ impl Stroke {
             return None;
         };
         let first = self.carried.is_none();
+        // Slots the first dab cannot pick up (outside the image or the
+        // selection) are empty (NaN): they lay nothing down until filled.
         let carried = self.carried.get_or_insert_with(|| Carried {
             size,
-            pixels: vec![finger.map_or([0.0; 4], premultiply); size * size],
+            pixels: vec![finger.map_or([f32::NAN; 4], premultiply); size * size],
         });
         if first && finger.is_none() {
             // Picks up what is under the first dab, lays nothing down.
@@ -651,7 +681,7 @@ impl Stroke {
                     (y as i64 - iy + half) as usize,
                 );
                 let slot = &mut carried.pixels[j * carried.size + i];
-                if amount <= 0.0 {
+                if amount <= 0.0 || slot[3].is_nan() {
                     *slot = cur;
                     continue;
                 }
@@ -1045,6 +1075,17 @@ mod tests {
         assert!(r == 255 && g < 200, "red dragged to the right: {r} {g}");
         assert_eq!(img.get_pixel(50, 10).0, WHITE, "not beyond the stroke");
         assert_eq!(img.get_pixel(25, 1).0, WHITE, "not beside it");
+    }
+
+    #[test]
+    fn smudge_from_the_image_edge_keeps_the_layer_opaque() {
+        let mut img = RgbaImage::from_pixel(100, 40, image::Rgba([90, 90, 90, 255]));
+        let mut set = settings([0, 0, 0, 255]);
+        (set.size, set.flow) = (30.0, 0.8);
+        let mut s = paint(&mut img, StrokeMode::Smudge { finger: None }, set);
+        s.add_point(&mut img, 2.0, 20.0, 1.0);
+        s.add_point(&mut img, 60.0, 20.0, 1.0);
+        assert!(img.pixels().all(|p| p.0 == [90, 90, 90, 255]));
     }
 
     #[test]

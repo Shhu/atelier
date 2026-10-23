@@ -129,7 +129,10 @@ fn reduced_coverage(sel: &Selection, canvas: PixelRect) -> (GrayImage, f32) {
         ((canvas.w as f32 * scale).round() as u32).max(1),
         ((canvas.h as f32 * scale).round() as u32).max(1),
     );
-    let reduced = image::imageops::resize(&full, w, h, image::imageops::FilterType::Triangle);
+    // Averaged by blocks first, on all the cores (the full size is large).
+    let block = ((1.0 / scale).floor() as u32).max(1);
+    let blocks = crate::compose::levels::reduce_gray(&full, block);
+    let reduced = image::imageops::resize(&blocks, w, h, image::imageops::FilterType::Triangle);
     (reduced, w as f32 / canvas.w as f32)
 }
 
@@ -146,11 +149,26 @@ fn mask_of(sel: &Selection, canvas: PixelRect, layer_offset: (i64, i64)) -> Mask
 }
 
 impl AtelierApp {
+    /// Select and Mask has something to refine: the selection, or the
+    /// targeted layer mask.
+    pub(super) fn can_select_mask(&self) -> bool {
+        self.selection.is_some() || self.doc.as_ref().is_some_and(refines_layer_mask)
+    }
+
     pub(super) fn open_select_mask(&mut self) {
-        let (Some(sel), Some(doc)) = (self.selection.clone(), &self.doc) else {
-            return;
+        let Some(doc) = &self.doc else { return };
+        // A targeted layer mask is refined, and replaced by the result.
+        let layer_mask = refines_layer_mask(doc);
+        let source = match layer_mask {
+            true => doc.mask_selection(doc.active),
+            false => self.selection.clone(),
         };
+        let Some(sel) = source else { return };
         let (reduced, scale) = reduced_coverage(&sel, doc.full_rect());
+        let output = match layer_mask {
+            true => Output::LayerMask,
+            false => Output::Selection,
+        };
         self.sel.select_mask = Some(SelectMask {
             source: sel,
             reduced: Arc::new(reduced),
@@ -158,7 +176,7 @@ impl AtelierApp {
             refine: Refine::default(),
             view: ViewMode::OnionSkin,
             opacity: [50.0, 100.0, 100.0, 50.0, 100.0],
-            output: Output::Selection,
+            output,
             shown: None,
         });
     }
@@ -327,6 +345,8 @@ impl AtelierApp {
         }
         let (source, r) = (sm.source, sm.refine);
         let pixels = canvas.w as u64 * canvas.h as u64;
+        let name = t!("sel-menu-select-and-mask");
+        self.sel.step_name = Some(super::select_menu::step_label(name));
         self.select_later(Then::Output(sm.output), pixels, move || {
             if r == Refine::default() {
                 Some(source)
@@ -378,6 +398,17 @@ impl AtelierApp {
             Output::Selection => {}
         }
         self.deselect();
+        // Dropped as part of the output's step.
+        self.sync_selection();
         self.reset_pending();
     }
+}
+
+/// Whether Select and Mask refines the active layer's mask: it is
+/// targeted (not the Quick Mask, nor a smart filter mask).
+fn refines_layer_mask(doc: &Document) -> bool {
+    doc.quick_mask().is_none()
+        && !doc.filter_mask_targeted()
+        && doc.mask_targeted()
+        && doc.active_layer().mask.is_some()
 }

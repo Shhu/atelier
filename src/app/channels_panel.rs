@@ -40,9 +40,17 @@ pub(super) struct ChannelsPanel {
     selected: Option<usize>,
     /// Alpha channel being renamed, and its new name.
     rename: Option<(usize, String)>,
-    /// Thumbnails for a history position: RGB, R, G, B, then the alphas.
-    thumbs: Option<((u64, u64), Vec<TextureHandle>)>,
+    /// Thumbnails for a state of the document (fingerprint), and when they
+    /// were made: RGB, R, G, B, then the alphas.
+    thumbs: Option<(u64, f64, Vec<TextureHandle>)>,
+    /// The layers reduced for the thumbnails, kept between them (only
+    /// what changed is reduced again): document (uid), and them.
+    reduced: Option<(u64, crate::compose::LevelCache)>,
 }
+
+/// Thumbnails are made again at most this often (seconds) while the image
+/// keeps changing (brush stroke, slider).
+const THUMBS_EVERY: f64 = 0.25;
 
 /// What a click in the panel asks for.
 enum Click {
@@ -141,12 +149,12 @@ impl AtelierApp {
         let thumbs: Vec<egui::TextureId> = panel
             .thumbs
             .as_ref()
-            .map(|(_, t)| t.iter().map(TextureHandle::id).collect())
+            .map(|(_, _, t)| t.iter().map(TextureHandle::id).collect())
             .unwrap_or_default();
         let names: Vec<String> = doc.channels.iter().map(|c| c.name.clone()).collect();
         let has_selection = self.selection.is_some();
         let mut click = None;
-        let pos = dialogs::tool_dialog_pos(ctx) + vec2(-300.0, 320.0);
+        let pos = dialogs::panel_pos(ctx, "channels");
         let out = floating_dialog(
             ctx,
             DialogSpec {
@@ -279,6 +287,7 @@ impl AtelierApp {
                     }
                     None => Selection::from_mask(&luminosity(&doc.flatten()), (0, 0)),
                 };
+                self.sel.step_name = Some(select_menu::step_label(t!("sel-menu-load")));
                 self.apply_selection(found, mode);
             }
             Click::Row(row, _) => {
@@ -340,6 +349,7 @@ impl AtelierApp {
             Click::LoadSelection => {
                 if let Some(i) = p.selected {
                     let found = doc.channel_selection(i);
+                    self.sel.step_name = Some(select_menu::step_label(t!("sel-menu-load")));
                     self.apply_selection(found, SelectMode::Replace);
                 }
             }
@@ -352,19 +362,40 @@ impl AtelierApp {
         }
     }
 
-    /// Thumbnails of the channels, made again with each history step.
+    /// Thumbnails of the channels, made again when what they show changes
+    /// (at most every [`THUMBS_EVERY`]).
     fn channel_thumbnails(&mut self, ctx: &egui::Context) {
         let Some(doc) = &self.doc else { return };
-        let key = (doc.uid(), doc.history_step());
-        if self
+        let layers = doc.render_layers();
+        let opts = crate::compose::Options {
+            later_styles: true,
+            ..Default::default()
+        };
+        let sigs = crate::compose::signatures(&layers, &opts);
+        let alphas: Vec<usize> = doc
             .channels
-            .thumbs
-            .as_ref()
-            .is_some_and(|(k, _)| *k == key)
-        {
-            return;
+            .iter()
+            .map(|c| Arc::as_ptr(&c.mask) as usize)
+            .collect();
+        let key = hash_of((doc.uid(), format!("{sigs:?}"), alphas));
+        let now = ctx.input(|i| i.time);
+        if let Some((k, at, _)) = &self.channels.thumbs {
+            if *k == key {
+                return;
+            }
+            let wait = THUMBS_EVERY - (now - at);
+            if wait > 0.0 {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
+                return;
+            }
         }
-        let small = small_composite(doc);
+        let uid = doc.uid();
+        let reduced = &mut self.channels.reduced;
+        if reduced.as_ref().is_none_or(|(d, _)| *d != uid) {
+            *reduced = Some((uid, crate::compose::LevelCache::new(thumb_level(doc))));
+        }
+        let cache = &mut reduced.as_mut().expect("set above").1;
+        let small = small_composite(doc, cache);
         let (w, h) = small.dimensions();
         let mut images: Vec<ColorImage> = vec![to_color_image(&small)];
         for c in 0..3 {
@@ -391,22 +422,33 @@ impl AtelierApp {
                 ctx.load_texture(format!("channel-{i}"), image, TextureOptions::LINEAR)
             })
             .collect();
-        self.channels.thumbs = Some((key, textures));
+        self.channels.thumbs = Some((key, now, textures));
     }
 }
 
-/// The flattened image reduced to [`THUMB`], composited at a reduced level
-/// (quick even for a large image).
-fn small_composite(doc: &Document) -> RgbaImage {
+/// Level of reduction the thumbnails are composited at (quick even for a
+/// large image).
+fn thumb_level(doc: &Document) -> u32 {
     let (w, h) = (doc.width(), doc.height());
     let mut level = 0;
     while (w.max(h) >> (level + 1)) >= THUMB && level < 12 {
         level += 1;
     }
+    level
+}
+
+/// The flattened image reduced to [`THUMB`], from the layers reduced in
+/// `cache` (at [`thumb_level`]).
+fn small_composite(doc: &Document, cache: &mut crate::compose::LevelCache) -> RgbaImage {
+    let (w, h) = (doc.width(), doc.height());
+    let level = crate::compose::Sources::level(cache);
     let layers = doc.render_layers();
-    let mut cache = crate::compose::LevelCache::new(level);
-    let options = crate::compose::Options::default();
-    let plan = crate::compose::plan(&layers, doc.full_rect(), &mut cache, &options);
+    let options = crate::compose::Options {
+        later_styles: true,
+        ..Default::default()
+    };
+    let plan = crate::compose::plan(&layers, doc.full_rect(), cache, &options);
+    cache.retain_used();
     let rect = PixelRect {
         x: 0,
         y: 0,
@@ -455,7 +497,8 @@ fn channel_key(ctx: &egui::Context, n: usize) -> String {
     })
 }
 
-/// The `n`-th channel shortcut pressed this frame (Ctrl+2…9), if any.
+/// The `n`-th channel shortcut pressed this frame (exactly Ctrl+2…9, the
+/// digit row by its place: see `shortcut_key`), if any.
 pub(super) fn channel_shortcut(input: &mut egui::InputState) -> Option<usize> {
     const DIGITS: [Key; 8] = [
         Key::Num2,
@@ -469,7 +512,7 @@ pub(super) fn channel_shortcut(input: &mut egui::InputState) -> Option<usize> {
     ];
     DIGITS
         .iter()
-        .position(|&k| input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, k)))
+        .position(|&k| consume_exact(input, KeyboardShortcut::new(Modifiers::COMMAND, k)))
 }
 
 /// A row's responses: the row, and whether its eye was clicked.
@@ -541,7 +584,11 @@ fn channel_row(
             ui_kit::color::TEXT,
         );
     let eye_clicked = eye_response.clicked();
-    let row = row.on_hover_text(t!("xchg-channel-row-tip"));
+    let tip = t!(
+        "input3-channel-row-tip",
+        ctrl_click = keys::click(ui.ctx(), Modifiers::COMMAND)
+    );
+    let row = row.on_hover_text(tip);
     row.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, name));
     RowResponse {
         row,

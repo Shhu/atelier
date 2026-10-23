@@ -4,7 +4,7 @@
 //! the dialogs of those commands (Alt + their buttons).
 
 use super::dialogs::{
-    DialogSpec, Track, block, floating_dialog, gap_between_blocks, slider_row, tool_dialog_pos,
+    DialogSpec, Track, block, floating_dialog, gap_between_blocks, panel_pos, slider_row,
 };
 use super::select_menu::Then;
 use super::*;
@@ -241,6 +241,7 @@ impl AtelierApp {
         } else {
             SelectMode::Replace
         };
+        self.sel.step_name = Some(t!("hist3-make-selection"));
         self.select_later(Then::Select(mode), pixels, move || {
             path_selection(&path, canvas, s.feather, s.antialias)
         });
@@ -353,6 +354,8 @@ impl AtelierApp {
         self.vector.selected = Some(PathRef::Work);
         self.vector.clear_selection();
         self.deselect();
+        // In the Make Work Path step.
+        self.sync_selection();
     }
 
     /// The Paths panel and its dialog.
@@ -390,7 +393,7 @@ impl AtelierApp {
                 modal: false,
                 footer: false,
                 width: 282.0,
-                ..DialogSpec::new("paths", t!("vector-paths-title"), tool_dialog_pos(ctx))
+                ..DialogSpec::new("paths", t!("vector-paths-title"), panel_pos(ctx, "paths"))
             },
             |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
@@ -433,28 +436,29 @@ impl AtelierApp {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     let any = current.is_some();
                     let deletable = matches!(current, Some(PathRef::Work | PathRef::Saved(_)));
+                    let alt = keys::modifiers(ui.ctx(), Modifiers::ALT);
                     let buttons = [
                         (
                             icon::PAINT_BUCKET,
-                            t!("vector-fill-path-tip"),
+                            t!("input3-fill-path-tip", alt = alt.clone()),
                             PathCommand::FillPath,
                             any,
                         ),
                         (
                             icon::PAINT_BRUSH,
-                            t!("vector-stroke-path-tip"),
+                            t!("input3-stroke-path-tip", alt = alt.clone()),
                             PathCommand::StrokePath,
                             any,
                         ),
                         (
                             icon::SELECTION,
-                            t!("vector-make-selection-tip"),
+                            t!("input3-make-selection-tip", alt = alt.clone()),
                             PathCommand::MakeSelection,
                             any,
                         ),
                         (
                             icon::BEZIER_CURVE,
-                            t!("vector-make-work-path-tip"),
+                            t!("input3-make-work-path-tip", alt = alt.clone()),
                             PathCommand::MakeWorkPath,
                             has_selection,
                         ),
@@ -508,6 +512,7 @@ impl AtelierApp {
                         .expect("document");
                     let mode = self.selection_mode(m.shift, m.alt);
                     let pixels = path.bounds().map_or(0, |b| (b.width() * b.height()) as u64);
+                    self.sel.step_name = Some(t!("hist3-make-selection"));
                     self.select_later(Then::Select(mode), pixels, move || {
                         path_selection(&path, canvas, 0.0, true)
                     });

@@ -9,7 +9,9 @@ use std::sync::mpsc;
 
 use super::dialogs::{DialogSpec, Track, floating_dialog, gap_between_blocks, slider_row};
 use super::*;
-use crate::document::{EmbeddedIn, SmartFilter, SmartFilterKind, SmartObject, SmartRender};
+use crate::document::{
+    EmbeddedIn, LinkFresh, LinkRead, SmartFilter, SmartFilterKind, SmartObject, SmartRender,
+};
 use crate::filters::{Filter, Target};
 use crate::i18n::t;
 use crate::xform::{Homography, Map};
@@ -69,6 +71,8 @@ pub(super) struct SmartUi {
     focused: bool,
     /// Document whose links were last looked at.
     links_of: u64,
+    /// Linked files being read again, by document.
+    links: Vec<(u64, mpsc::Receiver<Vec<LinkFresh>>)>,
     /// Thumbnails of the filter masks: layer → fingerprint, texture.
     pub(super) thumbs: HashMap<u64, (u64, egui::TextureHandle)>,
 }
@@ -98,6 +102,8 @@ struct Blending {
 
 /// A file just placed, its Free Transform being prepared.
 struct Placing {
+    path: PathBuf,
+    linked: bool,
     doc: u64,
     /// The history right after the place.
     step: u64,
@@ -399,6 +405,8 @@ impl AtelierApp {
                         t!("smart-hist-place-embedded")
                     };
                     self.smart.placing = Some(Placing {
+                        path: path.to_path_buf(),
+                        linked,
                         doc: doc.uid(),
                         step: doc.history_step(),
                         name,
@@ -410,6 +418,14 @@ impl AtelierApp {
                 self.status = t!("status-import-failed", path = shown, error = e.to_string());
             }
         }
+    }
+
+    /// The file being placed (its Free Transform not applied yet) and
+    /// whether it is linked.
+    pub(super) fn placing_file(&self) -> Option<(PathBuf, bool)> {
+        let p = self.smart.placing.as_ref().filter(|p| !p.committing)?;
+        let doc = self.doc.as_ref().filter(|d| d.uid() == p.doc)?;
+        (doc.history_step() == p.step).then(|| (p.path.clone(), p.linked))
     }
 
     /// Enter on the placing Free Transform: it applies.
@@ -455,8 +471,19 @@ impl AtelierApp {
     }
 
     /// Edit Contents: the contents in a tab of their own (the one already
-    /// showing them, if any); saving them updates the smart object.
+    /// showing them, if any); saving them updates the smart object. A
+    /// linked smart object's file opens itself: saved, it updates every
+    /// smart object linked to it.
     fn edit_contents(&mut self) {
+        let linked = self
+            .active_smart()
+            .and_then(|s| s.link.as_ref())
+            .filter(|l| !l.missing && l.path.exists())
+            .map(|l| l.path.clone());
+        if let Some(path) = linked {
+            self.open_path(&path);
+            return;
+        }
         let Some(doc) = &self.doc else { return };
         let Some(contents) = doc.smart_contents(doc.active) else {
             return;
@@ -492,7 +519,7 @@ impl AtelierApp {
         let parent = self.parked.iter_mut().find(|p| p.doc.uid() == e.parent);
         match parent.map(|p| p.doc.update_contents(e.contents, contents)) {
             Some(true) => {
-                doc.modified = false;
+                doc.mark_saved();
                 self.status = t!("smart-status-updated", name = e.name.as_str());
             }
             // Its document is closed, or its smart object deleted: a file.
@@ -566,20 +593,75 @@ impl AtelierApp {
         self.edit_smart(t!("smart-menu-reset-transform"), move |s| s.map = map);
     }
 
-    /// Linked smart objects whose file changed are shown again (`all`: of
-    /// every open document, else of the active one).
+    /// Linked smart objects whose file changed are read again on other
+    /// threads, then shown (`all`: of every open document, else of the
+    /// active one).
     fn update_links(&mut self, all: bool) {
-        let mut report = crate::document::LinkReport::default();
-        let mut merge = |r: crate::document::LinkReport| {
-            report.updated.extend(r.updated);
-            report.missing.extend(r.missing);
-        };
-        if let Some(doc) = &mut self.doc {
-            merge(doc.update_links());
-        }
+        let mut missing = Vec::new();
+        let mut docs: Vec<&mut Document> = self.doc.iter_mut().collect();
         if all {
-            for p in &mut self.parked {
-                merge(p.doc.update_links());
+            docs.extend(self.parked.iter_mut().map(|p| &mut p.doc));
+        }
+        for doc in docs {
+            let uid = doc.uid();
+            if self.smart.links.iter().any(|(d, _)| *d == uid) {
+                continue;
+            }
+            let (reads, gone) = doc.stale_links();
+            missing.extend(gone);
+            if reads.is_empty() {
+                continue;
+            }
+            let (tx, rx) = mpsc::channel();
+            let ctx = self.ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(reads.into_iter().map(LinkRead::run).collect());
+                ctx.request_repaint();
+            });
+            self.smart.links.push((uid, rx));
+        }
+        if !missing.is_empty() {
+            self.status = t!("smart-status-link-missing", names = missing.join(", "));
+        }
+    }
+
+    /// The linked files read again shown, each document's as one step
+    /// (not while a dialog, a gesture or a transform is going on).
+    fn put_links(&mut self, ctx: &egui::Context) {
+        if self.smart.links.is_empty()
+            || self.modal_open()
+            || self.transform_pending()
+            || ctx.input(|i| i.pointer.any_down())
+        {
+            return;
+        }
+        let mut report = crate::document::LinkReport::default();
+        let mut active = false;
+        let jobs = std::mem::take(&mut self.smart.links);
+        for (uid, rx) in jobs {
+            let fresh = match rx.try_recv() {
+                Ok(fresh) => fresh,
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.smart.links.push((uid, rx));
+                    continue;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => continue,
+            };
+            let doc = match self.doc.as_mut().filter(|d| d.uid() == uid) {
+                Some(doc) => {
+                    active = true;
+                    Some(doc)
+                }
+                None => self
+                    .parked
+                    .iter_mut()
+                    .map(|p| &mut p.doc)
+                    .find(|d| d.uid() == uid),
+            };
+            if let Some(doc) = doc {
+                let r = doc.put_links(fresh);
+                report.updated.extend(r.updated);
+                report.missing.extend(r.missing);
             }
         }
         if !report.missing.is_empty() {
@@ -593,9 +675,16 @@ impl AtelierApp {
                 names = report.updated.join(", ")
             );
         }
-        if !report.updated.is_empty() {
+        if active && !report.updated.is_empty() {
+            self.end_layer_preview();
             self.reset_pending();
         }
+    }
+
+    /// Linked files still being read.
+    #[cfg(test)]
+    pub(super) fn links_reading(&self) -> bool {
+        !self.smart.links.is_empty()
     }
 
     /// Every frame: the rendering being computed, linked files when the
@@ -631,6 +720,7 @@ impl AtelierApp {
             self.smart.links_of = uid;
             self.update_links(regained);
         }
+        self.put_links(ctx);
     }
 
     /// The busy indicator of a rendering, the Blending Options window.

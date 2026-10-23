@@ -114,7 +114,8 @@ struct Manifest {
     paths: Vec<vectors::SavedPathEntry>,
     #[serde(default)]
     work_path: Option<vectors::PathEntry>,
-    /// View › Proof Setup, Proof Colors and Gamut Warning.
+    /// View › Proof Setup (Proof Colors and Gamut Warning are views of a
+    /// session, not saved).
     #[serde(default)]
     proof: Option<ProofEntry>,
 }
@@ -125,8 +126,6 @@ struct ProofEntry {
     black_point_compensation: bool,
     paper_color: bool,
     black_ink: bool,
-    proof_colors: bool,
-    gamut_warning: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -837,8 +836,13 @@ fn text_data(t: TextEntry, image: &RgbaImage) -> TextData {
     data
 }
 
-/// Writes `doc` as an Atelier document.
-pub(super) fn write(doc: &Document, out: impl Write + Seek) -> Result<(), FileError> {
+/// Writes `doc` as an Atelier document, to be kept in `folder` (linked
+/// files are also recorded relative to it).
+pub(super) fn write(
+    doc: &Document,
+    out: impl Write + Seek,
+    folder: Option<&Path>,
+) -> Result<(), FileError> {
     let layers = doc.render_layers();
     // The layers' pixels then their masks (as RGBA or gray PNGs), encoded on
     // the other cores while this one flattens.
@@ -901,7 +905,6 @@ pub(super) fn write(doc: &Document, out: impl Write + Seek) -> Result<(), FileEr
             });
         }
     }
-    let folder = doc.path.as_deref().and_then(Path::parent);
     smart::write_all(&layers, &mut entries, &mut files, folder)?;
     let manifest = Manifest {
         format: FORMAT.into(),
@@ -924,13 +927,16 @@ pub(super) fn write(doc: &Document, out: impl Write + Seek) -> Result<(), FileEr
         channels,
         paths: doc.paths.iter().map(vectors::saved_path_entry).collect(),
         work_path: doc.work_path.as_ref().map(vectors::path_entry),
-        proof: (doc.proof != super::ProofSetup::default()).then_some(ProofEntry {
+        proof: (super::ProofSetup {
+            colors: false,
+            gamut: false,
+            ..doc.proof.clone()
+        } != super::ProofSetup::default())
+        .then_some(ProofEntry {
             intent: doc.proof.intent,
             black_point_compensation: doc.proof.bpc,
             paper_color: doc.proof.paper,
             black_ink: doc.proof.ink,
-            proof_colors: doc.proof.colors,
-            gamut_warning: doc.proof.gamut,
         }),
     };
 
@@ -1437,7 +1443,15 @@ fn read_archive(
             _ => return Err(FileError::Damaged),
         }
     }
+    // Offsets far beyond any canvas are damage (and would overflow).
+    let far = |x: i64, y: i64| {
+        let limit = 4 * MAX_DIMENSION as u64;
+        x.unsigned_abs() > limit || y.unsigned_abs() > limit
+    };
     for (entry, image) in manifest.layers.into_iter().zip(pixels) {
+        if far(entry.x, entry.y) || entry.mask.as_ref().is_some_and(|m| far(m.x, m.y)) {
+            return Err(FileError::Damaged);
+        }
         let fx = effects(&entry);
         let mut layer = doc.make_layer(entry.name, image, (entry.x, entry.y));
         layer.kind = match entry.kind {
@@ -1524,11 +1538,11 @@ fn read_archive(
             bpc: p.black_point_compensation,
             paper: p.paper_color,
             ink: p.black_ink,
-            colors: p.proof_colors,
-            gamut: p.gamut_warning,
+            colors: false,
+            gamut: false,
         };
     }
-    doc.modified = false;
+    doc.mark_saved();
     Ok(doc)
 }
 
@@ -1538,9 +1552,9 @@ fn effects(e: &LayerEntry) -> Effects {
         enabled: s.enabled,
         color: s.color,
         opacity: finite_or(s.opacity, d.opacity).clamp(0.0, 1.0),
-        dx: finite_or(s.dx, d.dx),
-        dy: finite_or(s.dy, d.dy),
-        blur: finite_or(s.blur, d.blur).max(0.0),
+        dx: finite_or(s.dx, d.dx).clamp(-30000.0, 30000.0),
+        dy: finite_or(s.dy, d.dy).clamp(-30000.0, 30000.0),
+        blur: finite_or(s.blur, d.blur).clamp(0.0, 250.0),
         blend: blend_mode(s.blend),
     };
     let glow = |g: &Option<GlowEntry>, d: GlowFx| match g {
@@ -1548,7 +1562,7 @@ fn effects(e: &LayerEntry) -> Effects {
             enabled: g.enabled,
             color: g.color,
             opacity: finite_or(g.opacity, d.opacity).clamp(0.0, 1.0),
-            size: finite_or(g.size, d.size).max(0.0),
+            size: finite_or(g.size, d.size).clamp(0.0, 250.0),
             spread: finite_or(g.spread, d.spread).clamp(0.0, 1.0),
             blend: blend_mode(g.blend),
         },
@@ -1558,7 +1572,7 @@ fn effects(e: &LayerEntry) -> Effects {
         stroke: StrokeFx {
             enabled: e.stroke.enabled,
             color: e.stroke.color,
-            width: finite_or(e.stroke.width, d.stroke.width).max(0.0),
+            width: finite_or(e.stroke.width, d.stroke.width).clamp(0.0, 250.0),
             opacity: finite_or(e.stroke.opacity, 1.0).clamp(0.0, 1.0),
             blend: blend_mode(e.stroke.blend),
         },
@@ -2075,6 +2089,56 @@ mod tests {
         let cut = path.with_file_name("cut.atelier");
         std::fs::write(&cut, &data[..data.len() / 2]).unwrap();
         assert!(Document::open(&cut).is_err());
+    }
+
+    /// `path` again as `name`, its manifest changed by `edit`.
+    fn with_manifest(
+        path: &Path,
+        name: &str,
+        edit: impl Fn(&mut serde_json::Value),
+    ) -> std::path::PathBuf {
+        let mut zip = ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let manifest = read_entry(&mut zip, MANIFEST, MAX_SMALL_ENTRY).unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        edit(&mut json);
+        let changed = path.with_file_name(name);
+        let mut out = ZipWriter::new(File::create(&changed).unwrap());
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).unwrap();
+            let entry_name = entry.name().to_string();
+            out.start_file(&entry_name, SimpleFileOptions::default())
+                .unwrap();
+            if entry_name == MANIFEST {
+                out.write_all(json.to_string().as_bytes()).unwrap();
+            } else {
+                std::io::copy(&mut entry, &mut out).unwrap();
+            }
+        }
+        out.finish().unwrap();
+        changed
+    }
+
+    #[test]
+    fn extreme_offsets_and_style_sizes_are_bounded() {
+        let path = temp("extremes");
+        sample().save(&path).unwrap();
+        let far = with_manifest(&path, "far.atelier", |j| {
+            j["layers"][1]["x"] = i64::MIN.into()
+        });
+        assert!(matches!(
+            Document::open(&far).map(|_| ()),
+            Err(FileError::Damaged)
+        ));
+        let huge = with_manifest(&path, "huge.atelier", |j| {
+            let shadow = &mut j["layers"][1]["shadow"];
+            shadow["enabled"] = true.into();
+            shadow["blur"] = 4_294_967_295u64.into();
+            shadow["dx"] = 1e12.into();
+        });
+        let doc = Document::open(&huge).unwrap().doc;
+        let shadow = &doc.layers[1].effects.shadow;
+        assert_eq!((shadow.blur, shadow.dx), (250.0, 30_000.0));
+        doc.flatten();
     }
 
     #[test]

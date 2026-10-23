@@ -435,6 +435,10 @@ impl Grayscale<'_> {
             let mut gray = vec![0u8; band.len() / 2];
             there.transform_pixels(band, &mut gray);
             back.transform_pixels(&gray, band);
+            for p in band.chunks_exact_mut(4) {
+                let v = neutral([p[0], p[1], p[2]]);
+                p[..3].fill(v);
+            }
         });
         true
     }
@@ -447,8 +451,14 @@ impl Grayscale<'_> {
         let (mut gray, mut out) = ([0u8], [0u8; 3]);
         there.transform_pixels(&rgb, &mut gray);
         back.transform_pixels(&gray, &mut out);
-        out
+        [neutral(out); 3]
     }
+}
+
+/// A gray back from the gray space, exactly neutral: the round trip can
+/// leave its channels a level apart, which later saturation would amplify.
+fn neutral([r, g, b]: [u8; 3]) -> u8 {
+    ((r as u32 + g as u32 + b as u32 + 1) / 3) as u8
 }
 
 /// Out of gamut: farther than this (ΔE) from its round trip through the

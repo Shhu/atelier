@@ -17,7 +17,8 @@ fn half(ui: &Ui) -> f32 {
 /// A percentage field over a ratio (1 = 100 %).
 fn percent_field(ui: &mut Ui, label: &str, ratio: &mut f32, width: f32, tip: String) {
     let mut v = *ratio * 100.0;
-    if ui_kit::number_field(ui, label, &mut v, 0.0..=1000.0, " %", width)
+    let suffix = crate::i18n::percent("");
+    if ui_kit::number_field(ui, label, &mut v, 0.0..=1000.0, &suffix, width)
         .on_hover_text(tip)
         .changed()
     {

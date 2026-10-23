@@ -16,6 +16,9 @@ pub(super) struct HistoryPanel {
     /// History position last shown (the current step is scrolled to when
     /// it changes).
     shown: Option<(u64, u64)>,
+    /// Active document, its history position and the number of tabs when
+    /// the histories were last trimmed (see `trim_histories`).
+    pub budget_key: Option<(u64, u64, usize)>,
 }
 
 impl AtelierApp {
@@ -27,9 +30,13 @@ impl AtelierApp {
         let (names, done) = doc.history();
         let position = (doc.uid(), doc.history_step());
         let scroll = self.history.shown != Some(position);
-        let title = doc.display_name();
+        // The opened state, unless steps were forgotten since.
+        let title = match doc.history_forgotten() {
+            false => doc.display_name(),
+            true => t!("hist3-oldest-state"),
+        };
         let mut target = None;
-        let pos = dialogs::tool_dialog_pos(ctx) + vec2(-300.0, 0.0);
+        let pos = dialogs::panel_pos(ctx, "history");
         let out = floating_dialog(
             ctx,
             DialogSpec {
@@ -71,13 +78,64 @@ impl AtelierApp {
     /// as many undos or redos.
     pub(super) fn go_to_history(&mut self, done: usize) {
         self.finish_stroke();
+        // A text being typed is committed first, as by Undo: its own steps
+        // are then ordinary ones.
+        self.commit_text();
         if self.cancel_select_move() {
             return;
         }
         self.reset_pending();
+        self.settle_selection();
         if self.doc.as_mut().is_some_and(|d| d.go_to_step(done)) {
             self.reset_pending();
-            self.clip_selection();
+            self.pull_selection();
+        }
+    }
+
+    // ------------------------------------------------------------ selection
+
+    /// Records the selection as it now is as a history step (like
+    /// Photoshop, every selection change is one), named after `name`, or
+    /// after what made it: the tool, or Deselect when nothing is left.
+    pub(super) fn commit_selection(&mut self, name: Option<String>) {
+        let hint = self.sel.step_name.take();
+        let Some(doc) = &mut self.doc else { return };
+        let name = name.or(hint).unwrap_or_else(|| match &self.selection {
+            None => t!("hist3-deselect"),
+            Some(_) if self.tool.selects() => self.tool.name(),
+            Some(_) => t!("hist3-selection"),
+        });
+        if doc.record_selection(self.selection.clone(), name) {
+            self.prop_session = None;
+        }
+    }
+
+    /// The selection changed as part of a step already recorded (a crop, a
+    /// move of pixels): the history's copy follows, without a step.
+    pub(super) fn sync_selection(&mut self) {
+        if let Some(doc) = &mut self.doc {
+            doc.sync_selection(self.selection.clone());
+        }
+    }
+
+    /// After an undo, a redo or a step given up: the selection as the
+    /// history has it, within the canvas.
+    pub(super) fn pull_selection(&mut self) {
+        let Some(doc) = &mut self.doc else { return };
+        let canvas = doc.full_rect();
+        self.selection = doc.selection().cloned().and_then(|s| s.within(canvas));
+        doc.sync_selection(self.selection.clone());
+    }
+
+    /// End of a frame (and before going through the history): a selection
+    /// changed by a gesture that is over, and recorded by nothing, is known
+    /// to the history from now on. The gestures (marquee, moving the
+    /// outline) record their step when they end.
+    pub(super) fn settle_selection(&mut self) {
+        let held = self.ctx.input(|i| i.pointer.any_down());
+        let gesture = self.marquee.is_some() || self.select_move.is_some();
+        if !held && !gesture {
+            self.sync_selection();
         }
     }
 }

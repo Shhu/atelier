@@ -34,6 +34,30 @@ pub fn inpaint(
     allowed: Option<&[bool]>,
     progress: &Progress,
 ) -> Option<RgbaImage> {
+    complete(image, hole, allowed, progress, None)
+}
+
+/// [`inpaint`] starting from `guide` (the image with the hole already
+/// filled, coarsely: an AI model's answer at a lower resolution), from the
+/// level `reduction` times halved: its shapes are kept, the patches giving
+/// back the texture of the finer levels.
+pub fn refine(
+    image: &RgbaImage,
+    hole: &[bool],
+    progress: &Progress,
+    guide: &RgbaImage,
+    reduction: usize,
+) -> Option<RgbaImage> {
+    complete(image, hole, None, progress, Some((guide, reduction)))
+}
+
+fn complete(
+    image: &RgbaImage,
+    hole: &[bool],
+    allowed: Option<&[bool]>,
+    progress: &Progress,
+    guide: Option<(&RgbaImage, usize)>,
+) -> Option<RgbaImage> {
     let (w, h) = (image.width() as i32, image.height() as i32);
     if !hole.contains(&true) {
         return Some(image.clone());
@@ -51,6 +75,9 @@ pub fn inpaint(
     loop {
         let last = levels.last().expect("one level");
         let [x0, y0, x1, y1] = last.hole_box();
+        if guide.is_some_and(|(_, reduction)| levels.len() > reduction) {
+            break;
+        }
         if levels.len() >= MAX_LEVELS
             || (x1 - x0).max(y1 - y0) <= COARSE_HOLE
             || last.w.min(last.h) / 2 < COARSE_SIDE
@@ -69,7 +96,12 @@ pub fn inpaint(
 
     // Work of each level, for the progress.
     let schedule: Vec<usize> = (0..levels.len())
-        .map(|i| em_iterations(levels.len() - 1 - i, i == levels.len() - 1))
+        .map(|i| {
+            em_iterations(
+                levels.len() - 1 - i,
+                guide.is_none() && i == levels.len() - 1,
+            )
+        })
         .collect();
     let total: f32 = levels
         .iter()
@@ -84,7 +116,22 @@ pub fn inpaint(
         let mut field = level.targets();
         match &previous {
             None => {
-                level.onion_fill();
+                match guide {
+                    // The guide's answer, reduced to this level.
+                    Some((guide, _)) => {
+                        let mut px: Vec<Pix> = guide.pixels().map(|p| premultiply(p.0)).collect();
+                        let (mut gw, mut gh) = (w, h);
+                        while gw > level.w || gh > level.h {
+                            (px, gw, gh) = halved(&px, gw, gh);
+                        }
+                        for (i, p) in level.px.iter_mut().enumerate() {
+                            if level.hole[i] {
+                                *p = px[i];
+                            }
+                        }
+                    }
+                    None => level.onion_fill(),
+                }
                 field.randomize(&level, depth as u64);
             }
             Some((coarse, coarse_field)) => {
@@ -116,6 +163,27 @@ pub fn inpaint(
         }
     }
     Some(out)
+}
+
+/// Pixels `w` × `h` reduced as [`Level::reduced`] reduces them (all known).
+fn halved(px: &[Pix], w: i32, h: i32) -> (Vec<Pix>, i32, i32) {
+    let (hw, hh) = ((w + 1) / 2, (h + 1) / 2);
+    let mut out = vec![[0u8; 4]; (hw * hh) as usize];
+    for y in 0..hh {
+        for x in 0..hw {
+            let (mut sum, mut count) = ([0u32; 4], 0);
+            for (cx, cy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let (fx, fy) = (2 * x + cx, 2 * y + cy);
+                if fx < w && fy < h {
+                    let p = px[(fy * w + fx) as usize];
+                    (0..4).for_each(|c| sum[c] += p[c] as u32);
+                    count += 1;
+                }
+            }
+            out[(y * hw + x) as usize] = sum.map(|v| ((v + count / 2) / count) as u8);
+        }
+    }
+    (out, hw, hh)
 }
 
 /// Expectation-maximization iterations at a level `steps` finer than the
@@ -806,6 +874,27 @@ mod tests {
 
     /// Only the allowed area is copied: a hole in a gray band, next to a
     /// red area that is not allowed, is filled with gray.
+    #[test]
+    fn refine_gives_back_the_texture_of_a_coarse_guide() {
+        let (w, h) = (160, 120);
+        let truth = texture(w, h);
+        let hole: Vec<bool> = (0..w * h)
+            .map(|i| (55..95).contains(&(i % w)) && (40..78).contains(&(i / w)))
+            .collect();
+        // What a model seeing it reduced 4 times would give: the truth,
+        // blurred.
+        let guide = image::imageops::resize(
+            &image::imageops::resize(&truth, w / 4, h / 4, image::imageops::FilterType::Triangle),
+            w,
+            h,
+            image::imageops::FilterType::Triangle,
+        );
+        let blurred = error(&guide, &truth, &hole);
+        let refined = refine(&truth, &hole, &Progress::default(), &guide, 2).unwrap();
+        let e = error(&refined, &truth, &hole);
+        assert!(e < blurred / 2.0, "mean error {e}, guide's {blurred}");
+    }
+
     #[test]
     fn copies_only_from_the_allowed_area() {
         let (w, h) = (90, 60);

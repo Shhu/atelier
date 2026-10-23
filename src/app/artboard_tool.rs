@@ -16,7 +16,7 @@ use super::dialogs::{
 use super::*;
 use crate::document::{
     ARTBOARD_GAP, ArtboardBackground, ArtboardExport, ArtboardFiles, ExportFormat, Side,
-    artboard_file_stem,
+    artboard_file_stem, unused_artboard_path,
 };
 use crate::export::ExportOptions;
 
@@ -96,11 +96,15 @@ impl Preset {
         format!("{} · {w} × {h}", self.name())
     }
 
-    /// The preset of this size, either way round.
-    fn of((w, h): (u32, u32)) -> Option<Preset> {
-        Preset::ALL
-            .into_iter()
-            .find(|p| p.size() == (w, h) || p.size() == (h, w))
+    /// The preset of this size, either way round: `picked` (the last one
+    /// picked, Phone and Story being the same size), else the first one
+    /// of this orientation, else turned.
+    fn of((w, h): (u32, u32), picked: Option<Preset>) -> Option<Preset> {
+        let fits = |p: &Preset| p.size() == (w, h) || p.size() == (h, w);
+        picked
+            .filter(fits)
+            .or_else(|| Preset::ALL.into_iter().find(|p| p.size() == (w, h)))
+            .or_else(|| Preset::ALL.into_iter().find(fits))
     }
 }
 
@@ -112,17 +116,20 @@ pub(super) fn preset_combo(
     size: (u32, u32),
     width: f32,
 ) -> Option<(u32, u32)> {
-    let shown = Preset::of(size).map_or_else(|| t!("artboard-preset-custom"), Preset::name);
+    let memory = egui::Id::new((id, "picked"));
+    let current = Preset::of(size, ui.data(|d| d.get_temp::<Preset>(memory)));
+    let shown = current.map_or_else(|| t!("artboard-preset-custom"), Preset::name);
     let mut picked = None;
     ui_kit::combo(ui, id, None, &shown, width, |ui| {
         for p in Preset::ALL {
-            let on = Preset::of(size) == Some(p);
-            if ui.selectable_label(on, p.label()).clicked() {
-                picked = Some(p.size());
+            if ui.selectable_label(current == Some(p), p.label()).clicked() {
+                picked = Some(p);
             }
         }
     });
-    picked
+    let picked = picked?;
+    ui.data_mut(|d| d.insert_temp(memory, picked));
+    Some(picked.size())
 }
 
 /// Portrait / landscape switch of a size; returns whether it turned.
@@ -883,6 +890,11 @@ impl AtelierApp {
         count: usize,
         job: impl FnOnce() -> Result<Vec<PathBuf>, String> + Send + 'static,
     ) {
+        // One at a time: a second one would write the same files.
+        if self.artboards.job.is_some() {
+            self.status = t!("files3-status-artboards-busy");
+            return;
+        }
         let (send, receive) = channel();
         std::thread::spawn(move || {
             let _ = send.send(job());
@@ -947,14 +959,23 @@ impl AtelierApp {
         let render = doc.artboard_images_later(&which, content);
         let icc = doc.icc_profile.clone();
         let options = options.clone();
+        // Converted as a single export is (sRGB, Use Proof Setup).
+        let (proof, srgb) = (self.proof_converter(), self.srgb_source(&options));
         self.run_artboards_job(which.len(), move || {
             let mut used = Vec::new();
             let mut written = Vec::new();
             for (name, image) in render() {
                 let stem = artboard_file_stem(&name, &mut used);
-                let path = folder.join(format!("{stem}.{}", options.format.extensions()[0]));
+                let ext = options.format.extensions()[0];
+                let path = unused_artboard_path(&folder, &stem, ext, &mut used);
                 let icc = icc.as_deref().map(Vec::as_slice);
-                let bytes = options.encode(&options.render(image), icc);
+                let bytes = super::export_as::export_bytes(
+                    image,
+                    &options,
+                    icc,
+                    proof.as_ref(),
+                    srgb.as_ref(),
+                );
                 bytes
                     .and_then(|b| crate::export::write(&path, &b))
                     .map_err(|e| e.to_string())?;
@@ -976,4 +997,22 @@ pub(super) fn size_fields(ui: &mut egui::Ui, size: &mut (u32, u32)) {
         ui_kit::number_field(ui, &h, &mut size.1, range, " px", half);
         orientation_field(ui, size);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Preset;
+
+    #[test]
+    fn presets_shown_for_a_size() {
+        // The default 1920 × 1080: Web Large, not Phone turned.
+        assert_eq!(Preset::of((1920, 1080), None), Some(Preset::WebLarge));
+        assert_eq!(Preset::of((1080, 1920), None), Some(Preset::Phone));
+        // Story picked: still Story, either way round.
+        let story = Some(Preset::SocialStory);
+        assert_eq!(Preset::of((1080, 1920), story), Some(Preset::SocialStory));
+        assert_eq!(Preset::of((1920, 1080), story), Some(Preset::SocialStory));
+        assert_eq!(Preset::of((800, 1280), None), Some(Preset::WebSmall));
+        assert_eq!(Preset::of((1000, 1000), story), None);
+    }
 }

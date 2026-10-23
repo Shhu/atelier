@@ -5,52 +5,115 @@ use super::keys;
 use super::*;
 use crate::i18n::t;
 
+/// A tool slot, the gap between slots, a section's line (with its gaps).
+const SLOT: f32 = 36.0;
+const SLOT_GAP: f32 = 2.0;
+const SECTION_LINE: f32 = 11.0;
+/// The panel's margins (top 8, bottom 12), the colors and the gap above them.
+const CHROME: f32 = 8.0 + 12.0 + 40.0 + 8.0;
+
+/// A line before each section: selection, painting, paths and text, view.
+fn starts_section(group: &[Tool]) -> bool {
+    matches!(
+        group[0],
+        Tool::Select | Tool::SpotHealing | Tool::Pen(_) | Tool::Hand
+    )
+}
+
+/// The groups by rows of `columns` slots, a section starting a new row;
+/// `true` when a section's line goes before the row.
+fn rows(columns: usize) -> Vec<(bool, Vec<usize>)> {
+    let mut rows: Vec<(bool, Vec<usize>)> = Vec::new();
+    for (index, group) in Tool::GROUPS.iter().enumerate() {
+        let section = starts_section(group);
+        match rows.last_mut() {
+            Some((_, row)) if !section && row.len() < columns => row.push(index),
+            _ => rows.push((section, vec![index])),
+        }
+    }
+    rows
+}
+
+/// Height of the tools laid out in `columns`.
+fn tools_height(columns: usize) -> f32 {
+    let rows = rows(columns);
+    let lines = rows.iter().filter(|(line, _)| *line).count() as f32;
+    let n = rows.len() as f32;
+    n * SLOT + (n - 1.0 + lines) * SLOT_GAP + lines * SECTION_LINE
+}
+
+/// One column of tools when they fit in `height` (the panel's), otherwise
+/// two, like Photoshop.
+pub(super) fn columns(height: f32) -> usize {
+    if tools_height(1) + CHROME <= height {
+        1
+    } else {
+        2
+    }
+}
+
+/// The tool bar's width for `columns` of tools.
+pub(super) fn width(columns: usize) -> f32 {
+    16.0 + SLOT * columns as f32 + 4.0 * (columns as f32 - 1.0)
+}
+
 impl AtelierApp {
-    pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn toolbar(&mut self, ui: &mut egui::Ui, columns: usize) {
         // The colors stay at the bottom; the tools scroll above them when
-        // the window is too low.
+        // even two columns don't fit.
         let full = ui.max_rect();
         let (tools, colors) = full.split_top_bottom_at_y(full.bottom() - 40.0);
-        ui.scope_builder(egui::UiBuilder::new().max_rect(colors), |ui| {
-            self.colors(ui);
-        });
+        let centered = egui::Layout::top_down(egui::Align::Center);
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(colors).layout(centered),
+            |ui| self.colors(ui),
+        );
         let mut tools =
             ui.new_child(egui::UiBuilder::new().max_rect(tools.with_max_y(tools.bottom() - 8.0)));
+        // The scroll bar stays visible while there is more to see.
+        tools.spacing_mut().scroll.dormant_handle_opacity = 0.6;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(&mut tools, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                for (index, group) in Tool::GROUPS.iter().enumerate() {
-                    // A line before each section: selection, painting, paths
-                    // and text, view.
-                    if matches!(
-                        group[0],
-                        Tool::Select | Tool::SpotHealing | Tool::Pen(_) | Tool::Hand
-                    ) {
-                        let (rect, _) = ui.allocate_exact_size(vec2(36.0, 11.0), Sense::hover());
+                ui.spacing_mut().item_spacing = vec2(4.0, SLOT_GAP);
+                for (line, row) in rows(columns) {
+                    if line {
+                        let (rect, _) = ui.allocate_exact_size(
+                            vec2(width(columns) - 16.0, SECTION_LINE),
+                            Sense::hover(),
+                        );
                         let line = Rect::from_center_size(rect.center(), vec2(22.0, 1.0));
                         ui.painter().rect_filled(line, 0.0, ui_kit::color::LINE);
                     }
-                    let tool = self.group_shown(index);
-                    let key = tool.shortcut().map_or("", |k| k.name());
-                    let response =
-                        ui_kit::tool_button(ui, tool.glyph(), &tool.name(), key, self.tool == tool);
-                    // A long press opens the group's menu instead.
-                    let menu_press = group.len() > 1 && self.group_menu(ui, &response, group);
-                    if response.clicked() && !menu_press {
-                        self.set_tool(tool);
-                    }
-                    // Double click, like Photoshop: the Hand fits the image on
-                    // screen, the Zoom shows it at 100 %.
-                    if response.double_clicked() {
-                        match tool {
-                            Tool::Hand => self.run(Action::Fit),
-                            Tool::Zoom => self.run(Action::ActualSize),
-                            _ => {}
+                    ui.horizontal(|ui| {
+                        for index in row {
+                            self.tool_slot(ui, index);
                         }
-                    }
+                    });
                 }
             });
+    }
+
+    /// The slot of group `index`: its last used tool, its menu.
+    fn tool_slot(&mut self, ui: &mut egui::Ui, index: usize) {
+        let group = Tool::GROUPS[index];
+        let tool = self.group_shown(index);
+        let key = tool.shortcut().map_or("", |k| k.name());
+        let response = ui_kit::tool_button(ui, tool.glyph(), &tool.name(), key, self.tool == tool);
+        // A long press opens the group's menu instead.
+        let menu_press = group.len() > 1 && self.group_menu(ui, &response, group);
+        if response.clicked() && !menu_press {
+            self.set_tool(tool);
+        }
+        // Double click, like Photoshop: the Hand fits the image on
+        // screen, the Zoom shows it at 100 %.
+        if response.double_clicked() {
+            match tool {
+                Tool::Hand => self.run(Action::Fit),
+                Tool::Zoom => self.run(Action::ActualSize),
+                _ => {}
+            }
+        }
     }
 
     /// A group's other tools: a small corner mark on the slot, and its menu

@@ -47,12 +47,19 @@ impl AtelierApp {
         let rows = n.clamp(1, VISIBLE_ROWS) as f32;
         let most = VISIBLE_ROWS as f32 * (ROW_HEIGHT + ROW_GAP) - ROW_GAP;
         let list_height = (rows * ROW_HEIGHT + (rows - 1.0) * ROW_GAP + sub).min(most);
-        let layers_height = HEADING_HEIGHT + list_height + 6.0 + FOOTER_HEIGHT;
+        // The Layers part: as dragged, or fitted to the list.
+        let dragged = self.workspace.layout.layers_height;
+        let layers_height = dragged.unwrap_or(HEADING_HEIGHT + list_height + 6.0 + FOOTER_HEIGHT);
         // Properties scroll: when the panel is short, they give up room
         // first, down to the layers' heading, one row and their buttons.
         let layers_min = HEADING_HEIGHT + ROW_HEIGHT + 6.0 + FOOTER_HEIGHT;
+        let props_min = if dragged.is_some() {
+            HEADING_HEIGHT
+        } else {
+            120.0
+        };
         let split = (full.bottom() - layers_height)
-            .max(full.top() + 120.0)
+            .max(full.top() + props_min)
             .min(full.bottom() - layers_min)
             .max(full.top());
         // The list first: a double-click there focuses the Name field in
@@ -64,7 +71,40 @@ impl AtelierApp {
         let props_rect = Rect::from_min_max(full.min, pos2(full.right(), split));
         let mut props = ui.new_child(UiBuilder::new().max_rect(props_rect));
         props.set_clip_rect(props_rect.intersect(ui.clip_rect()));
+        // Their scroll bar shows while they overflow.
+        props.spacing_mut().scroll.dormant_handle_opacity = 0.6;
         self.properties(&mut props);
+        self.layers_splitter(ui, full, split, layers_min);
+    }
+
+    /// The border between Properties and Layers: dragging it gives one
+    /// more room (kept for the next sessions); a double click fits the
+    /// Layers to their list again.
+    fn layers_splitter(&mut self, ui: &mut Ui, full: Rect, split: f32, layers_min: f32) {
+        let rect = Rect::from_x_y_ranges(full.x_range(), split - 3.0..=split + 3.0);
+        let response = ui
+            .interact(rect, Id::new("layers-splitter"), Sense::click_and_drag())
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+        let layout = &mut self.workspace.layout;
+        if response.double_clicked() {
+            layout.layers_height = None;
+            self.workspace.save_layout();
+        } else if response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+            let most = (full.height() - HEADING_HEIGHT).max(layers_min);
+            let height = full.bottom() - split - response.drag_delta().y;
+            layout.layers_height = Some(height.clamp(layers_min, most));
+        }
+        if response.drag_stopped() {
+            self.workspace.save_layout();
+        }
+        if response.hovered() || response.dragged() {
+            ui.painter().hline(
+                full.x_range(),
+                split + 0.5,
+                egui::Stroke::new(2.0, color::ACCENT),
+            );
+        }
     }
 
     // ------------------------------------------------------------ properties
@@ -512,7 +552,10 @@ impl AtelierApp {
                     } else {
                         (icon::EYE_SLASH, color::DISABLED)
                     };
-                    let tip = t!("panel-visibility-tip");
+                    let tip = t!(
+                        "input3-visibility-tip",
+                        alt_click = keys::click(ui.ctx(), Modifiers::ALT)
+                    );
                     if row_icon(ui, eye, Id::new(("side_eye", layer.id)), glyph, fg, &tip).clicked()
                     {
                         let solo = ui.input(|inp| inp.modifiers.alt);
@@ -659,23 +702,41 @@ impl AtelierApp {
                     } else {
                         kind
                     };
-                    let text_painter = painter.with_clip_rect(text.intersect(painter.clip_rect()));
-                    text_painter.text(
-                        pos2(text.left(), rect.center().y - 7.0),
-                        Align2::LEFT_CENTER,
-                        &layer.name,
+                    // Too long, the name and kind end with "…" (the tooltip
+                    // shows the name whole).
+                    let line = |s: String, font: FontId, color: Color32| {
+                        let mut job = egui::text::LayoutJob::single_section(
+                            s,
+                            egui::TextFormat::simple(font, color),
+                        );
+                        job.wrap =
+                            egui::text::TextWrapping::truncate_at_width(text.width().max(0.0));
+                        painter.layout_job(job)
+                    };
+                    let name_galley = line(
+                        layer.name.clone(),
                         ui_kit::medium(ui_kit::TEXT_SIZE),
                         name_color,
                     );
-                    text_painter.text(
-                        pos2(text.left(), rect.center().y + 9.0),
-                        Align2::LEFT_CENTER,
-                        kind,
-                        FontId::proportional(11.0),
-                        color::LABEL,
-                    );
+                    let name_elided = name_galley.elided;
+                    let kind_galley = line(kind, FontId::proportional(11.0), color::LABEL);
+                    let text_painter = painter.with_clip_rect(text.intersect(painter.clip_rect()));
+                    let name_y = rect.center().y - 7.0 - name_galley.size().y / 2.0;
+                    let name_rect =
+                        Rect::from_min_size(pos2(text.left(), name_y), name_galley.size());
+                    text_painter.galley(pos2(text.left(), name_y), name_galley, name_color);
+                    let kind_y = rect.center().y + 9.0 - kind_galley.size().y / 2.0;
+                    text_painter.galley(pos2(text.left(), kind_y), kind_galley, color::LABEL);
 
-                    let row = row.on_hover_text(t!("core-layer-row-tip"));
+                    let tip = layer_row_tip(ui.ctx());
+                    let row = if name_elided {
+                        row.on_hover_ui(|ui| {
+                            ui.label(egui::RichText::new(&layer.name).strong());
+                            ui.label(tip);
+                        })
+                    } else {
+                        row.on_hover_text(tip)
+                    };
                     let modifiers = ui.input(|inp| inp.modifiers);
                     let at = row.interact_pointer_pos();
                     let on = |r: Option<Rect>| {
@@ -690,8 +751,11 @@ impl AtelierApp {
                     } else {
                         RowPart::Name
                     };
+                    // Double-click: on the name, renames it; beside it, the
+                    // layer's style, like Photoshop.
+                    let on_name = on(Some(name_rect)) || !layer.has_pixels();
                     if row.double_clicked() {
-                        if part == RowPart::Name {
+                        if part == RowPart::Name && on_name {
                             rename = true;
                         } else if layer.artboard.is_some() {
                             // Zoom to fit the artboard.
@@ -875,6 +939,7 @@ impl AtelierApp {
             RowPart::Mask if modifiers.command => {
                 if let Some(found) = self.doc.as_ref().and_then(|d| d.mask_selection(i)) {
                     let mode = self.selection_mode(modifiers.shift, modifiers.alt);
+                    self.sel.step_name = Some(select_menu::step_label(t!("sel-menu-load")));
                     self.apply_selection(Some(found), mode);
                 }
                 return;
@@ -940,7 +1005,10 @@ impl AtelierApp {
             super::menus::menu_entries(ui, &entries, &mut action);
         });
         let alt = ui.input(|i| i.modifiers.alt);
-        let mask_tip = t!("core-add-mask-tip");
+        let mask_tip = t!(
+            "input3-add-mask-tip",
+            alt = keys::modifiers(ui.ctx(), Modifiers::ALT)
+        );
         if ui_kit::icon_button(ui, icon::SQUARE_HALF, &mask_tip, !has_mask).clicked() {
             // Alt: hiding all (or the selection), like Photoshop.
             action = Some(Action::AddMask(match (alt, self.selection.is_some()) {
@@ -996,8 +1064,7 @@ impl AtelierApp {
     /// brush stroke).
     fn thumbnail(&mut self, ctx: &egui::Context, i: usize, mask: bool) -> Option<egui::TextureId> {
         let doc = self.doc.as_ref()?;
-        let layers = doc.render_layers();
-        let layer = &layers[i];
+        let layer = doc.render_layer(i);
         let key = match (&layer.mask, mask) {
             (Some(m), true) => hash_of((m.rev(), m.origin(layer.offset), doc.full_rect())),
             (None, true) => return None,
@@ -1214,6 +1281,16 @@ fn line() -> UiStroke {
 }
 
 /// What a layer is: "Text", "Image", "Group", its adjustment, "Fill".
+/// Help of a row of the Layers panel.
+fn layer_row_tip(ctx: &egui::Context) -> String {
+    t!(
+        "input3-layer-row-tip",
+        alt_click = keys::click(ctx, Modifiers::ALT),
+        ctrl_click = keys::click(ctx, Modifiers::COMMAND),
+        shift_click = keys::click(ctx, Modifiers::SHIFT)
+    )
+}
+
 fn kind_label(layer: &Layer) -> String {
     match &layer.kind {
         LayerKind::Pixels if layer.text.is_some() => t!("side-kind-text"),
@@ -1229,8 +1306,9 @@ fn kind_label(layer: &Layer) -> String {
 
 /// Panel heading, 42 px: title on the left, `right` aligned on the right.
 fn heading_bar(ui: &mut Ui, title: &str, right: impl FnOnce(&mut Ui)) {
-    let (rect, _) =
+    let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), HEADING_HEIGHT), Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
     ui.painter().text(
         pos2(rect.left() + 14.0, rect.center().y),
         Align2::LEFT_CENTER,

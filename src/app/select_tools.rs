@@ -55,6 +55,8 @@ pub(super) struct Marquee {
     constrain: bool,
     /// Elliptical Marquee.
     ellipse: bool,
+    /// Pointer in the previous frame (image): Space held moves the marquee.
+    last: Pos2,
 }
 
 /// Style of the marquees: free, of fixed proportions, or of fixed size.
@@ -201,6 +203,7 @@ impl AtelierApp {
             self.deselect();
         }
         self.selection = result;
+        self.commit_selection(None);
     }
 
     /// Marquee tools: drawing, or moving the selection (outline; Ctrl: its
@@ -259,7 +262,15 @@ impl AtelierApp {
                 mode,
                 constrain: !modifiers_chose_mode,
                 ellipse: self.tool == Tool::Ellipse,
+                last: ip,
             });
+        }
+        // Space held during the drag moves the marquee, like Photoshop.
+        if let Some(m) = &mut self.marquee {
+            if self.ctx.input(|i| i.key_down(Key::Space)) {
+                m.from += ip - m.last;
+            }
+            m.last = ip;
         }
         let Some(m) = self.marquee else {
             // The hand: what is under it can be taken and moved.
@@ -325,7 +336,8 @@ impl AtelierApp {
         let Some(m) = self.marquee.take() else { return };
         self.record_marquee(m.ellipse, m.mode, self.marquee_preview);
         let Some(rect) = self.marquee_preview.take() else {
-            return;
+            // Drawn as it went (or a click: deselected).
+            return self.commit_selection(None);
         };
         let Edges { antialias, feather } = *self.sel.shape.edges(self.tool);
         self.select_shape(rect, m.ellipse, m.mode, feather, antialias);
@@ -357,7 +369,7 @@ impl AtelierApp {
 
     /// Ctrl+drag: the active layer's pixels can be lifted (otherwise says
     /// why not).
-    fn can_lift(&mut self) -> bool {
+    pub(super) fn can_lift(&mut self) -> bool {
         if self.refuse_if_locked() {
             return false;
         }
@@ -373,7 +385,7 @@ impl AtelierApp {
     /// Dragging of the current selection (Shift: horizontal or vertical).
     /// Pixels moved with Ctrl are lifted at the first real move, and put
     /// back on their layer on release. A click without moving deselects.
-    fn move_selection(
+    pub(super) fn move_selection(
         &mut self,
         view: View,
         pointer: Option<Pos2>,
@@ -428,6 +440,7 @@ impl AtelierApp {
             self.select_move = None;
             if outline_only {
                 self.deselect();
+                self.commit_selection(None);
             }
         }
         CursorIcon::Grab
@@ -454,8 +467,12 @@ impl AtelierApp {
             let layer = doc.active_layer_mut();
             layer.offset = (layer.offset.0 + d.0, layer.offset.1 + d.1);
             doc.drop_floating(id);
+            // Moved with the pixels, in their step.
+            self.selection = Some(moved);
+            return self.sync_selection();
         }
         self.selection = Some(moved);
+        self.commit_selection(Some(t!("hist3-move-selection")));
     }
 
     /// Magic Wand: on click, the pixels of similar color.
@@ -466,27 +483,31 @@ impl AtelierApp {
         let ip = view.to_image(p);
         let (x, y) = (ip.x.floor() as i64, ip.y.floor() as i64);
         let tolerance = (self.wand_tolerance * 255.0).round() as u8;
-        // Active layer, or the whole image as displayed.
-        let (image, origin) = if self.wand_all_layers {
-            (std::borrow::Cow::Owned(doc.flatten()), (0, 0))
+        let canvas = doc.full_rect();
+        // Active layer, or the whole image as displayed: flattened, then
+        // filled, with the selection, in the background when large.
+        type Pixels = Box<dyn FnOnce() -> Arc<image::RgbaImage> + Send>;
+        let ((w, h), origin, pixels): (_, _, Pixels) = if self.wand_all_layers {
+            let flatten = doc.flatten_later();
+            (
+                (canvas.w, canvas.h),
+                (0, 0),
+                Box::new(move || Arc::new(flatten())),
+            )
         } else {
             let layer = doc.active_layer();
-            (std::borrow::Cow::Borrowed(layer.image()), layer.offset)
+            let image = layer.shared_image();
+            (
+                layer.image().dimensions(),
+                layer.offset,
+                Box::new(move || image),
+            )
         };
         let (lx, ly) = (x - origin.0, y - origin.1);
-        if lx < 0 || ly < 0 || lx >= image.width() as i64 || ly >= image.height() as i64 {
+        if lx < 0 || ly < 0 || lx >= w as i64 || ly >= h as i64 {
             self.status = t!("select-wand-outside-layer");
             return;
         }
-        let mask = crate::pixel_ops::magic_wand(
-            &image,
-            lx as u32,
-            ly as u32,
-            tolerance,
-            self.wand_contiguous,
-        );
-        let canvas = doc.full_rect();
-        let found = Selection::from_mask(&mask, origin).and_then(|s| s.within(canvas));
         let (shift, alt) = self.ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
         let mode = self.selection_mode(shift, alt);
         // Anti-alias: edges softened by about a pixel.
@@ -495,10 +516,13 @@ impl AtelierApp {
         } else {
             0.0
         };
-        let pixels = found
-            .as_ref()
-            .map_or(0, |s| s.rect.w as u64 * s.rect.h as u64);
-        self.select_later(Then::Select(mode), pixels, move || {
+        let contiguous = self.wand_contiguous;
+        let area = w as u64 * h as u64;
+        self.select_later(Then::Select(mode), area, move || {
+            let image = pixels();
+            let mask =
+                crate::pixel_ops::magic_wand(&image, lx as u32, ly as u32, tolerance, contiguous);
+            let found = Selection::from_mask(&mask, origin).and_then(|s| s.within(canvas));
             feathered(found, feather, canvas)
         });
     }
@@ -728,10 +752,9 @@ impl AtelierApp {
         let ip = pointer.map(|p| view.to_image(p));
         let Some(lasso) = &mut self.sel.free_lasso else {
             if let (true, Some(ip)) = (start, ip) {
+                // The selection stays until the lasso closes, as with the
+                // Magnetic Lasso.
                 let mode = self.selection_mode(shift, alt);
-                if mode == SelectMode::Replace {
-                    self.deselect();
-                }
                 self.sel.free_lasso = Some(FreeLasso {
                     mode,
                     points: vec![ip],
@@ -947,6 +970,15 @@ impl AtelierApp {
         if remove_background && self.refuse_if_locked() {
             return;
         }
+        if remove_background
+            && self
+                .doc
+                .as_ref()
+                .is_some_and(|d| !d.active_layer().has_pixels())
+        {
+            self.status = t!("tools3-status-remove-background-pixels");
+            return;
+        }
         let then = if remove_background {
             AfterDownload::RemoveBackground
         } else {
@@ -1037,6 +1069,7 @@ impl AtelierApp {
             None => {
                 let canvas = doc.full_rect();
                 let found = Selection::from_mask(&mask, (0, 0)).and_then(|s| s.within(canvas));
+                self.sel.step_name = Some(t!("hist3-select-subject"));
                 self.apply_selection(found, SelectMode::Replace);
                 self.status = match note {
                     Some(note) => t!("select-subject-selected-note", note = note),

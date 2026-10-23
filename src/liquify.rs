@@ -312,6 +312,11 @@ impl Default for Brush {
 }
 
 impl Brush {
+    /// Distance between two dabs along a stroke.
+    pub fn spacing(&self) -> f32 {
+        (self.size * STEP).max(0.5)
+    }
+
     /// Strength at `t` (distance from the center over the radius): full in
     /// a core that grows with the density, fading smoothly to the edge.
     fn falloff(&self, t: f32) -> f32 {
@@ -357,6 +362,16 @@ struct Tile {
     index: usize,
     offsets: Vec<[f32; 2]>,
     freeze: Vec<f32>,
+}
+
+impl Snapshot {
+    /// Memory it holds.
+    pub fn bytes(&self) -> usize {
+        self.tiles
+            .iter()
+            .map(|t| t.offsets.len() * 8 + t.freeze.len() * 4)
+            .sum()
+    }
 }
 
 /// Liquify being edited: the mesh and the freeze mask.
@@ -554,7 +569,7 @@ impl Liquify {
         if effect.follows_motion() && len == 0.0 {
             return None;
         }
-        let n = ((len / (brush.size * STEP).max(0.5)).ceil() as usize).max(1);
+        let n = ((len / brush.spacing()).ceil() as usize).max(1);
         let step = [v[0] / n as f32, v[1] / n as f32];
         let mut dirty = None;
         for k in 0..n {
@@ -659,27 +674,28 @@ impl Liquify {
             _ => {
                 // Where the result at each node now takes its pixels from,
                 // in the current result: composed with the current map.
-                let mut new = Vec::with_capacity((x1 - x0) * (y1 - y0));
+                let w = x1 - x0;
+                let mut new = vec![[0.0f32; 2]; w * (y1 - y0)];
                 let (max_x, max_y) = (self.mesh.width as f32 - 1.0, self.mesh.height as f32 - 1.0);
-                for j in y0..y1 {
-                    for i in x0..x1 {
-                        let p = self.mesh.node_pos(i, j);
-                        let w = weight(self, i, j);
-                        let old = self.mesh.node(i, j);
-                        if w <= 0.0 {
-                            new.push(old);
+                let this = &*self;
+                par_rows(&mut new, w, |first, band| {
+                    for (n, out) in band.iter_mut().enumerate() {
+                        let (i, j) = (x0 + n % w, y0 + first + n / w);
+                        let p = this.mesh.node_pos(i, j);
+                        let weight = weight(this, i, j);
+                        if weight <= 0.0 {
+                            *out = this.mesh.node(i, j);
                             continue;
                         }
-                        let q = source_point(effect, p, c, motion, w * k, w);
-                        let o = self.mesh.offset_at(q[0], q[1]);
+                        let q = source_point(effect, p, c, motion, weight * k, weight);
+                        let o = this.mesh.offset_at(q[0], q[1]);
                         let mut to = [q[0] + o[0], q[1] + o[1]];
                         if brush.pin_edges {
                             to = [to[0].clamp(0.0, max_x), to[1].clamp(0.0, max_y)];
                         }
-                        new.push([to[0] - p[0], to[1] - p[1]]);
+                        *out = [to[0] - p[0], to[1] - p[1]];
                     }
-                }
-                let w = x1 - x0;
+                });
                 for (row, j) in new.chunks_exact(w).zip(y0..y1) {
                     self.mesh.offsets[j * cols + x0..j * cols + x1].copy_from_slice(row);
                 }
@@ -689,37 +705,37 @@ impl Liquify {
     }
 
     /// Average offset over (2r + 1)² nodes around each node of `rect`
-    /// (separable box, the edge nodes repeated).
+    /// (separable box with running sums, the edge nodes repeated).
     fn box_average(&self, [x0, y0, x1, y1]: NodeRect, r: usize) -> Vec<[f32; 2]> {
         let (cols, rows) = (self.mesh.cols as isize, self.mesh.rows as isize);
         let r = r as isize;
         let (ya, yb) = (y0 as isize - r, y1 as isize + r);
         let w = x1 - x0;
         let n = (2 * r + 1) as f32;
+        let add = |a: [f32; 2], b: [f32; 2]| [a[0] + b[0], a[1] + b[1]];
+        let sub = |a: [f32; 2], b: [f32; 2]| [a[0] - b[0], a[1] - b[1]];
         // Horizontal pass over the rows needed by the vertical one.
         let mut horizontal = Vec::with_capacity(w * (yb - ya) as usize);
         for j in ya..yb {
             let j = j.clamp(0, rows - 1) as usize;
-            for i in x0..x1 {
-                let mut sum = [0.0; 2];
-                for di in -r..=r {
-                    let o = self
-                        .mesh
-                        .node((i as isize + di).clamp(0, cols - 1) as usize, j);
-                    sum = [sum[0] + o[0], sum[1] + o[1]];
-                }
+            let at = |i: isize| self.mesh.node(i.clamp(0, cols - 1) as usize, j);
+            let first = x0 as isize;
+            let mut sum = (first - r..=first + r).fold([0.0; 2], |s, i| add(s, at(i)));
+            for i in first..x1 as isize {
                 horizontal.push([sum[0] / n, sum[1] / n]);
+                sum = sub(add(sum, at(i + r + 1)), at(i - r));
             }
         }
-        let mut out = Vec::with_capacity(w * (y1 - y0));
-        for j in 0..y1 - y0 {
-            for i in 0..w {
-                let mut sum = [0.0; 2];
-                for dj in 0..(2 * r + 1) as usize {
-                    let o = horizontal[(j + dj) * w + i];
-                    sum = [sum[0] + o[0], sum[1] + o[1]];
+        let k = (2 * r + 1) as usize;
+        let mut out = vec![[0.0; 2]; w * (y1 - y0)];
+        for i in 0..w {
+            let at = |j: usize| horizontal[j * w + i];
+            let mut sum = (0..k).fold([0.0; 2], |s, j| add(s, at(j)));
+            for j in 0..y1 - y0 {
+                out[j * w + i] = [sum[0] / n, sum[1] / n];
+                if j + 1 < y1 - y0 {
+                    sum = sub(add(sum, at(j + k)), at(j));
                 }
-                out.push([sum[0] / n, sum[1] / n]);
             }
         }
         out
@@ -1178,6 +1194,40 @@ mod tests {
             before,
             peak(&liquify)
         );
+    }
+
+    #[test]
+    fn box_average_matches_the_direct_sum() {
+        let mut liquify = Liquify::new(Mesh::new(60, 40));
+        let brush = Brush {
+            size: 20.0,
+            ..Brush::default()
+        };
+        liquify.stroke(Effect::Warp, &brush, [10.0, 10.0], [30.0, 25.0], 0.0, 1.0);
+        let mesh = &liquify.mesh;
+        let (cols, rows) = (mesh.cols as isize, mesh.rows as isize);
+        for (rect, r) in [([0, 0, mesh.cols, mesh.rows], 3), ([2, 3, 9, 7], 5)] {
+            let fast = liquify.box_average(rect, r);
+            let r = r as isize;
+            let w = rect[2] - rect[0];
+            for j in rect[1]..rect[3] {
+                for i in rect[0]..rect[2] {
+                    let mut sum = [0.0f32; 2];
+                    for dj in -r..=r {
+                        for di in -r..=r {
+                            let x = (i as isize + di).clamp(0, cols - 1) as usize;
+                            let y = (j as isize + dj).clamp(0, rows - 1) as usize;
+                            let o = mesh.node(x, y);
+                            sum = [sum[0] + o[0], sum[1] + o[1]];
+                        }
+                    }
+                    let n = ((2 * r + 1) * (2 * r + 1)) as f32;
+                    let got = fast[(j - rect[1]) * w + i - rect[0]];
+                    assert!((got[0] - sum[0] / n).abs() < 1e-3, "{got:?} {sum:?}");
+                    assert!((got[1] - sum[1] / n).abs() < 1e-3, "{got:?} {sum:?}");
+                }
+            }
+        }
     }
 
     #[test]

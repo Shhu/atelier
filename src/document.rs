@@ -23,18 +23,22 @@ use crate::vector::{Path as VectorPath, Shape};
 
 mod artboards;
 mod channels;
+mod clipboard;
 mod color;
 mod file_io;
 mod layers;
 mod masks;
 mod native;
 mod psd;
+mod quick_mask;
+mod shared_composite;
 mod smart;
+mod styles_jobs;
 mod transform;
 mod vectors;
 pub use artboards::{
     ARTBOARD_GAP, Artboard, ArtboardBackground, ArtboardExport, ArtboardFiles, Side,
-    artboard_file_stem,
+    artboard_file_stem, unused_artboard_path,
 };
 pub use color::{ProofSetup, to_cmyk};
 pub use file_io::{
@@ -46,18 +50,25 @@ pub use masks::{Mask, NewMask};
 pub use native::is_native;
 pub use native::{adjustment_from_json, adjustment_to_json};
 pub use psd::is_psd;
+pub use shared_composite::note_painted;
 pub use smart::{
-    Contents, EmbeddedIn, Link, LinkReport, SmartFilter, SmartFilterKind, SmartObject, SmartRender,
+    Contents, EmbeddedIn, Link, LinkFresh, LinkRead, LinkReport, SmartFilter, SmartFilterKind,
+    SmartObject, SmartRender,
 };
+pub use styles_jobs::styles_pending;
 pub use transform::{Target as TransformTarget, Transformed, transformed_selection};
 pub use vectors::{PathRef, SavedPath};
 
-const MAX_UNDO: usize = 30;
+const MAX_UNDO: usize = 50;
 
-/// Memory the undo history of a document may keep beyond its current state.
-/// Per document: each tab owns its history, and 1 GiB still holds about ten
-/// steps on a 24 MP layer. The last step is always kept.
-const HISTORY_BUDGET: usize = 1 << 30;
+/// Memory the undo history of a document may keep beyond its current state:
+/// 1 GiB still holds about ten steps on a 24 MP layer. The last step is
+/// always kept. The documents set aside in other tabs share
+/// [`TOTAL_HISTORY_BUDGET`] with it.
+pub const HISTORY_BUDGET: usize = 1 << 30;
+
+/// Memory the histories of all open documents may keep together.
+pub const TOTAL_HISTORY_BUDGET: usize = 2 << 30;
 
 /// Largest layer (in pixels, 1 GiB of RGBA) that merging or painting may
 /// create beyond the size of the canvas.
@@ -160,6 +171,8 @@ pub struct Layer {
     /// Box of the visible pixels (layer coordinates) for a revision.
     bounds: Cell<Option<(u64, Option<[u32; 4]>)>>,
     styles_cache: RefCell<Option<StylesCache>>,
+    /// Styles being drawn for the display (see [`Layer::styles_later`]).
+    styles_job: styles_jobs::JobSlot,
     /// Position of the top-left corner in the canvas.
     pub offset: (i64, i64),
     pub visible: bool,
@@ -255,6 +268,16 @@ impl Layer {
         Some(styles)
     }
 
+    /// The styles as drawn with `later` (the display, see
+    /// [`Self::styles_later`]), or at once.
+    pub fn styles_shown(&self, held: bool, later: bool) -> Option<Arc<Styles>> {
+        if later {
+            self.styles_later(held)
+        } else {
+            self.styles(held)
+        }
+    }
+
     /// Fingerprint of what the mask does to the layer's shape.
     fn mask_key(&self) -> u64 {
         self.active_mask().map_or(0, |m| m.key(self.offset))
@@ -280,6 +303,18 @@ impl Layer {
         Arc::make_mut(&mut self.image)
     }
 
+    /// Runs `f` on the mutable pixels (see [`Self::pixels_mut`]); when it
+    /// changed nothing (`None`: a brush that laid no dab), the revision
+    /// stays, so nothing is composited again.
+    pub fn paint<R>(&mut self, f: impl FnOnce(&mut RgbaImage) -> Option<R>) -> Option<R> {
+        let rev = self.rev;
+        let out = f(self.pixels_mut());
+        if out.is_none() {
+            self.rev = rev;
+        }
+        out
+    }
+
     /// Replaces the pixels (a text becomes pixels).
     pub fn replace_pixels(&mut self, image: RgbaImage) {
         self.text = None;
@@ -287,6 +322,14 @@ impl Layer {
         self.smart = None;
         self.rev = next_rev();
         self.image = Arc::new(image);
+    }
+
+    /// Puts back pixels the layer had (`rev` their revision) at `offset`:
+    /// a layer enlarged for a dialog's preview, the dialog cancelled.
+    pub fn put_back_pixels(&mut self, image: Arc<RgbaImage>, offset: (i64, i64), rev: u64) {
+        self.image = image;
+        self.offset = offset;
+        self.rev = rev;
     }
 
     /// Box of the visible pixels (alpha > 0), in canvas coordinates.
@@ -350,10 +393,15 @@ impl Layer {
     /// Box of what the layer shows on its own, styles included; `None` if
     /// it reaches everywhere (adjustment, fill without a hiding mask).
     pub fn extent(&self, held: bool) -> Option<PixelRect> {
+        self.extent_with(self.styles(held).as_deref())
+    }
+
+    /// The same, with these styles drawn (see [`Self::styles_later`]).
+    pub fn extent_with(&self, styles: Option<&Styles>) -> Option<PixelRect> {
         let own = match &self.kind {
             LayerKind::Pixels => {
                 let r = self.rect();
-                Some(match self.styles(held).and_then(|s| s.extent()) {
+                Some(match styles.and_then(|s| s.extent()) {
                     Some([x0, y0, x1, y1]) => r.union(PixelRect {
                         x: self.offset.0 + x0,
                         y: self.offset.1 + y0,
@@ -399,6 +447,36 @@ pub fn composite_layers<'a>(
 static NEXT_REV: AtomicU64 = AtomicU64::new(1);
 
 /// New revision, unique across the whole program.
+/// Whether two selections (or their absence) are the same.
+fn same_selection(a: Option<&Selection>, b: Option<&Selection>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.same(b),
+        _ => false,
+    }
+}
+
+impl Layer {
+    /// Address and size of each big buffer the layer holds (pixels, masks,
+    /// its styles' coverages, a smart object's contents and renderings),
+    /// for the history's memory budget.
+    fn buffers(&self, out: &mut Vec<(usize, usize)>) {
+        let mut raw = |r: &[u8]| out.push((r.as_ptr() as usize, r.len()));
+        raw(self.image.as_raw());
+        if let Some(m) = &self.mask {
+            raw(m.image().as_raw());
+        }
+        if let Some(c) = self.styles_cache.borrow().as_ref() {
+            for f in c.styles.exterior.iter().chain(&c.styles.interior) {
+                raw(f.coverage.as_raw());
+            }
+        }
+        if let Some(smart) = &self.smart {
+            smart.buffers(out);
+        }
+    }
+}
+
 fn next_rev() -> u64 {
     NEXT_REV.fetch_add(1, Ordering::Relaxed)
 }
@@ -505,14 +583,31 @@ struct State {
     paths: Vec<SavedPath>,
     work_path: Option<VectorPath>,
     icc_profile: Option<Arc<Vec<u8>>>,
+    selection: Option<Selection>,
+    quick_mask: Option<Arc<GrayImage>>,
+    mask_target: Option<u64>,
+    filter_mask_target: bool,
+    /// Identifies the state (whether it is the one saved).
+    id: u64,
 }
 
 /// A step of the history: the state on one side of it (before it in the
-/// undo list, after it in the redo list) and its name (History panel).
+/// undo list, after it in the redo list), its name (History panel), and
+/// its number (in the order recorded, see [`Document::history_mark`]).
 #[derive(Clone)]
 struct Step {
     state: State,
     name: String,
+    seq: u64,
+}
+
+/// Position in the history to go back to with [`Document::rollback_to`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryMark {
+    /// Steps numbered up to this one were recorded before it.
+    seq: u64,
+    /// The state at the mark.
+    id: u64,
 }
 
 /// A composition being edited: a canvas and layers (from the bottom to the
@@ -548,6 +643,25 @@ pub struct Document {
     redo: Vec<Step>,
     /// Changes on every history change (see [`Self::history_step`]).
     step: u64,
+    /// Number of the last step recorded.
+    seq: u64,
+    /// Steps were forgotten (a full history): the oldest state kept is no
+    /// longer the one opened.
+    forgotten: bool,
+    /// The redo list a step's recording dropped, with that step's number:
+    /// given back if the step is discarded (it changed nothing).
+    dropped_redo: Option<(u64, Vec<Step>)>,
+    /// Identifies the current state (see `State::id`), and the one saved.
+    state_id: u64,
+    saved_id: Option<u64>,
+    /// The selection, in the history like the layers (the app holds the
+    /// live one and records its changes here).
+    selection: Option<Selection>,
+    /// Quick Mask Mode: the mask edited instead of the selection, the size
+    /// of the canvas (white selected). In the history like the layers.
+    quick_mask: Option<Arc<GrayImage>>,
+    /// Changes whenever the quick mask does (display key).
+    quick_mask_rev: u64,
     /// Brush stroke in progress: the effects are not recomputed.
     effects_held: bool,
     /// Unique across the program (layer ids are only unique within a document).
@@ -562,6 +676,9 @@ pub struct Document {
     /// The contents of a smart object opened by Edit Contents: saving
     /// gives them back to it.
     pub embedded_in: Option<EmbeddedIn>,
+    /// What opening its file (a Photoshop document) had to simplify or
+    /// leave out: saving over that file would lose it.
+    pub file_notes: Vec<String>,
 }
 
 impl Document {
@@ -584,12 +701,21 @@ impl Document {
             undo: VecDeque::new(),
             redo: Vec::new(),
             step: 0,
+            seq: 0,
+            forgotten: false,
+            dropped_redo: None,
+            state_id: 0,
+            saved_id: Some(0),
+            selection: None,
+            quick_mask: None,
+            quick_mask_rev: next_rev(),
             effects_held: false,
             uid: next_rev(),
             mask_target: None,
             swapped: None,
             filter_mask_target: false,
             embedded_in: None,
+            file_notes: Vec::new(),
         };
         let layer = doc.make_layer(t!("doc-background-layer-name"), image, (0, 0));
         doc.layers.push(layer);
@@ -607,7 +733,8 @@ impl Document {
             });
         }
         if is_psd(path) {
-            let psd::Imported { doc, notes } = psd::read(path)?;
+            let psd::Imported { mut doc, notes } = psd::read(path)?;
+            doc.file_notes = notes.clone();
             return Ok(Opened {
                 doc,
                 animated: false,
@@ -635,6 +762,14 @@ impl Document {
         })
     }
 
+    /// What saving over its Photoshop file would lose: what opening it
+    /// left out, and what such a file can't hold (translated notes).
+    pub fn psd_losses(&self) -> Vec<String> {
+        let mut notes = self.file_notes.clone();
+        notes.extend(psd::losses(self));
+        notes
+    }
+
     /// Saves as an Atelier document (every layer kept), or as a Photoshop
     /// document if `path` names one, which becomes the document's file.
     /// The file at `path`, if any, is only replaced once the new one is
@@ -647,10 +782,19 @@ impl Document {
                 Ok(())
             })?;
         } else {
-            file_io::write_atomic(path, |out| native::write(self, out))?;
+            let folder = path.parent();
+            file_io::write_atomic(path, |out| native::write(self, out, folder))?;
         }
         self.path = Some(path.to_path_buf());
-        self.modified = false;
+        if notes.is_empty() {
+            self.mark_saved();
+            self.file_notes.clear();
+        } else {
+            // The file holds less than the document: still to be saved,
+            // whatever undo and redo come back to.
+            self.saved_id = None;
+            self.modified = true;
+        }
         Ok(notes)
     }
 
@@ -693,6 +837,45 @@ impl Document {
     /// Identity of the document, unique across the program.
     pub fn uid(&self) -> u64 {
         self.uid
+    }
+
+    /// A copy to work on while this one stays untouched: same file and
+    /// layers, no history, an identity of its own.
+    pub fn duplicate(&self) -> Self {
+        Self {
+            layers: self.layers.clone(),
+            active: self.active,
+            canvas: self.canvas,
+            path: self.path.clone(),
+            modified: self.modified,
+            icc_profile: self.icc_profile.clone(),
+            proof: self.proof.clone(),
+            guides: self.guides.clone(),
+            channels: self.channels.clone(),
+            paths: self.paths.clone(),
+            work_path: self.work_path.clone(),
+            next_id: self.next_id,
+            layer_number: self.layer_number,
+            undo: VecDeque::new(),
+            redo: Vec::new(),
+            step: 0,
+            seq: 0,
+            forgotten: false,
+            dropped_redo: None,
+            state_id: 0,
+            saved_id: (!self.modified).then_some(0),
+            selection: self.selection.clone(),
+            quick_mask: self.quick_mask.clone(),
+            quick_mask_rev: next_rev(),
+            effects_held: false,
+            uid: next_rev(),
+            mask_target: self.mask_target,
+            swapped: self.swapped.clone(),
+            filter_mask_target: self.filter_mask_target,
+            // Never gives contents back to a smart object.
+            embedded_in: None,
+            file_notes: self.file_notes.clone(),
+        }
     }
 
     /// Stacks the visible layers (according to their opacity and blend mode)
@@ -773,14 +956,16 @@ impl Document {
     /// Topmost visible and unlocked layer with a non-transparent pixel at
     /// (x, y).
     pub fn pick_layer(&self, x: i64, y: i64) -> Option<usize> {
-        (0..self.layers.len()).rev().find(|&i| {
+        self.layers_at(x, y).find(|&i| !self.layers[i].locked)
+    }
+
+    /// Visible layers with a non-transparent pixel at (x, y), topmost
+    /// first (locked ones too).
+    pub fn layers_at(&self, x: i64, y: i64) -> impl Iterator<Item = usize> + '_ {
+        (0..self.layers.len()).rev().filter(move |&i| {
             let l = &self.layers[i];
             let masked = l.active_mask().map_or(1.0, |m| m.value_at(x, y, l.offset));
-            !l.locked
-                && l.alpha_at(x, y) > 0
-                && masked > 0.0
-                && self.shown(i)
-                && self.within_artboard(i, x, y)
+            l.alpha_at(x, y) > 0 && masked > 0.0 && self.shown(i) && self.within_artboard(i, x, y)
         })
     }
 
@@ -801,11 +986,21 @@ impl Document {
             paths: self.paths.clone(),
             work_path: self.work_path.clone(),
             icc_profile: self.icc_profile.clone(),
+            selection: self.selection.clone(),
+            quick_mask: self.quick_mask.clone(),
+            mask_target: self.mask_target,
+            filter_mask_target: self.filter_mask_target,
+            id: self.state_id,
         }
     }
 
-    /// Replaces the current state with `s` and returns the old one (without copy).
+    /// Replaces the current state with `s` and returns the old one (without
+    /// copy). A mask being edited is given its place back first: what it
+    /// was painting is replaced too.
     fn restore(&mut self, s: State) -> State {
+        if let Some(real) = self.swapped.take() {
+            self.layers[self.active] = *real;
+        }
         let previous = State {
             layers: std::mem::replace(&mut self.layers, s.layers),
             active: self.active,
@@ -815,9 +1010,19 @@ impl Document {
             paths: std::mem::replace(&mut self.paths, s.paths),
             work_path: std::mem::replace(&mut self.work_path, s.work_path),
             icc_profile: std::mem::replace(&mut self.icc_profile, s.icc_profile),
+            selection: std::mem::replace(&mut self.selection, s.selection),
+            quick_mask: std::mem::replace(&mut self.quick_mask, s.quick_mask),
+            mask_target: std::mem::replace(&mut self.mask_target, s.mask_target),
+            filter_mask_target: std::mem::replace(
+                &mut self.filter_mask_target,
+                s.filter_mask_target,
+            ),
+            id: std::mem::replace(&mut self.state_id, s.id),
         };
         self.active = s.active.min(self.layers.len() - 1);
         self.canvas = s.canvas;
+        self.quick_mask_rev = next_rev();
+        self.modified = self.saved_id != Some(self.state_id);
         previous
     }
 
@@ -829,62 +1034,105 @@ impl Document {
 
     /// Records an already captured state (to add it only if something changed).
     fn push_state(&mut self, state: State, name: String) {
-        self.undo.push_back(Step { state, name });
+        self.seq += 1;
+        self.undo.push_back(Step {
+            state,
+            name,
+            seq: self.seq,
+        });
         if self.undo.len() > MAX_UNDO {
             self.undo.pop_front();
+            self.forgotten = true;
         }
-        self.redo.clear();
-        self.trim_history();
+        // Kept until another step comes: this one may change nothing.
+        let redo = std::mem::take(&mut self.redo);
+        match &self.dropped_redo {
+            // A step after the one that dropped them: they come back only
+            // if it is discarded too.
+            Some(_) if redo.is_empty() => {}
+            _ => self.dropped_redo = Some((self.seq, redo)),
+        }
+        self.trim_history(HISTORY_BUDGET);
         self.step += 1;
+        self.state_id = next_rev();
         self.modified = true;
     }
 
-    /// Forgets the oldest steps beyond [`HISTORY_BUDGET`]. Pixels shared
-    /// between states (and with the current state) count once.
-    fn trim_history(&mut self) {
+    /// Memory the history keeps beyond the current state, in bytes: each
+    /// buffer (pixels, masks, smart objects' contents and renderings,
+    /// channels, quick mask) counts once, however many states share it.
+    pub fn history_bytes(&self) -> usize {
         let mut seen = std::collections::HashSet::new();
-        let mut cost = |layers: &[Layer]| -> usize {
-            let mut bytes = 0;
-            for l in layers {
-                let mut raws: Vec<&[u8]> = vec![l.image.as_raw()];
-                if let Some(m) = &l.mask {
-                    raws.push(m.image().as_raw());
-                }
-                let styles = l
-                    .styles_cache
-                    .borrow()
-                    .as_ref()
-                    .map(|c| Arc::clone(&c.styles));
-                let fx = styles
-                    .iter()
-                    .flat_map(|s| s.exterior.iter().chain(&s.interior));
-                let fx: Vec<Arc<GrayImage>> = fx.map(|f| Arc::clone(&f.coverage)).collect();
-                raws.extend(fx.iter().map(|i| i.as_raw().as_slice()));
-                for raw in raws {
-                    if seen.insert(raw.as_ptr()) {
-                        bytes += raw.len();
-                    }
-                }
-            }
-            bytes
+        self.state_buffers(&mut seen, None);
+        let mut total = 0;
+        for state in self.redo.iter().chain(&self.undo).map(|s| &s.state) {
+            total += self.state_buffers(&mut seen, Some(state));
+        }
+        total
+    }
+
+    /// Bytes of the buffers of `state` (the current one with `None`) not
+    /// yet `seen`.
+    fn state_buffers(
+        &self,
+        seen: &mut std::collections::HashSet<usize>,
+        state: Option<&State>,
+    ) -> usize {
+        let mut buffers = Vec::new();
+        let (layers, channels, quick_mask, selection) = match state {
+            Some(s) => (&s.layers, &s.channels, &s.quick_mask, &s.selection),
+            None => (
+                &self.layers,
+                &self.channels,
+                &self.quick_mask,
+                &self.selection,
+            ),
         };
-        cost(&self.layers);
-        let mut total = self
-            .redo
-            .iter()
-            .map(|s| cost(&s.state.layers))
-            .sum::<usize>();
+        for l in layers {
+            l.buffers(&mut buffers);
+        }
+        if state.is_none()
+            && let Some(real) = &self.swapped
+        {
+            real.buffers(&mut buffers);
+        }
+        let grays = channels.iter().map(|c| &c.mask).chain(quick_mask);
+        let grays = grays.chain(selection.iter().filter_map(|s| s.mask.as_ref()));
+        buffers.extend(grays.map(|g| (g.as_raw().as_ptr() as usize, g.as_raw().len())));
+        buffers
+            .into_iter()
+            .filter(|&(ptr, _)| seen.insert(ptr))
+            .map(|(_, len)| len)
+            .sum()
+    }
+
+    /// Forgets the oldest steps beyond `budget` bytes of history (see
+    /// [`Self::history_bytes`]). The last step is always kept.
+    pub fn trim_history(&mut self, budget: usize) {
+        let mut seen = std::collections::HashSet::new();
+        self.state_buffers(&mut seen, None);
+        let mut total = 0;
+        for step in &self.redo {
+            total += self.state_buffers(&mut seen, Some(&step.state));
+        }
         // From the most recent step back: the first one is always kept.
         let mut keep = 0;
         for step in self.undo.iter().rev() {
-            total += cost(&step.state.layers);
-            if keep > 0 && total > HISTORY_BUDGET {
+            total += self.state_buffers(&mut seen, Some(&step.state));
+            if keep > 0 && total > budget {
                 break;
             }
             keep += 1;
         }
         let drop = self.undo.len() - keep;
         self.undo.drain(..drop);
+        self.forgotten |= drop > 0;
+    }
+
+    /// Whether the oldest state of the history is no longer the one the
+    /// document had when opened (steps forgotten to keep within limits).
+    pub fn history_forgotten(&self) -> bool {
+        self.forgotten
     }
 
     /// Identifies the history position: it changes whenever a step is
@@ -893,13 +1141,55 @@ impl Document {
         self.step
     }
 
+    /// The document was just saved: its current state is the saved one.
+    pub fn mark_saved(&mut self) {
+        self.saved_id = Some(self.state_id);
+        self.modified = false;
+    }
+
+    /// The current state changed without a new step (a series of edits
+    /// joining the last one): it is no longer the one saved.
+    pub fn mark_modified(&mut self) {
+        self.state_id = next_rev();
+        self.modified = true;
+    }
+
     /// Cancels the last recorded step, whose modification turned out to
-    /// change nothing (a brush click outside the selection).
+    /// change nothing (a brush click outside the selection, a cancelled
+    /// dialog): the steps it made impossible to redo can be redone again,
+    /// and the document is as modified as before it.
     pub fn discard_step(&mut self) {
         if let Some(prev) = self.undo.pop_back() {
             self.restore(prev.state);
             self.step += 1;
+            if let Some((seq, _)) = &self.dropped_redo
+                && *seq >= prev.seq
+            {
+                let (seq, redo) = self.dropped_redo.take().expect("checked");
+                if seq == prev.seq {
+                    self.redo = redo;
+                }
+            }
         }
+    }
+
+    /// The current position in the history, to give up what is recorded
+    /// after it with [`Self::rollback_to`] (a text edit cancelled).
+    pub fn history_mark(&self) -> HistoryMark {
+        HistoryMark {
+            seq: self.seq,
+            id: self.state_id,
+        }
+    }
+
+    /// Discards the steps recorded since `mark` (as [`Self::discard_step`]),
+    /// even if the oldest ones were forgotten meanwhile (a full history).
+    /// Returns whether the state at the mark is back.
+    pub fn rollback_to(&mut self, mark: HistoryMark) -> bool {
+        while self.undo.back().is_some_and(|s| s.seq > mark.seq) {
+            self.discard_step();
+        }
+        self.state_id == mark.id
     }
 
     pub fn can_undo(&self) -> bool {
@@ -916,8 +1206,8 @@ impl Document {
         };
         let state = self.restore(prev.state);
         self.redo.push(Step { state, ..prev });
+        self.dropped_redo = None;
         self.step += 1;
-        self.modified = true;
         true
     }
 
@@ -927,8 +1217,8 @@ impl Document {
         };
         let state = self.restore(next.state);
         self.undo.push_back(Step { state, ..next });
+        self.dropped_redo = None;
         self.step += 1;
-        self.modified = true;
         true
     }
 
@@ -953,6 +1243,32 @@ impl Document {
         moved
     }
 
+    // ------------------------------------------------------------ selection
+
+    /// The selection as the history knows it.
+    pub fn selection(&self) -> Option<&Selection> {
+        self.selection.as_ref()
+    }
+
+    /// Records the selection `new` as a step named `name`, if it differs
+    /// from the one known. Returns whether a step was recorded.
+    pub fn record_selection(&mut self, new: Option<Selection>, name: String) -> bool {
+        if same_selection(self.selection.as_ref(), new.as_ref()) {
+            return false;
+        }
+        self.checkpoint(name);
+        self.selection = new;
+        true
+    }
+
+    /// Updates the selection known to the history without a step of its
+    /// own (it follows a change already recorded: a crop, a move).
+    pub fn sync_selection(&mut self, selection: Option<Selection>) {
+        if !same_selection(self.selection.as_ref(), selection.as_ref()) {
+            self.selection = selection;
+        }
+    }
+
     // ------------------------------------------------------------ layers
 
     fn make_layer(
@@ -970,6 +1286,7 @@ impl Document {
             rev: next_rev(),
             bounds: Cell::new(None),
             styles_cache: RefCell::new(None),
+            styles_job: Default::default(),
             offset,
             visible: true,
             opacity: 1.0,
@@ -1178,6 +1495,7 @@ impl Document {
 
     /// Paint bucket on the active layer, at the canvas point (x, y).
     /// Returns `false` if nothing changed.
+    #[cfg(test)]
     pub fn fill_at(
         &mut self,
         x: i64,
@@ -1187,10 +1505,39 @@ impl Document {
         within: Option<&Selection>,
         contiguous: bool,
     ) -> bool {
-        self.with_target(|doc| doc.fill_target_at(x, y, color, tolerance, within, contiguous))
-            .unwrap_or(false)
+        let style = crate::pixel_ops::BucketStyle {
+            sample: None,
+            anti_alias: false,
+            opacity: 1.0,
+            blend: &|d, s, _, _| over(d, s),
+        };
+        self.fill_at_with(x, y, color, tolerance, within, contiguous, &style, false)
     }
 
+    /// [`Self::fill_at`] painted as `style` says; with `all_layers`, the
+    /// colors compared are those seen (not on a mask).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_at_with(
+        &mut self,
+        x: i64,
+        y: i64,
+        color: [u8; 4],
+        tolerance: u8,
+        within: Option<&Selection>,
+        contiguous: bool,
+        style: &crate::pixel_ops::BucketStyle,
+        all_layers: bool,
+    ) -> bool {
+        let all_layers = all_layers && !self.mask_targeted();
+        self.with_target(|doc| {
+            doc.fill_target_at(
+                x, y, color, tolerance, within, contiguous, style, all_layers,
+            )
+        })
+        .unwrap_or(false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn fill_target_at(
         &mut self,
         x: i64,
@@ -1199,6 +1546,8 @@ impl Document {
         tolerance: u8,
         within: Option<&Selection>,
         contiguous: bool,
+        style: &crate::pixel_ops::BucketStyle,
+        all_layers: bool,
     ) -> bool {
         let canvas = self.full_rect();
         if x < canvas.x || y < canvas.y || x >= canvas.right() || y >= canvas.bottom() {
@@ -1206,6 +1555,7 @@ impl Document {
         }
         let before = self.state();
         self.expand_active_to_canvas();
+        let visible = all_layers.then(|| self.composite(self.layers[self.active].rect(), None));
         let layer = &mut self.layers[self.active];
         let (lx, ly) = ((x - layer.offset.0) as u32, (y - layer.offset.1) as u32);
         let clip = match within {
@@ -1219,8 +1569,14 @@ impl Document {
             None => None,
         };
         let image = layer.pixels_mut();
-        if crate::pixel_ops::flood_fill(image, lx, ly, color, tolerance, clip, contiguous).is_none()
-        {
+        let style = crate::pixel_ops::BucketStyle {
+            sample: visible.as_ref(),
+            ..*style
+        };
+        let filled = crate::pixel_ops::flood_fill_with(
+            image, lx, ly, color, tolerance, clip, contiguous, &style,
+        );
+        if filled.is_none() {
             self.restore(before);
             return false;
         }
@@ -1253,11 +1609,21 @@ impl Document {
         let mut part =
             image::imageops::crop_imm(layer.image(), x0, y0, x1 - x0, y1 - y0).to_image();
         op(&mut part);
-        for (x, y, p) in part.enumerate_pixels() {
-            let (lx, ly) = (x0 + x, y0 + y);
-            let dst = out.get_pixel_mut(lx, ly);
-            dst.0 = mix(dst.0, p.0, clip.coverage(lx, ly));
-        }
+        let (row, part_row) = (out.width() as usize * 4, (x1 - x0) as usize * 4);
+        let rows = &mut out.as_mut()[y0 as usize * row..y1 as usize * row];
+        let part = part.as_raw();
+        crate::filters::par_rows(rows, row, |first, band| {
+            for (i, line) in band.chunks_exact_mut(row).enumerate() {
+                let y = y0 + (first + i) as u32;
+                let src = &part[(first + i) * part_row..];
+                for x in x0..x1 {
+                    let (d, s) = (x as usize * 4, (x - x0) as usize * 4);
+                    let from = [line[d], line[d + 1], line[d + 2], line[d + 3]];
+                    let to = [src[s], src[s + 1], src[s + 2], src[s + 3]];
+                    line[d..d + 4].copy_from_slice(&mix(from, to, clip.coverage(x, y)));
+                }
+            }
+        });
         Some(out)
     }
 
@@ -1310,8 +1676,15 @@ impl Document {
     /// Color shown at the canvas point (x, y) (all visible layers combined),
     /// if it is not fully transparent.
     pub fn color_at(&self, x: i64, y: i64) -> Option<[u8; 4]> {
-        let p = self
-            .composite(PixelRect { x, y, w: 1, h: 1 }, None)
+        // As shown: styles still being drawn are not waited for.
+        let options = compose::Options {
+            held: self.effects_held,
+            later_styles: true,
+            ..Default::default()
+        };
+        let layers = self.render_layers();
+        let p = compose::plan(&layers, self.full_rect(), &mut compose::FullSize, &options)
+            .render(PixelRect { x, y, w: 1, h: 1 })
             .get_pixel(0, 0)
             .0;
         (p[3] > 0).then_some(p)
@@ -1493,20 +1866,42 @@ impl Document {
         true
     }
 
-    /// Multiplies the opacity of the active layer by `mask` (same size as its
-    /// image): "Remove Background". A text becomes pixels.
+    /// "Remove Background": `mask` (same size as the active layer's image)
+    /// becomes its layer mask, within the mask it already has. The layer is
+    /// untouched: a text, shape or smart object stays one.
     pub fn mask_active(&mut self, mask: &GrayImage) -> bool {
-        if mask.dimensions() != self.active_layer().image().dimensions() {
+        let layer = &self.layers[self.active];
+        if !layer.has_pixels() || mask.dimensions() != layer.image().dimensions() {
             return false;
         }
-        self.checkpoint(t!("menu-layer-remove-background"));
-        let image = self.active_layer_mut().pixels_mut();
-        for (p, m) in image.pixels_mut().zip(mask.pixels()) {
-            p.0[3] = scale(p.0[3], m.0[0]);
-            if p.0[3] == 0 {
-                p.0 = [0, 0, 0, 0];
+        let offset = layer.offset;
+        let mut image = mask.clone();
+        if let Some(old) = &layer.mask {
+            let (ox, oy) = old.origin(offset);
+            let before = old.image();
+            for (x, y, p) in image.enumerate_pixels_mut() {
+                let (bx, by) = (offset.0 + x as i64 - ox, offset.1 + y as i64 - oy);
+                let inside =
+                    bx >= 0 && by >= 0 && bx < before.width() as i64 && by < before.height() as i64;
+                let v = if inside {
+                    before.get_pixel(bx as u32, by as u32).0[0]
+                } else {
+                    old.default
+                };
+                p.0[0] = scale(p.0[0], v);
             }
         }
+        self.checkpoint(t!("menu-layer-remove-background"));
+        let layer = &mut self.layers[self.active];
+        match &mut layer.mask {
+            Some(m) => {
+                m.replace(image, offset, offset);
+                m.default = 0;
+            }
+            None => layer.mask = Some(Mask::new(image, offset, 0, offset)),
+        }
+        self.mask_target = Some(layer.id);
+        self.filter_mask_target = false;
         true
     }
 
@@ -1665,9 +2060,7 @@ impl Document {
             1.0, 0.0, -x as f32, 0.0, 1.0, -y as f32,
         ]));
         guides::shift(&mut self.guides, -x as f32, -y as f32);
-        Channel::map_all(&mut self.channels, |m| {
-            mask_ops::recanvas(m, x, y, width, height)
-        });
+        self.map_canvas_masks(|m| mask_ops::recanvas(m, x, y, width, height));
         self.canvas = (width, height);
     }
 
@@ -1732,9 +2125,7 @@ impl Document {
             });
         }
         guides::rotate(&mut self.guides, degrees, self.canvas, canvas);
-        Channel::map_all(&mut self.channels, |m| {
-            mask_ops::rotate_canvas(m, degrees, canvas)
-        });
+        self.map_canvas_masks(|m| mask_ops::rotate_canvas(m, degrees, canvas));
         self.canvas = canvas;
         true
     }
@@ -1748,7 +2139,7 @@ impl Document {
             t!("menu-image-flip-vertical")
         });
         guides::flip(&mut self.guides, horizontal, self.canvas);
-        Channel::map_all(&mut self.channels, |m| mask_ops::flip(m, horizontal));
+        self.map_canvas_masks(|m| mask_ops::flip(m, horizontal));
         let (w, h) = (self.canvas.0 as i64, self.canvas.1 as i64);
         let map = mask_ops::Affine(if horizontal {
             [-1.0, 0.0, w as f32, 0.0, 1.0, 0.0]
@@ -1860,7 +2251,7 @@ impl Document {
             layer.effects.scale(s, sx as f32, sy as f32);
         }
         guides::scale(&mut self.guides, sx as f32, sy as f32);
-        Channel::map_all(&mut self.channels, |m| mask_ops::resize(m, width, height));
+        self.map_canvas_masks(|m| mask_ops::resize(m, width, height));
         self.canvas = (width, height);
         true
     }
@@ -2020,9 +2411,7 @@ impl Document {
             -r.y as f32,
         ]));
         guides::shift(&mut self.guides, -r.x as f32, -r.y as f32);
-        Channel::map_all(&mut self.channels, |m| {
-            mask_ops::recanvas(m, r.x, r.y, r.w, r.h)
-        });
+        self.map_canvas_masks(|m| mask_ops::recanvas(m, r.x, r.y, r.w, r.h));
         self.canvas = (r.w, r.h);
     }
 }
@@ -2862,8 +3251,97 @@ mod tests {
         let mut doc = Document::new(RgbaImage::new(1, 1), None);
         doc.checkpoint("step".into());
         doc.layers[0].replace_pixels(RgbaImage::new(1, 1));
-        doc.trim_history();
+        doc.trim_history(HISTORY_BUDGET);
         assert!(doc.can_undo());
+    }
+
+    #[test]
+    fn a_discarded_step_gives_back_redo_and_the_saved_state() {
+        let mut doc = Document::new(RgbaImage::new(4, 4), None);
+        doc.checkpoint("a".into());
+        doc.active_layer_mut().opacity = 0.5;
+        doc.mark_saved();
+        assert!(doc.undo() && doc.modified);
+        // A step that turns out to change nothing (a cancelled dialog).
+        doc.checkpoint("b".into());
+        assert!(!doc.can_redo());
+        doc.discard_step();
+        assert!(doc.can_redo() && doc.modified);
+        assert!(doc.redo() && !doc.modified);
+        // Two steps given up together (a text cancelled) as well.
+        doc.undo();
+        let mark = doc.history_mark();
+        doc.checkpoint("c".into());
+        doc.checkpoint("d".into());
+        assert!(doc.rollback_to(mark));
+        assert!(doc.can_redo() && doc.redo() && !doc.modified);
+    }
+
+    #[test]
+    fn rollback_reaches_its_mark_through_a_full_history() {
+        let mut doc = Document::new(RgbaImage::new(4, 4), None);
+        for _ in 0..MAX_UNDO {
+            doc.checkpoint("step".into());
+        }
+        let mark = doc.history_mark();
+        doc.add_empty_layer();
+        doc.checkpoint("typing".into());
+        assert!(doc.rollback_to(mark));
+        assert_eq!(doc.layers.len(), 1);
+        // Further back than the history reaches: not at the mark.
+        for _ in 0..MAX_UNDO + 1 {
+            doc.checkpoint("step".into());
+        }
+        assert!(!doc.rollback_to(mark));
+    }
+
+    #[test]
+    fn selection_and_mask_target_are_in_the_history() {
+        let mut doc = Document::new(RgbaImage::new(8, 8), None);
+        let sel: Selection = PixelRect {
+            x: 1,
+            y: 1,
+            w: 2,
+            h: 2,
+        }
+        .into();
+        assert!(doc.record_selection(Some(sel.clone()), "select".into()));
+        assert!(!doc.record_selection(Some(sel.clone()), "again".into()));
+        doc.add_mask(NewMask::RevealAll, None);
+        assert!(doc.mask_targeted());
+        doc.target_mask(false);
+        doc.checkpoint("step".into());
+        doc.target_mask(true);
+        doc.undo();
+        assert!(!doc.mask_targeted());
+        doc.redo();
+        assert!(doc.mask_targeted());
+        while doc.undo() {}
+        assert!(doc.selection().is_none());
+        doc.redo();
+        assert!(doc.selection().is_some_and(|s| s.same(&sel)));
+    }
+
+    #[test]
+    fn history_memory_counts_channels_and_smart_objects() {
+        let mut doc = Document::new(RgbaImage::new(100, 100), None);
+        doc.checkpoint("step".into());
+        let before = doc.history_bytes();
+        // A channel replaced: the old one is only in the history.
+        doc.channels.push(Channel {
+            name: "a".into(),
+            mask: Arc::new(GrayImage::new(100, 100)),
+        });
+        doc.checkpoint("step".into());
+        doc.channels[0].mask = Arc::new(GrayImage::new(100, 100));
+        assert_eq!(doc.history_bytes(), before + 100 * 100);
+        // A smart object's contents count too.
+        let mut smart = Document::new(RgbaImage::new(50, 50), None);
+        assert!(smart.convert_to_smart(&[0]));
+        let mut buffers = Vec::new();
+        smart.layers[0].buffers(&mut buffers);
+        let total: usize = buffers.iter().map(|b| b.1).sum();
+        assert!(total >= 2 * 50 * 50 * 4, "contents and image: {total}");
     }
 
     #[test]

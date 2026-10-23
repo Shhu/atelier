@@ -24,6 +24,11 @@ pub(super) fn combo(ctx: &Context, modifiers: Modifiers, what: &str) -> String {
     names + what
 }
 
+/// A click with `modifiers` held: "Alt+Click", "⌥Clic".
+pub(super) fn click(ctx: &Context, modifiers: Modifiers) -> String {
+    combo(ctx, modifiers, &t!("hint-key-click"))
+}
+
 /// Modifier keys alone: "Ctrl", "Maj+Alt".
 pub(super) fn modifiers(ctx: &Context, modifiers: Modifiers) -> String {
     modifier_names(ctx, modifiers)

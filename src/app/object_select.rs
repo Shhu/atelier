@@ -191,7 +191,8 @@ fn preview(mask: &GrayImage) -> Option<Preview> {
 }
 
 /// What the analysis depends on: the canvas and the displayed layers,
-/// with their effects. Pixel revisions are unique across documents.
+/// with their masks, effects and settings. Pixel revisions are unique
+/// across documents.
 pub(super) fn fingerprint(doc: &Document) -> u64 {
     hash_of((
         doc.width(),
@@ -200,13 +201,17 @@ pub(super) fn fingerprint(doc: &Document) -> u64 {
             .iter()
             .map(|l| {
                 (
-                    l.id,
-                    l.rev(),
-                    l.offset,
-                    l.visible,
-                    l.opacity.to_bits(),
-                    l.blend as u8,
+                    (l.id, l.rev(), l.offset, l.visible, l.depth),
+                    (
+                        l.opacity.to_bits(),
+                        l.fill.to_bits(),
+                        l.blend as u8,
+                        l.clipped,
+                    ),
                     l.effects.any().then(|| format!("{:?}", l.effects)),
+                    l.mask.as_ref().map(|m| m.key(l.offset)),
+                    // Adjustment and fill layers: their settings.
+                    format!("{:?}", l.kind),
                 )
             })
             .collect::<Vec<_>>(),
@@ -654,6 +659,30 @@ mod tests {
             });
         harness.run_steps(2);
         harness
+    }
+
+    #[test]
+    fn fingerprint_follows_masks_adjustments_and_clipping() {
+        let photo =
+            || image::RgbaImage::from_fn(64, 48, |x, y| image::Rgba([x as u8, y as u8, 9, 255]));
+        let mut doc = Document::new(photo(), None);
+        let before = fingerprint(&doc);
+        assert!(doc.add_mask(crate::document::NewMask::HideAll, None));
+        assert_ne!(fingerprint(&doc), before, "mask");
+
+        let mut doc = Document::new(photo(), None);
+        doc.add_adjustment_layer(crate::pixel_ops::Adjustment::Invert, None);
+        let before = fingerprint(&doc);
+        let i = doc.active;
+        doc.layers[i].kind = crate::document::LayerKind::Adjustment(
+            crate::pixel_ops::Adjustment::PhotoFilter(Default::default()),
+        );
+        let adjusted = fingerprint(&doc);
+        assert_ne!(adjusted, before, "adjustment");
+        doc.layers[i].clipped = true;
+        assert_ne!(fingerprint(&doc), adjusted, "clipping");
+        doc.layers[i].fill = 0.5;
+        assert_ne!(fingerprint(&doc), adjusted, "fill");
     }
 
     /// Press and release at `to` (from `from`, dragging), with `modifiers`.

@@ -12,6 +12,7 @@ use crate::cms::{self, Conversion, Grayscale, Intent, Profile, Space};
 use crate::compose::gradient::GradientFill;
 use crate::i18n::t;
 use crate::paint::gradient::StopColor;
+use crate::pixel_ops::{Adjustment, ColorBalance};
 use crate::vector::Paint;
 
 /// View › Proof Setup: the printing condition the canvas simulates, and
@@ -131,6 +132,11 @@ trait Recolor {
     fn profile(&self) -> Option<&Arc<Vec<u8>>> {
         None
     }
+    /// The colors become grays: adjustments that only add color are
+    /// neutralized.
+    fn grays(&self) -> bool {
+        false
+    }
 }
 
 impl Recolor for Conversion<'_> {
@@ -150,6 +156,10 @@ impl Recolor for Conversion<'_> {
 impl Recolor for Grayscale<'_> {
     fn pixels(&self, image: &mut image::RgbaImage) {
         self.convert_rgba(image);
+    }
+
+    fn grays(&self) -> bool {
+        true
     }
 
     fn color(&self, rgb: [u8; 3]) -> [u8; 3] {
@@ -186,11 +196,35 @@ fn convert_layer(layer: &mut Layer, c: &dyn Recolor) {
         Paint::Gradient(g) => gradient(g),
         Paint::None => {}
     };
-    if let LayerKind::Fill(fill) = &mut layer.kind {
-        match fill {
-            Fill::Solid(v) => rgb(v),
-            Fill::Gradient(g) => gradient(g),
+    let stops = |g: &mut crate::paint::gradient::Gradient| {
+        for stop in &mut g.colors {
+            if let StopColor::Rgb(v) = &mut stop.color {
+                rgb(v);
+            }
         }
+    };
+    match &mut layer.kind {
+        LayerKind::Fill(Fill::Solid(v)) => rgb(v),
+        LayerKind::Fill(Fill::Gradient(g)) => gradient(g),
+        LayerKind::Adjustment(a) => match a {
+            Adjustment::PhotoFilter(f) => rgb(&mut f.color),
+            Adjustment::GradientMap(g) => stops(&mut g.gradient),
+            // In grays, what only adds color is dropped (a gray image
+            // stays gray).
+            Adjustment::ColorBalance(b) if c.grays() => {
+                *b = ColorBalance {
+                    preserve_luminosity: b.preserve_luminosity,
+                    ..ColorBalance::default()
+                };
+            }
+            Adjustment::HueSaturation(h) if c.grays() && h.colorize => {
+                h.colorize = false;
+                (h.hue, h.saturation) = (0.0, 0.0);
+            }
+            Adjustment::BlackWhite(b) if c.grays() => b.tint = false,
+            _ => {}
+        },
+        _ => {}
     }
     if let Some(text) = &mut layer.text {
         for run in &mut text.runs {
@@ -305,20 +339,45 @@ fn tiff_profile(path: &Path, format: Option<ImageFormat>) -> Option<Vec<u8>> {
     decoder.get_tag_u8_vec(tiff::tags::Tag::IccProfile).ok()
 }
 
+/// Inks (0: none) of a YCCK pixel: Y, Cb, Cr encode the inverted cyan,
+/// magenta and yellow as Adobe stores them, and K the inverted black.
+fn ycck_inks(p: &[u8]) -> [u8; 4] {
+    let (y, cb, cr) = (p[0] as f32, p[1] as f32 - 128.0, p[2] as f32 - 128.0);
+    let level = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    [
+        level(y + 1.402 * cr),
+        level(y - 0.344_136 * cb - 0.714_136 * cr),
+        level(y + 1.772 * cb),
+        255 - p[3],
+    ]
+}
+
 /// The inks (0: none) of a CMYK JPEG or TIFF of `size`.
 fn read_inks(path: &Path, format: Option<ImageFormat>, (w, h): (u32, u32)) -> Option<Vec<u8>> {
     let data = std::fs::read(path).ok()?;
     let inks = match format? {
         ImageFormat::Jpeg => {
             use zune_core::colorspace::ColorSpace;
-            let options = zune_core::options::DecoderOptions::default()
-                .jpeg_set_out_colorspace(ColorSpace::CMYK);
-            let cursor = zune_core::bytestream::ZCursor::new(&data);
-            let mut decoder = zune_jpeg::JpegDecoder::new_with_options(cursor, options);
+            let cursor = || zune_core::bytestream::ZCursor::new(&data);
+            let mut headers = zune_jpeg::JpegDecoder::new(cursor());
+            headers.decode_headers().ok()?;
+            // Plain CMYK, or YCCK (Adobe's transform 2, how Photoshop
+            // usually writes them): decoded as stored.
+            let space = headers.input_colorspace()?;
+            if !matches!(space, ColorSpace::CMYK | ColorSpace::YCCK) {
+                return None;
+            }
+            let options =
+                zune_core::options::DecoderOptions::default().jpeg_set_out_colorspace(space);
+            let mut decoder = zune_jpeg::JpegDecoder::new_with_options(cursor(), options);
             let raw = decoder.decode().ok()?;
-            (decoder.input_colorspace()? == ColorSpace::CMYK).then_some(())?;
-            // Stored inverted, as Photoshop writes them (Adobe's marker).
-            raw.into_iter().map(|v| 255 - v).collect()
+            (decoder.input_colorspace()? == space).then_some(())?;
+            if space == ColorSpace::YCCK {
+                raw.chunks_exact(4).flat_map(ycck_inks).collect()
+            } else {
+                // Stored inverted, as Photoshop writes them (Adobe's marker).
+                raw.into_iter().map(|v| 255 - v).collect()
+            }
         }
         ImageFormat::Tiff => {
             let mut decoder = tiff::decoder::Decoder::new(std::io::Cursor::new(&data)).ok()?;
@@ -401,7 +460,13 @@ mod tests {
         };
         doc.save(&path).unwrap();
         let back = Document::open(&path).unwrap().doc;
-        assert_eq!(back.proof, doc.proof);
+        // Proof Colors and Gamut Warning are views, off when opened.
+        let setup = ProofSetup {
+            colors: false,
+            gamut: false,
+            ..doc.proof.clone()
+        };
+        assert_eq!(back.proof, setup);
         assert_eq!(back.icc_profile, doc.icc_profile);
         // The defaults are not written, and come back.
         doc.proof = ProofSetup::default();
@@ -511,6 +576,73 @@ mod tests {
             );
             let profile = back.icc_profile.as_deref().map(Vec::as_slice);
             assert_eq!(profile, Some(cms::srgb().icc().as_slice()), "{format:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grayscale_leaves_no_color() {
+        let photo = RgbaImage::from_fn(64, 48, |x, y| {
+            Rgba([(x * 4) as u8, (y * 5) as u8, 200, 255])
+        });
+        let colorize = crate::pixel_ops::HueSaturation {
+            hue: 30.0,
+            saturation: 0.5,
+            lightness: 0.0,
+            colorize: true,
+        };
+        for adjustment in [
+            Adjustment::PhotoFilter(Default::default()),
+            Adjustment::HueSaturation(colorize),
+            Adjustment::ColorBalance(ColorBalance {
+                midtones: [0.5, -0.3, 0.2],
+                ..Default::default()
+            }),
+            Adjustment::BlackWhite(crate::pixel_ops::BlackWhite {
+                tint: true,
+                ..Default::default()
+            }),
+        ] {
+            let mut doc = Document::new(photo.clone(), None);
+            doc.add_adjustment_layer(adjustment.clone(), None);
+            for of in [cms::srgb(), cms::WorkingRgb::AdobeRgb.profile()] {
+                doc.grayscale(&Grayscale { of });
+                let flat = doc.flatten();
+                let spread = |p: &Rgba<u8>| p[0].abs_diff(p[1]).max(p[0].abs_diff(p[2]));
+                let worst = flat.pixels().map(spread).max().unwrap();
+                assert!(worst <= 1, "{adjustment:?}: {worst}");
+            }
+        }
+    }
+
+    #[test]
+    fn ycck_jpegs_open_with_their_profile() {
+        // Photoshop's CMYK JPEGs are usually YCCK (Adobe's transform 2).
+        let dir = std::env::temp_dir().join(format!("atelier-ycck-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Conversion {
+            from: cms::srgb(),
+            to: cms::default_cmyk(),
+            intent: Intent::RelativeColorimetric,
+            bpc: true,
+        };
+        for steel in [[70u8, 130, 180], [200, 40, 30], [250, 250, 245]] {
+            let rgb: Vec<u8> = (0..16 * 16).flat_map(|_| steel).collect();
+            let ink = c.rgb_to_cmyk(&rgb).unwrap();
+            let path = dir.join("ycck.jpg");
+            let mut encoder = jpeg_encoder::Encoder::new_file(&path, 98).unwrap();
+            encoder.add_icc_profile(cms::default_cmyk().icc()).unwrap();
+            encoder
+                .encode(&ink, 16, 16, jpeg_encoder::ColorType::CmykAsYcck)
+                .unwrap();
+            let back = Document::open(&path).unwrap().doc;
+            let px = back.layers[0].pixel_at(8, 8).unwrap();
+            assert!(
+                (0..3).all(|i| px[i].abs_diff(steel[i]) <= 6),
+                "{steel:?}: {px:?}"
+            );
+            let profile = back.icc_profile.as_deref().map(Vec::as_slice);
+            assert_eq!(profile, Some(cms::srgb().icc().as_slice()));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

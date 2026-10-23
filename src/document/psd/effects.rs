@@ -51,8 +51,10 @@ pub fn read(fx: &Descriptor, global: f64) -> (Effects, bool) {
         return (e, false);
     }
     let scale = fx.num(b"Scl ").unwrap_or(100.0) as f32 / 100.0;
-    let px =
-        |d: &Descriptor, key: &[u8], default: f32| d.num(key).map_or(default, |v| v as f32 * scale);
+    let px = |d: &Descriptor, key: &[u8], default: f32| {
+        let v = d.num(key).map(|v| v as f32 * scale);
+        v.filter(|v| v.is_finite()).unwrap_or(default)
+    };
     let light = |d: &Descriptor| {
         if d.bool(b"uglg").unwrap_or(false) {
             global
@@ -63,14 +65,15 @@ pub fn read(fx: &Descriptor, global: f64) -> (Effects, bool) {
     let mut simplified = false;
     let shadow = |d: &Descriptor, default: ShadowFx| {
         let a = light(d).to_radians();
-        let dist = px(d, b"Dstn", 0.0);
+        // Photoshop's ranges: distance to 30000 px, size to 250.
+        let dist = px(d, b"Dstn", 0.0).clamp(0.0, 30000.0);
         ShadowFx {
             enabled: true,
             color: color4(d, b"Clr ", default.color),
             opacity: opacity(d, b"Opct", default.opacity),
             dx: -dist * a.cos() as f32,
             dy: dist * a.sin() as f32,
-            blur: px(d, b"blur", default.blur).max(0.0),
+            blur: px(d, b"blur", default.blur).clamp(0.0, 250.0),
             blend: mode(d, b"Md  ", default.blend),
         }
     };
@@ -88,7 +91,7 @@ pub fn read(fx: &Descriptor, global: f64) -> (Effects, bool) {
         enabled: true,
         color: color4(d, b"Clr ", default.color),
         opacity: opacity(d, b"Opct", default.opacity),
-        size: px(d, b"blur", default.size).max(0.0),
+        size: px(d, b"blur", default.size).clamp(0.0, 250.0),
         spread: (d.num(b"Ckmt").unwrap_or(0.0) as f32 / 100.0).clamp(0.0, 1.0),
         blend: mode(d, b"Md  ", default.blend),
     };
@@ -130,7 +133,7 @@ pub fn read(fx: &Descriptor, global: f64) -> (Effects, bool) {
         s.enabled = true;
         s.color = color4(d, b"Clr ", s.color);
         s.opacity = opacity(d, b"Opct", s.opacity);
-        s.width = px(d, b"Sz  ", s.width).max(0.0);
+        s.width = px(d, b"Sz  ", s.width).clamp(0.0, 250.0);
         s.blend = mode(d, b"Md  ", s.blend);
         simplified |= d.enumerated(b"Styl").is_some_and(|p| p != b"OutF")
             || d.enumerated(b"PntT").is_some_and(|p| p != b"SClr");

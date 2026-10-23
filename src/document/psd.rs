@@ -60,6 +60,12 @@ pub fn write(doc: &Document, out: &mut impl std::io::Write) -> Result<Vec<String
     Ok(notes)
 }
 
+/// What saving `doc` as a Photoshop document would lose, as [`write`]
+/// says it (translated notes).
+pub fn losses(doc: &Document) -> Vec<String> {
+    write::losses(doc)
+}
+
 /// [`write`] in CMYK: every layer and the merged image converted by
 /// `cmyk` (to its CMYK profile, which the file embeds).
 pub fn write_cmyk(
@@ -500,5 +506,173 @@ mod tests {
         let (doc_boards, back_boards) = (boards(&doc), boards(&back.doc));
         assert_eq!(back_boards, doc_boards);
         assert_eq!(back.doc.flatten(), doc.flatten());
+    }
+
+    /// A file with one layer of box `rect` (top, left, bottom, right) and
+    /// no channel data, on a 4 × 4 canvas.
+    fn one_layer(rect: [i32; 4]) -> Vec<u8> {
+        let mut rec = bytes::Writer::default();
+        for v in rect {
+            rec.i32(v);
+        }
+        rec.u16(0);
+        rec.bytes(b"8BIMnorm");
+        rec.bytes(&[255, 0, 0, 0]);
+        rec.u32(12);
+        rec.zeros(8);
+        rec.bytes(&[0, 0, 0, 0]);
+        let mut info = bytes::Writer::default();
+        info.u16(1);
+        info.bytes(&rec.data);
+        let mut w = bytes::Writer::default();
+        w.bytes(b"8BPS");
+        w.u16(1);
+        w.zeros(6);
+        w.u16(3);
+        w.u32(4);
+        w.u32(4);
+        w.u16(8);
+        w.u16(3);
+        w.zeros(8);
+        w.u32(info.data.len() as u32 + 4);
+        w.u32(info.data.len() as u32);
+        w.bytes(&info.data);
+        w.u16(0);
+        w.zeros(48);
+        w.data
+    }
+
+    #[test]
+    fn damaged_layer_boxes_never_take_the_memory() {
+        // Far beyond any canvas, or overflowing: refused.
+        for rect in [
+            [0, 0, 1_000_000_000, 1_000_000_000],
+            [i32::MIN, i32::MIN, i32::MAX, i32::MAX],
+        ] {
+            assert!(matches!(
+                read::document(&one_layer(rect)),
+                Err(FileError::Damaged)
+            ));
+        }
+        // Large, but without any data: an empty layer, at once.
+        let start = std::time::Instant::now();
+        let doc = read::document(&one_layer([0, 0, 40_000, 40_000]))
+            .unwrap()
+            .doc;
+        assert!(start.elapsed().as_secs() < 2);
+        assert_eq!(doc.layers[0].image().dimensions(), (0, 0));
+    }
+
+    #[test]
+    fn row_counts_must_fit_the_data() {
+        // 30000 × 30000, RLE rows of 2 bytes: they can't fill 30000 bytes.
+        let mut w = bytes::Writer::default();
+        w.bytes(b"8BPS");
+        w.u16(1);
+        w.zeros(6);
+        w.u16(3);
+        w.u32(30_000);
+        w.u32(30_000);
+        w.u16(8);
+        w.u16(3);
+        w.zeros(12);
+        w.u16(1);
+        for _ in 0..3 * 30_000 {
+            w.u16(2);
+        }
+        w.zeros(3 * 30_000 * 2);
+        assert!(read::document(&w.data).is_err());
+        // More channels than Photoshop allows.
+        let mut many = flat_file(3, 8, &[&[0, 0], &[0, 0], &[0, 0]]);
+        many[12..14].copy_from_slice(&65_535u16.to_be_bytes());
+        assert!(matches!(read::document(&many), Err(FileError::Damaged)));
+    }
+
+    #[test]
+    fn thumbnails_of_damaged_files_are_refused() {
+        let dir = std::env::temp_dir().join("atelier-psd-thumbnails");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.psd");
+        // Too large (and zero wide) headers: no preview, no allocation.
+        for (w, h) in [(1_000_000u32, 1_000_000u32), (0, 2)] {
+            let mut data = flat_file(3, 8, &[&[1, 2], &[3, 4], &[5, 6]]);
+            data[14..18].copy_from_slice(&h.to_be_bytes());
+            data[18..22].copy_from_slice(&w.to_be_bytes());
+            std::fs::write(&path, &data).unwrap();
+            assert!(thumbnail_of(&path).is_none());
+        }
+    }
+
+    #[test]
+    fn paths_round_trip_and_shapes_are_noted() {
+        use crate::vector::{
+            Align, Bounds, Cap, Join, Live, Paint, Path, Shape, ShapeKind, ShapeStroke, SubPath, pt,
+        };
+        let mut doc = Document::new(RgbaImage::from_pixel(60, 40, Rgba([255; 4])), None);
+        let mut path = Path::default();
+        path.subpaths
+            .push(SubPath::polygon([pt(3.0, 3.0), pt(9.0, 3.0), pt(6.0, 8.0)]));
+        let mut open = SubPath::polygon([pt(10.0, 20.0), pt(30.0, 25.0)]);
+        open.closed = false;
+        open.op = crate::vector::PathOp::Subtract;
+        path.subpaths.push(open);
+        doc.work_path = Some(path.clone());
+        doc.paths.push(crate::document::SavedPath {
+            name: "Outline".into(),
+            path: path.clone(),
+        });
+        let (back, notes) = write_read(&doc);
+        assert!(notes.is_empty(), "{notes:?}");
+        let near = |a: &Path, b: &Path| {
+            a.subpaths.len() == b.subpaths.len()
+                && a.subpaths.iter().zip(&b.subpaths).all(|(s, t)| {
+                    s.closed == t.closed
+                        && s.op == t.op
+                        && s.anchors
+                            .iter()
+                            .zip(&t.anchors)
+                            .all(|(x, y)| x.p.dist(y.p) < 0.01)
+                })
+        };
+        assert_eq!(back.doc.paths.len(), 1);
+        assert_eq!(back.doc.paths[0].name, "Outline");
+        assert!(near(&back.doc.paths[0].path, &path));
+        assert!(near(back.doc.work_path.as_ref().unwrap(), &path));
+
+        // A shape layer is saved as pixels, and says so: the document is
+        // still to be saved.
+        let live = Live::new(ShapeKind::Polygon, Bounds::of(pt(5.0, 5.0), pt(35.0, 30.0)));
+        let stroke = ShapeStroke {
+            paint: Paint::Color([0, 0, 0]),
+            width: 3.0,
+            align: Align::Outside,
+            cap: Cap::Round,
+            join: Join::Bevel,
+            dash: None,
+        };
+        let shape = Shape::live(live, Paint::Color([10, 20, 30]), stroke);
+        doc.add_shape_layer("Polygon".into(), "Polygon", shape);
+        assert!(!doc.psd_losses().is_empty());
+        let dir = std::env::temp_dir().join("atelier-psd-shapes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let notes = doc.save(&dir.join("shape.psd")).unwrap();
+        assert!(!notes.is_empty());
+        assert!(doc.modified);
+    }
+
+    #[test]
+    fn an_opened_psd_remembers_what_it_lost() {
+        let dir = std::env::temp_dir().join("atelier-psd-file-notes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gray16.psd");
+        std::fs::write(&path, flat_file(1, 16, &[&[0xff, 0xff, 0x80, 0x00]])).unwrap();
+        let opened = Document::open(&path).unwrap();
+        assert!(!opened.notes.is_empty());
+        let mut doc = opened.doc;
+        assert_eq!(doc.file_notes, opened.notes);
+        assert_eq!(doc.psd_losses(), opened.notes);
+        // Saved as an Atelier document: nothing is lost any more.
+        doc.save(&dir.join("gray16.atelier")).unwrap();
+        assert!(doc.psd_losses().is_empty() && !doc.modified);
     }
 }

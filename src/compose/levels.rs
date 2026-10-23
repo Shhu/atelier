@@ -95,12 +95,14 @@ pub struct Hint {
     pub rect: crate::document::PixelRect,
 }
 
+#[derive(Clone)]
 enum Reduced {
     Rgba(Arc<RgbaImage>),
     Gray(Arc<GrayImage>),
 }
 
 /// A reduced image: version, canvas origin and size of its source.
+#[derive(Clone)]
 struct Entry {
     version: u64,
     at: (i64, i64),
@@ -108,7 +110,9 @@ struct Entry {
     image: Reduced,
 }
 
-/// Reduced images of one level, kept from frame to frame.
+/// Reduced images of one level, kept from frame to frame (a copy shares
+/// them).
+#[derive(Clone)]
 pub struct LevelCache {
     level: u32,
     entries: HashMap<SourceKey, Entry>,
@@ -125,6 +129,24 @@ impl LevelCache {
             hints: Vec::new(),
             used: Default::default(),
         }
+    }
+
+    /// The images of the next level (twice as reduced), made from these
+    /// rather than from the full-size ones: four times fewer pixels to
+    /// read when zooming out.
+    pub fn coarser(&self) -> Self {
+        let mut next = Self::new(self.level + 1);
+        if self.level == 0 {
+            return next;
+        }
+        for (key, e) in &self.entries {
+            let image = match &e.image {
+                Reduced::Rgba(i) => Reduced::Rgba(Arc::new(reduce_rgba(i, 2))),
+                Reduced::Gray(i) => Reduced::Gray(Arc::new(reduce_gray(i, 2))),
+            };
+            next.entries.insert(*key, Entry { image, ..e.clone() });
+        }
+        next
     }
 
     /// Some pixels of a layer changed, only there (see [`Hint`]).
@@ -442,5 +464,28 @@ mod tests {
         assert_eq!(*next.image, reduce_rgba(&image, 2));
         let gray = reduce_gray(&GrayImage::from_raw(2, 1, vec![0, 255]).unwrap(), 2);
         assert_eq!(gray.get_pixel(0, 0).0, [128]);
+    }
+
+    /// The next level made from this one (zooming out) is the reduction of
+    /// the full-size image, to rounding.
+    #[test]
+    fn coarser_levels_come_from_finer_ones() {
+        let image = Arc::new(RgbaImage::from_fn(64, 48, |x, y| {
+            Rgba([(x * 4) as u8, (y * 5) as u8, 90, (128 + x * y % 128) as u8])
+        }));
+        let key = SourceKey { layer: 1, slot: 0 };
+        let mut fine = LevelCache::new(1);
+        let _ = fine.rgba(key, 7, &image, (0, 0));
+        let mut coarse = fine.coarser();
+        assert_eq!(coarse.level(), 2);
+        let derived = coarse.rgba(key, 7, &image, (0, 0));
+        let direct = reduce_rgba(&image, 4);
+        assert_eq!(derived.image.dimensions(), direct.dimensions());
+        for (a, b) in derived.image.pixels().zip(direct.pixels()) {
+            assert!(
+                a.0.iter().zip(b.0).all(|(a, b)| a.abs_diff(b) <= 2),
+                "{a:?} {b:?}"
+            );
+        }
     }
 }

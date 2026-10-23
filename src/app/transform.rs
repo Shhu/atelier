@@ -176,6 +176,25 @@ struct Lift {
     step: u64,
 }
 
+/// The pending transform as it was before a drag: Ctrl+Z inside Free
+/// Transform goes back to it.
+#[derive(Clone, Copy, PartialEq)]
+struct Snapshot {
+    rect: Option<Rect>,
+    angle: f32,
+    quad: Option<[Pt; 4]>,
+    warp: Option<(Warp, Homography, Option<[Pt; 4]>)>,
+    reference: Option<Pt>,
+}
+
+/// A warp applied when switching to another mode, kept pending with the
+/// transform that goes on: where the history was before it, and the
+/// selection then.
+struct Applied {
+    mark: crate::document::HistoryMark,
+    selection: Option<Selection>,
+}
+
 /// Above this many pixels, a transform is computed on another thread.
 const ASYNC_PIXELS: u64 = 4 << 20;
 
@@ -214,8 +233,9 @@ struct Applying {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy)]
 enum Last {
-    /// Canvas → canvas.
-    Map(Homography),
+    /// Canvas → canvas, from the source box (first) to the box of what it
+    /// made (second).
+    Map(Homography, Bounds, Bounds),
     /// A warp of the source box `Bounds`, to fit to the next one.
     Warp(Bounds, Warp),
 }
@@ -279,6 +299,11 @@ pub(super) struct Transforming {
     /// `render::Lifted`), by id.
     lifted: Vec<(u64, render::Lifted)>,
     applying: Option<Applying>,
+    /// Ctrl+Z inside Free Transform: the states before each drag.
+    undo: Vec<Snapshot>,
+    applied: Option<Applied>,
+    /// The mode to go on in once the warp being applied is done.
+    reenter: Option<Mode>,
 }
 
 impl Transforming {
@@ -313,6 +338,9 @@ impl Default for Transforming {
             reduced_mask: None,
             lifted: Vec::new(),
             applying: None,
+            undo: Vec::new(),
+            applied: None,
+            reenter: None,
         }
     }
 }
@@ -356,6 +384,33 @@ fn unit(a: Pt) -> Pt {
 
 /// The source box `src` brought to `rect`, turned by `angle` around its
 /// center: the map of the turned rectangle.
+/// Transform Again's memory of `h` applied to the box `src`.
+fn last_map(h: Homography, src: Bounds) -> Last {
+    let made = h.corners(src).map_or(src, |q| {
+        let (xs, ys) = (q.map(|p| p[0]), q.map(|p| p[1]));
+        let min = |v: [f64; 4]| v.into_iter().fold(f64::INFINITY, f64::min);
+        let max = |v: [f64; 4]| v.into_iter().fold(f64::NEG_INFINITY, f64::max);
+        [min(xs), min(ys), max(xs), max(ys)]
+    });
+    Last::Map(h, src, made)
+}
+
+/// The map Transform Again applies to the box `b`: the last one `h` (of
+/// the box `from`, which became `made`) as it is for what it made (or a
+/// copy of it in place: step and repeat), otherwise the same scale and
+/// turn around the center of `b`.
+fn again_map(h: Homography, from: Bounds, made: Bounds, b: Bounds) -> Homography {
+    if (0..4).all(|k| (made[k] - b[k]).abs() <= 2.0) {
+        return h;
+    }
+    let center = |r: Bounds| [(r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0];
+    let (c0, c1) = (center(from), center(b));
+    let (dx, dy) = (c1[0] - c0[0], c1[1] - c0[1]);
+    Homography::affine([1.0, 0.0, -dx, 0.0, 1.0, -dy])
+        .then(&h)
+        .then(&Homography::affine([1.0, 0.0, dx, 0.0, 1.0, dy]))
+}
+
 fn turned_map(src: Rect, rect: Rect, angle: f32) -> Homography {
     let b = bounds(src);
     let [x0, y0, x1, y1] = bounds(rect);
@@ -573,6 +628,7 @@ impl AtelierApp {
         }
         self.set_tool(Tool::Transform);
         if self.transform_rect.is_some() {
+            self.free_transform = true;
             return true;
         }
         if !self.lift_selection() {
@@ -584,6 +640,7 @@ impl AtelierApp {
             return false;
         };
         self.transform_rect = Some(src);
+        self.free_transform = true;
         true
     }
 
@@ -630,10 +687,85 @@ impl AtelierApp {
             }
             self.selection = Some(lift.selection);
         }
+        // A warp applied on the way (another mode chosen after it) goes too.
+        if let Some(applied) = self.xform.applied.take() {
+            if let Some(doc) = &mut self.doc {
+                doc.rollback_to(applied.mark);
+            }
+            self.selection = applied.selection;
+        }
         let x = &mut self.xform;
         x.mode = Mode::Free;
         (x.quad, x.warp, x.reference, x.drag, x.step) = (None, None, None, None, None);
         x.mask_preview = None;
+        x.undo.clear();
+    }
+
+    /// Move tool with a selection, like Photoshop: a drag moves the
+    /// selected pixels (Alt: a copy of them) rather than the whole layer.
+    /// The cursor while it does.
+    pub(super) fn move_tool_selection(
+        &mut self,
+        view: View,
+        pointer: Option<Pos2>,
+        start: bool,
+        down: bool,
+        shift: bool,
+    ) -> Option<CursorIcon> {
+        if self.select_move.is_some() {
+            return Some(self.move_selection(view, pointer, down, shift));
+        }
+        if !start || self.transform_rect.is_some() || self.transform_angle != 0.0 {
+            return None;
+        }
+        let selection = self.selection.clone()?;
+        let doc = self.doc.as_ref()?;
+        // Groups, smart objects… move whole; a targeted mask too.
+        if !doc.active_layer().paintable() || doc.mask_targeted() {
+            return None;
+        }
+        let p = pointer?;
+        if !self.can_lift() {
+            return Some(CursorIcon::NotAllowed);
+        }
+        let alt = self.ctx.input(|i| i.modifiers.alt);
+        self.select_move = Some(SelectMove {
+            from: view.to_image(p),
+            selection,
+            pixels: Some(alt),
+            floating: None,
+            moved: false,
+        });
+        Some(self.move_selection(view, pointer, down, shift))
+    }
+
+    /// The pending transform's state, for Ctrl+Z inside it.
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            rect: self.transform_rect,
+            angle: self.transform_angle,
+            quad: self.xform.quad,
+            warp: self.xform.warp,
+            reference: self.xform.reference,
+        }
+    }
+
+    /// Ctrl+Z during Free Transform: back to before the last drag, still
+    /// transforming. `false` when there is none (the transform is then
+    /// cancelled).
+    pub(super) fn undo_transform_edit(&mut self) -> bool {
+        let now = self.snapshot();
+        while let Some(s) = self.xform.undo.pop() {
+            if s != now && s.rect.is_some() {
+                self.transform_rect = s.rect;
+                self.transform_angle = s.angle;
+                (self.xform.quad, self.xform.warp) = (s.quad, s.warp);
+                self.xform.reference = s.reference;
+                (self.xform.drag, self.drag, self.rotate_drag) = (None, None, None);
+                return true;
+            }
+        }
+        false
     }
 
     /// The layers a transform changes: the selected ones (a group with its
@@ -786,17 +918,42 @@ impl AtelierApp {
             }
         } else if let Some((w, frame, quad)) = self.xform.warp {
             // A warp left unchanged gives back its frame; otherwise it is
-            // applied, and Free Transform goes on from it.
+            // applied, and Free Transform goes on from it: the two stay
+            // pending together (one step on Enter, nothing left on Esc).
             if Warp::from_map(&frame) == Some(w) {
                 self.xform.warp = None;
                 self.xform.quad = quad;
             } else {
+                let Some(doc) = &self.doc else { return };
+                let applied = self.xform.applied.take().unwrap_or(Applied {
+                    mark: doc.history_mark(),
+                    selection: self.selection.clone(),
+                });
+                self.xform.reenter = Some(mode);
                 self.apply_transform();
-                if !self.enter_transform() {
-                    return;
+                self.xform.applied = Some(applied);
+                // Large: once computed (see `transform_window`).
+                if !self.transform_busy() {
+                    self.reenter_transform();
                 }
+                return;
             }
         }
+        self.xform.mode = mode;
+    }
+
+    /// After a warp applied on a change of mode: Free Transform again, in
+    /// the mode chosen.
+    fn reenter_transform(&mut self) {
+        let Some(mode) = self.xform.reenter.take() else {
+            return;
+        };
+        let applied = self.xform.applied.take();
+        if !self.enter_transform() {
+            // Nothing left to transform: the warp stays applied.
+            return;
+        }
+        self.xform.applied = applied;
         self.xform.mode = mode;
     }
 
@@ -907,13 +1064,13 @@ impl AtelierApp {
         };
         let b = bounds(src);
         match last {
-            Last::Map(h) => match h.as_turned_box(b) {
+            Last::Map(h, from, made) => match again_map(h, from, made, b).as_turned_box(b) {
                 Some((r, angle)) => {
                     self.transform_rect =
                         Some(Rect::from_min_max(pos([r[0], r[1]]), pos([r[2], r[3]])));
                     self.transform_angle = normalize_angle(angle as f32);
                 }
-                None => self.xform.quad = h.corners(b),
+                None => self.xform.quad = again_map(h, from, made, b).corners(b),
             },
             Last::Warp(old, w) => {
                 let fit = Homography::rect_to_quad(
@@ -937,7 +1094,7 @@ impl AtelierApp {
     /// Remembers a plain scale or turn applied (from the box `src` to the
     /// rectangle `frame` turned by `angle`), for Transform Again.
     pub(super) fn remember_transform(&mut self, src: Rect, frame: Rect, angle: f32) {
-        self.xform.last = Some(Last::Map(turned_map(src, frame, angle)));
+        self.xform.last = Some(last_map(turned_map(src, frame, angle), bounds(src)));
         // Named after the command or the mode, rather than as a plain
         // Free Transform.
         let mode = self.xform.mode;
@@ -985,9 +1142,18 @@ impl AtelierApp {
     /// to transform.
     pub(super) fn play_transform(&mut self, unit: [Pt; 4], dialog: bool) -> bool {
         self.commit_pending();
-        if !self.enter_transform() {
+        if !self.enter_transform() || !self.set_transform_frame(unit) {
             return false;
         }
+        if !dialog {
+            self.apply_transform();
+        }
+        true
+    }
+
+    /// The Free Transform in progress takes the corners of its box to
+    /// `unit` (as recorded: see [`Self::recorded_frame`]).
+    pub(super) fn set_transform_frame(&mut self, unit: [Pt; 4]) -> bool {
         let Some(src) = self.transform_source() else {
             return false;
         };
@@ -1001,9 +1167,6 @@ impl AtelierApp {
                 self.transform_angle = normalize_angle(angle as f32);
             }
             None => self.xform.quad = Some(quad),
-        }
-        if !dialog {
-            self.apply_transform();
         }
         true
     }
@@ -1024,7 +1187,22 @@ impl AtelierApp {
                 .iter()
                 .flat_map(|&i| doc.block(i))
                 .any(|i| doc.layers[i].is_smart());
-        if plain && !mask && !smart && targets.len() == 1 {
+        // The texts of a group scaled or turned stay texts (the plain path
+        // makes them pixels).
+        let moved_only = self.transform_angle == 0.0
+            && self
+                .transform_rect
+                .zip(self.transform_source())
+                .is_none_or(|(r, s)| (r.size() - s.size()).length() < 0.5);
+        let grouped_text = !mask
+            && !moved_only
+            && targets.iter().any(|&i| {
+                doc.layers[i].is_group() && doc.block(i).any(|j| doc.layers[j].text.is_some())
+            });
+        // After a warp applied on the way, the commit joins it (see
+        // `finish_transform`).
+        let after_warp = self.xform.applied.is_some();
+        if plain && !mask && !smart && !grouped_text && !after_warp && targets.len() == 1 {
             return false;
         }
         let Some(t) = self
@@ -1141,12 +1319,17 @@ impl AtelierApp {
         };
         if self.doc.as_ref().is_some_and(|d| d.uid() == a.doc) {
             self.finish_transform(a.commit, done);
+            self.reenter_transform();
+        } else {
+            (self.xform.reenter, self.xform.applied) = (None, None);
         }
     }
 
     /// Puts a transform in place with the pixels computed for it (`None`:
     /// it changes nothing), with its texts, lifted pixels, canvas and status.
     fn finish_transform(&mut self, c: Commit, done: Option<Vec<Transformed>>) {
+        // A warp applied on the way is kept, with this in the same step.
+        let applied = self.xform.applied.take();
         let Some(doc) = &mut self.doc else { return };
         let changed = done.is_some();
         if let Some(done) = done {
@@ -1174,6 +1357,9 @@ impl AtelierApp {
                 self.selection = Some(lift.selection);
             }
         }
+        if let Some(applied) = applied {
+            doc.join_since(applied.mark);
+        }
         if !changed {
             return self.reset_transform();
         }
@@ -1191,7 +1377,7 @@ impl AtelierApp {
             doc.fit_canvas_to(r);
         }
         self.xform.last = Some(match c.t.map {
-            Map::Projective(h) => Last::Map(h),
+            Map::Projective(h) => last_map(h, c.t.src),
             Map::Warp(w) => Last::Warp(c.t.src, w),
         });
         let (name, layer) = (c.name.as_str(), c.layer.as_str());
@@ -1282,6 +1468,13 @@ impl AtelierApp {
         if self.active_locked() {
             return None;
         }
+        // Every press may start an edit of the pending transform.
+        if start && self.transform_rect.is_some() {
+            let now = self.snapshot();
+            if self.xform.undo.last() != Some(&now) {
+                self.xform.undo.push(now);
+            }
+        }
         let src = self.transform_source()?;
         let (ctrl, alt, double) = self.ctx.input(|i| {
             let double = i.pointer.button_double_clicked(PointerButton::Primary);
@@ -1327,6 +1520,9 @@ impl AtelierApp {
             Some(Grab::Reference) => Some(Grab::Reference),
             Some(g @ (Grab::WarpPoint(..) | Grab::WarpSurface(..))) => Some(g),
             _ if warping => None,
+            // Rotate mode: inside, the frame still moves.
+            Some(Grab::Move) if self.xform.mode == Mode::Rotate && !distorted => None,
+            Some(Grab::Move) if self.xform.mode == Mode::Rotate => Some(Grab::Move),
             _ if self.xform.mode == Mode::Rotate => Some(Grab::Rotate),
             Some(g @ (Grab::Corner(_) | Grab::Edge(_)))
                 if edit.is_some() || distorted || (alt && pivot_moved) =>
@@ -1334,13 +1530,16 @@ impl AtelierApp {
                 Some(g)
             }
             Some(Grab::Rotate) if distorted || pivot_moved => Some(Grab::Rotate),
-            // Alt+click: the reference point there.
-            Some(Grab::Move) | None if alt && !ctrl && self.transform_rect.is_some() => {
+            // Alt+click: the reference point there (in Free Transform; the
+            // Move tool's Alt+drag moves a copy).
+            Some(Grab::Move) | None
+                if alt && !ctrl && self.transform_rect.is_some() && self.free_transform =>
+            {
                 Some(Grab::Reference)
             }
             Some(Grab::Move) if distorted => Some(Grab::Move),
             // Outside the frame: turns it.
-            None if distorted => Some(Grab::Rotate),
+            None if distorted && self.xform.mode != Mode::Scale => Some(Grab::Rotate),
             _ => None,
         };
         // Scale mode: the frame doesn't turn.

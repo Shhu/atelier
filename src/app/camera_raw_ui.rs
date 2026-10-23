@@ -5,7 +5,7 @@
 //! resolution; OK develops at full resolution, in one undo step (a RAW
 //! file: a new document).
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 
 use image::RgbaImage;
@@ -34,8 +34,8 @@ const ZOOMS: [f32; 13] = [
 ];
 /// Width of the panels' column.
 const SIDE: f32 = 300.0;
-/// Delay (s) before the progress of a development shows.
-const BUSY_DELAY: f64 = 0.3;
+/// Longest side of the development the histogram is counted on.
+const HISTOGRAM_SIDE: f32 = 640.0;
 
 /// Camera Raw in the session: its window, a RAW file being read, a
 /// development being done, the user's presets.
@@ -89,6 +89,8 @@ struct Developing {
     started: f64,
     progress: Arc<AtomicU32>,
     rx: mpsc::Receiver<RgbaImage>,
+    /// Set to stop the development (cancelled).
+    cancel: Arc<AtomicBool>,
 }
 
 /// Where a development goes.
@@ -195,6 +197,9 @@ struct RawWindow {
     purpose: Purpose,
     source: Arc<Source>,
     analysis: Arc<Analysis>,
+    /// The canvas's color table (a filter): the preview looks as the
+    /// canvas does.
+    lut: Option<Arc<crate::cms::Lut>>,
     /// The settings a reset goes back to, those the window opened with
     /// (Before), those being edited.
     defaults: Settings,
@@ -244,7 +249,12 @@ struct Preview {
     scaled: Option<(u32, Arc<Source>)>,
     /// After, before.
     panes: [Pane; 2],
+    /// Of the whole image developed (small), for the settings of a key.
     histogram: Option<Box<[[u32; 256]; 3]>>,
+    histogram_key: u64,
+    histogram_job: Option<(u64, mpsc::Receiver<Developed>)>,
+    /// The source reduced for the histogram.
+    small: Option<(u32, Arc<Source>)>,
 }
 
 #[derive(Default)]
@@ -385,7 +395,7 @@ fn develop_region(
         .to_image()
     };
     let mut histogram = Box::new([[0u32; 256]; 3]);
-    for p in image.pixels() {
+    for p in image.pixels().filter(|p| p[3] > 0) {
         for c in 0..3 {
             histogram[c][p.0[c] as usize] += 1;
         }
@@ -406,6 +416,9 @@ impl AtelierApp {
     /// its mask) in the selection, or for a smart filter of a smart object;
     /// opening with `settings` (a smart filter re-edited, an action's step).
     pub(super) fn camera_raw_filter(&mut self, settings: Option<Settings>) {
+        if self.refuse_hidden_target() {
+            return;
+        }
         if self.smart_filters_apply() {
             let Some(target) = self.smart_filter_input() else {
                 return;
@@ -426,9 +439,8 @@ impl AtelierApp {
             return;
         }
         // Developed over the whole layer, like the result.
-        if !doc.mask_targeted() && !doc.active_layer().is_live() {
-            doc.expand_active_to_canvas();
-        }
+        self.enlarge_for_dialog();
+        let Some(doc) = &mut self.doc else { return };
         let Some(target) = filters_ui::active_target(doc, self.selection.as_ref()) else {
             self.status = t!("status-selection-empty");
             return;
@@ -494,10 +506,15 @@ impl AtelierApp {
         let defaults = Settings::for_source(&source);
         let opened = settings.unwrap_or_else(|| defaults.clone());
         let center = pos2(source.width as f32 / 2.0, source.height as f32 / 2.0);
+        let lut = match purpose {
+            Purpose::Open { .. } => None,
+            _ => self.color.shown().1,
+        };
         self.camera_raw.window = Some(Box::new(RawWindow {
             purpose,
             source: Arc::new(source),
             analysis: Arc::new(analysis),
+            lut,
             settings: opened.clone(),
             opened,
             defaults,
@@ -538,7 +555,16 @@ impl AtelierApp {
         }
         if let Some(d) = &self.camera_raw.developing {
             let fraction = d.progress.load(Ordering::Relaxed) as f32 / 1000.0;
-            progress_indicator(ctx, &t!("raw-developing"), fraction, d.started);
+            let name = t!("raw-developing");
+            if filters_ui::cancellable_indicator(
+                ctx,
+                "camera_raw_busy",
+                &name,
+                d.started,
+                Some(fraction),
+            ) {
+                self.cancel_development();
+            }
             return;
         }
         let Some(mut window) = self.camera_raw.window.take() else {
@@ -587,7 +613,9 @@ impl AtelierApp {
         }
         if out.ok {
             self.develop(*window);
-        } else if !out.cancel {
+        } else if out.cancel {
+            self.shrink_after_preview();
+        } else {
             self.camera_raw.window = Some(window);
         }
     }
@@ -660,6 +688,9 @@ impl AtelierApp {
     /// Last Filter, or an action's step played without its dialog:
     /// `settings` again, on the active layer or as a smart filter.
     pub(super) fn camera_raw_again(&mut self, settings: Settings) {
+        if self.refuse_hidden_target() {
+            return;
+        }
         if self.smart_filters_apply() {
             self.add_camera_raw_smart_filter(settings);
             return;
@@ -732,11 +763,13 @@ impl AtelierApp {
         work: impl FnOnce(&AtomicU32) -> RgbaImage + Send + 'static,
     ) {
         let progress = Arc::new(AtomicU32::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
-        let done = progress.clone();
+        let (done, flag) = (progress.clone(), cancel.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(work(&done));
+            let image = crate::filters::cancellable(Some(flag), || work(&done));
+            let _ = tx.send(image);
             ctx.request_repaint();
         });
         self.camera_raw.developing = Some(Developing {
@@ -744,7 +777,33 @@ impl AtelierApp {
             started: self.ctx.input(|i| i.time),
             progress,
             rx,
+            cancel,
         });
+    }
+
+    /// Cancel of the development: it stops, the layer stays as it was.
+    fn cancel_development(&mut self) {
+        let Some(d) = self.camera_raw.developing.take() else {
+            return;
+        };
+        d.cancel.store(true, Ordering::Relaxed);
+        let name = match d.destination {
+            Destination::Layer {
+                doc: uid, layer, ..
+            } => {
+                if let Some(doc) = &mut self.doc
+                    && (doc.uid(), doc.active_layer().id) == (uid, layer)
+                {
+                    doc.end_paint();
+                    doc.discard_step();
+                }
+                self.end_layer_preview();
+                self.reset_pending();
+                t!("raw-filter-title")
+            }
+            Destination::Document { path, .. } => file_label(&path),
+        };
+        self.status = t!("retouch-status-cancelled", name = name.as_str());
     }
 
     /// The development is done: the layer's new pixels, or a new document.
@@ -784,6 +843,7 @@ impl AtelierApp {
                         None => {
                             doc.end_paint();
                             doc.discard_step();
+                            self.status = t!("fx3-filter-failed", name = name.as_str());
                         }
                     }
                 }
@@ -812,38 +872,6 @@ fn file_label(path: &Path) -> String {
         || path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
     )
-}
-
-/// While the result is developed: blocks the window; after a moment, says
-/// so with the progress.
-fn progress_indicator(ctx: &egui::Context, name: &str, fraction: f32, started: f64) {
-    let elapsed = ctx.input(|i| i.time) - started;
-    let visible = elapsed >= BUSY_DELAY;
-    ctx.request_repaint_after(std::time::Duration::from_millis(100));
-    let frame = if visible {
-        egui::Frame::new()
-            .fill(color::BG2)
-            .stroke(UiStroke::new(1.0, color::WINDOW_LINE))
-            .corner_radius(12)
-            .inner_margin(egui::Margin::symmetric(18, 14))
-    } else {
-        egui::Frame::new()
-    };
-    egui::Modal::new(egui::Id::new("camera_raw_busy"))
-        .backdrop_color(Color32::TRANSPARENT)
-        .frame(frame)
-        .show(ctx, |ui| {
-            if visible {
-                ui.set_width(260.0);
-                ui.label(egui::RichText::new(format!("{name}…")).color(color::TEXT));
-                ui.add_space(6.0);
-                ui.add(
-                    egui::ProgressBar::new(fraction)
-                        .desired_height(6.0)
-                        .fill(color::ACCENT),
-                );
-            }
-        });
 }
 
 impl RawWindow {
@@ -909,7 +937,9 @@ impl RawWindow {
                 developed.image.width() as usize,
                 developed.image.height() as usize,
             ];
-            let pixels = ColorImage::from_rgba_unmultiplied(size, developed.image.as_raw());
+            let mut shown = developed.image.as_raw().clone();
+            color_ui::show_through(self.lut.as_deref(), &mut shown, false);
+            let pixels = ColorImage::from_rgba_unmultiplied(size, &shown);
             let texture = ctx.load_texture(format!("camera_raw_{i}"), pixels, IMAGE_TEX_OPTIONS);
             pane.shown = Some(Shown {
                 key,
@@ -919,10 +949,47 @@ impl RawWindow {
                 overlay: None,
             });
             self.preview.scaled = Some(developed.scaled);
-            if i == 0 {
-                self.preview.histogram = Some(developed.histogram);
-            }
         }
+    }
+
+    /// The histogram: of the whole image developed small with the current
+    /// settings, whatever the panes show (zoomed in, Alt held on a
+    /// sharpening slider, before).
+    fn update_histogram(&mut self, ctx: &egui::Context) {
+        let p = &mut self.preview;
+        if let Some((key, rx)) = &p.histogram_job
+            && let Ok(developed) = rx.try_recv()
+        {
+            p.histogram_key = *key;
+            p.histogram = Some(developed.histogram);
+            p.small = Some(developed.scaled);
+            p.histogram_job = None;
+        }
+        let key = hash_of(format!("{:?}", self.settings));
+        if (p.histogram.is_some() && p.histogram_key == key) || p.histogram_job.is_some() {
+            return;
+        }
+        let (source, analysis) = (self.source.clone(), self.analysis.clone());
+        let (settings, cached) = (self.settings.clone(), p.small.clone());
+        let (w, h) = (source.width, source.height);
+        let scale = (HISTOGRAM_SIDE / w.max(h) as f32).min(1.0);
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let region = [0, 0, w, h];
+            let developed = develop_region(
+                &source,
+                cached,
+                &analysis,
+                &settings,
+                region,
+                scale,
+                Visual::Image,
+            );
+            let _ = tx.send(developed);
+            ctx.request_repaint();
+        });
+        p.histogram_job = Some((key, rx));
     }
 
     /// Asks pane `i` for `wanted` with `settings`.
@@ -1015,10 +1082,7 @@ impl RawWindow {
             let settings = if i == 0 { &after } else { &before };
             self.request(&ctx, i, &wanted, settings);
         }
-        // The histogram follows the image, even while Before is shown.
-        if panes.iter().all(|&(i, _)| i != 0) {
-            self.request(&ctx, 0, &wanted, &after);
-        }
+        self.update_histogram(&ctx);
         for &(i, pane_rect) in &panes {
             let to_screen = |p: Pos2| pane_rect.center() + (p - wanted.center) * wanted.zoom / ppp;
             let painter = ui.painter_at(pane_rect);
@@ -1797,7 +1861,8 @@ impl RawWindow {
         if let Some(v) = visual {
             self.view.visual = v;
         }
-        help(ui, &t!("raw-sharpen-hint"));
+        let alt = keys::modifiers(ui.ctx(), Modifiers::ALT);
+        help(ui, &t!("input3-raw-sharpen-hint", alt = alt));
         gap_between_blocks(ui);
         ui_kit::section(ui, &t!("raw-noise-reduction"));
         ui.add_space(4.0);

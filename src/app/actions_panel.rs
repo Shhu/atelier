@@ -91,6 +91,8 @@ enum PanelDialog {
     Delete(Row),
     /// Replace the actions with the default ones (or add them)?
     Reset,
+    /// Delete every set?
+    ClearAll,
 }
 
 /// What stops the playing: a Stop step's message, or a step that failed.
@@ -160,13 +162,20 @@ pub(super) struct ActionsState {
     again: Option<Row>,
     /// Why the last action played by Batch stopped.
     batch_error: Option<String>,
+    /// The actions file may be written (it was read, or set aside).
+    saving: bool,
+    /// For the status bar: a problem with the actions file.
+    notice: Option<String>,
 }
 
 impl Default for ActionsState {
     fn default() -> Self {
+        let load = Library::load();
         Self {
             open: false,
-            library: Library::load(),
+            library: load.library,
+            saving: load.saving,
+            notice: load.notice,
             selected: None,
             recording: None,
             insert_at: 0,
@@ -207,7 +216,11 @@ impl ActionsState {
         if self.recording.is_some_and(|r| self.action(r).is_none()) {
             self.recording = None;
         }
-        self.library.save();
+        if self.saving
+            && let Err(e) = self.library.save()
+        {
+            self.notice = Some(t!("smart3-actions-not-saved", error = e.to_string()));
+        }
     }
 
     pub(super) fn playing(&self) -> bool {
@@ -229,6 +242,11 @@ impl ActionsState {
             (Row::Step(..), _) | (_, None) => {}
             _ => self.recording = None,
         }
+    }
+
+    /// Steps of the action being recorded (`None`: not recording).
+    pub(super) fn recording_len(&self) -> Option<usize> {
+        self.action(self.recording?).map(|a| a.steps.len())
     }
 
     pub(super) fn stop_recording(&mut self) {
@@ -261,6 +279,7 @@ fn has_dialog(r: &Recorded) -> bool {
         | Recorded::Fill { .. }
         | Recorded::ModifySelection { .. }
         | Recorded::Transform { .. }
+        | Recorded::Place { .. }
         | Recorded::Export { .. }
         | Recorded::Liquify { .. }
         | Recorded::ConvertToProfile { .. }
@@ -269,6 +288,9 @@ fn has_dialog(r: &Recorded) -> bool {
         _ => false,
     }
 }
+
+/// A Free Transform's corners when nothing moves.
+const IDENTITY_FRAME: [[f64; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
 
 /// Steps that change the document (not only the selection).
 fn edits(r: &Recorded) -> bool {
@@ -575,8 +597,9 @@ impl AtelierApp {
         a.changed();
     }
 
-    /// Records a menu command without settings (see [`MenuItem`]).
-    pub(super) fn record_action(&mut self, action: Action) {
+    /// The step a menu command without settings records (see
+    /// [`MenuItem`]), taken before it runs.
+    pub(super) fn recorded_action(&self, action: Action) -> Option<Recorded> {
         let command = match action {
             Action::SelectAll => Recorded::SelectAll,
             Action::Deselect => Recorded::Deselect,
@@ -603,13 +626,38 @@ impl AtelierApp {
                 ),
             },
             // Without a selection, it duplicates the layer (recorded so).
-            Action::LayerFromSelection if self.selection.is_none() => return,
-            _ => match MenuItem::of(action) {
-                Some(item) => Recorded::Menu { item },
-                None => return,
+            Action::LayerFromSelection if self.selection.is_none() => return None,
+            _ => Recorded::Menu {
+                item: MenuItem::of(action)?,
             },
         };
-        if self.doc.is_some() {
+        self.doc.is_some().then_some(command)
+    }
+
+    /// A command that changed the document while recording without
+    /// recording anything (`len`: the steps before it): the status says
+    /// it isn't in the action.
+    pub(super) fn tell_unrecorded(
+        &mut self,
+        action: Action,
+        len: Option<usize>,
+        before: Option<(u64, u64)>,
+    ) {
+        let after = self.doc.as_ref().map(|d| (d.uid(), d.history_step()));
+        let changed = after != before && after.map(|a| a.0) == before.map(|b| b.0);
+        // Undo and Redo aren't commands; a transform records when applied.
+        let pending = matches!(action, Action::Undo | Action::Redo) || self.transform_pending();
+        if len.is_some() && changed && !pending && self.actions.recording_len() == len {
+            self.status = t!("smart3-actions-not-recorded");
+        }
+    }
+
+    /// Records `command`, run from the history step `before` (document,
+    /// step): a command that edits only once it changed the document.
+    pub(super) fn record_done(&mut self, command: Recorded, before: Option<(u64, u64)>) {
+        let after = self.doc.as_ref().map(|d| (d.uid(), d.history_step()));
+        // Played: the step's failure is told by the player.
+        if !edits(&command) || after != before || self.actions.playing() {
             self.record(command);
         }
     }
@@ -667,11 +715,20 @@ impl AtelierApp {
 
     /// Free Transform, about to be applied.
     pub(super) fn record_transform(&mut self) {
+        // A file being placed: the place and its transform, one step.
+        if let Some((path, linked)) = self.placing_file() {
+            let corners = self.recorded_frame().unwrap_or(IDENTITY_FRAME);
+            return self.record(Recorded::Place {
+                path,
+                linked,
+                corners,
+            });
+        }
         match self.recorded_frame() {
             Some(corners) => self.record(Recorded::Transform { corners }),
             // Applied as it was: still the OK of a played step's transform.
             None if self.actions.playing() => self.record(Recorded::Transform {
-                corners: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                corners: IDENTITY_FRAME,
             }),
             None => {}
         }
@@ -790,6 +847,9 @@ impl AtelierApp {
 
     /// Plays the next step, once the previous one is done (every frame).
     pub(super) fn play_actions(&mut self) {
+        if let Some(notice) = self.actions.notice.take() {
+            self.status = notice;
+        }
         // Record Again's dialog closed without OK.
         if self.actions.again.is_some() && !self.actions_wait() && !self.transform_pending() {
             self.actions.again = None;
@@ -1013,6 +1073,9 @@ impl AtelierApp {
                 if locked {
                     return Err(lock_error());
                 }
+                if !can_paint && self.smart_filters_apply() {
+                    return Err(t!("smart-status-no-adjustments"));
+                }
                 if !can_paint {
                     return Err(t!("filter-no-pixels"));
                 }
@@ -1133,6 +1196,19 @@ impl AtelierApp {
                     return Err(self.status.clone());
                 }
             }
+            Recorded::Place {
+                path,
+                linked,
+                corners,
+            } => {
+                self.place_path(path, *linked);
+                if !self.transform_pending() || !self.set_transform_frame(*corners) {
+                    return Err(self.status.clone());
+                }
+                if !dialog {
+                    self.apply_transform();
+                }
+            }
             Recorded::Menu { item } => {
                 if item.selects() && !has_selection {
                     return Err(t!("actions-error-no-selection"));
@@ -1224,7 +1300,7 @@ impl AtelierApp {
 
     fn actions_panel_window(&mut self, ctx: &egui::Context) {
         let mut click: Option<PanelClick> = None;
-        let pos = dialogs::tool_dialog_pos(ctx) + vec2(-300.0, 240.0);
+        let pos = dialogs::panel_pos(ctx, "actions");
         let recording = self.actions.recording;
         let playing = self.actions.playing();
         let has_doc = self.doc.is_some();
@@ -1414,10 +1490,7 @@ impl AtelierApp {
                 });
             }
             PanelClick::ButtonMode => a.button_mode = !a.button_mode,
-            PanelClick::ClearAll => {
-                a.library.sets.clear();
-                a.changed();
-            }
+            PanelClick::ClearAll => a.dialog = Some(PanelDialog::ClearAll),
             PanelClick::Reset => a.dialog = Some(PanelDialog::Reset),
             PanelClick::Load(replace) => self.load_actions(replace),
             PanelClick::Save => self.save_actions(),
@@ -1629,7 +1702,9 @@ impl AtelierApp {
             }
             PanelDialog::Set { .. } => (t!("actions-set-options-title"), t!("dialog-ok")),
             PanelDialog::Stop { .. } => (t!("actions-insert-stop-title"), t!("dialog-ok")),
-            PanelDialog::Delete(_) | PanelDialog::Reset => (t!("actions-title"), t!("dialog-ok")),
+            PanelDialog::Delete(_) | PanelDialog::Reset | PanelDialog::ClearAll => {
+                (t!("actions-title"), t!("dialog-ok"))
+            }
         };
         let taken = |key: u8, shift: bool, ctrl: bool| {
             key_taken(FnKey {
@@ -1747,6 +1822,9 @@ impl AtelierApp {
                 }
                 PanelDialog::Reset => {
                     ui.label(t!("actions-reset-question"));
+                }
+                PanelDialog::ClearAll => {
+                    ui.label(t!("smart3-actions-clear-all-question"));
                 }
             },
         );
@@ -1874,6 +1952,10 @@ impl AtelierApp {
                     a.library.sets = defaults;
                     a.recording = None;
                 }
+            }
+            PanelDialog::ClearAll => {
+                a.library.sets.clear();
+                a.selected = None;
             }
         }
         a.changed();
@@ -2048,11 +2130,18 @@ fn action_buttons(
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for &(s, i, a) in pair {
-                let label = match a.key {
-                    Some(k) => format!("{}  {}", a.name, key_label(ui.ctx(), k)),
-                    None => a.name.clone(),
-                };
-                if ui_kit::button(ui, &label, Kind::Normal, Some(width), enabled).clicked() {
+                // The shortcut in the tooltip, with the whole name.
+                let key = a.key.map_or(String::new(), |k| key_label(ui.ctx(), k));
+                let button = ui_kit::keyed_button(
+                    ui,
+                    None,
+                    &a.name,
+                    &key,
+                    Kind::Normal,
+                    Some(width),
+                    enabled,
+                );
+                if button.clicked() {
                     *click = Some(PanelClick::PlayAction(s, i));
                 }
             }
@@ -2385,6 +2474,10 @@ fn duplicate(library: &mut Library, row: Row) {
             if let Some(set) = library.sets.get(s) {
                 let mut copy = set.clone();
                 copy.name = t!("actions-copy-name", name = set.name.as_str());
+                // A function key plays one action only.
+                for action in &mut copy.actions {
+                    action.key = None;
+                }
                 library.sets.insert(s + 1, copy);
             }
         }
@@ -2464,6 +2557,8 @@ pub(super) fn step_title(r: &Recorded) -> String {
             .trim_end_matches('…')
             .to_owned(),
         Recorded::Transform { .. } => t!("menu-edit-free-transform"),
+        Recorded::Place { linked: true, .. } => t!("smart-hist-place-linked"),
+        Recorded::Place { .. } => t!("smart-hist-place-embedded"),
         Recorded::Menu { item } => item.label(),
         Recorded::Export { .. } => t!("actions-step-export"),
         Recorded::Liquify { .. } => t!("liquify-title"),
@@ -2491,7 +2586,7 @@ fn deg(v: f64) -> String {
 }
 
 fn line(label: &str, value: impl Into<String>) -> String {
-    format!("{label}: {}", value.into())
+    t!("words3-label-value", label = label, value = value.into())
 }
 
 fn yes_no(on: bool) -> String {
@@ -2598,16 +2693,20 @@ pub(super) fn step_details(r: &Recorded) -> Vec<String> {
             px(i18n::short_decimal(f64::from(*amount))),
             line(&t!("sel-modify-at-bounds"), yes_no(*at_bounds)),
         ],
-        Recorded::Transform { corners } => {
+        Recorded::Transform { corners } | Recorded::Place { corners, .. } => {
             let d = |a: [f64; 2], b: [f64; 2]| (b[0] - a[0]).hypot(b[1] - a[1]);
             let angle = (corners[1][1] - corners[0][1])
                 .atan2(corners[1][0] - corners[0][0])
                 .to_degrees();
-            vec![
+            let mut lines = vec![
                 line(&width, pct(d(corners[0], corners[1]) * 100.0)),
                 line(&height, pct(d(corners[0], corners[3]) * 100.0)),
                 line(&t!("dialog-rotate-angle"), deg(angle)),
-            ]
+            ];
+            if let Recorded::Place { path, .. } = r {
+                lines.insert(0, path.display().to_string());
+            }
+            lines
         }
         Recorded::Export { options, folder } => {
             let mut lines = vec![
@@ -3260,5 +3359,102 @@ mod tests {
         h.run_steps(1);
         assert_eq!(h.state().actions.library.sets[0].actions.len(), 1);
         h.run_steps(2);
+    }
+
+    #[test]
+    fn clear_all_asks_first_and_duplicated_sets_drop_their_keys() {
+        let mut h = app();
+        let key = FnKey {
+            number: 3,
+            shift: false,
+            ctrl: false,
+        };
+        let app = h.state_mut();
+        app.actions.library.sets[0].actions[0].key = Some(key);
+        app.actions.selected = Some(Row::Set(0));
+        app.panel_click(PanelClick::Duplicate);
+        assert_eq!(app.actions.library.sets.len(), 2);
+        assert_eq!(app.actions.library.with_key(key), Some((0, 0)));
+        let copied = &app.actions.library.sets[1].actions;
+        assert!(copied.iter().all(|a| a.key.is_none()));
+        // Clear All: only once confirmed.
+        app.panel_click(PanelClick::ClearAll);
+        h.run_steps(2);
+        assert_eq!(h.state().actions.library.sets.len(), 2);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(1);
+        assert!(h.state().actions.library.sets.is_empty());
+    }
+
+    /// A command that changed nothing isn't recorded (Merge Down on the
+    /// bottom layer); once it does something, it is.
+    #[test]
+    fn commands_are_recorded_once_done() {
+        let mut h = app();
+        with_action(&mut h, Vec::new());
+        let app = h.state_mut();
+        app.actions.start_recording((0, 0));
+        app.run(Action::MergeDown);
+        app.run(Action::NewLayer);
+        app.run(Action::SelectAll);
+        app.run(Action::MergeDown);
+        let steps: Vec<Recorded> = app.actions.library.sets[0].actions[0]
+            .steps
+            .iter()
+            .map(|s| s.command.clone())
+            .collect();
+        let menu = |item| Recorded::Menu { item };
+        assert_eq!(
+            steps,
+            [
+                menu(MenuItem::NewLayer),
+                Recorded::SelectAll,
+                menu(MenuItem::MergeDown)
+            ]
+        );
+    }
+
+    /// Place Embedded then scaled: one step, the file and its transform,
+    /// played as such (not a transform of whatever layer is active).
+    #[test]
+    fn a_placed_file_is_recorded_with_its_transform() {
+        let dir = std::env::temp_dir().join("atelier-actions-place");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("logo.png");
+        RgbaImage::from_pixel(20, 10, Rgba([0, 0, 255, 255]))
+            .save(&path)
+            .unwrap();
+        let mut h = app();
+        with_action(&mut h, Vec::new());
+        h.state_mut().actions.start_recording((0, 0));
+        h.state_mut().place_path(&path, false);
+        h.run_steps(2);
+        let frame = h.state().transform_rect.unwrap();
+        h.state_mut().transform_rect = Some(Rect::from_min_size(frame.min, frame.size() * 2.0));
+        h.key_press(egui::Key::Enter);
+        let applied = |app: &AtelierApp| !app.transform_pending() && !app.transform_busy();
+        settle(&mut h, applied);
+        let steps = &h.state().actions.library.sets[0].actions[0].steps;
+        assert_eq!(steps.len(), 1);
+        let Recorded::Place {
+            path: recorded,
+            linked: false,
+            corners,
+        } = &steps[0].command
+        else {
+            panic!("{:?}", steps[0].command);
+        };
+        assert_eq!(recorded, &path);
+        assert!((corners[2][0] - 2.0).abs() < 1e-6, "{corners:?}");
+        // Played on another document: the file placed, scaled.
+        let mut h2 = app();
+        let steps = h.state().actions.library.sets[0].actions[0].steps.clone();
+        with_action(&mut h2, steps);
+        play(&mut h2);
+        let doc = h2.state().doc.as_ref().unwrap();
+        assert_eq!(doc.layers.len(), 2);
+        assert!(doc.active_layer().is_smart());
+        assert_eq!(doc.active_layer().rect().w, 40);
     }
 }

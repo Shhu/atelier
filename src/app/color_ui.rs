@@ -333,6 +333,27 @@ impl ColorUi {
     }
 }
 
+/// RGBA pixels (`premultiplied` or not) of a dialog's preview made to look
+/// as the canvas shows them, through its table (`None`: as they are).
+pub(super) fn show_through(lut: Option<&Lut>, rgba: &mut [u8], premultiplied: bool) {
+    let Some(lut) = lut else { return };
+    crate::pixel_ops::par_bands(rgba, 4 << 10, |band| {
+        for p in band.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            if !premultiplied || a == 255 {
+                let [r, g, b] = lut.apply([p[0], p[1], p[2]]);
+                p[..3].copy_from_slice(&[r, g, b]);
+            } else if a > 0 {
+                let straight = |v: u8| ((v as u32 * 255 + a / 2) / a).min(255) as u8;
+                let shown = lut.apply([straight(p[0]), straight(p[1]), straight(p[2])]);
+                for c in 0..3 {
+                    p[c] = ((shown[c] as u32 * a + 127) / 255) as u8;
+                }
+            }
+        }
+    });
+}
+
 /// An image (a layer lifted to be transformed) as the canvas shows it.
 pub(super) fn shown_image<'a>(
     lut: Option<&Lut>,
@@ -855,6 +876,7 @@ impl AtelierApp {
             DialogSpec {
                 pivot: egui::Align2::CENTER_CENTER,
                 ok: t!("color-grayscale-discard-ok"),
+                note: Some(t!("fx3-grayscale-note")),
                 ..DialogSpec::new("grayscale", t!("color-menu-mode-grayscale"), center)
             },
             |ui| {

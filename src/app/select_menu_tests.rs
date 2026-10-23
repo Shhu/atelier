@@ -411,8 +411,10 @@ fn saved_selections_load_back_and_undo() {
     doc.resize_canvas(10, 10, 100, 100);
     assert_eq!(doc.channels[0].mask.dimensions(), (100, 100));
     assert_eq!(doc.channels[0].mask.get_pixel(10, 10).0[0], 255);
-    doc.undo();
-    doc.undo();
+    // Undone: the crop, Load Selection, Deselect, then the saving.
+    for _ in 0..4 {
+        doc.undo();
+    }
     assert!(doc.channels.is_empty());
 }
 
@@ -445,6 +447,13 @@ fn transform_selection_moves_scales_and_applies() {
     assert_eq!(selection(&h), rect(70, 60, 80, 80).into());
 }
 
+fn quick_mask_on(h: &Harness<'_, AtelierApp>) -> bool {
+    h.state()
+        .doc
+        .as_ref()
+        .is_some_and(|d| d.quick_mask().is_some())
+}
+
 #[test]
 fn quick_mask_turns_painting_into_the_selection() {
     let mut h = app_with(halves());
@@ -453,7 +462,7 @@ fn quick_mask_turns_painting_into_the_selection() {
     h.state_mut().hardness = 1.0;
     h.state_mut().selection = Some(rect(20, 20, 160, 160).into());
     key(&mut h, Key::Q, Modifiers::NONE);
-    assert!(h.state().sel.quick_mask.is_some() && h.state().selection.is_none());
+    assert!(quick_mask_on(&h) && h.state().selection.is_none());
     // Black paints the mask: that part leaves the selection.
     let (from, to) = (screen(&h, 100.0, 40.0), screen(&h, 100.0, 160.0));
     drag(&mut h, from, to, Modifiers::NONE);
@@ -468,7 +477,7 @@ fn quick_mask_turns_painting_into_the_selection() {
     h.state_mut().redo();
     key(&mut h, Key::Q, Modifiers::NONE);
     let sel = selection(&h);
-    assert!(h.state().sel.quick_mask.is_none());
+    assert!(!quick_mask_on(&h));
     assert_eq!((sel.coverage(100, 100), sel.coverage(50, 100)), (0, 255));
     assert_eq!(sel.coverage(10, 10), 0);
 }

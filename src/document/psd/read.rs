@@ -10,7 +10,7 @@ use image::{GrayImage, RgbaImage};
 use super::bytes::{Reader, Result, unpack_row};
 use super::descriptor::Descriptor;
 use super::{Imported, adjust, artboard, blend_of, effects, vector};
-use crate::document::file_io::check_size;
+use crate::document::file_io::{MAX_DIMENSION, check_size};
 use crate::document::native::par_map;
 use crate::document::{BlendMode, Channel, Document, FileError, LayerKind, Mask};
 use crate::guides::{Guide, Orientation};
@@ -53,7 +53,8 @@ fn header(r: &mut Reader) -> Result<Header> {
     let width = r.u32()?;
     let depth = r.u16()?;
     let mode = r.u16()?;
-    if channels == 0 || ![1, 8, 16, 32].contains(&depth) {
+    // Photoshop's limit is 56 channels.
+    if channels == 0 || channels > 56 || ![1, 8, 16, 32].contains(&depth) {
         return Err(FileError::Damaged);
     }
     Ok(Header {
@@ -89,6 +90,9 @@ struct Resources {
     global_angle: Option<f64>,
     /// JPEG preview.
     thumbnail: Option<Vec<u8>>,
+    /// The Paths panel's saved paths (name, records) and Work Path.
+    paths: Vec<(String, Vec<u8>)>,
+    work_path: Option<Vec<u8>>,
 }
 
 fn resources(r: &mut Reader) -> Result<Resources> {
@@ -96,7 +100,7 @@ fn resources(r: &mut Reader) -> Result<Resources> {
     let mut ascii_names = Vec::new();
     while r.remaining() >= 12 && r.bytes(4)? == b"8BIM" {
         let id = r.u16()?;
-        r.pascal(2)?;
+        let name = r.pascal(2)?;
         let len = r.u32()? as usize;
         let mut d = r.sub(len)?;
         r.skip(len % 2)?;
@@ -131,6 +135,8 @@ fn resources(r: &mut Reader) -> Result<Resources> {
                 }
             }
             1037 => out.global_angle = Some(d.i32()? as f64),
+            1025 => out.work_path = Some(d.bytes(len)?.to_vec()),
+            2000..=2997 => out.paths.push((mac_roman(name), d.bytes(len)?.to_vec())),
             // Format (1: JPEG), sizes…, then the JFIF data.
             1036 if len > 28 && d.u32()? == 1 => {
                 d.skip(24)?;
@@ -190,6 +196,15 @@ impl Record<'_> {
     fn user_mask(&self) -> Option<UserMask> {
         self.mask?.user(self.vector_mask().is_some())
     }
+}
+
+/// Refuses a layer or mask box no file can hold (as the native reader).
+fn check_rect(rect: [i32; 4]) -> Result<()> {
+    let (w, h) = size(rect);
+    if w > 4 * MAX_DIMENSION || h > 4 * MAX_DIMENSION {
+        return Err(FileError::Damaged);
+    }
+    Ok(())
 }
 
 /// Width and height of a top, left, bottom, right rectangle.
@@ -290,6 +305,7 @@ fn layer_info<'a>(r: &mut Reader<'a>, big: bool) -> Result<(Vec<Record<'a>>, boo
 
 fn record<'a>(r: &mut Reader<'a>, big: bool) -> Result<(Record<'a>, Vec<(i16, usize)>)> {
     let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+    check_rect(rect)?;
     let n = r.u16()? as usize;
     if n > 56 {
         return Err(FileError::Damaged);
@@ -341,6 +357,7 @@ fn record<'a>(r: &mut Reader<'a>, big: bool) -> Result<(Record<'a>, Vec<(i16, us
 
 fn mask_data(r: &mut Reader, len: usize, has_real: bool) -> Result<MaskData> {
     let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+    check_rect(rect)?;
     let default = r.u8()?;
     let flags = r.u8()?;
     let mut m = MaskData {
@@ -358,7 +375,9 @@ fn mask_data(r: &mut Reader, len: usize, has_real: bool) -> Result<MaskData> {
     if has_real && len >= 36 {
         let flags = r.u8()?;
         let default = r.u8()?;
-        m.real = Some(([r.i32()?, r.i32()?, r.i32()?, r.i32()?], default, flags));
+        let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+        check_rect(rect)?;
+        m.real = Some((rect, default, flags));
     }
     if flags & 16 != 0 && r.remaining() > 0 {
         let params = r.u8()?;
@@ -405,13 +424,9 @@ fn decompress(
     match compression {
         0 => Ok(r.bytes(size)?.to_vec()),
         1 => {
-            let mut counts = Vec::with_capacity(h);
-            for _ in 0..h {
-                counts.push(if big {
-                    r.u32()? as usize
-                } else {
-                    r.u16()? as usize
-                });
+            let counts = rle_counts(r, h, big)?;
+            if !rle_fits(&counts, row) {
+                return Err(FileError::Damaged);
             }
             let mut out = vec![0; size];
             for (y, n) in counts.into_iter().enumerate() {
@@ -420,7 +435,8 @@ fn decompress(
             Ok(out)
         }
         2 | 3 => {
-            let mut out = Vec::with_capacity(size);
+            // Grows with what the data really holds.
+            let mut out = Vec::new();
             flate2::read::ZlibDecoder::new(r.bytes(r.remaining())?)
                 .take(size as u64)
                 .read_to_end(&mut out)
@@ -435,6 +451,29 @@ fn decompress(
         }
         _ => Err(FileError::Damaged),
     }
+}
+
+/// The byte counts of `n` PackBits rows, refused when the data is too
+/// short to hold them.
+fn rle_counts(r: &mut Reader, n: usize, big: bool) -> Result<Vec<usize>> {
+    if r.remaining() < n.saturating_mul(if big { 4 } else { 2 }) {
+        return Err(FileError::Damaged);
+    }
+    (0..n)
+        .map(|_| {
+            Ok(if big {
+                r.u32()? as usize
+            } else {
+                r.u16()? as usize
+            })
+        })
+        .collect()
+}
+
+/// Whether PackBits rows of these sizes can unpack to `row` bytes each:
+/// two bytes give at most 128 (checked before allocating the output).
+fn rle_fits(counts: &[usize], row: usize) -> bool {
+    counts.iter().all(|&n| n.saturating_mul(64) >= row)
 }
 
 /// Undoes the prediction of "ZIP with prediction": deltas along each row
@@ -521,7 +560,8 @@ fn to_rgba(
     palette: &[u8],
 ) -> RgbaImage {
     let mode = header.mode;
-    let n = w as usize * h as usize;
+    // Sides are bounded by the readers (`check_rect`, `check_size`).
+    let n = (w as usize).checked_mul(h as usize).expect("bounded size");
     let at = |plane: usize, i: usize| {
         color
             .get(plane)
@@ -592,6 +632,9 @@ fn decode_record(rec: &Record, h: &Header, palette: &[u8]) -> Result<Decoded> {
         colors.push(plane(c, rec.rect, true)?.unwrap_or_default());
     }
     let alpha = plane(-1, rec.rect, false)?;
+    // A box without any channel data holds nothing (damaged files).
+    let pixels = colors.iter().chain(&alpha).any(|p| !p.is_empty());
+    let (w, ht) = if pixels { (w, ht) } else { (0, 0) };
     let refs: Vec<&[u8]> = colors.iter().map(Vec::as_slice).collect();
     let image = to_rgba(h, (w, ht), &refs, alpha.as_deref(), palette);
     let mask = match rec.user_mask() {
@@ -629,7 +672,7 @@ impl Notes {
             let mut s = names
                 .iter()
                 .take(SHOWN)
-                .map(|n| format!("“{n}”"))
+                .map(|n| t!("files3-quoted-name", name = n.as_str()))
                 .collect::<Vec<_>>()
                 .join(", ");
             if names.len() > SHOWN {
@@ -742,6 +785,7 @@ fn parse(data: &[u8]) -> Result<File<'_>> {
 /// The merged image's channels `wanted` (by index), decoded.
 fn merged_planes(f: &File, wanted: &[usize]) -> Result<Vec<Vec<u8>>> {
     let h = &f.header;
+    check_size(h.width, h.height)?;
     let (w, ht) = (h.width as usize, h.height as usize);
     let row = (w * h.depth as usize).div_ceil(8);
     if wanted.is_empty() {
@@ -752,13 +796,9 @@ fn merged_planes(f: &File, wanted: &[usize]) -> Result<Vec<Vec<u8>>> {
     let channels = h.channels as usize;
     let planes: Vec<Vec<u8>> = match compression {
         1 => {
-            let mut counts = Vec::with_capacity(channels * ht);
-            for _ in 0..channels * ht {
-                counts.push(if h.big {
-                    r.u32()? as usize
-                } else {
-                    r.u16()? as usize
-                });
+            let counts = rle_counts(&mut r, channels * ht, h.big)?;
+            if !rle_fits(&counts, row) {
+                return Err(FileError::Damaged);
             }
             let mut planes = Vec::new();
             for c in 0..channels {
@@ -1036,6 +1076,17 @@ pub(super) fn document(data: &[u8]) -> Result<Imported> {
     }
     doc.active = target.unwrap_or(doc.layers.len() - 1);
     doc.guides = f.resources.guides;
+    let path = |data: &[u8]| super::vector::path_of(data, canvas).ok();
+    doc.paths = (f.resources.paths.iter())
+        .filter_map(|(name, data)| {
+            let path = path(data)?;
+            Some(crate::document::SavedPath {
+                name: name.clone(),
+                path,
+            })
+        })
+        .collect();
+    doc.work_path = f.resources.work_path.as_deref().and_then(path);
     // With artboards, the canvas is their box (Photoshop's also reaches
     // the origin).
     doc.fit_artboards();
@@ -1045,7 +1096,7 @@ pub(super) fn document(data: &[u8]) -> Result<Imported> {
         mode => crate::document::color::rgb_profile(f.resources.icc, matches!(mode, RGB | INDEXED)),
     }
     .map(Arc::new);
-    doc.modified = false;
+    doc.mark_saved();
     Ok(Imported {
         doc,
         notes: notes.finish(),

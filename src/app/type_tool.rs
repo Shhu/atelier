@@ -8,6 +8,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use super::*;
+use crate::document::HistoryMark;
 use crate::mask_ops::Affine;
 use crate::text::{
     self, AntiAlias, CharStyle, Layout, ParagraphStyle, TextAlign, TextData, TextEngine,
@@ -46,15 +47,47 @@ pub(super) struct TypeEdit {
     goal_x: Option<f32>,
     /// Style chosen with nothing selected: what is typed next takes it.
     pub typing: Option<CharStyle>,
-    /// Undo steps before the edit (Cancel goes back to them).
-    undo_len: usize,
+    /// The history before the edit (Cancel goes back to it).
+    undo_len: HistoryMark,
     /// Its layer was created for it: dropped if it ends empty.
     created: bool,
     /// When the caret last moved: it shows steadily, then blinks.
     moved: f64,
+    /// Ctrl+Z / Ctrl+Shift+Z while typing: the text and its caret and
+    /// selection before each series of changes, and those undone.
+    undo: Vec<TextState>,
+    redo: Vec<TextState>,
+    /// When the text last changed; a space or a line typed ends a series.
+    changed: f64,
+    new_series: bool,
 }
 
+/// A text as it was during an edit: its data, its caret and anchor.
+type TextState = (TextData, usize, usize);
+
+/// While typing, changes this far apart (s) are undone separately.
+const TYPING_PAUSE: f64 = 1.0;
+/// Series of changes that can be undone while typing, at most.
+const TYPING_UNDO: usize = 200;
+
 impl TypeEdit {
+    fn new(layer: u64, caret: usize, undo_len: HistoryMark, created: bool, now: f64) -> Self {
+        Self {
+            layer,
+            caret,
+            anchor: caret,
+            goal_x: None,
+            typing: None,
+            undo_len,
+            created,
+            moved: now,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            changed: f64::NEG_INFINITY,
+            new_series: false,
+        }
+    }
+
     pub fn range(&self) -> Range<usize> {
         self.caret.min(self.anchor)..self.caret.max(self.anchor)
     }
@@ -176,47 +209,29 @@ impl AtelierApp {
         let rendered = self.text_engine().render(&data);
         let now = self.ctx.input(|i| i.time);
         let Some(doc) = &mut self.doc else { return };
-        let undo_len = doc.history().1;
+        let undo_len = doc.history_mark();
         doc.add_text_layer(data, rendered, (origin.x, origin.y));
         let id = doc.active_layer().id;
         // The creation is in the history: the typing joins it.
         self.prop_session = Some(((id, "text"), doc.history_step()));
-        self.type_tool.edit = Some(TypeEdit {
-            layer: id,
-            caret: 0,
-            anchor: 0,
-            goal_x: None,
-            typing: None,
-            undo_len,
-            created: true,
-            moved: now,
-        });
+        self.type_tool.edit = Some(TypeEdit::new(id, 0, undo_len, true, now));
         self.status = t!("type-status-typing");
     }
 
     /// Starts typing in the text layer `i`, the caret at the canvas point
     /// `at`.
-    fn edit_text_layer(&mut self, i: usize, at: Pos2) {
+    pub(super) fn edit_text_layer(&mut self, i: usize, at: Pos2) {
         self.select_layer(i);
         let now = self.ctx.input(|i| i.time);
         let Some(doc) = &self.doc else { return };
         let layer = doc.active_layer();
         let Some(t) = layer.text.clone() else { return };
         let (id, offset) = (layer.id, layer.offset);
-        let undo_len = doc.history().1;
+        let undo_len = doc.history_mark();
         let (x, y) = canvas_to_text(offset, &t, at);
         let caret = self.text_engine().layout(&t).hit(x, y);
         self.prop_session = None;
-        self.type_tool.edit = Some(TypeEdit {
-            layer: id,
-            caret,
-            anchor: caret,
-            goal_x: None,
-            typing: None,
-            undo_len,
-            created: false,
-            moved: now,
-        });
+        self.type_tool.edit = Some(TypeEdit::new(id, caret, undo_len, false, now));
         self.status = t!("type-status-typing");
     }
 
@@ -239,11 +254,9 @@ impl AtelierApp {
             self.status = t!("type-status-committed");
             return;
         }
-        if edit.created {
-            drop_steps(doc, edit.undo_len);
-        } else {
-            doc.active = i;
-            doc.delete_active();
+        if !edit.created || !doc.rollback_to(edit.undo_len) {
+            // (A new layer whose creation the history no longer reaches.)
+            delete_layer(doc, edit.layer);
         }
     }
 
@@ -254,8 +267,12 @@ impl AtelierApp {
             return;
         };
         self.prop_session = None;
-        if let Some(doc) = &mut self.doc {
-            drop_steps(doc, edit.undo_len);
+        if let Some(doc) = &mut self.doc
+            && !doc.rollback_to(edit.undo_len)
+            && edit.created
+        {
+            // (A new layer whose creation the history no longer reaches.)
+            delete_layer(doc, edit.layer);
         }
         self.status = t!("type-status-cancelled");
     }
@@ -274,12 +291,23 @@ impl AtelierApp {
         let mut data = old.clone();
         let now = self.ctx.input(|i| i.time);
         let edit = self.type_tool.edit.as_mut();
+        let before = edit.as_ref().map(|e| (e.caret, e.anchor));
         f(&mut data, edit);
         if let Some(edit) = &mut self.type_tool.edit {
             edit.moved = now;
         }
         if data == old {
             return;
+        }
+        if let (Some(edit), Some((caret, anchor))) = (&mut self.type_tool.edit, before) {
+            if edit.new_series || edit.undo.is_empty() || now - edit.changed > TYPING_PAUSE {
+                edit.undo.push((old, caret, anchor));
+                if edit.undo.len() > TYPING_UNDO {
+                    edit.undo.remove(0);
+                }
+            }
+            edit.redo.clear();
+            (edit.changed, edit.new_series) = (now, false);
         }
         let rendered = self.text_engine().render(&data);
         self.record_change(t!("xchg-hist-edit-type"), Some((id, "text")));
@@ -288,8 +316,53 @@ impl AtelierApp {
         }
     }
 
+    /// Ctrl+Z (`redo`: Ctrl+Shift+Z) while typing: the last series of
+    /// changes of the edit is undone, the edit goes on. `false` if there
+    /// is none.
+    fn undo_typing(&mut self, redo: bool) -> bool {
+        self.sync_type_edit();
+        let Some(layer) = self.doc.as_ref().map(Document::active_layer) else {
+            return false;
+        };
+        let (Some(now), id) = (layer.text.clone(), layer.id) else {
+            return false;
+        };
+        let Some(edit) = &mut self.type_tool.edit else {
+            return false;
+        };
+        let current = (now, edit.caret, edit.anchor);
+        let (from, to) = if redo {
+            (&mut edit.redo, &mut edit.undo)
+        } else {
+            (&mut edit.undo, &mut edit.redo)
+        };
+        let Some((data, caret, anchor)) = from.pop() else {
+            return false;
+        };
+        to.push(current);
+        edit.place(caret, false);
+        edit.anchor = anchor;
+        edit.new_series = true;
+        let rendered = self.text_engine().render(&data);
+        self.record_change(t!("xchg-hist-edit-type"), Some((id, "text")));
+        if let Some(doc) = &mut self.doc {
+            doc.set_active_text(data, rendered);
+        }
+        true
+    }
+
     /// Types `s` in place of the selection.
     pub(super) fn type_text(&mut self, s: &str) {
+        self.type_text_in(s);
+        // A word or a line typed: what follows is undone on its own.
+        if s.chars().any(char::is_whitespace)
+            && let Some(edit) = &mut self.type_tool.edit
+        {
+            edit.new_series = true;
+        }
+    }
+
+    fn type_text_in(&mut self, s: &str) {
         self.change_text(|data, edit| {
             let Some(edit) = edit else { return };
             let range = edit.range();
@@ -357,6 +430,10 @@ impl AtelierApp {
                     let s = s.replace("\r\n", "\n").replace('\r', "\n");
                     self.type_text(&s);
                 }
+                // What an input method (Chinese, Japanese, Korean…) composed.
+                egui::Event::Ime(egui::ImeEvent::Commit(s)) if !s.is_empty() => {
+                    self.type_text(&s);
+                }
                 egui::Event::Copy | egui::Event::Cut => {
                     if let Some(s) = self.selected_text() {
                         ctx.copy_text(s);
@@ -401,11 +478,22 @@ impl AtelierApp {
                     e.place(len, true);
                 }
             }
-            Key::Z if ctrl => {
+            // The edit's own changes first, like Photoshop: the edit goes on.
+            Key::Z | Key::Y if ctrl && self.undo_typing(shift || key == Key::Y) => {}
+            Key::Z if ctrl && !shift => {
+                // A new text with nothing typed: it goes, nothing else.
+                let empty_new = self.type_tool.edit.as_ref().is_some_and(|e| e.created)
+                    && self
+                        .doc
+                        .as_ref()
+                        .and_then(|d| d.active_layer().text.as_ref())
+                        .is_some_and(|t| t.text.is_empty());
                 self.commit_text();
-                self.run(if shift { Action::Redo } else { Action::Undo });
+                if !empty_new {
+                    self.run(Action::Undo);
+                }
             }
-            Key::Y if ctrl => {
+            Key::Z | Key::Y if ctrl => {
                 self.commit_text();
                 self.run(Action::Redo);
             }
@@ -903,6 +991,17 @@ impl AtelierApp {
                 }
             }
         }
+        // Input methods on, their candidates next to the caret.
+        let (x, top, bottom) = layout.caret(edit.caret);
+        let cursor_rect = Rect::from_two_pos(screen((x, top)), screen((x, bottom)));
+        self.ctx.output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput {
+                purpose: egui::IMEPurpose::Normal,
+                rect: painter.clip_rect(),
+                cursor_rect,
+                should_interrupt_composition: false,
+            });
+        });
         // The caret: shown for a while after it moved, then blinking.
         let now = self.ctx.input(|i| i.time);
         let phase = (now - edit.moved).max(0.0) % 1.0;
@@ -997,10 +1096,11 @@ impl AtelierApp {
     }
 }
 
-/// Undoes, without a redo, the steps recorded after the first `len` ones.
-fn drop_steps(doc: &mut Document, len: usize) {
-    while doc.history().1 > len {
-        doc.discard_step();
+/// Deletes the layer `id`, if it is still there.
+fn delete_layer(doc: &mut Document, id: u64) {
+    if let Some(i) = doc.layers.iter().position(|l| l.id == id) {
+        doc.active = i;
+        doc.delete_active();
     }
 }
 

@@ -343,23 +343,30 @@ pub fn render_styles(image: &RgbaImage, fx: &Effects) -> Styles {
     let Some([bx, by, bw, bh]) = content_box(image) else {
         return out;
     };
+    // Sizes as the dialog bounds them, whatever the file said. The shadows'
+    // offsets don't enlarge the buffers: the drop shadow is translated, and
+    // what the inner one moves in from beyond its blur is empty anyway.
     let stroke_w = if fx.stroke.enabled {
-        fx.stroke.width.max(0.0)
+        fx.stroke.width.clamp(0.0, MAX_SIZE)
     } else {
         0.0
     };
-    let reach = |s: &ShadowFx| s.blur * 1.5 + s.dx.abs().max(s.dy.abs());
+    let reach = |s: &ShadowFx| s.blur.min(MAX_SIZE) * 1.5;
     let mut outside = stroke_w;
     if fx.shadow.enabled {
         outside += reach(&fx.shadow);
     }
     if fx.outer_glow.enabled {
-        outside = outside.max(stroke_w + fx.outer_glow.size * 1.5);
+        outside = outside.max(stroke_w + fx.outer_glow.size.min(MAX_SIZE) * 1.5);
     }
     let inner = [
         fx.inner_shadow.enabled.then(|| reach(&fx.inner_shadow)),
-        fx.inner_glow.enabled.then_some(fx.inner_glow.size * 1.5),
-        fx.bevel.enabled.then_some(fx.bevel.size + fx.bevel.soften),
+        fx.inner_glow
+            .enabled
+            .then_some(fx.inner_glow.size.min(MAX_SIZE) * 1.5),
+        fx.bevel
+            .enabled
+            .then_some(fx.bevel.size.min(MAX_SIZE) + fx.bevel.soften.min(MAX_SIZE)),
     ]
     .into_iter()
     .flatten()
@@ -441,20 +448,34 @@ pub fn render_styles(image: &RgbaImage, fx: &Effects) -> Styles {
     let s = &fx.shadow;
     if s.enabled {
         let mut shape = outline();
-        blur(&mut shape, w, h, s.blur);
-        let shifted = shift(&shape, w, h, s.dx, s.dy);
-        let field: Vec<f32> = shifted
+        blur(&mut shape, w, h, s.blur.min(MAX_SIZE));
+        // Drawn in its own place, moved by the offset: the content knocks
+        // out what falls under it.
+        let (dx, dy) = (offset(s.dx), offset(s.dy));
+        let content = |x: i64, y: i64| {
+            let inside = (0..w as i64).contains(&x) && (0..h as i64).contains(&y);
+            if inside {
+                alpha[y as usize * w + x as usize]
+            } else {
+                0.0
+            }
+        };
+        let field: Vec<f32> = shape
             .iter()
-            .zip(&alpha)
-            .map(|(v, a)| v * (1.0 - a))
+            .enumerate()
+            .map(|(i, v)| {
+                let (x, y) = ((i % w) as i64 + dx, (i / w) as i64 + dy);
+                v * (1.0 - content(x, y))
+            })
             .collect();
-        out.exterior
-            .push(fx_image(&field, true, s.color, s.opacity, s.blend));
+        let mut fx = fx_image(&field, true, s.color, s.opacity, s.blend);
+        fx.offset = (fx.offset.0 + dx, fx.offset.1 + dy);
+        out.exterior.push(fx);
     }
     let g = &fx.outer_glow;
     if g.enabled {
         let mut shape = outline();
-        blur(&mut shape, w, h, g.size);
+        blur(&mut shape, w, h, g.size.min(MAX_SIZE));
         let gain = 1.0 / (1.0 - g.spread.clamp(0.0, 0.99));
         let field: Vec<f32> = shape
             .iter()
@@ -473,7 +494,7 @@ pub fn render_styles(image: &RgbaImage, fx: &Effects) -> Styles {
     let g = &fx.inner_glow;
     if g.enabled {
         let mut shape = alpha.clone();
-        blur(&mut shape, w, h, g.size);
+        blur(&mut shape, w, h, g.size.min(MAX_SIZE));
         let gain = 2.0 / (1.0 - g.spread.clamp(0.0, 0.99));
         let field: Vec<f32> = shape.iter().map(|v| ((1.0 - v) * gain).min(1.0)).collect();
         out.interior
@@ -482,7 +503,7 @@ pub fn render_styles(image: &RgbaImage, fx: &Effects) -> Styles {
     let s = &fx.inner_shadow;
     if s.enabled {
         let mut shape = alpha.clone();
-        blur(&mut shape, w, h, s.blur);
+        blur(&mut shape, w, h, s.blur.min(MAX_SIZE));
         let shifted = shift(&shape, w, h, s.dx, s.dy);
         let field: Vec<f32> = shifted.iter().map(|v| 1.0 - v).collect();
         out.interior
@@ -509,9 +530,21 @@ pub fn render_styles(image: &RgbaImage, fx: &Effects) -> Styles {
     out
 }
 
+/// Largest stroke, blur, glow and bevel size (the Layer Style dialog's).
+const MAX_SIZE: f32 = 250.0;
+
+/// A shadow offset in whole pixels (bounded: files may hold anything).
+fn offset(d: f32) -> i64 {
+    if d.is_finite() {
+        d.round().clamp(-1e6, 1e6) as i64
+    } else {
+        0
+    }
+}
+
 /// `field` moved by (`dx`, `dy`) (rounded), zero where nothing comes in.
 fn shift(field: &[f32], w: usize, h: usize, dx: f32, dy: f32) -> Vec<f32> {
-    let (dx, dy) = (dx.round() as i64, dy.round() as i64);
+    let (dx, dy) = (offset(dx), offset(dy));
     let mut out = vec![0.0f32; w * h];
     for y in 0..h as i64 {
         let sy = y - dy;
@@ -533,7 +566,7 @@ fn shift(field: &[f32], w: usize, h: usize, dx: f32, dy: f32) -> Vec<f32> {
 /// bevel's angle and altitude, is brighter or darker than a flat surface.
 fn bevel(inside: &[bool], w: usize, h: usize, b: &BevelFx) -> (Vec<f32>, Vec<f32>) {
     let outside: Vec<bool> = inside.iter().map(|i| !i).collect();
-    let size = b.size.max(1.0);
+    let size = b.size.clamp(1.0, MAX_SIZE);
     let mut height: Vec<f32> = distance_field(&outside, w, h)
         .into_iter()
         .map(|d| {
@@ -542,7 +575,7 @@ fn bevel(inside: &[bool], w: usize, h: usize, b: &BevelFx) -> (Vec<f32>, Vec<f32
             t * t * (3.0 - 2.0 * t)
         })
         .collect();
-    blur(&mut height, w, h, b.soften.max(1.0));
+    blur(&mut height, w, h, b.soften.clamp(1.0, MAX_SIZE));
     let (alt, ang) = (b.altitude.to_radians(), b.angle.to_radians());
     let light = [alt.cos() * ang.cos(), -alt.cos() * ang.sin(), alt.sin()];
     let flat = light[2];
@@ -583,7 +616,33 @@ mod tests {
 
     fn at(f: &FxImage, x: i64, y: i64) -> u8 {
         let (lx, ly) = (x - f.offset.0, y - f.offset.1);
+        let (w, h) = f.coverage.dimensions();
+        if lx < 0 || ly < 0 || lx >= w as i64 || ly >= h as i64 {
+            return 0;
+        }
         f.coverage.get_pixel(lx as u32, ly as u32).0[0]
+    }
+
+    #[test]
+    fn far_shadows_and_huge_sizes_keep_small_buffers() {
+        let mut fx = Effects::default();
+        fx.shadow.enabled = true;
+        (fx.shadow.dx, fx.shadow.dy, fx.shadow.blur) = (30_000.0, -12_000.0, 0.0);
+        fx.inner_shadow.enabled = true;
+        (fx.inner_shadow.dx, fx.inner_shadow.blur) = (4_294_967_295.0, 4_294_967_295.0);
+        fx.stroke.enabled = true;
+        fx.stroke.width = 1e9;
+        let styles = render_styles(&square(), &fx);
+        for f in styles.exterior.iter().chain(&styles.interior) {
+            let (w, h) = f.coverage.dimensions();
+            assert!(w <= 2000 && h <= 2000, "{w} × {h}");
+        }
+        // The drop shadow is moved by its offset, the content's shape.
+        fx.stroke.enabled = false;
+        let styles = render_styles(&square(), &fx);
+        let shadow = &styles.exterior[0];
+        assert_eq!(at(shadow, 30_015, -11_985), 255);
+        assert_eq!(at(shadow, 30_005, -11_985), 0);
     }
 
     #[test]

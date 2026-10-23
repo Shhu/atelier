@@ -65,14 +65,24 @@ impl Source {
         let lut: [f32; 256] = std::array::from_fn(|i| decode_level(i as u8));
         let raw = image.as_raw();
         let opaque = raw.chunks_exact(4).all(|p| p[3] == 255);
+        let mut rgb: Vec<[f32; 3]> = raw
+            .chunks_exact(4)
+            .map(|p| [lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]])
+            .collect();
+        let alpha: Option<Vec<u8>> = (!opaque).then(|| raw.chunks_exact(4).map(|p| p[3]).collect());
+        if let Some(alpha) = &alpha {
+            fill_hidden(
+                &mut rgb,
+                alpha,
+                image.width() as usize,
+                image.height() as usize,
+            );
+        }
         Source {
             width: image.width(),
             height: image.height(),
-            rgb: raw
-                .chunks_exact(4)
-                .map(|p| [lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]])
-                .collect(),
-            alpha: (!opaque).then(|| raw.chunks_exact(4).map(|p| p[3]).collect()),
+            rgb,
+            alpha,
             camera: None,
         }
     }
@@ -159,6 +169,83 @@ impl Source {
             rgb,
             alpha,
             camera: self.camera,
+        }
+    }
+}
+
+/// Gives the transparent pixels of `rgb` (w × h) the colors of the visible
+/// ones around them (pull-push over a pyramid of alpha-weighted averages):
+/// what develops around each visible pixel (texture, clarity, dehaze,
+/// sharpening, a lens correction) then never depends on the hidden colors
+/// of transparent pixels.
+fn fill_hidden(rgb: &mut [[f32; 3]], alpha: &[u8], w: usize, h: usize) {
+    /// Half the size: averages of 2 × 2 values (fewer at the edges).
+    fn halved(at: impl Fn(usize, usize) -> [f32; 4], w: usize, h: usize) -> Vec<[f32; 4]> {
+        let (pw, ph) = (w.div_ceil(2), h.div_ceil(2));
+        let mut out = vec![[0.0f32; 4]; pw * ph];
+        for (i, p) in out.iter_mut().enumerate() {
+            let (px, py) = (i % pw, i / pw);
+            let mut n = 0.0;
+            for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(x, y)| (2 * px + x, 2 * py + y)) {
+                if x < w && y < h {
+                    let q = at(x, y);
+                    (0..4).for_each(|c| p[c] += q[c]);
+                    n += 1.0;
+                }
+            }
+            p.iter_mut().for_each(|v| *v /= n);
+        }
+        out
+    }
+    if w * h <= 1 {
+        return;
+    }
+    // Levels of halved size: premultiplied colors and opacity (0..1).
+    let first = halved(
+        |x, y| {
+            let (c, a) = (rgb[y * w + x], alpha[y * w + x] as f32 / 255.0);
+            [c[0] * a, c[1] * a, c[2] * a, a]
+        },
+        w,
+        h,
+    );
+    let mut levels = vec![(first, w.div_ceil(2), h.div_ceil(2))];
+    while let Some((last, lw, lh)) = levels.last()
+        && (*lw > 1 || *lh > 1)
+    {
+        let next = halved(|x, y| last[y * lw + x], *lw, *lh);
+        levels.push((next, lw.div_ceil(2), lh.div_ceil(2)));
+    }
+    // From the top down: what a level lacks in opacity comes from the
+    // level above, the colors becoming straight.
+    let mut above: Vec<[f32; 3]> = levels[levels.len() - 1]
+        .0
+        .iter()
+        .map(|p| {
+            if p[3] > 1e-6 {
+                [p[0] / p[3], p[1] / p[3], p[2] / p[3]]
+            } else {
+                [0.0; 3]
+            }
+        })
+        .collect();
+    for l in (0..levels.len() - 1).rev() {
+        let (level, lw, _) = &levels[l];
+        let pw = levels[l + 1].1;
+        above = level
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let parent = above[(i / lw / 2) * pw + (i % lw) / 2];
+                let rest = 1.0 - p[3];
+                std::array::from_fn(|c| p[c] + rest * parent[c])
+            })
+            .collect();
+    }
+    let pw = w.div_ceil(2);
+    for (i, c) in rgb.iter_mut().enumerate() {
+        if alpha[i] == 0 {
+            *c = above[(i / w / 2) * pw + (i % w) / 2];
         }
     }
 }

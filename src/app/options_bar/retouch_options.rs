@@ -61,14 +61,20 @@ impl AtelierApp {
                     .on_hover_text(t!("retouch-aligned-tip"));
                 sample(ui, "clone_sample", &mut r.clone_sample);
                 pressure_size(ui, &mut p.pressure_size);
-                t!("retouch-clone-hint")
+                t!(
+                    "input3-clone-hint",
+                    alt_click = keys::click(ui.ctx(), Modifiers::ALT)
+                )
             }
             Tool::HealingBrush => {
                 ui_kit::checkbox(ui, &mut r.heal_aligned, &t!("retouch-aligned"))
                     .on_hover_text(t!("retouch-aligned-tip"));
                 sample(ui, "heal_sample", &mut r.heal_sample);
                 pressure_size(ui, &mut self.paint.pressure_size);
-                t!("retouch-healing-hint")
+                t!(
+                    "input3-healing-hint",
+                    alt_click = keys::click(ui.ctx(), Modifiers::ALT)
+                )
             }
             Tool::SpotHealing => {
                 ui_kit::field_label(ui, &t!("retouch-type"));

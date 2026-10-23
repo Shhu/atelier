@@ -236,14 +236,14 @@ impl AtelierApp {
             ui.set_width(260.0);
             let width = ui.available_width();
             let mut px = self.brush_size.round() as u32;
-            if ui_kit::number_field(ui, &t!("options-size"), &mut px, 1..=500, " px", width)
+            if ui_kit::number_field(ui, &t!("options-size"), &mut px, 1..=5000, " px", width)
                 .changed()
             {
                 self.brush_size = px as f32;
             }
             ui.spacing_mut().slider_width = width;
             ui.add(
-                egui::Slider::new(&mut self.brush_size, 1.0..=500.0)
+                egui::Slider::new(&mut self.brush_size, 1.0..=super::super::MAX_BRUSH_SIZE)
                     .logarithmic(true)
                     .show_value(false),
             );

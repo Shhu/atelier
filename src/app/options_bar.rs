@@ -43,6 +43,19 @@ impl AtelierApp {
         if self.sel.transform.is_some() {
             return self.selection_transform_options(ui);
         }
+        // Painting a locked layer would be refused: said before the click.
+        if self.paints_on_locked_layer() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} {}",
+                    icon::LOCK_SIMPLE,
+                    t!("options-layer-locked")
+                ))
+                .color(color::MUTED),
+            )
+            .on_hover_text(t!("side-locked-notice"));
+            sep(ui);
+        }
         match self.tool {
             Tool::Transform => self.transform_options(ui),
             Tool::Artboard => self.artboard_options(ui),
@@ -79,6 +92,14 @@ impl AtelierApp {
     }
 
     fn transform_options(&mut self, ui: &mut egui::Ui) {
+        // The Move tool's, not a pending transform's (the bar keeps its
+        // height while the frame is edited).
+        if !self.free_transform && !self.transform_pending() {
+            let ctrl = keys::modifiers(ui.ctx(), Modifiers::COMMAND);
+            ui_kit::checkbox(ui, &mut self.auto_select, &t!("input3-auto-select"))
+                .on_hover_text(t!("input3-auto-select-tip", key = ctrl));
+            sep(ui);
+        }
         if self.active_locked() {
             locked_notice(
                 ui,
@@ -377,7 +398,7 @@ impl AtelierApp {
         }
 
         let mask = t!("sel-menu-select-and-mask");
-        if ui_kit::button(ui, &mask, Kind::Normal, None, self.selection.is_some())
+        if ui_kit::button(ui, &mask, Kind::Normal, None, self.can_select_mask())
             .on_hover_text(keys::shortcut(
                 ui.ctx(),
                 &select_menu::SHORTCUT_SELECT_AND_MASK,
@@ -464,9 +485,45 @@ impl AtelierApp {
 
     fn bucket_options(&mut self, ui: &mut egui::Ui) {
         ui_kit::swatch(ui, &mut self.primary, 22.0, &t!("options-foreground"));
+        let b = &mut self.paint.bucket;
+        let mode = b.mode.label();
+        ui_kit::combo(
+            ui,
+            "bucket_mode",
+            Some(&t!("paint-mode")),
+            &mode,
+            150.0,
+            |ui| {
+                for (i, group) in BlendMode::GROUPS.iter().enumerate() {
+                    if i > 0 {
+                        ui.separator();
+                    }
+                    for &m in *group {
+                        ui.selectable_value(&mut b.mode, m, m.label());
+                    }
+                }
+            },
+        );
+        let text = i18n::percent(format!("{:.0}", b.opacity * 100.0));
+        ui_kit::scrub(
+            ui,
+            &t!("options-opacity"),
+            &mut b.opacity,
+            0.01..=1.0,
+            &text,
+            150.0,
+        );
         tolerance_field(ui, &mut self.bucket_tolerance);
+        let b = &mut self.paint.bucket;
+        ui_kit::checkbox(ui, &mut b.anti_alias, &t!("sel-anti-alias"));
         ui_kit::checkbox(ui, &mut self.bucket_contiguous, &t!("options-contiguous"))
             .on_hover_text(t!("options-bucket-contiguous-tip"));
+        ui_kit::checkbox(
+            ui,
+            &mut self.paint.bucket.all_layers,
+            &t!("tools3-bucket-all-layers"),
+        )
+        .on_hover_text(t!("tools3-bucket-all-layers-tip"));
         trailing_hint(ui, &t!("options-bucket-hint"));
     }
 
@@ -480,7 +537,8 @@ impl AtelierApp {
             ui.label(egui::RichText::new(label).color(color::LABEL));
             ui_kit::swatch(ui, swatch, 22.0, label);
         }
-        trailing_hint(ui, &t!("options-eyedropper-hint"));
+        let alt_click = keys::click(ui.ctx(), Modifiers::ALT);
+        trailing_hint(ui, &t!("input3-eyedropper-hint", alt_click = alt_click));
     }
 
     fn canvas_options(&mut self, ui: &mut egui::Ui) {
@@ -657,6 +715,12 @@ fn room(ui: &egui::Ui) -> f32 {
 
 /// Separator between groups; at the end of a full row, starts the next one.
 fn sep(ui: &mut egui::Ui) {
+    // Nothing since the last separator: one is enough.
+    let id = ui.id().with("last-separator");
+    let here = (ui.cursor().min, ui.ctx().cumulative_pass_nr());
+    if ui.data(|d| d.get_temp::<(Pos2, u64)>(id)) == Some(here) {
+        return;
+    }
     if room(ui) < 80.0 {
         ui.end_row();
         return;
@@ -664,6 +728,8 @@ fn sep(ui: &mut egui::Ui) {
     ui.add_space(2.0);
     ui_kit::separator(ui);
     ui.add_space(2.0);
+    let after = (ui.cursor().min, ui.ctx().cumulative_pass_nr());
+    ui.data_mut(|d| d.insert_temp(id, after));
 }
 
 /// Hint at the end of the row, after a separator: left out when it doesn't fit.

@@ -18,7 +18,7 @@ use ui_kit::color;
 
 /// Spot Healing Brush: holes of up to this many pixels are filled at once,
 /// larger ones on another thread.
-const SYNC_HOLE: usize = 4_000;
+const SYNC_HOLE: usize = 600;
 /// Holes at least this wide are painted in by the AI model, when it is
 /// there (Spot Healing Brush).
 const AI_HOLE: u32 = 64;
@@ -116,7 +116,7 @@ pub(super) struct RetouchTools {
     pub pupil: f32,
     pub darken: f32,
     /// Source point (Alt + click), shared by the Clone Stamp and the
-    /// Healing Brush.
+    /// Healing Brush, in any open document.
     source: Option<Source>,
     /// The stroke in progress: its box, and the part not healed yet (layer
     /// coordinates); the offset to its source (canvas).
@@ -132,8 +132,9 @@ pub(super) struct RetouchTools {
     /// Content-Aware Fill window open, and its settings for the session.
     pub(super) dialog: Option<FillSettings>,
     pub(super) settings: FillSettings,
-    /// What waits for the AI model to be downloaded.
-    waiting: Option<FillRequest>,
+    /// What waits for the AI model to be downloaded, and what it was asked
+    /// on (see [`AtelierApp::fill_context`]).
+    waiting: Option<(FillRequest, FillContext)>,
     job: Option<FillJob>,
 }
 
@@ -182,12 +183,12 @@ impl RetouchTools {
     }
 }
 
-/// The source point of a document; the layer clicked, for Current Layer.
+/// The source point, in a document (Current Layer samples its active
+/// layer when the stroke starts).
 #[derive(Clone, Copy)]
 struct Source {
     clone: CloneSource,
     doc: u64,
-    layer: u64,
 }
 
 struct PatchDrag {
@@ -251,7 +252,18 @@ impl FillTask {
             Method::Proximity => retouch::proximity_fill(&self.sample, &hole).or_else(patches),
             Method::Ai => {
                 match crate::ai::catch_panic(|| crate::ai::inpaint::inpaint(&self.sample, &hole)) {
-                    Ok(filled) => Some(filled),
+                    Ok(filled) => {
+                        // A large hole the model saw reduced: its answer
+                        // gives the shapes, patches the finer texture.
+                        let size = self.sample.dimensions();
+                        let reduction = crate::ai::inpaint::reduction(size, &hole);
+                        let levels = reduction.log2().floor() as usize;
+                        if levels == 0 {
+                            Some(filled)
+                        } else {
+                            patchmatch::refine(&self.sample, &hole, progress, &filled, levels)
+                        }
+                    }
                     Err(e) => {
                         failure = Some(e);
                         patches()
@@ -295,6 +307,21 @@ impl Tool {
         matches!(self, Tool::CloneStamp | Tool::HealingBrush)
     }
 
+    /// Tools with a brush size ([ and ], Alt + right drag).
+    pub(super) fn sized_brush(self) -> bool {
+        matches!(
+            self,
+            Tool::Brush
+                | Tool::Eraser
+                | Tool::Dodge
+                | Tool::Burn
+                | Tool::Sponge
+                | Tool::Blur
+                | Tool::Sharpen
+                | Tool::Smudge
+        ) || self.retouch_brush()
+    }
+
     /// Retouching tools painted with the brush engine.
     pub(super) fn retouch_brush(self) -> bool {
         matches!(
@@ -314,6 +341,35 @@ fn grow(r: DirtyRect, margin: u32, (w, h): (u32, u32)) -> DirtyRect {
         w: x1.saturating_sub(x0),
         h: y1.saturating_sub(y0),
     }
+}
+
+/// Side of the tiles the Healing Brush heals a stroke by, at the end.
+const HEAL_TILE: u32 = 256;
+
+/// `r` cut in tiles of `side` (overlapping by 2 pixels, so that each tile's
+/// kept edge is healed by its neighbor).
+fn tiles(r: DirtyRect, side: u32) -> Vec<DirtyRect> {
+    let starts = |from: u32, len: u32| {
+        let end = from + len;
+        let mut at = vec![from];
+        while at.last().is_some_and(|&a| a + side < end) {
+            at.push(at.last().expect("not empty") + side - 2);
+        }
+        at.into_iter().map(move |a| (a, side.min(end - a)))
+    };
+    starts(r.y, r.h)
+        .flat_map(|(y, h)| starts(r.x, r.w).map(move |(x, w)| DirtyRect { x, y, w, h }))
+        .collect()
+}
+
+/// Whether `a` and `b` (same size) have the same pixels in `r`.
+fn same_pixels(a: &RgbaImage, b: &RgbaImage, r: DirtyRect) -> bool {
+    a.dimensions() == b.dimensions()
+        && (r.y..r.y + r.h).all(|y| {
+            let from = ((y * a.width() + r.x) * 4) as usize;
+            let to = from + r.w as usize * 4;
+            a.as_raw()[from..to] == b.as_raw()[from..to]
+        })
 }
 
 fn crop(image: &RgbaImage, r: DirtyRect) -> RgbaImage {
@@ -337,22 +393,21 @@ fn composite_below(doc: &Document, region: PixelRect) -> RgbaImage {
     compose::plan(&below, doc.full_rect(), &mut compose::FullSize, &options).render(region)
 }
 
-/// The image a source is sampled in, and its corner on the canvas.
-fn sample_image(doc: &Document, sample: Sample, source_layer: u64) -> (Arc<RgbaImage>, (i64, i64)) {
-    let layer = doc.active_layer();
-    let rect = layer.rect();
+/// The image a source is sampled in, and its corner on the canvas: in
+/// `from`, the document of the source, for a stroke on `doc`.
+fn sample_image(doc: &Document, from: &Document, sample: Sample) -> (Arc<RgbaImage>, (i64, i64)) {
+    let layer = from.active_layer();
+    // Over the stroke's layer, or the whole canvas of another document.
+    let rect = if from.uid() == doc.uid() {
+        layer.rect()
+    } else {
+        from.full_rect()
+    };
     match sample {
-        _ if doc.mask_targeted() => (layer.shared_image(), layer.offset),
-        Sample::Current => {
-            let from = doc
-                .layers
-                .iter()
-                .find(|l| l.id == source_layer && l.has_pixels())
-                .unwrap_or(layer);
-            (from.shared_image(), from.offset)
-        }
-        Sample::CurrentAndBelow => (Arc::new(composite_below(doc, rect)), layer.offset),
-        Sample::All => (Arc::new(doc.composite(rect, None)), layer.offset),
+        _ if doc.mask_targeted() && from.uid() == doc.uid() => (layer.shared_image(), layer.offset),
+        Sample::Current => (layer.shared_image(), layer.offset),
+        Sample::CurrentAndBelow => (Arc::new(composite_below(from, rect)), (rect.x, rect.y)),
+        Sample::All => (from.composite_shared(rect), (rect.x, rect.y)),
     }
 }
 
@@ -363,6 +418,7 @@ impl RetouchTools {
         &mut self,
         tool: Tool,
         doc: &Document,
+        parked: &[tabs::ParkedDoc],
         stroke: Stroke,
         at: Pos2,
     ) -> Stroke {
@@ -374,12 +430,15 @@ impl RetouchTools {
             Tool::HealingBrush => (self.heal_aligned, self.heal_sample),
             _ => return stroke,
         };
-        let Some(source) = self.source.as_mut().filter(|s| s.doc == doc.uid()) else {
+        let Some(source) = self.source.as_mut() else {
+            return stroke;
+        };
+        let Some(from) = source_document(doc, parked, source.doc) else {
             return stroke;
         };
         let offset = source.clone.stroke_offset((at.x, at.y), aligned);
         self.stroke_offset = Some(offset);
-        let (image, origin) = sample_image(doc, sample, source.layer);
+        let (image, origin) = sample_image(doc, from, sample);
         let layer = doc.active_layer().offset;
         stroke.with_clone(
             image,
@@ -392,6 +451,18 @@ impl RetouchTools {
         self.bounds = Some(self.bounds.map_or(r, |b| b.union(r)));
         self.pending = Some(self.pending.map_or(r, |b| b.union(r)));
     }
+}
+
+/// The open document `uid`: the active one or a tab set aside.
+fn source_document<'a>(
+    doc: &'a Document,
+    parked: &'a [tabs::ParkedDoc],
+    uid: u64,
+) -> Option<&'a Document> {
+    if doc.uid() == uid {
+        return Some(doc);
+    }
+    parked.iter().map(|p| &p.doc).find(|d| d.uid() == uid)
 }
 
 /// Healing Brush: area `r` of `image` (layer coordinates) healed from the
@@ -428,10 +499,11 @@ impl AtelierApp {
         }
     }
 
-    /// The source point of the active document, if set.
-    fn clone_source(&self) -> Option<&Source> {
-        let uid = self.doc.as_ref()?.uid();
-        self.retouch.source.as_ref().filter(|s| s.doc == uid)
+    /// The source point, if set in a document still open, and that document.
+    fn clone_source(&self) -> Option<(&Source, &Document)> {
+        let source = self.retouch.source.as_ref()?;
+        let doc = source_document(self.doc.as_ref()?, &self.parked, source.doc)?;
+        Some((source, doc))
     }
 
     /// Alt + click with the Clone Stamp or the Healing Brush: the source.
@@ -440,7 +512,6 @@ impl AtelierApp {
         self.retouch.source = Some(Source {
             clone: CloneSource::new((at.x, at.y)),
             doc: doc.uid(),
-            layer: doc.active_layer().id,
         });
         self.retouch.overlay = None;
         self.status = t!("retouch-status-source-set");
@@ -487,8 +558,23 @@ impl AtelierApp {
             Tool::HealingBrush => {
                 if let (Some(b), Some(doc)) = (bounds, &mut self.doc) {
                     let layer = doc.active_layer_mut();
-                    let window = grow(b, 2, layer.image().dimensions());
-                    heal_stroke(&stroke, layer.pixels_mut(), window);
+                    let size = layer.image().dimensions();
+                    let window = grow(b, 2, size);
+                    // Tile by tile, only where the stroke went: each tile
+                    // meets the pixels healed around it (the box of a long
+                    // diagonal stroke is most of the image).
+                    let cover = stroke.coverage();
+                    for tile in tiles(window, HEAL_TILE) {
+                        let covered = (tile.y..tile.y + tile.h).any(|y| {
+                            let row = (y * size.0) as usize;
+                            cover[row + tile.x as usize..row + (tile.x + tile.w) as usize]
+                                .iter()
+                                .any(|&c| c > 0)
+                        });
+                        if covered {
+                            heal_stroke(&stroke, layer.pixels_mut(), tile);
+                        }
+                    }
                     self.stroke_dirty = Some(self.stroke_dirty.map_or(window, |d| d.union(window)));
                 }
                 Some(stroke)
@@ -535,15 +621,18 @@ impl AtelierApp {
             .map(|(x, y)| (cover[(y * size.0 + x) as usize] as f32 / full).min(1.0))
             .collect();
         let holes = coverage.iter().filter(|&&c| c > 0.0).count();
+        let ai_wanted = spot_type == SpotType::ContentAware
+            && b.w.max(b.h) >= AI_HOLE
+            && self.retouch.settings.ai
+            && Model::Inpaint.ready();
         let method = match spot_type {
             SpotType::ProximityMatch => Method::Proximity,
-            SpotType::ContentAware
-                if b.w.max(b.h) >= AI_HOLE && self.retouch.settings.ai && ai_usable(&sample) =>
-            {
-                Method::Ai
-            }
+            SpotType::ContentAware if ai_wanted && ai_usable(&sample) => Method::Ai,
             SpotType::ContentAware => Method::Patches,
         };
+        if ai_wanted && method != Method::Ai {
+            self.status = t!("fx3-ai-skipped-transparency");
+        }
         let task = FillTask {
             sample,
             base,
@@ -679,7 +768,7 @@ impl AtelierApp {
     /// is wanted but missing.
     pub(super) fn start_content_aware(&mut self, request: FillRequest) {
         if request.settings.ai && !Model::Inpaint.ready() {
-            self.retouch.waiting = Some(request);
+            self.retouch.waiting = Some((request, self.fill_context()));
             if self.request_model(AfterDownload::ContentAwareFill) {
                 self.retouch.waiting = None;
             } else {
@@ -759,6 +848,9 @@ impl AtelierApp {
         } else {
             Method::Patches
         };
+        if request.settings.ai && method != Method::Ai && Model::Inpaint.ready() {
+            self.status = t!("fx3-ai-skipped-transparency");
+        }
         let task = FillTask {
             sample: base.clone(),
             base,
@@ -773,19 +865,41 @@ impl AtelierApp {
         self.spawn_fill(task, name, (region.x, region.y));
     }
 
-    /// The AI model has been downloaded for a fill that waits for it.
+    /// What a fill waiting for the AI model was asked on: the document,
+    /// the layer and the selection.
+    fn fill_context(&self) -> FillContext {
+        let doc = self.doc.as_ref();
+        (
+            doc.map(|d| (d.uid(), d.active_layer().id)),
+            self.selection.clone(),
+        )
+    }
+
+    /// The AI model has been downloaded for a fill that waits for it: the
+    /// fill runs if what it was asked on is still there (else the model is
+    /// just ready, for the command again).
     pub(super) fn content_aware_downloaded(&mut self) {
-        if let Some(request) = self.retouch.waiting.take() {
-            self.start_content_aware(request);
+        if let Some((request, context)) = self.retouch.waiting.take() {
+            if context == self.fill_context() {
+                self.start_content_aware(request);
+            } else {
+                let name = Model::Inpaint.name();
+                self.status = t!("fx3-model-ready-run-again", name = name);
+            }
         }
     }
 
     /// The fill waiting for the AI model goes without it.
     pub(super) fn content_aware_without_ai(&mut self) {
-        if let Some(mut request) = self.retouch.waiting.take() {
+        if let Some((mut request, _)) = self.retouch.waiting.take() {
             request.settings.ai = false;
             self.start_content_aware(request);
         }
+    }
+
+    /// The document goes away: a fill waiting for the AI model is dropped.
+    pub(super) fn forget_waiting_fill(&mut self) {
+        self.retouch.waiting = None;
     }
 
     /// Content-Aware Fill window, then the progress of a fill under way.
@@ -936,7 +1050,7 @@ impl AtelierApp {
             (to.x - from.x).round() as i64,
             (to.y - from.y).round() as i64,
         );
-        if (dx, dy) == (0, 0) || self.refuse_if_locked() {
+        if (dx, dy) == (0, 0) || self.paint_refuses() {
             return;
         }
         let Some(selection) = self.selection.clone() else {
@@ -980,9 +1094,17 @@ impl AtelierApp {
         let base = layer.shared_image();
         let cover = |x: u32, y: u32| clip.coverage(x, y) as f32 / 255.0;
         retouch::heal_area(layer.pixels_mut(), &base, cover, (&base, offset), window);
+        let changed = !same_pixels(layer.image(), &base, window);
         doc.end_paint();
+        if !changed {
+            // An empty layer, or a patch from an identical area.
+            doc.discard_step();
+            return;
+        }
         if mode == PatchMode::Destination {
+            // Moved with the patch, in its step.
             self.selection = area;
+            self.sync_selection();
         }
         self.reset_pending();
     }
@@ -991,7 +1113,7 @@ impl AtelierApp {
 
     /// Red Eye tool: a click on a red pupil darkens it.
     pub(super) fn red_eye_click(&mut self, at: Pos2) {
-        if self.refuse_if_locked() {
+        if self.paint_refuses() {
             return;
         }
         let (pupil, darken) = (self.retouch.pupil, self.retouch.darken);
@@ -1067,7 +1189,7 @@ impl AtelierApp {
             Tool::CloneStamp => self.retouch.clone_aligned,
             _ => self.retouch.heal_aligned,
         };
-        let Some(source) = self.clone_source().map(|s| s.clone) else {
+        let Some(source) = self.clone_source().map(|(s, _)| s.clone) else {
             return;
         };
         if self.stroke.is_some() {
@@ -1132,17 +1254,12 @@ impl AtelierApp {
     /// Texture of the `side` × `side` pixels at `corner` (canvas) of what
     /// the source samples, made again only when they change.
     fn overlay_texture(&mut self, corner: (i64, i64), side: u32) -> Option<egui::TextureId> {
-        let doc = self.doc.as_ref()?;
-        let source = self.clone_source()?;
+        let (_, doc) = self.clone_source()?;
         let sample = match self.tool {
             Tool::CloneStamp => self.retouch.clone_sample,
             _ => self.retouch.heal_sample,
         };
-        let layer = doc
-            .layers
-            .iter()
-            .find(|l| l.id == source.layer && l.has_pixels() && sample == Sample::Current)
-            .unwrap_or(doc.active_layer());
+        let layer = doc.active_layer();
         let key = hash_of((
             doc.uid(),
             doc.history_step(),
@@ -1219,6 +1336,9 @@ impl AtelierApp {
     }
 }
 
+/// Document and layer (uid, id), and selection a fill was asked on.
+type FillContext = (Option<(u64, u64)>, Option<Selection>);
+
 /// Whether the AI model can paint `image` in: downloaded, and the image
 /// opaque (it knows no transparency).
 fn ai_usable(image: &RgbaImage) -> bool {
@@ -1265,4 +1385,37 @@ fn fill_progress(ctx: &egui::Context, job: &FillJob) -> bool {
             });
         });
     cancel
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heal_tiles_cover_the_area_and_overlap() {
+        let r = DirtyRect {
+            x: 10,
+            y: 20,
+            w: 600,
+            h: 300,
+        };
+        let tiles = tiles(r, 256);
+        for y in r.y..r.y + r.h {
+            for x in r.x..r.x + r.w {
+                assert!(
+                    tiles
+                        .iter()
+                        .any(|t| x >= t.x && x < t.x + t.w && y >= t.y && y < t.y + t.h)
+                );
+            }
+        }
+        assert!(
+            tiles
+                .iter()
+                .all(|t| t.w <= 256 && t.h <= 256 && t.w > 2 && t.h > 2)
+        );
+        // Neighbors share two columns.
+        assert_eq!(tiles[1].x, tiles[0].x + 254);
+        assert_eq!(tiles.len(), 3 * 2);
+    }
 }

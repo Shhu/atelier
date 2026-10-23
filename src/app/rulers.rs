@@ -29,14 +29,19 @@ pub(super) const SHORTCUT_SNAP: KeyboardShortcut =
 pub(super) const SHORTCUT_LOCK_GUIDES: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::Semicolon);
 
-/// The View menu's shortcuts. Shift+; is typed ":" on many keyboards.
-pub(super) const SHORTCUTS: [(KeyboardShortcut, Command); 6] = [
+/// The View menu's shortcuts. Shift+; is typed ":" on many keyboards, and
+/// "." on an AZERTY one.
+pub(super) const SHORTCUTS: [(KeyboardShortcut, Command); 7] = [
     (SHORTCUT_RULERS, Command::Rulers),
     (SHORTCUT_GUIDES, Command::Guides),
     (SHORTCUT_GRID, Command::Grid),
     (SHORTCUT_SNAP, Command::Snap),
     (
         KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Colon),
+        Command::Snap,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Period),
         Command::Snap,
     ),
     (SHORTCUT_LOCK_GUIDES, Command::LockGuides),

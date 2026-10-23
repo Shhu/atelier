@@ -134,7 +134,7 @@ pub(super) fn write_all(
         let contents = format!("smart/{}.atelier", s.contents.id);
         if !written.contains(&s.contents.id) {
             let mut data = Cursor::new(Vec::new());
-            write(&Document::from_contents(&s.contents), &mut data)?;
+            write(&Document::from_contents(&s.contents), &mut data, folder)?;
             files.push((contents.clone(), data.into_inner()));
             written.push(s.contents.id);
         }
@@ -186,9 +186,49 @@ pub(super) fn write_all(
     Ok(())
 }
 
-/// `path` relative to `folder`, when inside it.
+/// `path` relative to `folder` ("../assets/logo.png" for a file beside
+/// it), when both are absolute on the same drive or share.
 fn relative(path: &Path, folder: &Path) -> Option<PathBuf> {
-    path.strip_prefix(folder).ok().map(Path::to_path_buf)
+    use std::path::Component;
+    if !path.is_absolute() || !folder.is_absolute() {
+        return None;
+    }
+    let (mut p, mut f) = (path.components().peekable(), folder.components().peekable());
+    while let (Some(a), Some(b)) = (p.peek(), f.peek()) {
+        if a != b {
+            break;
+        }
+        p.next();
+        f.next();
+    }
+    // Not even the same root (a Windows drive or share).
+    if matches!(p.peek(), Some(Component::Prefix(_) | Component::RootDir)) {
+        return None;
+    }
+    let mut out: PathBuf = f.map(|_| Component::ParentDir).collect();
+    out.extend(p);
+    Some(out)
+}
+
+/// A path on another machine: UNC (`\\host\share`, also `//host/share`
+/// on Windows), as written on any system.
+fn remote(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let local = ["\\\\?\\", "\\\\.\\"];
+    if text.starts_with("\\\\") && !local.iter().any(|l| text.starts_with(l)) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        if let Some(Component::Prefix(p)) = path.components().next() {
+            return matches!(
+                p.kind(),
+                Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..)
+            );
+        }
+    }
+    false
 }
 
 /// The entry of `f`; a Liquify mesh goes to `files` as `mesh`.
@@ -246,12 +286,15 @@ pub(super) fn smart_of(
         InterpolationEntry::Lanczos => xform::Filter::Lanczos,
     };
     s.link = e.link.map(|l| {
+        // A network path a received file names is not visited on opening
+        // (Windows would connect to that host): missing until updated.
+        let exists = |p: &Path| !remote(p) && p.exists();
         let path = match (&l.relative, folder) {
-            (Some(r), Some(f)) if !l.path.exists() && f.join(r).exists() => f.join(r),
+            (Some(r), Some(f)) if !exists(&l.path) && exists(&f.join(r)) => f.join(r),
             _ => l.path,
         };
         Link {
-            missing: !path.exists(),
+            missing: !exists(&path),
             modified: l
                 .modified
                 .and_then(|(s, n)| UNIX_EPOCH.checked_add(Duration::new(s, n.min(999_999_999)))),
@@ -297,6 +340,18 @@ mod tests {
     use super::*;
     use crate::document::{PixelRect, Selection};
     use crate::filters::Filter;
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_paths_relative_to_the_folder() {
+        let r = |p: &str, f: &str| relative(Path::new(p), Path::new(f));
+        let some = |p: &str| Some(PathBuf::from(p));
+        assert_eq!(r("/w/project/logo.png", "/w/project"), some("logo.png"));
+        assert_eq!(r("/w/project/a/logo.png", "/w/project"), some("a/logo.png"));
+        let sibling = r("/w/assets/logo.png", "/w/project/doc");
+        assert_eq!(sibling, some("../../assets/logo.png"));
+        assert_eq!(r("logo.png", "/w/project"), None);
+    }
     use image::{Rgba, RgbaImage};
 
     #[test]
@@ -383,5 +438,38 @@ mod tests {
         let inner = again.smart_contents(1).unwrap();
         assert_eq!(inner.layers.len(), 1);
         assert_eq!(inner.layers[0].name, "pattern");
+    }
+
+    #[test]
+    fn the_first_save_records_links_relative_to_its_folder() {
+        let base = std::env::temp_dir().join("atelier-link-first-save");
+        let _ = std::fs::remove_dir_all(&base);
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let linked = project.join("photo.png");
+        RgbaImage::from_pixel(8, 8, Rgba([0, 255, 0, 255]))
+            .save(&linked)
+            .unwrap();
+        let mut doc = Document::new(RgbaImage::from_pixel(20, 20, Rgba([255; 4])), None);
+        doc.place_file(&linked, true).unwrap();
+        doc.save(&project.join("doc.atelier")).unwrap();
+        // The whole folder moves: the link is found there.
+        let moved = base.join("moved");
+        std::fs::rename(&project, &moved).unwrap();
+        let back = Document::open(&moved.join("doc.atelier")).unwrap().doc;
+        let link = back
+            .layers
+            .iter()
+            .find_map(|l| l.smart.as_ref().and_then(|s| s.link.as_ref()))
+            .unwrap();
+        assert!(!link.missing);
+        assert_eq!(link.path, moved.join("photo.png"));
+    }
+
+    #[test]
+    fn network_paths_are_not_visited_on_opening() {
+        assert!(remote(Path::new(r"\\host\share\x.png")));
+        assert!(!remote(Path::new(r"\\?\C:\img\x.png")));
+        assert!(!remote(Path::new("/home/me/x.png")));
     }
 }

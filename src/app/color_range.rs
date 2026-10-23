@@ -89,6 +89,10 @@ pub(super) struct ColorRange {
     /// The thumbnail shows the image rather than the selection.
     thumb_image: bool,
     reduced: Reduced,
+    /// The selection it works within (OK keeps only what is in it), and
+    /// its coverage of the reduced image, made once.
+    within: Option<Selection>,
+    within_reduced: Option<GrayImage>,
     /// Coverage of the reduced image for the settings (identified by the
     /// key), and the thumbnail drawn from it.
     shown: Option<(u64, Arc<GrayImage>)>,
@@ -121,6 +125,19 @@ impl ColorRange {
             let mut mask = mask_ops::color_range(image, &self.samples, self.fuzziness);
             if self.invert {
                 mask.iter_mut().for_each(|v| *v = 255 - *v);
+            }
+            // What OK gives: only within the selection.
+            if let Some(sel) = &self.within {
+                let within = self.within_reduced.get_or_insert_with(|| {
+                    let scale = *scale;
+                    GrayImage::from_fn(mask.width(), mask.height(), |x, y| {
+                        let (cx, cy) = ((x as f32 + 0.5) / scale, (y as f32 + 0.5) / scale);
+                        image::Luma([sel.coverage(cx as i64, cy as i64)])
+                    })
+                });
+                for (v, w) in mask.iter_mut().zip(within.iter()) {
+                    *v = ((*v as u32 * *w as u32 + 127) / 255) as u8;
+                }
             }
             self.shown = Some((key, Arc::new(mask)));
         }
@@ -168,6 +185,8 @@ impl AtelierApp {
             preview: Preview::None,
             thumb_image: false,
             reduced,
+            within: self.selection.clone(),
+            within_reduced: None,
             shown: None,
             thumb: None,
         });
@@ -338,11 +357,13 @@ impl AtelierApp {
     }
 
     fn apply_color_range(&mut self, cr: &ColorRange) {
+        self.wait_select_job();
         let Some(doc) = &self.doc else { return };
         let (canvas, flatten) = (doc.full_rect(), doc.flatten_later());
         let (samples, fuzziness, invert) = (cr.samples.clone(), cr.fuzziness, cr.invert);
         let within = self.selection.clone();
         let pixels = canvas.w as u64 * canvas.h as u64;
+        self.sel.step_name = Some(super::select_menu::step_label(t!("sel-menu-color-range")));
         self.select_later(Then::Modified, pixels, move || {
             let mut mask = mask_ops::color_range(&flatten(), &samples, fuzziness);
             if invert {

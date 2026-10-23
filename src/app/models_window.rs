@@ -52,6 +52,32 @@ pub(super) struct ModelsWindow {
     confirm_delete: Option<Model>,
 }
 
+/// The downloads under way, at the right of the status bar (laid out right
+/// to left): each model's progress, and a button that cancels it.
+pub(super) fn download_chips(ui: &mut egui::Ui, downloads: &mut super::downloads::Downloads) {
+    let mut cancel = None;
+    for model in Model::ALL {
+        let Some(fraction) = downloads.progress(model) else {
+            continue;
+        };
+        let tip = t!("fx3-download-cancel-tip", name = model.name());
+        if ui_kit::icon_button(ui, icon::X, &tip, true).clicked() {
+            cancel = Some(model);
+        }
+        let percent = format!("{:.0}", fraction * 100.0);
+        let text = t!(
+            "models-status-downloading",
+            name = model.name(),
+            percent = percent
+        );
+        let font = egui::FontId::proportional(12.0);
+        ui.label(egui::RichText::new(text).font(font).color(color::MUTED));
+    }
+    if let Some(model) = cancel {
+        downloads.cancel(model);
+    }
+}
+
 /// What a model's card asked for.
 enum CardAction {
     Download,
@@ -93,11 +119,13 @@ impl AtelierApp {
         self.model_prompt = None;
         self.subject_job = None;
         self.after_download.clear();
+        self.forget_waiting_fill();
         self.object_select.leave_document();
     }
 
     /// Ended downloads (once per frame): messages, and what was waiting for
-    /// them. While a download runs, the status bar shows its progress.
+    /// them. While a download runs, the status bar shows its progress (see
+    /// [`download_chips`]).
     pub(super) fn poll_downloads(&mut self, ctx: &egui::Context) {
         for (model, result) in self.downloads.finished() {
             let waiting: Vec<AfterDownload> = self
@@ -125,20 +153,8 @@ impl AtelierApp {
                 }
             }
         }
-        if !self.downloads.any() {
-            return;
-        }
-        let downloading = Model::ALL
-            .into_iter()
-            .find_map(|m| self.downloads.progress(m).map(|f| (m, f)));
-        if let Some((model, fraction)) = downloading {
-            let percent = format!("{:.0}", fraction * 100.0);
-            self.status = t!(
-                "models-status-downloading",
-                name = model.name(),
-                percent = percent
-            );
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        if self.downloads.any() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
 

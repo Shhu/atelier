@@ -15,6 +15,10 @@ use crate::document::{Fill, Layer, LayerKind, intersect};
 pub struct Options<'a> {
     /// Brush stroke in progress: the styles stay as they were.
     pub held: bool,
+    /// The display: styles not yet drawn for a layer's current pixels and
+    /// settings are drawn on a worker thread, the former ones shown
+    /// meanwhile (see `Layer::styles_later`).
+    pub later_styles: bool,
     /// Layer left out (a group: with its layers), drawn on its own while it
     /// is transformed.
     pub hidden: Option<usize>,
@@ -423,7 +427,7 @@ impl Builder<'_, '_> {
                     blend: c.blend,
                 });
             }
-            if let Some(styles) = l.styles(self.opts.held) {
+            if let Some(styles) = l.styles_shown(self.opts.held, self.opts.later_styles) {
                 let mut slot = 2;
                 let mut src = |s: &mut Self, f: &crate::compose::styles::FxImage| {
                     let key = SourceKey { layer: l.id, slot };
@@ -534,7 +538,12 @@ pub fn signatures(layers: &[Layer], opts: &Options) -> Vec<Sig> {
             Some((id, mode)) if id == l.id => mode,
             _ => l.blend,
         };
-        let held = opts.held && l.effects.rendered();
+        // The styles shown (a hidden layer: as last drawn).
+        let styles = if shown[i] {
+            l.styles_shown(opts.held, opts.later_styles)
+        } else {
+            l.styles_cached()
+        };
         let state = hash_of((
             shown[i],
             [l.opacity.to_bits(), l.fill.to_bits()],
@@ -544,7 +553,11 @@ pub fn signatures(layers: &[Layer], opts: &Options) -> Vec<Sig> {
             mask,
             debug_hash(&l.kind),
             debug_hash(&l.effects),
-            (held, pixels, opts.only.is_some()),
+            (
+                styles.as_ref().map(|s| s.version),
+                pixels,
+                opts.only.is_some(),
+            ),
             l.artboard,
         ));
         let extent = if let Some(p) = placed {
@@ -584,7 +597,7 @@ pub fn signatures(layers: &[Layer], opts: &Options) -> Vec<Sig> {
                 (a, None) => a,
             }
         } else {
-            l.extent(opts.held)
+            l.extent_with(styles.as_deref())
         };
         sigs.push(Sig {
             id: l.id,

@@ -169,10 +169,12 @@ enum Gesture {
     /// Rubber band: selects the anchors (Direct Selection) or the
     /// components (Path Selection) it touches.
     Marquee { from: Pt, to: Pt },
-    /// A shape tool's box, from `from`; `made`: where its outline went.
+    /// A shape tool's box, from `from`; `made`: where its outline went;
+    /// `last`: the pointer before (Space held moves the box).
     ShapeBox {
         from: Pt,
         made: Option<(PathRef, usize)>,
+        last: Pt,
     },
     /// Freeform Pen: the trace.
     Freehand { points: Vec<Pt> },
@@ -541,6 +543,7 @@ impl AtelierApp {
                 self.vector.gesture = Some(Gesture::ShapeBox {
                     from: p,
                     made: None,
+                    last: p,
                 });
             }
             _ => {}
@@ -703,11 +706,32 @@ impl AtelierApp {
                 path.remove_anchor(s, a);
             }
         }
-        let Some(doc) = &mut self.doc else { return };
-        doc.checkpoint(t!("vector-hist-delete-anchor"));
-        doc.set_path(r, path);
+        if !self.drop_empty_shape(r, &path) {
+            let Some(doc) = &mut self.doc else { return };
+            doc.checkpoint(t!("vector-hist-delete-anchor"));
+            doc.set_path(r, path);
+        }
         self.vector.clear_selection();
         self.vector.drawing = None;
+    }
+
+    /// A shape layer left without any path is deleted (as the step):
+    /// whether it was.
+    fn drop_empty_shape(&mut self, r: PathRef, path: &VPath) -> bool {
+        let PathRef::Layer(id) = r else { return false };
+        let Some(doc) = self.doc.as_mut().filter(|_| path.is_empty()) else {
+            return false;
+        };
+        let Some(i) = doc.layer_index(id) else {
+            return false;
+        };
+        let active = doc.active;
+        doc.active = i;
+        if doc.delete_active() {
+            return true;
+        }
+        doc.active = active;
+        false
     }
 
     /// Convert Point: on a handle, drags it on its own; on an anchor, takes
@@ -1115,10 +1139,15 @@ impl AtelierApp {
                 }
             }
             Gesture::Marquee { to, .. } => *to = p,
-            Gesture::ShapeBox { from, made } => {
+            Gesture::ShapeBox { from, made, last } => {
                 let Tool::Shape(tool) = self.tool else {
                     return;
                 };
+                // Space held: the box moves with the pointer, like Photoshop.
+                if self.ctx.input(|i| i.key_down(Key::Space)) {
+                    *from = *from + (p - *last);
+                }
+                *last = p;
                 let line = tool == ShapeTool::Line;
                 let rect = shape_box(*from, p, m.shift, m.alt, line);
                 if made.is_none() && from.dist(p) > small {
@@ -1462,6 +1491,12 @@ impl AtelierApp {
             which.sort_unstable();
             for &k in which.iter().rev() {
                 path.subpaths.remove(k);
+            }
+            if self.drop_empty_shape(r, &path) {
+                self.vector.clear_selection();
+                consume(ctx, Key::Delete);
+                consume(ctx, Key::Backspace);
+                return true;
             }
             let doc = self.doc.as_mut().expect("document");
             doc.checkpoint(t!("vector-hist-delete-path"));

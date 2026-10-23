@@ -26,13 +26,13 @@ options-remove-background = Remove Background
 
 ## Paint Bucket tool options
 
-options-bucket-hint = Fills with the foreground color.
+options-bucket-hint = Fills with the foreground color
 options-bucket-contiguous-tip = Unchecked: also fills areas of the same color that don't touch the click.
 
 ## Type tool options
 
-options-text-locked = Text locked
-options-text-locked-hint = Unlock it in the Layers panel to edit it, or click elsewhere to create a text.
+options-text-locked = Type layer locked
+options-text-locked-hint = Unlock it in the Layers panel to edit it, or click elsewhere to create a type layer
 options-font-default = Sans-serif (default)
 options-font = Font
 options-font-search = Search…
@@ -42,7 +42,7 @@ options-align-right = Right align text
 options-color = Color
 options-foreground = Foreground
 options-use-foreground-tip = Use the foreground color
-options-text-color-hint = New texts take the foreground color.
+options-text-color-hint = New type layers take the foreground color
 
 ## Menu bar
 
@@ -104,10 +104,6 @@ menu-view-zoom-in = Zoom In
 menu-view-zoom-out = Zoom Out
 menu-view-fit-on-screen = Fit on Screen
 
-## Tools panel
-
-options-eyedropper-hint = Click: foreground · Alt+click: background
-
 ## Colors
 
 panel-foreground = Foreground
@@ -119,11 +115,11 @@ panel-default-colors = Black / White
 
 ## Brush tool options
 
-options-brush-hint = Paints with the foreground color.
+options-brush-hint = Paints with the foreground color
 options-hardness = Hardness
 options-opacity = Opacity
 
-## Canvas tool options
+## Crop tool options
 
 options-canvas-origin = Origin { $x }, { $y }
 options-fit-visible-pixels = Fit to Visible Pixels
@@ -132,7 +128,7 @@ options-fit-visible-pixels-tip = Frames exactly the content of all visible layer
 ## Move tool options
 
 options-layer-locked = Layer locked
-options-layer-locked-hint = Click another element, or unlock this one in the Layers panel.
+options-layer-locked-hint = Click another element, or unlock this one in the Layers panel
 options-center-on-canvas = Center on Canvas
 options-rotation = Rotation
 options-constrain-proportions = Constrain Proportions
@@ -147,7 +143,6 @@ panel-layers = Layers
 panel-delete-layer-tip = Delete layer
 panel-new-layer-tip = New layer
 panel-no-image = No image.
-panel-visibility-tip = Show / hide (Alt+click: this one only)
 panel-unlock-tip = Unlock
 
 ## Layer properties
@@ -183,11 +178,11 @@ menu-edit-language = Language
 
 ## Tools
 
-tool-transform = Move / Resize
+tool-transform = Move
 tool-brush = Brush
 tool-eraser = Eraser
-tool-text = Text
-tool-canvas = Canvas
+tool-text = Horizontal Type
+tool-canvas = Crop
 tool-bucket = Paint Bucket
 tool-eyedropper = Eyedropper
 tool-select = Rectangular Marquee
@@ -214,14 +209,12 @@ app-fill-white = White
 
 ## Status messages, file dialogs and default contents
 
-status-welcome = Open an image ({ $key }) or drop it into the window.
 status-opened = Opened: { $path }
 status-open-failed = Could not open { $path }: { $error }
 status-import-failed = Could not import { $path }: { $error }
 app-file-filter-all = All Files
 app-dialog-save-as = Save As
 status-saved = Saved: { $path }
-status-layer-moved = "{ $name }" at ({ $x }, { $y })
 status-nothing-to-copy = Nothing to copy: the layer is empty.
 status-copied = "{ $name }" copied
 status-copy-failed = Could not copy: { $error }
@@ -239,15 +232,12 @@ status-selection-empty = The selection is empty on this layer.
 status-layer-locked = "{ $name }" locked
 status-layer-unlocked = "{ $name }" unlocked
 app-dialog-open-image = Open Image
-status-fill-foreground-color = the foreground color
-status-fill-background-color = the background color
 status-element-fills-canvas = "{ $name }" already fills the whole canvas.
 status-content-fills-canvas = The content already fills the whole canvas.
 status-nothing-to-crop = Nothing visible to crop.
 status-layers-merged = Layers merged into "{ $name }"
 status-merge-down-failed = Cannot merge: there must be a visible, unlocked layer below.
 status-merge-visible-failed = At least two visible layers are needed to merge.
-status-canvas-size = Canvas: { $width } × { $height } px
 status-rotated = , rotated { $angle }°
 status-canvas-fit-element = Canvas fitted to the element: { $width } × { $height } px{ $rotated }
 status-element-placed = Element: { $width } × { $height } px at ({ $x }, { $y }){ $rotated }
@@ -302,7 +292,6 @@ dialog-adjust-contrast = Contrast
 dialog-adjust-channel = Channel
 dialog-adjust-auto = Auto
 dialog-adjust-auto-tip = Stretches each channel, ignoring 0.1% of the pixels at each end
-dialog-curves-hint = Click to add a point; drag it off the graph (or Ctrl+click, Delete) to remove it. Arrows: move the point, Ctrl+Tab: next point.
 dialog-adjust-vibrance = Vibrance
 dialog-adjust-saturation = Saturation
 dialog-vibrance-hint = Vibrance mostly boosts dull colors and spares those that are already vivid (skin tones included).
@@ -449,7 +438,7 @@ palette-suggested = Suggested
 palette-tools = Tools
 palette-commands = Commands
 palette-tool = Tool
-palette-no-match = No command matches “{ $query }”.
+palette-no-match = No command matches "{ $query }".
 palette-navigate = Navigate
 palette-run = Run
 palette-close = Close
@@ -472,7 +461,7 @@ optbar-select-new = New selection
 
 ## Options bar: Eraser tool
 
-optbar-eraser-hint = Erases to transparency on the active layer.
+optbar-eraser-hint = Erases to transparency on the active layer
 
 ## Options bar: Eyedropper tool
 
@@ -485,7 +474,7 @@ optbar-use-foreground = Use Foreground
 ## Side panel: Properties
 
 side-kind-image = Image
-side-kind-text = Text
+side-kind-text = Type
 side-kind-locked = { $kind } · locked
 side-locked-notice = Layer locked — unlock it in the Layers panel.
 side-transform = Transform
@@ -496,7 +485,7 @@ side-align-layers = Align { $count } layers
 side-layer = Layer
 side-character = Character
 side-text-color-tip = Text color
-side-fill-layer = Fill layer
+side-fill-layer = Fill
 
 ## Side panel: Layers
 
@@ -599,7 +588,7 @@ models-delete = Delete
 models-in-use = In use
 models-total = Disk space used: { $size }
 models-open-folder = Open Folder
-models-open-folder-failed = Couldn't open the models folder ({ $error }).
+models-open-folder-failed = Could not open the models folder ({ $error }).
 models-size-mb = { $size } MB
 models-size-gb = { $size } GB
 
@@ -616,9 +605,9 @@ models-prompt-text = "{ $feature }" uses an AI model, { $name }, that runs on th
 models-prompt-hint = No image is sent online. You can delete the model at any time in Edit › AI Models.
 models-status-downloading = Downloading { $name }… { $percent }%
 models-status-downloaded = { $name } downloaded.
-models-status-failed = Couldn't download { $name } ({ $error }).
+models-status-failed = Could not download { $name } ({ $error }).
 models-status-deleted = { $name } deleted.
-models-status-delete-failed = Couldn't delete { $name } ({ $error }).
+models-status-delete-failed = Could not delete { $name } ({ $error }).
 
 ## Object Selection tool
 
@@ -654,10 +643,10 @@ file-filter-atelier = Atelier Document
 
 file-status-opened-first-frame = Opened: { $path } (first frame only: animations are not supported)
 file-status-imported-first-frame = Layer added: { $path } (first frame only: animations are not supported)
-file-status-open-in-another-tab = “{ $name }” is open in another tab: close it first, or choose another name.
-file-status-save-failed = Could not save “{ $name }”: { $error }. Nothing was overwritten.
+file-status-open-in-another-tab = "{ $name }" is open in another tab: close it first, or choose another name.
+file-status-save-failed = Could not save "{ $name }": { $error }. Nothing was overwritten.
 file-status-exported = Exported: { $path }
-file-status-export-failed = Could not export “{ $name }”: { $error }. Nothing was overwritten.
+file-status-export-failed = Could not export "{ $name }": { $error }. Nothing was overwritten.
 file-status-paste-failed = Could not paste the image: { $error }
 
 ## File errors (after "Could not open …:")
@@ -795,12 +784,10 @@ core-style-open-tip = Settings in the Layer Style window
 
 ## Layers panel
 
-core-layer-row-tip = Drag to reorder, or into a group · double-click: rename · Alt+click: clip to the layer below · Ctrl+click on a thumbnail: its pixels or mask as the selection · on the mask: Shift+click turns it off or on, Alt+click shows it alone
 core-group-fold-tip = Open / close the group
 core-link-layers-tip = Link layers
 core-unlink-layers-tip = Unlink layers
 core-styles-tip = Add a layer style
-core-add-mask-tip = Add layer mask (Alt: hide all)
 core-new-adjustment-tip = New fill or adjustment layer
 core-new-group-tip = New group
 
@@ -1029,7 +1016,7 @@ sel-mask-replaces-mask = The layer's mask is replaced.
 
 ## Transform Selection
 
-sel-transform-hint = Drag the handles to scale, outside the frame to rotate.
+sel-transform-hint = Drag the handles to scale, outside the frame to rotate
 
 ## Status messages
 
@@ -1084,12 +1071,12 @@ paint-strength = Strength
 paint-sample-all-tip = Works on what all the visible layers show, and paints the result on the active layer
 paint-finger-painting = Finger Painting
 paint-finger-painting-tip = Starts each stroke with the foreground color
-paint-dodge-hint = Lightens the areas you paint.
-paint-burn-hint = Darkens the areas you paint.
-paint-sponge-hint = Changes the color saturation of the areas you paint.
-paint-blur-hint = Softens hard edges in the areas you paint.
-paint-sharpen-hint = Increases the contrast of edges in the areas you paint.
-paint-smudge-hint = Drags the color along the stroke, like a finger in wet paint.
+paint-dodge-hint = Lightens the areas you paint
+paint-burn-hint = Darkens the areas you paint
+paint-sponge-hint = Changes the color saturation of the areas you paint
+paint-blur-hint = Softens hard edges in the areas you paint
+paint-sharpen-hint = Increases the contrast of edges in the areas you paint
+paint-smudge-hint = Drags the color along the stroke, like a finger in wet paint
 
 ## Gradient tool options
 
@@ -1105,7 +1092,7 @@ paint-gradient-dither = Dither
 paint-gradient-dither-tip = Adds a little noise to avoid banding
 paint-gradient-transparency = Transparency
 paint-gradient-transparency-tip = Uses the gradient's opacity stops
-paint-gradient-hint = Drag across the image to draw the gradient.
+paint-gradient-hint = Drag across the image to draw the gradient
 paint-gradient-fg-to-bg = Foreground to Background
 paint-gradient-fg-to-transparent = Foreground to Transparent
 paint-gradient-black-white = Black, White
@@ -1233,8 +1220,6 @@ retouch-patch-destination = Destination
 retouch-patch-destination-tip = Drag the selection to the area to patch with it
 retouch-pupil-size = Pupil Size
 retouch-darken-amount = Darken Amount
-retouch-clone-hint = Alt-click to set the source, then paint to copy it
-retouch-healing-hint = Alt-click to set the source, then paint: its texture blends into the colors around
 retouch-spot-hint = Paint over a blemish to remove it
 retouch-patch-hint = Select an area, then drag it
 retouch-red-eye-hint = Click a red pupil
@@ -1247,13 +1232,13 @@ retouch-key-drag-inside = Drag inside
 retouch-hint-patch = patch
 retouch-hint-red-eye = remove a red eye
 retouch-status-source-set = Source set
-retouch-status-no-source = { $keys } to set the source first
-retouch-status-nothing-to-sample = Nothing around to sample from
-retouch-status-no-red-eye = No red eye found there
-retouch-status-select-first = Select the area to fill first
+retouch-status-no-source = { $keys } to set the source first.
+retouch-status-nothing-to-sample = Nothing around to sample from.
+retouch-status-no-red-eye = No red eye found there.
+retouch-status-select-first = Select the area to fill first.
 retouch-needs-selection = Needs a selection
 retouch-status-cancelled = { $name } cancelled
-retouch-status-ai-failed = The AI model failed ({ $error }): filled without it
+retouch-status-ai-failed = The AI model failed ({ $error }): filled without it.
 
 ## Content-Aware Fill
 
@@ -1376,7 +1361,7 @@ vector-op-exclude = Exclude Overlapping Shapes
 vector-corner-radius = Corner radius
 vector-sides = Sides
 vector-star-ratio = Star Ratio
-vector-star-ratio-tip = Inner radius of the star, in percent of the outer one (100 %: a polygon)
+vector-star-ratio-tip = Inner radius of the star, in percent of the outer one (100%: a polygon)
 vector-weight = Weight
 vector-weight-tip = Width of the line
 vector-arrow-start = Start arrowhead
@@ -1457,10 +1442,6 @@ vector-work-path = Work Path
 vector-path-name = Path { $number }
 vector-shape-path-name = { $name } Shape Path
 vector-path-name-label = Name
-vector-fill-path-tip = Fill path with foreground color (Alt: options)
-vector-stroke-path-tip = Stroke path with brush (Alt: options)
-vector-make-selection-tip = Load path as a selection (Alt: options)
-vector-make-work-path-tip = Make work path from selection (Alt: tolerance)
 vector-new-path-tip = Create new path
 vector-delete-path-tip = Delete current path
 vector-make-selection-title = Make Selection
@@ -1486,13 +1467,13 @@ vector-status-no-selection = Make a selection first.
 type-status-typing = Type your text
 type-status-committed = Text committed
 type-status-cancelled = Text edit cancelled
-type-click-hint = Click to type a point text, drag to draw a paragraph text box.
+type-click-hint = Click to type a point text, drag to draw a paragraph text box
 
 ## Type tool: status bar hints
 
 type-hint-point = point text
 type-hint-paragraph = paragraph text
-type-hint-new = new text over a text
+type-hint-new = new type layer over another
 type-hint-move = move the text
 type-hint-commit = commit
 type-hint-extend = extend the selection
@@ -1504,7 +1485,7 @@ type-size-tip = Set the font size
 type-leading = Leading
 type-leading-tip = Set the leading
 type-leading-auto = Auto leading
-type-leading-auto-tip = Leading at 120 % of the font size
+type-leading-auto-tip = Leading at 120% of the font size
 type-kerning = Kerning
 type-kerning-metrics = Metrics
 type-kerning-tip = Set the kerning between two characters
@@ -1603,7 +1584,6 @@ xchg-channel-green = Green
 xchg-channel-blue = Blue
 xchg-channel-alpha-name = Alpha { $number }
 xchg-channel-name = Name
-xchg-channel-row-tip = Click: show alone · Ctrl+click: load as selection · Double-click: rename
 xchg-channel-duplicate = Duplicate Channel
 xchg-channel-delete = Delete Channel
 xchg-channel-load-tip = Load channel as selection
@@ -1759,7 +1739,6 @@ smart-menu-disable-filter-mask = Disable Filter Mask
 smart-menu-enable-filter-mask = Enable Filter Mask
 smart-blending-title = Blending Options ({ $name })
 smart-blending-tip = Blending Options
-smart-filter-mask-tip = Filter mask: click to edit it, Shift + click to turn it off or on
 smart-filter-row-tip = Double-click to edit the filter, drag to move it
 
 ## History steps
@@ -1778,13 +1757,13 @@ smart-hist-add-filter-mask = Add Filter Mask
 ## Status bar
 
 smart-status-converted = "{ $name }" converted to a smart object
-smart-status-locked = A locked layer can't be converted
-smart-status-no-adjustments = Adjustments don't apply to a smart object: use an adjustment layer clipped to it
-smart-status-not-editable = The smart object isn't directly editable: rasterize it first
+smart-status-locked = A locked layer cannot be converted.
+smart-status-no-adjustments = Adjustments don't apply to a smart object: use an adjustment layer clipped to it.
+smart-status-not-editable = The smart object isn't directly editable: rasterize it first.
 smart-status-placed = Placed: { $path }
 smart-status-replaced = Contents replaced: { $path }
 smart-status-updated = Smart object updated: { $name }
-smart-status-parent-gone = The smart object's document is closed: save these contents as a file
+smart-status-parent-gone = The smart object's document is closed: save these contents as a file.
 smart-status-link-missing = Linked file missing, its last copy shown: { $names }
 smart-status-links-updated = Linked files updated: { $names }
 
@@ -1922,9 +1901,9 @@ actions-continue = Continue
 actions-stop = Stop
 actions-append = Append
 actions-reset-question = Replace current actions with the default actions?
-actions-delete-set-question = Delete the set “{ $name }”?
-actions-delete-action-question = Delete the action “{ $name }”?
-actions-delete-step-question = Delete the step “{ $name }”?
+actions-delete-set-question = Delete the set "{ $name }"?
+actions-delete-action-question = Delete the action "{ $name }"?
+actions-delete-step-question = Delete the step "{ $name }"?
 actions-set-default-name = Set { $n }
 actions-action-default-name = Action { $n }
 actions-copy-name = { $name } copy
@@ -1955,13 +1934,13 @@ actions-document-folder = The document’s folder
 
 ## Playing actions
 
-actions-status-played = Action “{ $name }” played.
-actions-status-stopped = Action “{ $name }” stopped.
+actions-status-played = Action "{ $name }" played.
+actions-status-stopped = Action "{ $name }" stopped.
 actions-status-loaded = Actions loaded from { $path }.
 actions-status-load-failed = Could not load the actions: { $error }
 actions-status-saved = Actions saved to { $path }.
 actions-status-save-failed = Could not save the actions: { $error }
-actions-error-step = “{ $step }” (action “{ $action }”) could not be played: { $error }
+actions-error-step = "{ $step }" (action "{ $action }") could not be played: { $error }
 actions-error-no-document = no document is open.
 actions-error-no-selection = there is no selection.
 actions-error-unknown = this version of Atelier doesn’t know this command.
@@ -2172,7 +2151,6 @@ raw-sharpen-amount = Amount
 raw-sharpen-radius = Radius
 raw-sharpen-detail = Detail
 raw-sharpen-masking = Masking
-raw-sharpen-hint = Hold Alt while dragging a sharpening slider to see what it does. Sharpening and noise reduction show from 100%.
 raw-noise-reduction = Noise Reduction
 raw-nr-luminance = Luminance
 raw-nr-luminance-detail = Luminance Detail
@@ -2206,7 +2184,7 @@ raw-preset-warm-film = Warm Film
 raw-preset-save = Save Preset
 raw-preset-name = Name
 raw-preset-delete = Delete Preset
-raw-preset-save-failed = Couldn't save the presets: { $error }
+raw-preset-save-failed = Could not save the presets: { $error }
 
 ## Artboards: the tool, the layers, the history
 
@@ -2287,7 +2265,7 @@ artboard-export-as-list = Artboards (one file each)
 artboard-status-new-document = New document: { $width } × { $height } px
 artboard-status-not-group = Select a group outside any artboard first.
 artboard-status-none = The document has no artboards.
-artboard-status-refused = Can't make that artboard (locked layers, or an artboard among them).
+artboard-status-refused = Cannot make that artboard (locked layers, or an artboard among them).
 artboard-status-exporting = Exporting { $count ->
     [one] { $count } artboard…
    *[other] { $count } artboards…
@@ -2306,3 +2284,184 @@ actions-use-proof-tip = JPEG and TIFF files converted to the document’s proof 
 ## Color management: profile names
 
 color-adobe-rgb-compatible = Compatible with Adobe RGB (1998)
+
+## History panel: selection steps (named like the commands)
+hist3-deselect = Deselect
+hist3-select-all = Select All
+hist3-reselect = Reselect
+hist3-inverse = Select Inverse
+hist3-move-selection = Move Selection
+hist3-select-subject = Select Subject
+hist3-make-selection = Make Selection
+hist3-selection = Selection Change
+hist3-quick-mask = Quick Mask
+
+## History panel: first row once older steps were forgotten
+hist3-oldest-state = Oldest State Kept
+
+## Selection computed in the background
+hist3-selection-changed = The selection changed while the previous one was being computed: that result was dropped.
+
+## Move tool options
+input3-auto-select = Auto-Select
+input3-auto-select-tip = A click selects the layer under the pointer. Hold { $key } to do the opposite for a moment.
+
+## Hints and tips with modifier keys (written by the app for each system)
+input3-eyedropper-hint = Click: foreground · { $alt_click }: background
+input3-visibility-tip = Show / hide ({ $alt_click }: this one only)
+input3-curves-hint = Click to add a point; drag it off the graph (or { $ctrl_click }, { $delete }) to remove it. Arrows: move the point, { $next }: next point.
+input3-layer-row-tip = Drag to reorder, or into a group · double-click on the name: rename, beside it: layer style · { $alt_click }: clip to the layer below · { $ctrl_click } on a thumbnail: its pixels or mask as the selection · on the mask: { $shift_click } turns it off or on, { $alt_click } shows it alone
+input3-clone-hint = { $alt_click } to set the source, then paint to copy it
+input3-healing-hint = { $alt_click } to set the source, then paint: its texture blends into the colors around
+input3-channel-row-tip = Click: show alone · { $ctrl_click }: load as selection · Double-click: rename
+input3-filter-mask-tip = Filter mask: click to edit it, { $shift_click } to turn it off or on
+input3-add-mask-tip = Add layer mask ({ $alt }: hide all)
+input3-fill-path-tip = Fill path with foreground color ({ $alt }: options)
+input3-stroke-path-tip = Stroke path with brush ({ $alt }: options)
+input3-make-selection-tip = Load path as a selection ({ $alt }: options)
+input3-make-work-path-tip = Make work path from selection ({ $alt }: tolerance)
+input3-raw-sharpen-hint = Hold { $alt } while dragging a sharpening slider to see what it does. Sharpening and noise reduction show from 100%.
+
+## Status bar hints of the Move tool
+input3-hint-axis = horizontally or vertically
+input3-hint-copy = move a copy
+input3-hint-pick-layer = the layer under the pointer
+input3-hint-selected-layers = the selected layers
+
+## Saving over a Photoshop document
+
+files3-quoted-name = "{ $name }"
+files3-psd-note-shapes = shape layers saved as pixels: { $names }
+files3-status-psd-would-lose = A Photoshop file would lose: { $notes }. Save as an Atelier document to keep everything.
+files3-dialog-save-as-lossy = Save As (an Atelier document keeps everything)
+
+## Clipboard
+
+files3-menu-copy-merged = Copy Merged
+files3-menu-paste-special = Paste Special
+files3-menu-paste-in-place = Paste in Place
+files3-menu-paste-into = Paste Into
+files3-status-copied-merged = Visible layers copied
+files3-status-paste-into-no-selection = Paste Into needs a selection.
+
+## Export
+
+files3-export-no-metadata = { $format } files hold no metadata.
+files3-status-artboards-busy = Artboards are still being exported.
+
+## Painting and retouching (fix3 tools)
+
+tools3-status-source-empty = Nothing copied: the source area is empty (Sample: { $sample }).
+tools3-status-layer-hidden = Could not paint: "{ $name }" is hidden.
+tools3-rasterize-text = The type layer "{ $name }" must be rasterized before painting on it. Its text will no longer be editable.
+tools3-rasterize-shape = The shape layer "{ $name }" must be rasterized before painting on it. Its shape will no longer be editable.
+tools3-rasterize-ok = Rasterize
+tools3-bucket-all-layers = All Layers
+tools3-bucket-all-layers-tip = Fills by the colors all the visible layers show, on the active layer
+
+## Layer › Remove Background (fix3 tools)
+
+tools3-status-remove-background-pixels = Remove Background works on a pixel, type, shape or smart object layer.
+
+## Actions panel: Clear All Actions, the actions file
+smart3-actions-clear-all-question = Delete all actions?
+smart3-actions-damaged = The saved actions could not be read ({ $error }): the default actions are shown, and the file was kept as { $backup }.
+smart3-actions-unreadable = The saved actions could not be read ({ $error }): the default actions are shown, and changes to actions won't be saved until Atelier restarts.
+smart3-actions-not-recorded = Not recorded: this command can't be part of an action.
+smart3-actions-not-saved = The actions could not be saved: { $error }
+
+## Batch
+smart3-batch-written-twice = { $name } was already written by this batch: change the File Naming (add a serial number).
+
+## Filters, Liquify, Camera Raw
+fx3-filter-failed = { $name } could not be applied: the layer is unchanged.
+fx3-filter-layer-hidden = "{ $name }" is hidden: show it to filter it.
+
+## Image › Mode › Grayscale
+fx3-grayscale-note = Colors become grays of the same lightness, and color-only adjustments are neutralized. The document stays in RGB mode: colors painted later stay in color.
+
+## Proof Colors on: next to the zoom in the document tab
+fx3-tab-proof = { $zoom } (RGB/8/CMYK)
+
+## AI models: downloads
+fx3-download-cancel-tip = Cancel the download of { $name }
+fx3-ai-error-offline = no connection to the server: check the Internet connection
+fx3-ai-error-status = the server answered with error { $code }
+fx3-ai-error-secure = the secure connection to the server failed
+fx3-ai-error-disk-full = the disk is full
+fx3-ai-error-no-write = cannot write to the models folder ({ $folder })
+fx3-ai-error-write = the file could not be written ({ $error })
+fx3-model-ready-run-again = { $name } is ready: run the command again (the selection or the layer changed meanwhile).
+
+## Content-Aware Fill, Spot Healing Brush
+fx3-ai-skipped-transparency = AI model not used: the area has transparent pixels, filled with patches instead.
+
+## Start screen
+ui3-status-welcome = Create an image ({ $new }), open one ({ $open }) or drop it into the window.
+
+## File menu: recent files
+ui3-menu-open-recent = Open Recent
+ui3-menu-clear-recent = Clear Recent File List
+
+## Window menu: workspace
+ui3-menu-hide-panels = Hide Panels
+ui3-menu-reset-workspace = Reset Workspace
+
+## Help menu
+ui3-menu-help = Help
+ui3-menu-shortcuts = Keyboard Shortcuts…
+ui3-menu-website = Atelier Website
+ui3-menu-report-problem = Report a Problem…
+ui3-menu-about = About Atelier
+
+## About window
+ui3-about-version = Version { $version }
+ui3-about-description = A light image editor with familiar shortcuts.
+ui3-about-license = License: { $license }
+ui3-about-source = Source code
+
+## Keyboard Shortcuts window
+ui3-shortcuts-title = Keyboard Shortcuts
+ui3-shortcuts-filter = Search
+ui3-shortcuts-other = Other keys
+ui3-shortcuts-palette = Search commands
+ui3-shortcuts-hide-side = Hide the side panel
+ui3-shortcuts-brush-size = Brush size (smaller / larger)
+ui3-shortcuts-pan = Pan the view (hold)
+
+## Error alert
+ui3-alert-title = Something went wrong
+
+## Command palette
+ui3-palette-more = { $count ->
+    [one] { $count } more result: keep typing to narrow down
+   *[other] { $count } more results: keep typing to narrow down
+}
+# Why a greyed command can't run
+ui3-why-no-image = Open or create an image first
+ui3-why-no-selection = Make a selection first
+ui3-why-nothing-to-undo = Nothing to undo
+ui3-why-nothing-to-redo = Nothing to redo
+ui3-why-not-now = Not available for the active layer or in the current state
+# Other words a command is found by (space-separated, never shown)
+ui3-palette-keywords-image-size = resize scale resample dimensions enlarge shrink
+ui3-palette-keywords-canvas-size = extend expand border margin
+ui3-palette-keywords-rotate = rotate turn flip mirror
+ui3-palette-keywords-crop = crop trim cut
+ui3-palette-keywords-move = move
+ui3-palette-keywords-type = type font write
+ui3-palette-keywords-black-white = black white grayscale greyscale monochrome
+ui3-palette-keywords-export = jpg jpeg png webp gif save web
+ui3-palette-keywords-save = psd
+ui3-palette-keywords-cut-out = cut out cutout isolate erase background transparent
+ui3-palette-keywords-shortcuts = keys keyboard hotkeys help
+ui3-palette-keywords-about = version help license credits
+ui3-palette-keywords-recent = recent file open
+
+## Export As: file sizes
+
+words3-size-kb = { $size } KB
+
+## A label and its value (action steps, batch errors)
+
+words3-label-value = { $label }: { $value }

@@ -111,7 +111,7 @@ impl AtelierApp {
                 &t!("xform-bend"),
                 &mut style.1,
                 -100.0..=100.0,
-                "%",
+                &crate::i18n::percent(""),
                 120.0,
             )
             .changed();

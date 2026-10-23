@@ -338,6 +338,60 @@ mod tests {
         assert!(unused.is_empty(), "unused keys: {unused:?}");
     }
 
+    /// French puts a no-break space before : ; ! ? % and inside « »: a
+    /// line must not start with one of them. English has no space before %.
+    #[test]
+    fn typography_follows_the_language() {
+        let lines = |lang: Lang| {
+            lang.source()
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+        };
+        for line in lines(Lang::Fr) {
+            for bad in [" :", " ;", " !", " ?", " %", "« ", " »"] {
+                assert!(
+                    !line.contains(bad),
+                    "fr: breakable space in {bad:?}: {line}"
+                );
+            }
+        }
+        for line in lines(Lang::En) {
+            assert!(!line.contains(" %"), "en: space before %: {line}");
+        }
+    }
+
+    /// French "one" also covers 0: its variants show the number rather than
+    /// a written "1" ("annulé après 1 document" when none was processed).
+    #[test]
+    fn french_singular_variants_show_the_count() {
+        fn check(pattern: &ast::Pattern<&str>, key: &str) {
+            for element in &pattern.elements {
+                if let ast::PatternElement::Placeable {
+                    expression: ast::Expression::Select { variants, .. },
+                } = element
+                {
+                    for v in variants {
+                        if matches!(v.key, ast::VariantKey::Identifier { name: "one" }) {
+                            let mut vars = BTreeSet::new();
+                            collect_vars(&v.value, &mut vars);
+                            assert!(!vars.is_empty(), "fr: {key}: [one] without its number");
+                        }
+                        check(&v.value, key);
+                    }
+                }
+            }
+        }
+        let resource = fluent_syntax::parser::parse(Lang::Fr.source()).expect("valid fr.ftl");
+        for entry in resource.body {
+            if let ast::Entry::Message(m) = entry
+                && let Some(value) = &m.value
+            {
+                check(value, m.id.name);
+            }
+        }
+    }
+
     #[test]
     fn numbers_follow_the_language() {
         set_lang(Lang::Fr);
@@ -349,6 +403,11 @@ mod tests {
         assert_eq!(decimal(1.4, 2), "1.40");
         assert_eq!(short_decimal(-0.01), "0");
         assert_eq!(percent("7.5"), "7.5%");
+        // The suffix of a percent field.
+        assert_eq!(percent(""), "%");
+        set_lang(Lang::Fr);
+        assert_eq!(percent(""), "\u{a0}%");
+        set_lang(Lang::En);
     }
 
     #[test]

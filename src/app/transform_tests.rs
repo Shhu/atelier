@@ -215,9 +215,14 @@ fn the_edit_menu_lists_the_transforms_and_flips() {
         t!("optbar-rotate-ccw"),
         t!("xform-flip-vertical"),
     ] {
-        assert!(h.query_by_label(&label).is_some(), "{label}");
+        // The options bar has buttons with the same names.
+        assert!(h.query_all_by_label(&label).next().is_some(), "{label}");
     }
-    h.get_by_label(&t!("xform-flip-horizontal")).click();
+    // The menu's item: below the options bar.
+    h.query_all_by_label(&t!("xform-flip-horizontal"))
+        .max_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .expect("Flip Horizontal")
+        .click();
     h.run_steps(3);
     // Flipped in place, at once: one step.
     let d = doc(&h);

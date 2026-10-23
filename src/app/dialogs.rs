@@ -207,12 +207,25 @@ impl AtelierApp {
         self.reset_pending();
     }
 
-    /// Histograms of the active layer (computed once per pixel revision).
+    /// Histograms of what an adjustment changes: the active layer's pixels
+    /// (its mask's when targeted), inside the selection (computed once per
+    /// pixel revision and selection).
     fn active_histogram(&mut self) -> Option<Histograms> {
-        let layer = self.doc.as_ref()?.active_layer();
-        let key = (layer.id, layer.rev());
+        let doc = self.doc.as_ref()?;
+        let layer = doc.active_layer();
+        let selection = self.selection.as_ref().map(|s| {
+            let r = s.rect;
+            let mask = s.mask.as_ref().map_or(0, |m| Arc::as_ptr(m) as usize);
+            (r.x, r.y, r.w, r.h, mask, s.inverted)
+        });
+        let key = (
+            layer.id,
+            hash_of((layer.rev(), doc.mask_targeted(), selection)),
+        );
         if self.histogram.as_ref().is_none_or(|(k, _)| *k != key) {
-            self.histogram = Some((key, crate::pixel_ops::histogram(layer.image())));
+            let target = super::filters_ui::active_target(doc, self.selection.as_ref())?;
+            let h = crate::pixel_ops::histogram_within(&target.image, target.clip.as_ref());
+            self.histogram = Some((key, h));
         }
         self.histogram.as_ref().map(|(_, h)| *h)
     }
@@ -798,8 +811,130 @@ const MIN_PANEL_BODY: f32 = 80.0;
 /// Where tool dialogs (adjustments, split, transparency) first appear: top
 /// right of the canvas, next to the side panel.
 pub(super) fn tool_dialog_pos(ctx: &egui::Context) -> Pos2 {
-    let r = ctx.content_rect();
-    pos2(r.right() - 312.0 - 16.0, r.top() + 132.0)
+    let r = canvas_area(ctx);
+    pos2(r.right() - 16.0, r.top() + 46.0)
+}
+
+fn work_area_id() -> egui::Id {
+    egui::Id::new("work-area")
+}
+
+/// Records the canvas area (between the bars and panels) of this frame.
+pub(super) fn set_work_area(ctx: &egui::Context, area: Rect) {
+    ctx.data_mut(|d| d.insert_temp(work_area_id(), area));
+}
+
+/// The canvas area, or the whole window before it is known.
+fn canvas_area(ctx: &egui::Context) -> Rect {
+    ctx.data(|d| d.get_temp::<Rect>(work_area_id()))
+        .unwrap_or_else(|| ctx.content_rect())
+}
+
+/// Where dialogs stay: the window's width, between the options bar and the
+/// status bar, so that they never cover the menus.
+/// A window too low for that gives them its whole height.
+fn dialog_bounds(ctx: &egui::Context) -> Rect {
+    let window = ctx.content_rect();
+    let area = canvas_area(ctx);
+    let bounds = if area.height() >= 240.0 {
+        Rect::from_x_y_ranges(window.x_range(), area.y_range())
+    } else {
+        window
+    };
+    bounds.shrink(DIALOG_MARGIN)
+}
+
+/// Floating panels (History, Channels, Actions, Paths, Swatches, Keyboard
+/// Shortcuts) whose place was chosen: the place, the frame it was chosen,
+/// the last frame the panel showed.
+#[derive(Clone, Default)]
+struct PanelPlaces(Vec<(&'static str, Pos2, u64, u64)>);
+
+fn panel_places_id() -> egui::Id {
+    egui::Id::new("panel-places")
+}
+
+/// Where a floating panel first appears (its top right corner, with the
+/// `RIGHT_TOP` pivot): next to the side panel, under the panels already
+/// open, then in a new column on their left when the column is full.
+pub(super) fn panel_pos(ctx: &egui::Context, id: &'static str) -> Pos2 {
+    let pass = ctx.cumulative_pass_nr();
+    let mut places = ctx.data(|d| {
+        d.get_temp::<PanelPlaces>(panel_places_id())
+            .unwrap_or_default()
+    });
+    // Closed panels give their place back.
+    places.0.retain(|&(_, _, _, seen)| seen + 2 >= pass);
+    let own = ctx.memory(|m| m.area_rect(egui::Id::new(id)));
+    let others: Vec<Rect> = places
+        .0
+        .iter()
+        .filter(|p| p.0 != id)
+        .filter_map(|p| ctx.memory(|m| m.area_rect(egui::Id::new(p.0))))
+        .collect();
+    let pos = match places.0.iter_mut().find(|p| p.0 == id) {
+        // Placed again in its first frames, once its height is known.
+        Some(place) if pass <= place.2 + 2 => {
+            let height = own.map_or(160.0, |r| r.height());
+            place.1 = free_place(ctx, &others, height);
+            place.3 = pass;
+            place.1
+        }
+        Some(place) => {
+            place.3 = pass;
+            place.1
+        }
+        None => {
+            // The size it had last time, if it was open before.
+            let height = own.map_or(160.0, |r| r.height());
+            let pos = free_place(ctx, &others, height);
+            places.0.push((id, pos, pass, pass));
+            pos
+        }
+    };
+    ctx.data_mut(|d| d.insert_temp(panel_places_id(), places));
+    pos
+}
+
+/// The first place, from the top right of the canvas, down then leftwards,
+/// where a panel `height` high covers none of `others`.
+fn free_place(ctx: &egui::Context, others: &[Rect], height: f32) -> Pos2 {
+    const WIDTH: f32 = 300.0;
+    let start = tool_dialog_pos(ctx);
+    let bottom = dialog_bounds(ctx).bottom();
+    let left = dialog_bounds(ctx).left();
+    let mut pos = start;
+    for _ in 0..16 {
+        let probe = Rect::from_min_max(pos2(pos.x - WIDTH, pos.y), pos2(pos.x, pos.y + height));
+        match others.iter().find(|r| r.intersects(probe)) {
+            Some(r) if r.bottom() + 8.0 + height <= bottom => pos.y = r.bottom() + 8.0,
+            Some(_) if pos.x - 2.0 * WIDTH - 8.0 >= left => {
+                pos = pos2(pos.x - WIDTH - 8.0, start.y);
+            }
+            _ => break,
+        }
+    }
+    pos
+}
+
+/// Window › Reset Workspace: the floating panels go back to their first
+/// place and size.
+pub(super) fn forget_panel_places(ctx: &egui::Context) {
+    ctx.data_mut(|d| {
+        d.remove::<PanelPlaces>(panel_places_id());
+        for id in [
+            "history",
+            "channels",
+            "actions",
+            "paths",
+            "swatches",
+            "shortcuts",
+        ] {
+            let id = egui::Id::new(id);
+            d.remove::<Vec2>(id.with("offset"));
+            d.remove::<Vec2>(id.with("size"));
+        }
+    });
 }
 
 /// What a floating dialog looks like and offers.
@@ -898,9 +1033,9 @@ pub(super) fn floating_dialog(
     let size_id = id.with("size");
     let resized_to = resize.and_then(|_| ctx.data(|d| d.get_temp::<Vec2>(size_id)));
     let width = resized_to.map_or(width, |s| s.x);
-    // Always within the window, header and footer included: a dialog
-    // taller than the window scrolls its body.
-    let screen = ctx.content_rect().shrink(DIALOG_MARGIN);
+    // Always within the window, below the menus and options bar, header
+    // and footer included: a dialog taller than that scrolls its body.
+    let screen = dialog_bounds(ctx);
     // Between header, body and footer: two gaps of 8 px; the border: 2 px.
     let body_max = (screen.height() - DIALOG_HEADER - DIALOG_FOOTER - 18.0).max(0.0);
     // Its margins aside.
@@ -1258,7 +1393,9 @@ fn color_to_remove(ui: &mut egui::Ui, color: &mut Color32, picking: &mut bool) {
         });
 }
 
-/// Segments sharing the full width (tone balance, channels).
+/// Segments sharing the full width (tone balance, channels). Each gets its
+/// label's width plus an equal share of the rest; labels that still don't
+/// fit are cut with "…" and shown whole in a tooltip.
 pub(super) fn full_segmented<T: PartialEq + Copy>(
     ui: &mut egui::Ui,
     value: &mut T,
@@ -1273,17 +1410,22 @@ pub(super) fn full_segmented<T: PartialEq + Copy>(
         UiStroke::new(1.0, color::LINE),
         StrokeKind::Inside,
     );
-    let n = options.len() as f32;
-    let cell = (rect.width() - 4.0 - 2.0 * (n - 1.0)) / n;
+    let font = ui_kit::medium(ui_kit::TEXT_SIZE);
+    let labels: Vec<f32> = options
+        .iter()
+        .map(|(_, label)| {
+            let galley = ui
+                .painter()
+                .layout_no_wrap(label.to_string(), font.clone(), color::TEXT);
+            galley.size().x + 16.0
+        })
+        .collect();
+    let cells = segment_widths(&labels, rect.width() - 4.0, 2.0);
+    let mut left = rect.left() + 2.0;
     for (i, (option, label)) in options.iter().enumerate() {
-        let r = Rect::from_min_size(
-            pos2(
-                rect.left() + 2.0 + i as f32 * (cell + 2.0),
-                rect.top() + 2.0,
-            ),
-            vec2(cell, 26.0),
-        );
-        let response = ui.interact(r, group.id.with(i), Sense::click());
+        let r = Rect::from_min_size(pos2(left, rect.top() + 2.0), vec2(cells[i], 26.0));
+        left += cells[i] + 2.0;
+        let mut response = ui.interact(r, group.id.with(i), Sense::click());
         let selected = *value == *option;
         if selected {
             ui.painter().rect(
@@ -1299,16 +1441,47 @@ pub(super) fn full_segmented<T: PartialEq + Copy>(
         } else {
             color::MUTED
         };
-        ui.painter().text(
-            r.center(),
-            egui::Align2::CENTER_CENTER,
-            *label,
-            ui_kit::medium(ui_kit::TEXT_SIZE),
-            fg,
+        let mut job = egui::text::LayoutJob::single_section(
+            label.to_string(),
+            egui::TextFormat::simple(font.clone(), fg),
         );
+        job.wrap = egui::text::TextWrapping::truncate_at_width((r.width() - 12.0).max(0.0));
+        let galley = ui.painter().layout_job(job);
+        let elided = galley.elided;
+        ui.painter()
+            .galley(r.center() - galley.size() / 2.0, galley, fg);
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, selected, *label)
+        });
+        if elided {
+            response = response.on_hover_text(*label);
+        }
         if response.clicked() {
             *value = *option;
         }
+    }
+}
+
+/// Widths of segments sharing `total` (with `gap` between them): each gets
+/// its wanted width plus an equal share of what is left, or, when they
+/// don't all fit, a share of the total in proportion to what it wants.
+pub(super) fn segment_widths(wanted: &[f32], total: f32, gap: f32) -> Vec<f32> {
+    let n = wanted.len().max(1) as f32;
+    let room = (total - gap * (n - 1.0)).max(0.0);
+    let sum: f32 = wanted.iter().sum();
+    if sum <= room {
+        let extra = (room - sum) / n;
+        wanted.iter().map(|w| w + extra).collect()
+    } else {
+        // Not every label fits: shares in proportion, but never below an
+        // equal share's half, so a short label stays clickable.
+        let floor = room / n / 2.0;
+        let above: f32 = wanted.iter().map(|w| (w - floor).max(0.0)).sum();
+        let left = room - floor * n;
+        wanted
+            .iter()
+            .map(|w| floor + (w - floor).max(0.0) / above.max(1e-3) * left)
+            .collect()
     }
 }
 
@@ -2210,7 +2383,15 @@ pub(super) fn adjustment_editor(
             let hist = histogram.map_or(&empty, |h| &h[c]);
             curves_editor(ui, curve, hist, CHANNEL_TINTS[c], point);
             gap_between_blocks(ui);
-            help(ui, &t!("dialog-curves-hint"));
+            let ctx = ui.ctx().clone();
+            let next = KeyboardShortcut::new(Modifiers::COMMAND, Key::Tab);
+            let hint = t!(
+                "input3-curves-hint",
+                ctrl_click = keys::click(&ctx, Modifiers::COMMAND),
+                delete = keys::key(Key::Delete),
+                next = keys::shortcut(&ctx, &next)
+            );
+            help(ui, &hint);
         }
         Adjustment::Vibrance(v) => {
             let vibrance = t!("dialog-adjust-vibrance");

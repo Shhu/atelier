@@ -123,6 +123,12 @@ pub fn render(
             progress.store(p, Ordering::Relaxed);
         }
     };
+    // A stage done: true when the development was cancelled (its result
+    // is then dropped).
+    let stage = |p: u32| {
+        report(p);
+        crate::filters::cancel_requested()
+    };
     let s = settings;
     let (w, h) = (source.width as usize, source.height as usize);
     let long = frame.size.0.max(frame.size.1).max(1) as f32;
@@ -144,10 +150,19 @@ pub fn render(
         });
         out
     };
-    report(100);
+    if stage(100) {
+        return RgbaImage::new(source.width, source.height);
+    }
 
+    // A distortion moves the opacity with the colors.
+    let mut alpha = source.alpha.as_deref().map(std::borrow::Cow::Borrowed);
     if s.lens.distortion != 0.0 || s.lens.vignetting != 0.0 {
         rgb = lens(&rgb, w, h, frame, s);
+        if s.lens.distortion != 0.0
+            && let Some(a) = &source.alpha
+        {
+            alpha = Some(std::borrow::Cow::Owned(lens_alpha(a, w, h, frame, s)));
+        }
     }
     if s.dehaze != 0.0 {
         let m = matrix.map(|row| row.map(|v| v as f32));
@@ -160,11 +175,15 @@ pub fn render(
             long,
         );
     }
-    report(200);
+    if stage(200) {
+        return RgbaImage::new(source.width, source.height);
+    }
     if s.highlights != 0.0 || s.shadows != 0.0 || s.clarity != 0.0 || s.texture != 0.0 {
         local_tone(&mut rgb, w, h, s, long);
     }
-    report(450);
+    if stage(450) {
+        return RgbaImage::new(source.width, source.height);
+    }
 
     // To the display.
     par_rows(&mut rgb, w.max(1), |_, band| {
@@ -175,10 +194,14 @@ pub fn render(
             });
         }
     });
-    report(550);
+    if stage(550) {
+        return RgbaImage::new(source.width, source.height);
+    }
 
     noise_reduction(&mut rgb, w, h, s, frame.scale);
-    report(650);
+    if stage(650) {
+        return RgbaImage::new(source.width, source.height);
+    }
     if let Some(luts) = tone_luts(s, raw) {
         par_rows(&mut rgb, w.max(1), |_, band| {
             for p in band {
@@ -196,10 +219,14 @@ pub fn render(
             }
         });
     }
-    report(750);
+    if stage(750) {
+        return RgbaImage::new(source.width, source.height);
+    }
 
     let shown = sharpen(&mut rgb, w, h, s, frame.scale, visual);
-    report(900);
+    if stage(900) {
+        return RgbaImage::new(source.width, source.height);
+    }
     if visual == Visual::Image {
         effects(&mut rgb, w, s, frame);
     }
@@ -216,7 +243,7 @@ pub fn render(
             for c in 0..3 {
                 px[c] = (p[c].clamp(0.0, 1.0) * 255.0).round() as u8;
             }
-            px[3] = source.alpha.as_ref().map_or(255, |a| a[k]);
+            px[3] = alpha.as_ref().map_or(255, |a| a[k]);
         }
     });
     report(1000);
@@ -257,24 +284,59 @@ fn luma(p: [f32; 3]) -> f32 {
     0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]
 }
 
-/// Manual lens corrections: distortion (resampling around the center of
-/// the image) and vignetting.
-fn lens(rgb: &[[f32; 3]], w: usize, h: usize, frame: &Frame, s: &Settings) -> Vec<[f32; 3]> {
+/// Where the distortion of `s` takes the pixel at `x`, `y` of the frame's
+/// part from, and its squared distance to the center (1 at the corners).
+fn lens_source(frame: &Frame, s: &Settings) -> impl Fn(f32, f32) -> (f32, f32, f32) + Sync {
     let (fw, fh) = (frame.size.0 as f32, frame.size.1 as f32);
     let (cx, cy) = (fw / 2.0, fh / 2.0);
     let half_diagonal = (cx * cx + cy * cy).sqrt().max(1.0);
     let k = s.lens.distortion / 100.0 * 0.15;
+    let (ox, oy) = (frame.origin.0 as f32, frame.origin.1 as f32);
+    move |x, y| {
+        let (dx, dy) = (ox + x + 0.5 - cx, oy + y + 0.5 - cy);
+        let r2 = (dx * dx + dy * dy) / (half_diagonal * half_diagonal);
+        let f = 1.0 - k * r2;
+        (cx + dx * f - ox - 0.5, cy + dy * f - oy - 0.5, r2)
+    }
+}
+
+/// The opacity distorted as [`lens`] distorts the colors; nothing comes
+/// from beyond the image.
+fn lens_alpha(alpha: &[u8], w: usize, h: usize, frame: &Frame, s: &Settings) -> Vec<u8> {
+    let source = lens_source(frame, s);
+    let mut out = vec![0u8; w * h];
+    par_rows(&mut out, w.max(1), |y0, band| {
+        for (i, a) in band.iter_mut().enumerate() {
+            let (sx, sy, _) = source((i % w) as f32, (y0 + i / w) as f32);
+            let (left, up) = (sx.floor(), sy.floor());
+            let (tx, ty) = (sx - left, sy - up);
+            let at = |x: f32, y: f32| {
+                if x < 0.0 || y < 0.0 || x >= w as f32 || y >= h as f32 {
+                    0.0
+                } else {
+                    alpha[y as usize * w + x as usize] as f32
+                }
+            };
+            let top = at(left, up) + (at(left + 1.0, up) - at(left, up)) * tx;
+            let bottom = at(left, up + 1.0) + (at(left + 1.0, up + 1.0) - at(left, up + 1.0)) * tx;
+            *a = (top + (bottom - top) * ty).round().clamp(0.0, 255.0) as u8;
+        }
+    });
+    out
+}
+
+/// Manual lens corrections: distortion (resampling around the center of
+/// the image) and vignetting.
+fn lens(rgb: &[[f32; 3]], w: usize, h: usize, frame: &Frame, s: &Settings) -> Vec<[f32; 3]> {
+    let k = s.lens.distortion;
     let v = s.lens.vignetting / 100.0;
     let power = 1.0 + s.lens.midpoint / 100.0 * 4.0;
-    let (ox, oy) = (frame.origin.0 as f32, frame.origin.1 as f32);
+    let source = lens_source(frame, s);
     let mut out = vec![[0.0f32; 3]; w * h];
     par_rows(&mut out, w.max(1), |y0, band| {
         for (i, p) in band.iter_mut().enumerate() {
             let (x, y) = ((i % w) as f32, (y0 + i / w) as f32);
-            let (dx, dy) = (ox + x + 0.5 - cx, oy + y + 0.5 - cy);
-            let r2 = (dx * dx + dy * dy) / (half_diagonal * half_diagonal);
-            let f = 1.0 - k * r2;
-            let (sx, sy) = (cx + dx * f - ox - 0.5, cy + dy * f - oy - 0.5);
+            let (sx, sy, r2) = source(x, y);
             let mut q = if k == 0.0 {
                 rgb[(y0 * w) + i]
             } else {

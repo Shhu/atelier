@@ -9,29 +9,20 @@ impl AtelierApp {
     /// the active layer (inside the selection), without touching the
     /// document.
     pub(super) fn sync_layer_preview(&mut self) {
-        let Some(doc) = &self.doc else { return };
-        let layer = doc.active_layer();
         let preview = match (self.transparency, &self.adjust) {
             (Some(t), _) if t.preview => LayerPreview::Transparency(t),
             (None, Some(dialog)) if dialog.preview => {
                 LayerPreview::Adjust(dialog.adjustment.clone())
             }
             // Preview unchecked: the layer shows its real pixels.
-            (Some(_), _) | (None, Some(_)) => return self.end_layer_preview(),
-            (None, None) => return,
+            (Some(_), _) | (None, Some(_)) => {
+                self.forget_adjust_preview();
+                return self.end_layer_preview();
+            }
+            (None, None) => return self.forget_adjust_preview(),
         };
-        if let Some(p) = &self.preview_shown
-            && (&p.preview, p.layer, p.rev) == (&preview, layer.id, layer.rev())
-        {
-            return;
-        }
-        // Like the result: only inside the selection.
-        let Some(image) =
-            doc.processed_active(self.selection.as_ref(), |image| preview.apply(image))
-        else {
-            return self.end_layer_preview();
-        };
-        self.show_preview(preview, image);
+        // Computed on another thread (24 MP take tens of milliseconds).
+        self.adjust_preview(preview);
     }
 
     /// Shows `image` (the result of a dialog's processing, see
@@ -97,7 +88,7 @@ impl AtelierApp {
             let (scroll, pinch, alt) =
                 ctx.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers.alt));
             let wheel_zoom = if alt { scroll.y + scroll.x } else { 0.0 };
-            let factor = pinch * (wheel_zoom * 0.0015).exp();
+            let factor = pinch * (wheel_zoom * WHEEL_ZOOM_RATE).exp();
             if factor != 1.0 {
                 self.set_zoom_around(self.zoom * factor, pos, area.center());
             }
@@ -106,14 +97,32 @@ impl AtelierApp {
             }
         }
 
-        // Panning the view: middle click, or Space (or Hand tool) + left click.
-        let space = (ctx.input(|i| i.key_down(Key::Space))
+        // Panning the view: middle click, or Space (or Hand tool) + left
+        // click. Decided at the press: Space held during a stroke or a
+        // marquee doesn't turn it into a pan (it moves the marquee).
+        let space_key = ctx.input(|i| i.key_down(Key::Space))
             && !ctx.egui_wants_keyboard_input()
-            && !self.typing_on_canvas())
-            || self.tool == Tool::Hand;
+            && !self.typing_on_canvas();
+        let space = space_key || self.tool == Tool::Hand;
+        let (press, zoom_keys) = ctx.input(|i| {
+            let m = i.modifiers;
+            (i.pointer.primary_pressed(), (m.command, m.alt))
+        });
+        if press {
+            self.space_pan = space && hovered;
+            // Ctrl+Space + click: the Zoom tool, for a moment; with Alt
+            // (Alt+Space or Ctrl+Alt+Space), zooming out.
+            if self.space_pan
+                && space_key
+                && (zoom_keys.0 || zoom_keys.1)
+                && let Some(p) = pointer
+            {
+                self.zoom_step(!zoom_keys.1, p, area.center());
+            }
+        }
         let panning = response.dragged_by(PointerButton::Middle)
-            || (space && response.dragged_by(PointerButton::Primary));
-        if panning {
+            || (self.space_pan && response.dragged_by(PointerButton::Primary));
+        if panning && !(space_key && (zoom_keys.0 || zoom_keys.1)) {
             self.pan += response.drag_delta();
         }
 
@@ -164,6 +173,10 @@ impl AtelierApp {
         }
 
         // Alt + click (brush, bucket, eyedropper): pick a color, like Photoshop.
+        // A selection still being computed applies before anything else.
+        if start {
+            self.wait_select_job();
+        }
         let picks = self.tool == Tool::Eyedropper
             || (alt && matches!(self.tool, Tool::Brush | Tool::Bucket));
         if start
@@ -203,10 +216,35 @@ impl AtelierApp {
         let drag_end = released && response.drag_stopped_by(PointerButton::Primary);
         let tool_pointer = pointer.filter(|_| hovered || down || drag_end);
         let mut cursor = None;
+        // Ctrl with a painting tool: the Move tool for a moment, like
+        // Photoshop (the selected layers, or with Auto-Select the one under
+        // the pointer). The tool sees neither the press nor the drag.
+        let temp_move = self.layer_drag.is_some() || (start && self.snap_off);
+        let temp_move = temp_move
+            && matches!(
+                self.tool,
+                Tool::Brush
+                    | Tool::Eraser
+                    | Tool::Dodge
+                    | Tool::Burn
+                    | Tool::Sponge
+                    | Tool::Blur
+                    | Tool::Sharpen
+                    | Tool::Smudge
+                    | Tool::CloneStamp
+                    | Tool::HealingBrush
+                    | Tool::SpotHealing
+                    | Tool::Patch
+                    | Tool::RedEye
+                    | Tool::Gradient
+                    | Tool::Bucket
+            );
+        if temp_move {
+            cursor = self.temporary_move(view, tool_pointer, start, down);
+            start = false;
+        }
+        let down = down && !temp_move;
         match self.tool {
-            Tool::Brush | Tool::Eraser if self.sel.quick_mask.is_some() => {
-                self.quick_mask_input(view, tool_pointer, start, down);
-            }
             Tool::Brush
             | Tool::Eraser
             | Tool::Dodge
@@ -296,6 +334,12 @@ impl AtelierApp {
                 let label = (self.tool == Tool::Transform)
                     .then(|| self.artboard_label_input(view, tool_pointer, start, down))
                     .flatten();
+                // With a selection, the Move tool moves its pixels.
+                let label = label.or_else(|| {
+                    (self.tool == Tool::Transform)
+                        .then(|| self.move_tool_selection(view, tool_pointer, start, down, shift))
+                        .flatten()
+                });
                 cursor = Some(
                     label
                         .or_else(|| {
@@ -317,37 +361,57 @@ impl AtelierApp {
         if guide_cursor.is_some() {
             cursor = guide_cursor;
         }
+        // Alt + right drag: the brush's size and hardness.
+        if self.brush_size_drag(hovered, pointer, view.zoom) {
+            cursor = None;
+        } else if self.stroke.is_none() && self.paint_blocked() {
+            // A locked or hidden layer: painting is refused before the click.
+            cursor = Some(CursorIcon::NotAllowed);
+        }
 
-        // Right click: selects the element under the mouse and opens the menu
-        // (not during a transform or crop: that would apply it).
+        // Right click: the menu, for the active layer (it doesn't change the
+        // layer, like Photoshop). With the Move tool, it lists the layers
+        // under the mouse, to pick one (not during a transform or crop:
+        // that would apply it).
         if hovered
-            && self.layer_drag.is_none()
-            && self.drag.is_none()
-            && self.transform_rect.is_none()
-            && self.canvas_rect.is_none()
             && ctx.input(|i| i.pointer.secondary_pressed())
             && let Some(p) = pointer
         {
             let ip = view.to_image(p);
-            let picked = self
+            let pickable = self.tool == Tool::Transform
+                && self.layer_drag.is_none()
+                && self.drag.is_none()
+                && self.transform_rect.is_none()
+                && self.canvas_rect.is_none();
+            self.menu_layers = self
                 .doc
                 .as_ref()
-                .and_then(|d| d.pick_layer(ip.x.floor() as i64, ip.y.floor() as i64));
-            if let Some(i) = picked {
-                self.select_layer(i);
-            }
+                .filter(|_| pickable)
+                .map(|d| {
+                    d.layers_at(ip.x.floor() as i64, ip.y.floor() as i64)
+                        .collect()
+                })
+                .unwrap_or_default();
         }
         let mut menu_action = None;
+        let mut menu_pick = None;
         response.context_menu(|ui| {
             if self.transform_context_menu(ui, &mut menu_action) {
                 return;
             }
-            let name = self
-                .doc
-                .as_ref()
-                .map(|d| d.active_layer().name.clone())
-                .unwrap_or_default();
-            ui.weak(name);
+            let Some(doc) = &self.doc else { return };
+            if self.menu_layers.is_empty() {
+                ui.weak(doc.active_layer().name.as_str());
+            }
+            for &i in self.menu_layers.iter().filter(|&&i| i < doc.layers.len()) {
+                if ui
+                    .selectable_label(i == doc.active, doc.layers[i].name.as_str())
+                    .clicked()
+                {
+                    menu_pick = Some(i);
+                    ui.close();
+                }
+            }
             ui.separator();
             if self.selection.as_ref().is_some_and(|s| !s.inverted)
                 && ui
@@ -454,6 +518,12 @@ impl AtelierApp {
                 },
             );
         });
+        if let Some(i) = menu_pick {
+            if let Some(id) = self.doc.as_ref().map(|d| d.layers[i].id) {
+                self.layer_set = vec![id];
+            }
+            self.select_layer(i);
+        }
         if let Some(act) = menu_action {
             self.run(act);
         }
@@ -491,13 +561,24 @@ impl AtelierApp {
         self.draw_rulers(ui.painter(), view);
 
         // Cursor.
+        // A tool's drag in progress keeps its cursor while Space is held.
+        let space = space && (self.space_pan || !down);
         if hovered && let Some(pos) = pointer {
-            if space || panning {
+            if space && space_key && (zoom_keys.0 || zoom_keys.1) {
+                ctx.set_cursor_icon(if zoom_keys.1 {
+                    CursorIcon::ZoomOut
+                } else {
+                    CursorIcon::ZoomIn
+                });
+            } else if space || panning {
                 ctx.set_cursor_icon(if panning {
                     CursorIcon::Grabbing
                 } else {
                     CursorIcon::Grab
                 });
+            } else if self.paints_on_locked_layer() {
+                // Said before the click, like the refusal after it.
+                ctx.set_cursor_icon(CursorIcon::NotAllowed);
             } else if let Some(icon) = cursor {
                 ctx.set_cursor_icon(icon);
             } else {
@@ -715,12 +796,22 @@ impl AtelierApp {
         let mut hover = pointer
             .filter(|_| !locked)
             .and_then(|p| hit_test(rect_screen, local(p)));
+        let pending = self.transform_rect.is_some() || self.transform_angle != 0.0;
         let on_rotate_handle = !is_canvas
             && !locked
             && self.drag.is_none()
             && pointer.is_some_and(|p| {
                 local(p).distance(rotate_handle_pos(rect_screen)) <= handles::GRAB_RADIUS
             });
+        // Free Transform: outside its frame, a drag turns it, like Photoshop
+        // (never picks another layer, which would apply it).
+        let outside = !is_canvas
+            && !locked
+            && pending
+            && (self.free_transform || self.transform_angle != 0.0)
+            && hover.is_none()
+            && self.drag.is_none();
+        let on_rotate_handle = on_rotate_handle || outside;
         if on_rotate_handle {
             hover = None;
         }
@@ -735,11 +826,14 @@ impl AtelierApp {
             }
         }
 
-        // Move tool: a click on another element selects its layer, except
-        // inside the frame of a pending transform (its pixels aren't there yet).
-        let pending = self.transform_rect.is_some() || self.transform_angle != 0.0;
+        // Move tool with Auto-Select (Ctrl inverts it): a click on another
+        // element selects its layer, except inside the frame of a pending
+        // transform (its pixels aren't there yet). Without, a drag anywhere
+        // moves the selected layers.
+        let auto_select = self.auto_select != self.ctx.input(|i| i.modifiers.command);
         let mut picked = None;
         if !is_canvas
+            && auto_select
             && !on_rotate_handle
             && hover.is_none_or(|h| h == Handle::Move && !pending)
             && self.drag.is_none()
@@ -755,10 +849,14 @@ impl AtelierApp {
                 hover = Some(Handle::Move);
             }
         }
+        if !is_canvas && !auto_select && !locked && !on_rotate_handle && hover.is_none() {
+            hover = Some(Handle::Move);
+        }
 
         if start && let Some(p) = pointer {
             if on_rotate_handle {
                 self.rotate_drag = Some((pointer_angle(p, rect_screen.center()), angle));
+                self.free_transform = true;
             } else if let Some(doc) = &self.doc {
                 let mut angle = angle;
                 let target = picked.unwrap_or(doc.active);
@@ -770,6 +868,17 @@ impl AtelierApp {
                         rect = src;
                     }
                 }
+                // Alt: the move drags a copy (made when it starts to move),
+                // like Photoshop; a move still pending is applied first.
+                let copy = !is_canvas && alt && !self.free_transform && hover == Some(Handle::Move);
+                if copy && pending {
+                    self.commit_pending();
+                    angle = self.transform_angle;
+                    if let Some(src) = self.transform_source() {
+                        rect = src;
+                    }
+                }
+                self.alt_drag_copy = copy.then_some(p);
                 // Several layers selected: a move drags them all.
                 let group =
                     !is_canvas && hover == Some(Handle::Move) && self.selected_indices().len() > 1;
@@ -784,11 +893,15 @@ impl AtelierApp {
                     view.origin += shift * view.zoom;
                 }
                 if group {
+                    self.alt_drag_copy = None;
                     self.start_layer_drag(target, view.to_image(p), true);
                     return Some(CursorIcon::Grabbing);
                 }
                 let ip = rotate_around(view.to_image(p), rect.center(), -angle);
                 self.drag = hover.map(|h| RectDrag::new(h, rect, ip));
+                if !is_canvas && hover.is_some_and(|h| h != Handle::Move) {
+                    self.free_transform = true;
+                }
                 if !is_canvas && hover == Some(Handle::Move) {
                     self.snap_targets = self
                         .doc
@@ -802,6 +915,7 @@ impl AtelierApp {
             self.drag = None;
             self.rotate_drag = None;
             self.snap_targets = None;
+            self.alt_drag_copy = None;
         } else if let (Some((pointer_start, angle_start)), Some(p)) = (self.rotate_drag, pointer) {
             let mut a = angle_start + pointer_angle(p, rect_screen.center()) - pointer_start;
             if shift {
@@ -816,6 +930,14 @@ impl AtelierApp {
         } else if let (Some(drag), Some(p)) = (self.drag, pointer) {
             // Pointer brought back into the starting element's unrotated frame.
             let mut ip = rotate_around(view.to_image(p), drag.start_center(), -angle);
+            if self.alt_drag_copy.is_some_and(|at| at != p) {
+                self.alt_drag_copy = None;
+                let targets = self.snap_targets.take();
+                // Not moved yet: nothing to apply to the original.
+                self.transform_rect = None;
+                self.run(Action::Duplicate);
+                (self.drag, self.snap_targets) = (Some(drag), targets);
+            }
             // Move: proportions kept by default, Shift inverts. Canvas: free, Shift constrains.
             let keep_ratio = if is_canvas {
                 shift
@@ -920,6 +1042,38 @@ impl AtelierApp {
         };
         if start {
             self.start_layer_drag(target, ip, !text_only);
+        }
+        Some(CursorIcon::Move)
+    }
+
+    /// Ctrl held with a painting tool: the Move tool's drag of the selected
+    /// layers, or with Auto-Select of the one under the pointer. Returns the
+    /// cursor.
+    fn temporary_move(
+        &mut self,
+        view: View,
+        pointer: Option<Pos2>,
+        start: bool,
+        down: bool,
+    ) -> Option<CursorIcon> {
+        if self.layer_drag.is_some() {
+            return Some(self.move_layers(view, pointer, down));
+        }
+        let ip = view.to_image(pointer?);
+        let doc = self.doc.as_ref()?;
+        let target = if self.auto_select {
+            doc.pick_layer(ip.x.floor() as i64, ip.y.floor() as i64)?
+        } else {
+            doc.active
+        };
+        if start {
+            if target != doc.active {
+                self.layer_set.clear();
+                self.select_layer(target);
+            } else if self.refuse_if_locked() {
+                return Some(CursorIcon::NotAllowed);
+            }
+            self.start_layer_drag(target, ip, true);
         }
         Some(CursorIcon::Move)
     }
@@ -1145,6 +1299,12 @@ impl AtelierApp {
             .map(|(doc, zoom)| {
                 let name = doc.display_name();
                 let zoom = zoom_label(zoom);
+                // Proof Colors on: says that the colors shown are simulated.
+                let zoom = if doc.proof.colors {
+                    t!("fx3-tab-proof", zoom = zoom)
+                } else {
+                    zoom
+                };
                 let zoom_w = painter
                     .layout_no_wrap(zoom.clone(), ui_kit::mono(12.0), color::LABEL)
                     .size()

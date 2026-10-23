@@ -4,7 +4,7 @@
 use image::GrayImage;
 use zeno::{Command, Fill, Mask, Vector};
 
-use super::bytes::{Reader, Result};
+use super::bytes::{Reader, Result, Writer};
 
 /// A subpath: closed or not, its knots as (preceding control, anchor,
 /// leaving control) points in canvas pixels.
@@ -94,6 +94,102 @@ pub fn rasterize(data: &[u8], (w, h): (u32, u32)) -> Result<Option<GrayImage>> {
         })
         .collect();
     Ok(GrayImage::from_raw(w, h, bytes))
+}
+
+/// A path's records ("Path resource format"): its anchors in 8.24 fixed
+/// point, fractions of the canvas, each subpath with its operation.
+pub fn records(path: &crate::vector::Path, (w, h): (u32, u32)) -> Vec<u8> {
+    use crate::vector::PathOp;
+    let mut out = Writer::default();
+    let record = |out: &mut Writer, selector: u16, body: &dyn Fn(&mut Writer)| {
+        let mut b = Writer::default();
+        body(&mut b);
+        b.data.resize(24, 0);
+        out.u16(selector);
+        out.bytes(&b.data);
+    };
+    // Path fill rule, then initial fill rule (empty).
+    record(&mut out, 6, &|_| {});
+    record(&mut out, 8, &|b| b.u16(0));
+    let fixed = |v: f32, size: u32| {
+        let f = v as f64 / size.max(1) as f64 * (1 << 24) as f64;
+        f.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32
+    };
+    for sub in path.subpaths.iter().filter(|s| !s.anchors.is_empty()) {
+        let op: i16 = match sub.op {
+            PathOp::Exclude => 0,
+            PathOp::Combine => 1,
+            PathOp::Subtract => 2,
+            PathOp::Intersect => 3,
+        };
+        let count = sub.anchors.len().min(u16::MAX as usize);
+        record(&mut out, if sub.closed { 0 } else { 3 }, &|b| {
+            b.u16(count as u16);
+            b.i16(op);
+        });
+        for a in &sub.anchors[..count] {
+            let selector = match (sub.closed, a.smooth) {
+                (true, true) => 1,
+                (true, false) => 2,
+                (false, true) => 4,
+                (false, false) => 5,
+            };
+            record(&mut out, selector, &|b| {
+                for p in [a.before, a.p, a.after] {
+                    b.i32(fixed(p.y, h));
+                    b.i32(fixed(p.x, w));
+                }
+            });
+        }
+    }
+    out.data
+}
+
+/// The path of records written as [`records`] does (or by Photoshop: a
+/// subpath without operation takes the previous one's), in canvas pixels.
+pub fn path_of(data: &[u8], (w, h): (u32, u32)) -> Result<crate::vector::Path> {
+    use crate::vector::{Anchor, PathOp, SubPath, pt};
+    let mut path = crate::vector::Path::default();
+    let fixed = |v: i32, size: u32| (v as f64 / (1 << 24) as f64 * size as f64) as f32;
+    let mut r = Reader::new(data);
+    while r.remaining() >= 26 {
+        let mut rec = r.sub(26)?;
+        match rec.u16()? {
+            selector @ (0 | 3) => {
+                rec.u16()?;
+                let previous = path.subpaths.last().map_or(PathOp::Combine, |s| s.op);
+                let op = match rec.i16()? {
+                    0 => PathOp::Exclude,
+                    2 => PathOp::Subtract,
+                    3 => PathOp::Intersect,
+                    -1 => previous,
+                    _ => PathOp::Combine,
+                };
+                let mut sub = SubPath::new(Vec::new(), selector == 0);
+                sub.op = op;
+                path.subpaths.push(sub);
+            }
+            selector @ (1 | 2 | 4 | 5) => {
+                let mut point = || -> Result<crate::vector::Pt> {
+                    let y = rec.i32()?;
+                    let x = rec.i32()?;
+                    Ok(pt(fixed(x, w), fixed(y, h)))
+                };
+                let (before, p, after) = (point()?, point()?, point()?);
+                if let Some(sub) = path.subpaths.last_mut() {
+                    sub.anchors.push(Anchor {
+                        p,
+                        before,
+                        after,
+                        smooth: matches!(selector, 1 | 4),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    path.subpaths.retain(|s| !s.anchors.is_empty());
+    Ok(path)
 }
 
 /// The subpaths filled by the even-odd rule over the canvas.

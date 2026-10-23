@@ -42,17 +42,22 @@ pub mod color {
     pub const BUTTON_HOVER: Color32 = Color32::from_rgb(0x2f, 0x32, 0x38);
     /// Color swatch borders.
     pub const SWATCH_LINE: Color32 = Color32::from_rgb(0x5a, 0x5e, 0x66);
+    /// Outline of an unchecked checkbox, track of a switch that is off: at
+    /// least 3:1 against the panels, so the control can be seen.
+    pub const CONTROL_LINE: Color32 = Color32::from_rgb(0x6b, 0x6f, 0x79);
     pub const TEXT: Color32 = Color32::from_rgb(0xec, 0xed, 0xef);
     /// Secondary text, idle icons.
     pub const MUTED: Color32 = Color32::from_rgb(0xa3, 0xa6, 0xaf);
-    /// Field labels, hints, section titles.
-    pub const LABEL: Color32 = Color32::from_rgb(0x8a, 0x8e, 0x98);
+    /// Field labels, hints, section titles (4.5:1 on BG3).
+    pub const LABEL: Color32 = Color32::from_rgb(0x91, 0x96, 0xa0);
     /// Disabled icons, hidden layers.
     pub const DISABLED: Color32 = Color32::from_rgb(0x6b, 0x6f, 0x79);
     /// Accent: frames, selection, primary button.
     pub const ACCENT: Color32 = Color32::from_rgb(0x2f, 0x6b, 0xe0);
-    /// Hovered primary button.
+    /// Lit accent: hovered handles and paths on the canvas.
     pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x3a, 0x7a, 0xf5);
+    /// Hovered primary button: darker, so white text keeps 4.5:1.
+    pub const PRIMARY_HOVER: Color32 = Color32::from_rgb(0x2a, 0x62, 0xd0);
     /// Selected state background: the accent at 26 %.
     pub const ACCENT_SOFT: Color32 = Color32::from_rgba_premultiplied(12, 28, 58, 66);
     /// Selected state text: the accent mixed with 55 % white.
@@ -326,7 +331,11 @@ pub fn tip_with_key(response: Response, name: &str, key: &str) -> Response {
 
 /// Frameless icon button, 28 × 28 (hover: discreet background).
 pub fn icon_button(ui: &mut Ui, glyph: &str, tip: &str, enabled: bool) -> Response {
-    icon_cell(ui, glyph, tip, enabled, false, 28.0, 16.0)
+    let response = icon_cell(ui, glyph, tip, enabled, false, 28.0, 16.0);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, spoken_name(glyph, tip))
+    });
+    response
 }
 
 /// Icon button that stays highlighted while `on` (e.g. constrain proportions).
@@ -336,7 +345,37 @@ pub fn icon_toggle(ui: &mut Ui, glyph: &str, tip: &str, on: &mut bool) -> Respon
         *on = !*on;
         response.mark_changed();
     }
+    let on = *on;
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            true,
+            on,
+            spoken_name(glyph, tip),
+        )
+    });
     response
+}
+
+/// Name given to screen readers: the label, or the tooltip when the label
+/// is only an icon (Phosphor glyphs are in the Private Use Area).
+fn spoken_name<'a>(label: &'a str, tip: &'a str) -> &'a str {
+    let glyph_only = label
+        .chars()
+        .all(|c| c.is_whitespace() || ('\u{e000}'..='\u{f8ff}').contains(&c));
+    if glyph_only && !tip.is_empty() {
+        tip
+    } else {
+        label
+    }
+}
+
+/// Gives a tooltip that isn't the widget's name to screen readers too.
+fn describe(ui: &Ui, response: &Response, name: &str, tip: &str) {
+    if !tip.is_empty() && tip != name {
+        ui.ctx()
+            .accesskit_node_builder(response.id, |node| node.set_description(tip));
+    }
 }
 
 fn icon_cell(
@@ -411,17 +450,41 @@ pub fn button_with_icon(
     width: Option<f32>,
     enabled: bool,
 ) -> Response {
-    let galley =
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), medium(TEXT_SIZE), Color32::PLACEHOLDER);
+    keyed_button(ui, glyph, label, "", kind, width, enabled)
+}
+
+/// Button whose shortcut `key` shows only in its tooltip, with the whole
+/// label (the button may cut it).
+pub fn keyed_button(
+    ui: &mut Ui,
+    glyph: Option<&str>,
+    label: &str,
+    key: &str,
+    kind: Kind,
+    width: Option<f32>,
+    enabled: bool,
+) -> Response {
     let icon_w = if glyph.is_some() { 23.0 } else { 0.0 };
+    // A fixed width too narrow for the label cuts it with "…"; the
+    // tooltip then shows it whole.
+    let mut job = LayoutJob::single_section(
+        label.to_owned(),
+        TextFormat::simple(medium(TEXT_SIZE), Color32::PLACEHOLDER),
+    );
+    if let Some(w) = width {
+        job.wrap = egui::text::TextWrapping::truncate_at_width((w - icon_w - 16.0).max(0.0));
+    }
+    let galley = ui.painter().layout_job(job);
     let w = width.unwrap_or(galley.size().x + icon_w + 24.0);
     let sense = if enabled {
         Sense::click()
     } else {
         Sense::hover()
     };
-    let (rect, response) = ui.allocate_exact_size(vec2(w, 28.0), sense);
+    let (rect, mut response) = ui.allocate_exact_size(vec2(w, 28.0), sense);
+    if galley.elided || !key.is_empty() {
+        response = tip_with_key(response, label, key);
+    }
     let (fill, border, fg) = button_colors(kind, enabled && response.hovered(), enabled);
     let painter = ui.painter();
     painter.rect(
@@ -449,6 +512,7 @@ pub fn button_with_icon(
         x += icon_w;
     }
     painter.galley(pos2(x, rect.center().y - galley.size().y / 2.0), galley, fg);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     response
 }
 
@@ -457,7 +521,7 @@ pub fn button_with_icon(
 pub fn button_colors(kind: Kind, hovered: bool, enabled: bool) -> (Color32, Color32, Color32) {
     match kind {
         _ if !enabled => (color::BG3.gamma_multiply(0.6), color::LINE, color::DISABLED),
-        Kind::Primary if hovered => (color::ACCENT_HOVER, Color32::TRANSPARENT, color::ON_ACCENT),
+        Kind::Primary if hovered => (color::PRIMARY_HOVER, Color32::TRANSPARENT, color::ON_ACCENT),
         Kind::Primary => (color::ACCENT, Color32::TRANSPARENT, color::ON_ACCENT),
         _ if hovered => (color::BUTTON_HOVER, color::LINE, color::TEXT),
         Kind::Normal | Kind::Ai => (color::BG3, color::LINE, color::TEXT),
@@ -496,6 +560,14 @@ pub fn number_field<N: Numeric>(
     suffix: &str,
     width: f32,
 ) -> Response {
+    // A longer (translated) label widens the field rather than running
+    // into the value.
+    let label_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), medium(11.0), color::LABEL)
+        .size()
+        .x;
+    let width = width.max(8.0 + label_w + 4.0 + 44.0);
     let (rect, _) = ui.allocate_exact_size(vec2(width, 28.0), Sense::hover());
     let hovered = ui.rect_contains_pointer(rect);
     let painter = ui.painter().clone();
@@ -528,6 +600,9 @@ pub fn number_field<N: Numeric>(
         drag = drag.custom_formatter(|v, _| i18n::short_decimal(v));
     }
     let response = child.add(drag);
+    // The painted label names the value for screen readers.
+    ui.ctx()
+        .accesskit_node_builder(response.id, |node| node.set_label(label));
     painter.set(frame, field_shape(rect, hovered, response.has_focus()));
     response
 }
@@ -590,7 +665,8 @@ fn frameless(ui: &mut Ui) {
 
 /// "Scrub" field: label on the left, value on the right, a 2 px accent bar
 /// along the bottom showing where the value sits in `range`. Drag sideways
-/// to change it; double-click to type it.
+/// to change it; double-click to type it. Reached with Tab, it becomes its
+/// text field, where ↑/↓ step the value (Shift: ×10).
 pub fn scrub(
     ui: &mut Ui,
     label: &str,
@@ -600,11 +676,14 @@ pub fn scrub(
     width: f32,
 ) -> Response {
     let (min, max) = (*range.start(), *range.end());
+    let width = width.max(scrub_min_width(ui, label, value_text));
     let (rect, mut response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click_and_drag());
     let id = response.id.with("typing");
     let mut typing: Option<String> = ui.data(|d| d.get_temp(id));
 
-    if response.double_clicked() {
+    // Keyboard focus (Tab) goes straight to the text field: the app keeps
+    // the keyboard for its shortcuts everywhere else.
+    if response.double_clicked() || (response.has_focus() && typing.is_none()) {
         typing = Some(
             value_text
                 .trim_end_matches(['%', ' ', '\u{a0}', 'p', 'x'])
@@ -613,6 +692,28 @@ pub fn scrub(
         ui.memory_mut(|m| m.request_focus(id));
     }
     if let Some(text) = &mut typing {
+        // Percent ranges (0..1) are shown and typed as 0..100.
+        let scale = if max <= 1.0 { 100.0 } else { 1.0 };
+        if ui.memory(|m| m.has_focus(id)) {
+            let steps = ui.input_mut(|i| {
+                let big = i.count_and_consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp)
+                    as f32
+                    - i.count_and_consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) as f32;
+                let small = i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+                    as f32
+                    - i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) as f32;
+                10.0 * big + small
+            });
+            if steps != 0.0 {
+                let shown = i18n::parse_decimal(text).map_or(*value * scale, |v| v as f32);
+                let new = ((shown + steps) / scale).clamp(min, max);
+                *text = i18n::short_decimal(f64::from(new * scale));
+                if new != *value {
+                    *value = new;
+                    response.mark_changed();
+                }
+            }
+        }
         let edit_rect = rect.shrink2(vec2(8.0, 2.0));
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -631,9 +732,7 @@ pub fn scrub(
             // Esc gives up the typed value, like Photoshop.
             let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
             if !escape && let Some(typed) = i18n::parse_decimal(text).map(|v| v as f32) {
-                // Percent ranges (0..1) are typed as 0..100.
-                let typed = if max <= 1.0 { typed / 100.0 } else { typed };
-                *value = typed.clamp(min, max);
+                *value = (typed / scale).clamp(min, max);
                 response.mark_changed();
             }
             typing = None;
@@ -681,7 +780,26 @@ pub fn scrub(
             d.remove::<String>(id);
         }
     });
+    let current = f64::from(*value);
+    response.widget_info(|| egui::WidgetInfo::slider(true, current, label));
     response.on_hover_cursor(CursorIcon::ResizeHorizontal)
+}
+
+/// Narrowest scrub field showing `label` and a value as long as
+/// `value_text` (at least 5 characters, so the width doesn't follow the
+/// value), with a gap between them.
+fn scrub_min_width(ui: &Ui, label: &str, value_text: &str) -> f32 {
+    let painter = ui.painter();
+    let label_w = painter
+        .layout_no_wrap(label.to_owned(), FontId::proportional(12.0), color::LABEL)
+        .size()
+        .x;
+    let digits = "0".repeat(value_text.chars().count().max(5));
+    let value_w = painter
+        .layout_no_wrap(digits, mono_medium(12.0), color::TEXT)
+        .size()
+        .x;
+    10.0 + label_w + 12.0 + value_w + 10.0
 }
 
 /// Drop-down list: optional label in grey, then the chosen value.
@@ -754,10 +872,15 @@ pub fn segmented<T: PartialEq + Copy>(
         let r = Rect::from_min_size(pos2(x, rect.top() + 3.0), vec2(w, 22.0));
         x += w + 2.0;
         let mut response = ui.interact(r, group.id.with(i), Sense::click());
+        let selected = *value == *option;
+        let name = spoken_name(label, tip);
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, selected, name)
+        });
+        describe(ui, &response, name, tip);
         if !tip.is_empty() {
             response = response.on_hover_text(*tip);
         }
-        let selected = *value == *option;
         let painter = ui.painter();
         if selected {
             painter.rect(
@@ -801,9 +924,13 @@ pub fn toggles(ui: &mut Ui, options: &mut [(&mut bool, &str, FontId, &str)]) -> 
             pos2(rect.left() + 3.0 + 28.0 * i as f32, rect.top() + 3.0),
             vec2(26.0, 22.0),
         );
-        let response = ui
-            .interact(r, group.id.with(i), Sense::click())
-            .on_hover_text(*tip);
+        let response = ui.interact(r, group.id.with(i), Sense::click());
+        let on = **value;
+        // Their labels are single letters or glyphs: the tooltip names them.
+        let name = if tip.is_empty() { *label } else { *tip };
+        response
+            .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, name));
+        let response = response.on_hover_text(*tip);
         if **value {
             ui.painter().rect(
                 r,
@@ -843,6 +970,9 @@ pub fn checkbox(ui: &mut Ui, value: &mut bool, label: &str) -> Response {
         *value = !*value;
         response.mark_changed();
     }
+    let on = *value;
+    response
+        .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, label));
     let boxed = Rect::from_center_size(pos2(rect.left() + 7.0, rect.center().y), Vec2::splat(14.0));
     paint_check(ui.painter(), boxed, *value, response.hovered());
     let fg = if response.hovered() {
@@ -872,7 +1002,7 @@ fn paint_check(painter: &Painter, r: Rect, on: bool, hovered: bool) {
         let border = if hovered {
             color::MUTED
         } else {
-            color::LINE_HOVER
+            color::CONTROL_LINE
         };
         painter.rect(
             r,
@@ -893,13 +1023,15 @@ pub fn switch(ui: &mut Ui, value: &mut bool, tip: &str) -> Response {
     }
     let t = ui.ctx().animate_bool(response.id, *value);
     let track = egui::lerp(
-        egui::Rgba::from(color::LINE_HOVER)..=egui::Rgba::from(color::ACCENT),
+        egui::Rgba::from(color::CONTROL_LINE)..=egui::Rgba::from(color::ACCENT),
         t,
     );
     let painter = ui.painter();
     painter.rect_filled(rect, 9.0, Color32::from(track));
     let x = egui::lerp(rect.left() + 9.0..=rect.right() - 9.0, t);
     painter.circle_filled(pos2(x, rect.center().y), 7.0, Color32::WHITE);
+    let on = *value;
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, tip));
     response.on_hover_text(tip)
 }
 
@@ -920,6 +1052,7 @@ pub fn swatch(ui: &mut Ui, color: &mut Color32, size: f32, tip: &str) -> Respons
         Stroke::new(1.0, border),
         StrokeKind::Inside,
     );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ColorButton, true, tip));
     picker_link(ui.ctx(), response, color, i18n::t!("uip-picker-title")).on_hover_text(tip)
 }
 
@@ -1040,4 +1173,118 @@ pub fn pill(painter: &Painter, pos: Pos2, anchor: Align2, text: &str) -> Rect {
         color::ON_ACCENT,
     );
     rect
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::accesskit::Toggled;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::{NodeT, Queryable};
+
+    use super::*;
+
+    /// The first frame installs the fonts the widgets use.
+    fn with_fonts(ui: &mut Ui, installed: &mut bool) -> bool {
+        if !*installed {
+            install(ui.ctx());
+            *installed = true;
+            return false;
+        }
+        true
+    }
+
+    #[test]
+    fn custom_widgets_have_accessible_names_and_states() {
+        let mut fonts = false;
+        let mut h = Harness::new_ui(move |ui| {
+            if !with_fonts(ui, &mut fonts) {
+                return;
+            }
+            button(ui, "Okay", Kind::Primary, None, true);
+            icon_button(ui, icon::TRASH, "Delete Layer", true);
+            let mut on = true;
+            icon_toggle(ui, icon::LINK, "Constrain", &mut on);
+            let mut checked = true;
+            checkbox(ui, &mut checked, "Preview");
+            let mut off = false;
+            switch(ui, &mut off, "Visible");
+            let mut v = 0.5f32;
+            scrub(ui, "Opacity", &mut v, 0.0..=1.0, "50%", 120.0);
+            let mut n = 10.0f32;
+            number_field(ui, "Width", &mut n, 0.0..=100.0, " px", 120.0);
+            let mut c = Color32::RED;
+            swatch(ui, &mut c, 20.0, "Shadow color");
+            let mut seg = 0;
+            segmented(
+                ui,
+                &mut seg,
+                &[(0, "Pixels", "In pixels"), (1, icon::PERCENT, "Percent")],
+            );
+            let (mut b, mut i) = (true, false);
+            toggles(
+                ui,
+                &mut [
+                    (&mut b, "B", bold(13.0), "Bold"),
+                    (&mut i, "I", medium(13.0), "Italic"),
+                ],
+            );
+        });
+        h.run();
+        for name in [
+            "Okay",
+            "Delete Layer",
+            "Opacity",
+            "Width",
+            "Shadow color",
+            "Percent",
+        ] {
+            h.get_by_label(name);
+        }
+        let toggled = |h: &Harness, name: &str| h.get_by_label(name).accesskit_node().toggled();
+        assert_eq!(toggled(&h, "Constrain"), Some(Toggled::True));
+        assert_eq!(toggled(&h, "Preview"), Some(Toggled::True));
+        assert_eq!(toggled(&h, "Visible"), Some(Toggled::False));
+        assert_eq!(toggled(&h, "Bold"), Some(Toggled::True));
+        assert_eq!(toggled(&h, "Italic"), Some(Toggled::False));
+        let pixels = h.get_by_label("Pixels");
+        assert_eq!(pixels.accesskit_node().toggled(), Some(Toggled::True));
+        assert_eq!(
+            pixels.accesskit_node().description().as_deref(),
+            Some("In pixels")
+        );
+    }
+
+    #[test]
+    fn scrub_reached_with_tab_steps_with_the_arrows() {
+        let mut fonts = false;
+        let mut h = Harness::new_ui_state(
+            move |ui, v: &mut f32| {
+                if !with_fonts(ui, &mut fonts) {
+                    return;
+                }
+                scrub(
+                    ui,
+                    "Opacity",
+                    v,
+                    0.0..=1.0,
+                    &format!("{:.0}%", *v * 100.0),
+                    120.0,
+                );
+            },
+            0.5f32,
+        );
+        h.run();
+        h.key_press(egui::Key::Tab);
+        h.run();
+        h.key_press(egui::Key::ArrowUp);
+        h.run();
+        assert!((h.state() - 0.51).abs() < 1e-4, "{}", h.state());
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowDown);
+        h.run();
+        assert!((h.state() - 0.41).abs() < 1e-4, "{}", h.state());
+        // Esc leaves the field: the stepped value stays.
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!((h.state() - 0.41).abs() < 1e-4, "{}", h.state());
+    }
 }

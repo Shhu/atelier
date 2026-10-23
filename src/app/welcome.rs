@@ -1,5 +1,5 @@
 //! Start screen, in the canvas area while no image is open: drop zone with
-//! Open and Paste, then the recent files.
+//! New, Open and Paste, then the recent files.
 
 use super::keys;
 use super::*;
@@ -47,18 +47,41 @@ impl AtelierApp {
                 } else {
                     28.0 + 20.0 + recent.len() as f32 * (ROW + ROW_GAP)
                 };
-                let open = t!("menu-file-open");
-                let paste = t!("menu-edit-paste");
-                let open_key = keys::shortcut(&ctx, &SHORTCUT_OPEN);
-                let paste_key = keys::shortcut(&ctx, &SHORTCUT_PASTE);
-                let (open_w, paste_w) = (
-                    big_button_width(&painter, &open, &open_key),
-                    big_button_width(&painter, &paste, &paste_key),
-                );
+                // New, Open (the main one) and Paste.
+                let buttons = [
+                    (
+                        t!("artboard-menu-new-document"),
+                        keys::shortcut(&ctx, &new_document::SHORTCUT_NEW),
+                        Action::NewDocument,
+                        false,
+                    ),
+                    (
+                        t!("menu-file-open"),
+                        keys::shortcut(&ctx, &SHORTCUT_OPEN),
+                        Action::Open,
+                        true,
+                    ),
+                    (
+                        t!("menu-edit-paste"),
+                        keys::shortcut(&ctx, &SHORTCUT_PASTE),
+                        Action::Paste,
+                        false,
+                    ),
+                ];
+                let widths: Vec<f32> = buttons
+                    .iter()
+                    .map(|(label, key, ..)| big_button_width(&painter, label, key))
+                    .collect();
+                let row_width = widths.iter().sum::<f32>() + 8.0 * (widths.len() - 1) as f32;
                 // Side by side, or one above the other in a narrow window.
-                let stacked = open_w + 8.0 + paste_w > width - 24.0;
-                let buttons = if stacked { 36.0 + 8.0 + 36.0 } else { 36.0 };
-                let texts = title.size().y + 14.0 + subtitle.size().y + 20.0 + buttons;
+                let stacked = row_width > width - 24.0;
+                let n = buttons.len() as f32;
+                let buttons_height = if stacked {
+                    36.0 * n + 8.0 * (n - 1.0)
+                } else {
+                    36.0
+                };
+                let texts = title.size().y + 14.0 + subtitle.size().y + 20.0 + buttons_height;
                 // A small window: the card loses its icon and some padding.
                 let roomy =
                     44.0 + 52.0 + 14.0 + texts + 44.0 + recent_height + 32.0 <= area.height();
@@ -115,25 +138,20 @@ impl AtelierApp {
                 painter.galley(pos2(center_x, y), subtitle, color::MUTED);
                 y += subtitle_height + 20.0;
 
-                let (open_rect, paste_rect) = if stacked {
-                    let open = Rect::from_center_size(pos2(center_x, y + 18.0), vec2(open_w, 36.0));
-                    let paste = Rect::from_center_size(
-                        pos2(center_x, open.bottom() + 8.0 + 18.0),
-                        vec2(paste_w, 36.0),
-                    );
-                    (open, paste)
-                } else {
-                    let left = center_x - (open_w + 8.0 + paste_w) / 2.0;
-                    let open = Rect::from_min_size(pos2(left, y), vec2(open_w, 36.0));
-                    let paste =
-                        Rect::from_min_size(pos2(open.right() + 8.0, y), vec2(paste_w, 36.0));
-                    (open, paste)
-                };
-                if big_button(ui, open_rect, &open, &open_key, true).clicked() {
-                    action = Some(Action::Open);
-                }
-                if big_button(ui, paste_rect, &paste, &paste_key, false).clicked() {
-                    action = Some(Action::Paste);
+                let mut left = center_x - row_width / 2.0;
+                for ((label, key, act, primary), w) in buttons.iter().zip(&widths) {
+                    let rect = if stacked {
+                        let rect = Rect::from_center_size(pos2(center_x, y + 18.0), vec2(*w, 36.0));
+                        y += 36.0 + 8.0;
+                        rect
+                    } else {
+                        let rect = Rect::from_min_size(pos2(left, y), vec2(*w, 36.0));
+                        left += w + 8.0;
+                        rect
+                    };
+                    if big_button(ui, rect, label, key, *primary).clicked() {
+                        action = Some(*act);
+                    }
                 }
 
                 // Recent files.
@@ -302,6 +320,7 @@ fn big_button(
         ui.id().with(("welcome-button", label)),
         Sense::click(),
     );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     let hovered = response.hovered();
     let painter = ui.painter();
     let kind = if primary { Kind::Primary } else { Kind::Normal };

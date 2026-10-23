@@ -38,7 +38,9 @@ impl AtelierApp {
                 self.add_tab(opened.doc);
             }
             Err(e) => {
-                self.status = t!("status-open-failed", path = shown, error = e.to_string());
+                // The name only, so that the cause stays in view.
+                let name = file_name(path);
+                self.report_error(t!("status-open-failed", path = name, error = e.to_string()));
             }
         }
     }
@@ -62,42 +64,73 @@ impl AtelierApp {
 
     /// Save (Ctrl+S): to the document's file if it is an Atelier or
     /// Photoshop document, otherwise Save As (an opened PNG or JPEG becomes
-    /// an Atelier document, as Photoshop makes it a PSD).
+    /// an Atelier document, as Photoshop makes it a PSD). A Photoshop file
+    /// is never silently replaced by one holding less: Save As then
+    /// proposes an Atelier document, and says why.
     pub(super) fn save(&mut self) {
         // A smart object's contents (Edit Contents) go back to it.
         if self.save_embedded() {
             return;
         }
-        match self.doc.as_ref().and_then(|d| d.path.clone()) {
-            Some(path) if is_native(&path) || has_extension(&path, "psd") => self.save_to(&path),
+        let Some(doc) = &self.doc else { return };
+        match doc.path.clone() {
+            Some(path) if is_native(&path) => self.save_to(&path),
+            Some(path) if has_extension(&path, "psd") => {
+                let losses = doc.psd_losses();
+                if losses.is_empty() {
+                    self.save_to(&path);
+                } else {
+                    let notes = losses.join(" · ");
+                    let why = t!("files3-status-psd-would-lose", notes = notes);
+                    // Cancelled: the reason stays in view.
+                    if !self.save_as_asked() {
+                        self.status = why;
+                    }
+                }
+            }
             _ => self.save_as_dialog(),
         }
     }
 
     /// Save As: an Atelier document, or a Photoshop document (the format
-    /// of the document's file first).
+    /// of the document's file first, unless such a file would lose
+    /// something).
     pub(super) fn save_as_dialog(&mut self) {
-        if self.doc.is_none() {
-            return;
-        }
-        let title = t!("app-dialog-save-as");
+        self.save_as_asked();
+    }
+
+    /// [`Self::save_as_dialog`]; whether a file was chosen.
+    fn save_as_asked(&mut self) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        let lossy = doc.path.as_deref().is_some_and(|p| has_extension(p, "psd"))
+            && !doc.psd_losses().is_empty();
+        let title = if lossy {
+            t!("files3-dialog-save-as-lossy")
+        } else {
+            t!("app-dialog-save-as")
+        };
         let atelier = t!("file-filter-atelier");
         let atelier = (atelier.as_str(), &["atelier"][..]);
         let psd_filter = t!("xchg-file-filter-psd");
         let photoshop = (psd_filter.as_str(), &["psd"][..]);
-        let psd = self
-            .doc
-            .as_ref()
-            .and_then(|d| d.path.as_deref())
-            .is_some_and(|p| has_extension(p, "psd"));
+        let psd = !lossy
+            && self
+                .doc
+                .as_ref()
+                .and_then(|d| d.path.as_deref())
+                .is_some_and(|p| has_extension(p, "psd"));
         let filters = if psd {
             [photoshop, atelier]
         } else {
             [atelier, photoshop]
         };
         let stem = self.file_stem();
-        if let Some(path) = ask_save_path(&title, &filters, self.current_dir(), &stem) {
-            self.save_to(&path);
+        match ask_save_path(&title, &filters, self.current_dir(), &stem) {
+            Some(path) => {
+                self.save_to(&path);
+                true
+            }
+            None => false,
         }
     }
 
@@ -110,7 +143,9 @@ impl AtelierApp {
             return;
         }
         let Some(doc) = &mut self.doc else { return };
-        self.status = match doc.save(path) {
+        let saved = doc.save(path);
+        let failed = saved.is_err();
+        self.status = match saved {
             Ok(notes) => {
                 // Saved as a file of its own: no longer a smart object's
                 // contents.
@@ -133,6 +168,10 @@ impl AtelierApp {
                 error = e.to_string()
             ),
         };
+        // Not saved: said where it can't be missed.
+        if failed {
+            self.report_error(self.status.clone());
+        }
     }
 
     /// Name of the document without its extension, for the file dialogs.
@@ -164,10 +203,27 @@ impl AtelierApp {
     /// in gray) to the clipboard. Returns whether they are on it.
     pub(super) fn copy_to_clipboard(&mut self) -> bool {
         let Some(doc) = &self.doc else { return false };
-        let Some(image) = doc.copied_pixels(self.selection.as_ref()) else {
+        let Some((image, rect)) = doc.copied(self.selection.as_ref()) else {
             self.status = t!("status-nothing-to-copy");
             return false;
         };
+        let name = doc.active_layer().name.clone();
+        self.put_on_clipboard(image, rect, t!("status-copied", name = name.as_str()))
+    }
+
+    /// Copy Merged: the visible layers together, inside the selection.
+    pub(super) fn copy_merged(&mut self) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        let Some((image, rect)) = doc.merged_pixels(self.selection.as_ref()) else {
+            self.status = t!("status-nothing-to-copy");
+            return false;
+        };
+        self.put_on_clipboard(image, rect, t!("files3-status-copied-merged"))
+    }
+
+    /// Puts `image`, from `rect` of the canvas, on the clipboard.
+    fn put_on_clipboard(&mut self, image: image::RgbaImage, rect: PixelRect, done: String) -> bool {
+        let copied = CopiedFrom::new(&image, (rect.x, rect.y));
         let data = arboard::ImageData {
             width: image.width() as usize,
             height: image.height() as usize,
@@ -175,7 +231,8 @@ impl AtelierApp {
         };
         match arboard::Clipboard::new().and_then(|mut c| c.set_image(data)) {
             Ok(()) => {
-                self.status = t!("status-copied", name = doc.active_layer().name.as_str());
+                self.last_copy = Some(copied);
+                self.status = done;
                 true
             }
             Err(e) => {
@@ -185,9 +242,9 @@ impl AtelierApp {
         }
     }
 
-    /// Pastes the clipboard image as a new layer, or as a new document,
-    /// unsaved, when none is open.
-    pub(super) fn paste_from_clipboard(&mut self) {
+    /// Pastes the clipboard image as a new layer (`mode`), or as a new
+    /// document, unsaved, when none is open.
+    pub(super) fn paste_from_clipboard(&mut self, mode: PasteMode) {
         // Files copied in the file manager: placed, like Photoshop.
         let files = arboard::Clipboard::new()
             .and_then(|mut c| c.get().file_list())
@@ -209,27 +266,48 @@ impl AtelierApp {
                 )
             });
         match image {
-            Some(image) => self.paste_image(image),
+            Some(image) => self.paste_image(image, mode),
             None => self.status = t!("status-clipboard-no-image"),
         }
     }
 
-    fn paste_image(&mut self, image: image::RgbaImage) {
+    fn paste_image(&mut self, image: image::RgbaImage, mode: PasteMode) {
         let (w, h) = image.dimensions();
         if let Err(e) = crate::document::check_size(w, h) {
             self.status = t!("file-status-paste-failed", error = e.to_string());
             return;
         }
+        if mode == PasteMode::Into && self.selection.is_none() {
+            self.status = t!("files3-status-paste-into-no-selection");
+            return;
+        }
         self.commit_pending();
+        // Paste in Place: where the same pixels were copied from (the
+        // center otherwise, as Paste).
+        let origin = (self.last_copy.as_ref())
+            .filter(|c| mode == PasteMode::InPlace && c.matches(&image))
+            .map(|c| c.origin);
+        let step = match mode {
+            PasteMode::Centered => t!("menu-edit-paste"),
+            PasteMode::InPlace => t!("files3-menu-paste-in-place"),
+            PasteMode::Into => t!("files3-menu-paste-into"),
+        };
+        let name = t!("app-pasted-layer-name");
         match &mut self.doc {
-            Some(doc) => {
-                doc.add_centered_layer(t!("menu-edit-paste"), t!("app-pasted-layer-name"), image)
-            }
+            Some(doc) => match (mode, &self.selection, origin) {
+                (PasteMode::Into, Some(sel), _) => doc.paste_into(step, name, image, sel),
+                (_, _, Some(origin)) => doc.paste_at(step, name, image, origin),
+                _ => doc.add_centered_layer(step, name, image),
+            },
             None => {
                 let mut doc = Document::new(image, None);
-                doc.modified = true;
+                doc.mark_modified();
                 self.add_tab(doc);
             }
+        }
+        // Paste Into works inside the selection: it ends, as in Photoshop.
+        if mode == PasteMode::Into {
+            self.deselect();
         }
         self.status = t!("status-pasted", width = w, height = h);
         self.reset_pending();
@@ -258,11 +336,76 @@ impl AtelierApp {
     }
 }
 
+/// Where a pasted image goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PasteMode {
+    /// Centered on the canvas (Paste).
+    Centered,
+    /// Where it was copied from, when it is the last copy (Paste in Place).
+    InPlace,
+    /// Into the selection, through a layer mask (Paste Into).
+    Into,
+}
+
+/// The last image copied, to know it again on the clipboard: its origin
+/// on the canvas, its size, and a fingerprint of its transparency (what
+/// survives every clipboard).
+pub(super) struct CopiedFrom {
+    origin: (i64, i64),
+    size: (u32, u32),
+    print: u64,
+}
+
+impl CopiedFrom {
+    fn new(image: &image::RgbaImage, origin: (i64, i64)) -> Self {
+        Self {
+            origin,
+            size: image.dimensions(),
+            print: print(image),
+        }
+    }
+
+    fn matches(&self, image: &image::RgbaImage) -> bool {
+        self.size == image.dimensions() && self.print == print(image)
+    }
+}
+
+/// Fingerprint of an image's alpha, from a few thousand samples (fast on
+/// any size).
+fn print(image: &image::RgbaImage) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let alpha = image.as_raw().iter().skip(3).step_by(4);
+    let n = (image.width() as usize * image.height() as usize).max(1);
+    alpha.step_by(n.div_ceil(4096)).for_each(|a| a.hash(&mut h));
+    h.finish()
+}
+
 /// Asks where to save with the system dialog, proposing `stem` with the
 /// first of `extensions`. A name typed without one of them gets it.
 /// Where to save: the system dialog with `filters` (name, extensions),
 /// the first one's first extension given to a name typed without one.
 pub(super) fn ask_save_path(
+    title: &str,
+    filters: &[(&str, &[&str])],
+    dir: Option<PathBuf>,
+    stem: &str,
+) -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        let _ = (dir, stem);
+        SAVE_DIALOG.with_borrow_mut(|d| {
+            d.asked
+                .push((title.to_string(), filters[0].1[0].to_string()));
+            d.answer.take()
+        })
+    }
+    #[cfg(not(test))]
+    system_save_dialog(title, filters, dir, stem)
+}
+
+#[cfg(not(test))]
+fn system_save_dialog(
     title: &str,
     filters: &[(&str, &[&str])],
     mut dir: Option<PathBuf>,
@@ -290,6 +433,20 @@ pub(super) fn ask_save_path(
         name = completed.file_name()?.to_string_lossy().into_owned();
         dir = completed.parent().map(Path::to_path_buf);
     }
+}
+
+/// The save dialog in tests: never shown; what it was asked (title, first
+/// extension), and its answer.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct SaveDialog {
+    pub(super) asked: Vec<(String, String)>,
+    pub(super) answer: Option<PathBuf>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static SAVE_DIALOG: std::cell::RefCell<SaveDialog> = Default::default();
 }
 
 pub(super) fn file_name(path: &Path) -> String {
@@ -395,7 +552,9 @@ mod tests {
     #[test]
     fn a_pasted_document_asks_before_closing() {
         let mut harness = harness(Vec::new());
-        harness.state_mut().paste_image(image([1, 2, 3, 255]));
+        harness
+            .state_mut()
+            .paste_image(image([1, 2, 3, 255]), PasteMode::Centered);
         harness.run_steps(2);
         assert!(harness.state().doc.as_ref().is_some_and(|d| d.modified));
         close_window(&mut harness);
@@ -488,5 +647,91 @@ mod tests {
         harness.state_mut().adjust = None;
         harness.run_steps(2);
         assert_eq!(harness.state().doc.as_ref().unwrap().layers.len(), 2);
+    }
+
+    #[test]
+    fn ctrl_s_never_overwrites_a_psd_with_less() {
+        let dir = folder("lossy-psd");
+        let path = dir.join("gray16.psd");
+        // 16-bit grayscale: opened as 8-bit RGB.
+        let mut w = Vec::new();
+        w.extend(b"8BPS");
+        w.extend(1u16.to_be_bytes());
+        w.extend([0; 6]);
+        w.extend(1u16.to_be_bytes());
+        w.extend(1u32.to_be_bytes());
+        w.extend(2u32.to_be_bytes());
+        w.extend(16u16.to_be_bytes());
+        w.extend(1u16.to_be_bytes());
+        w.extend([0; 12]);
+        w.extend(0u16.to_be_bytes());
+        w.extend([0xff, 0xff, 0x80, 0x00]);
+        std::fs::write(&path, &w).unwrap();
+        let mut harness = harness(Vec::new());
+        let app = harness.state_mut();
+        app.open_path(&path);
+        app.doc.as_mut().unwrap().add_empty_layer();
+        SAVE_DIALOG.with_borrow_mut(|d| d.asked.clear());
+        app.save();
+        // Save As instead, an Atelier document first, and why.
+        let asked = SAVE_DIALOG.with_borrow_mut(|d| std::mem::take(&mut d.asked));
+        assert_eq!(
+            asked,
+            [(t!("files3-dialog-save-as-lossy"), "atelier".to_string())]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), w);
+        let losses = app.doc.as_ref().unwrap().psd_losses();
+        assert!(losses.contains(&t!("xchg-psd-note-depth", bits = 16)));
+        let why = t!("files3-status-psd-would-lose", notes = losses.join(" · "));
+        assert_eq!(app.status, why);
+        assert!(app.doc.as_ref().is_some_and(|d| d.modified));
+        // Saved as an Atelier document: done.
+        let atelier = dir.join("gray16.atelier");
+        SAVE_DIALOG.with_borrow_mut(|d| d.answer = Some(atelier.clone()));
+        app.save();
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(doc.path.as_deref(), Some(atelier.as_path()));
+        assert!(!doc.modified);
+    }
+
+    #[test]
+    fn paste_in_place_and_paste_into() {
+        let mut harness = harness(vec![Document::new(image([9, 9, 9, 255]), None)]);
+        let app = harness.state_mut();
+        let copied = image::RgbaImage::from_fn(4, 3, |x, _| image::Rgba([x as u8 * 60, 0, 0, 255]));
+        app.last_copy = Some(CopiedFrom::new(&copied, (5, 6)));
+        // The same pixels go back where they came from.
+        app.paste_image(copied.clone(), PasteMode::InPlace);
+        assert_eq!(app.doc.as_ref().unwrap().active_layer().offset, (5, 6));
+        // Others are centered.
+        let other = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
+        app.paste_image(other.clone(), PasteMode::InPlace);
+        assert_eq!(app.doc.as_ref().unwrap().active_layer().offset, (6, 6));
+        // Into the selection: masked by it, the selection ended.
+        let rect = PixelRect {
+            x: 2,
+            y: 2,
+            w: 6,
+            h: 6,
+        };
+        app.paste_image(other.clone(), PasteMode::Into);
+        assert!(
+            app.status
+                .contains(&t!("files3-status-paste-into-no-selection"))
+        );
+        app.selection = Some(rect.into());
+        let layers = app.doc.as_ref().unwrap().layers.len();
+        app.paste_image(other, PasteMode::Into);
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(doc.layers.len(), layers + 1);
+        let layer = doc.active_layer();
+        assert_eq!(layer.offset, (3, 3));
+        let mask = layer.mask.as_ref().expect("a layer mask");
+        assert_eq!(mask.value_at(4, 4, layer.offset), 1.0);
+        assert_eq!(mask.value_at(0, 0, layer.offset), 0.0);
+        assert!(app.selection.is_none());
+        // One step.
+        app.doc.as_mut().unwrap().undo();
+        assert_eq!(app.doc.as_ref().unwrap().layers.len(), layers);
     }
 }

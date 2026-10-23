@@ -435,6 +435,7 @@ dependencies = [
  "jpeg-decoder",
  "jpeg-encoder",
  "lcms2",
+ "libc",
  "ort",
  "rfd",
  "serde",

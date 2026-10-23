@@ -181,6 +181,14 @@ pub enum Recorded {
     Transform {
         corners: [[f64; 2]; 4],
     },
+    /// File › Place Embedded or Place Linked: the file, fitted and
+    /// centered as when placed, then its Free Transform (as `Transform`).
+    Place {
+        path: PathBuf,
+        #[serde(default)]
+        linked: bool,
+        corners: [[f64; 2]; 4],
+    },
     /// A menu command without settings.
     Menu {
         item: MenuItem,
@@ -420,20 +428,54 @@ impl std::fmt::Display for FileError {
 
 impl Library {
     /// The saved actions, or the default ones the first time (tests start
-    /// from the default ones).
-    pub fn load() -> Self {
+    /// from the default ones). A file that can't be read is never
+    /// overwritten: a damaged one is renamed aside first; one made by a
+    /// newer Atelier, or unreadable, is left as it is and nothing is saved
+    /// this session (`Load::saving` false).
+    pub fn load() -> Load {
         if cfg!(test) {
-            return Self::defaults();
+            return Load::fine(Self::defaults());
         }
-        read(&library_file()).map_or_else(|_| Self::defaults(), |sets| Self { sets })
+        Self::load_from(&library_file())
     }
 
-    pub fn save(&self) {
-        if cfg!(test) {
-            return;
+    fn load_from(path: &Path) -> Load {
+        let error = match read(path) {
+            Ok(sets) => return Load::fine(Self { sets }),
+            Err(FileError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Load::fine(Self::defaults());
+            }
+            Err(e) => e,
+        };
+        let backup = matches!(error, FileError::Invalid)
+            .then(|| set_aside(path))
+            .flatten();
+        let notice = match &backup {
+            Some(b) => t!(
+                "smart3-actions-damaged",
+                error = error.to_string(),
+                backup = b
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            None => t!("smart3-actions-unreadable", error = error.to_string()),
+        };
+        Load {
+            library: Self::defaults(),
+            saving: backup.is_some(),
+            notice: Some(notice),
         }
-        let _ = std::fs::create_dir_all(crate::config::dir());
-        let _ = write(&library_file(), &self.sets);
+    }
+
+    /// Saved over the actions file, atomically.
+    pub fn save(&self) -> Result<(), FileError> {
+        if cfg!(test) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(crate::config::dir()).map_err(FileError::Io)?;
+        write(&library_file(), &self.sets)
     }
 
     /// The actions Atelier comes with, built from its commands.
@@ -518,6 +560,37 @@ impl Library {
     }
 }
 
+/// The library read at start, and what the user must know about it.
+pub struct Load {
+    pub library: Library,
+    /// The actions file may be written.
+    pub saving: bool,
+    pub notice: Option<String>,
+}
+
+impl Load {
+    fn fine(library: Library) -> Self {
+        Self {
+            library,
+            saving: true,
+            notice: None,
+        }
+    }
+}
+
+/// `path` renamed to "name.bak", "name.bak-2"…: its new path.
+fn set_aside(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let backup = (1..1000)
+        .map(|n| match n {
+            1 => path.with_file_name(format!("{name}.bak")),
+            n => path.with_file_name(format!("{name}.bak-{n}")),
+        })
+        .find(|p| !p.exists())?;
+    std::fs::rename(path, &backup).ok()?;
+    Some(backup)
+}
+
 fn library_file() -> PathBuf {
     crate::config::dir().join("actions.json")
 }
@@ -543,7 +616,12 @@ pub fn write(path: &Path, sets: &[Set]) -> Result<(), FileError> {
         sets: sets.to_vec(),
     };
     let json = serde_json::to_vec_pretty(&file).map_err(|_| FileError::Invalid)?;
-    std::fs::write(path, json).map_err(FileError::Io)
+    let written =
+        crate::document::write_atomic(path, |out| Ok(std::io::Write::write_all(out, &json)?));
+    written.map_err(|e| match e {
+        crate::document::FileError::Io(e) => FileError::Io(e),
+        e => FileError::Io(std::io::Error::other(e.to_string())),
+    })
 }
 
 /// A part of the names Batch gives the files it saves, like Photoshop's
@@ -638,10 +716,64 @@ fn serial_letter(mut n: u32) -> String {
 
 /// Today (local time is not known without a time zone database: UTC).
 pub fn today() -> (i32, u32, u32) {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    civil_date((secs / 86_400) as i64)
+    local_date().unwrap_or_else(|| {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        civil_date((secs / 86_400) as i64)
+    })
+}
+
+/// Today in the local time zone.
+#[cfg(unix)]
+fn local_date() -> Option<(i32, u32, u32)> {
+    // SAFETY: `time(NULL)` has no preconditions; `localtime_r` writes into
+    // the `tm` it is given and returns null on failure.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return None;
+        }
+        Some((tm.tm_year + 1900, (tm.tm_mon + 1) as u32, tm.tm_mday as u32))
+    }
+}
+
+#[cfg(windows)]
+fn local_date() -> Option<(i32, u32, u32)> {
+    #[repr(C)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLocalTime(time: *mut SystemTime);
+    }
+    let mut t = SystemTime {
+        year: 0,
+        month: 0,
+        day_of_week: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        milliseconds: 0,
+    };
+    // SAFETY: GetLocalTime fills the SYSTEMTIME it is given.
+    unsafe { GetLocalTime(&mut t) };
+    Some((i32::from(t.year), u32::from(t.month), u32::from(t.day)))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn local_date() -> Option<(i32, u32, u32)> {
+    None
 }
 
 /// Year, month, day of the `days`-th day since 1970-01-01 (Howard
@@ -747,6 +879,35 @@ mod tests {
         assert!(matches!(read(&path), Err(FileError::Newer(9))));
         std::fs::write(&path, r#"{"layers": []}"#).unwrap();
         assert!(matches!(read(&path), Err(FileError::Invalid)));
+    }
+
+    #[test]
+    fn an_unreadable_library_is_never_overwritten() {
+        let dir = std::env::temp_dir().join("atelier-actions-library-load");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("actions.json");
+        // None yet: the defaults, saved as usual.
+        let load = Library::load_from(&path);
+        assert!(load.saving && load.notice.is_none());
+        // Made by a newer version: kept as it is, nothing saved.
+        let newer = r#"{"version": 9, "sets": []}"#;
+        std::fs::write(&path, newer).unwrap();
+        let load = Library::load_from(&path);
+        assert!(!load.saving && load.notice.is_some());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+        // Damaged: set aside before anything is saved over it.
+        std::fs::write(&path, "{\"version\": 1, \"se").unwrap();
+        let load = Library::load_from(&path);
+        assert!(load.saving && load.notice.is_some());
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("actions.json.bak")).unwrap(),
+            "{\"version\": 1, \"se"
+        );
+        std::fs::write(&path, "x").unwrap();
+        Library::load_from(&path);
+        assert!(dir.join("actions.json.bak-2").exists());
     }
 
     #[test]

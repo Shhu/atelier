@@ -164,6 +164,9 @@ impl TransformJob {
     }
 }
 
+/// Parts each segment of a shape is cut in before it is warped.
+const WARP_CUTS: usize = 8;
+
 /// The map of a vector shape following `t`, if it can (an affine map keeps
 /// it a live shape; beyond a perspective's horizon, it can't).
 fn shape_map(t: &Transform) -> Option<xform::Homography> {
@@ -221,9 +224,13 @@ impl Document {
             .flatten()
     }
 
-    /// Whether layer `i` is a shape that follows `t` as a vector.
+    /// Whether layer `i` is a shape that follows `t` as a vector (a warp
+    /// bends its path).
     fn follows_as_shape(&self, i: usize, t: &Transform) -> bool {
         let l = &self.layers[i];
+        if l.shape.is_some() && matches!(t.map, xform::Map::Warp(_)) {
+            return true;
+        }
         let (Some(shape), Some(h)) = (&l.shape, shape_map(t)) else {
             return false;
         };
@@ -315,7 +322,22 @@ impl Document {
                 continue;
             };
             let old = layer.offset;
-            if shape && let Some(h) = shape_map(t) {
+            if shape && matches!(t.map, xform::Map::Warp(_)) {
+                // Cut in short segments, which then follow the warp closely.
+                if let Some(s) = layer.shape.as_mut() {
+                    for sub in &mut s.path.subpaths {
+                        *sub = sub.subdivided(WARP_CUTS);
+                    }
+                }
+                layer.map_shape_with(
+                    old,
+                    |p| {
+                        let [x, y] = t.forward([p.x as f64, p.y as f64])?;
+                        Some(crate::vector::pt(x as f32, y as f32))
+                    },
+                    limit,
+                );
+            } else if shape && let Some(h) = shape_map(t) {
                 if h.is_affine() {
                     let [a, b, c, d, e, f, .., k] = h.0;
                     let m = [a, b, c, d, e, f].map(|v| (v / k) as f32);
@@ -363,6 +385,14 @@ impl Document {
     pub fn rename_last_step(&mut self, name: String) {
         if let Some(step) = self.undo.back_mut() {
             step.name = name;
+        }
+    }
+
+    /// The steps recorded since `mark` become one, under the last one's
+    /// name.
+    pub fn join_since(&mut self, mark: super::HistoryMark) {
+        while self.undo.len() >= 2 && self.undo[self.undo.len() - 2].seq > mark.seq {
+            self.join_last_step();
         }
     }
 

@@ -154,6 +154,21 @@ pub struct SmartObject {
 }
 
 impl SmartObject {
+    /// Its big buffers (see `Layer::buffers`): the contents' layers and
+    /// composite, the renderings kept, the filter mask.
+    pub(super) fn buffers(&self, out: &mut Vec<(usize, usize)>) {
+        let c = &self.contents;
+        for l in &c.layers {
+            l.buffers(out);
+        }
+        let grays = c.channels.iter().map(|ch| ch.mask.as_raw());
+        let grays = grays.chain(self.filter_mask.iter().map(|m| m.image().as_raw()));
+        let rgba = std::iter::once(&c.flat).chain(self.cache.iter().flat_map(|(a, b)| [a, b]));
+        for raw in grays.chain(rgba.map(|i| i.as_raw())) {
+            out.push((raw.as_ptr() as usize, raw.len()));
+        }
+    }
+
     pub fn new(contents: Contents, map: Map) -> Self {
         Self {
             contents,
@@ -722,6 +737,52 @@ pub struct EmbeddedIn {
     pub name: String,
 }
 
+/// A linked file to read again, and its smart object rendered with it
+/// (see [`Document::stale_links`]).
+pub struct LinkRead {
+    layer: u64,
+    /// The layer's revision: rendered for it as it was.
+    rev: u64,
+    name: String,
+    path: PathBuf,
+    /// The file's modification time before it is read.
+    stamp: Option<SystemTime>,
+    smart: SmartObject,
+    offset: (i64, i64),
+    limit: PixelRect,
+}
+
+/// A linked file read again (`read`: `None` if it could not be).
+pub struct LinkFresh {
+    layer: u64,
+    rev: u64,
+    name: String,
+    path: PathBuf,
+    stamp: Option<SystemTime>,
+    read: Option<(Contents, SmartRender)>,
+}
+
+impl LinkRead {
+    /// Reads the file and renders the smart object with it (slow: any
+    /// thread).
+    pub fn run(self) -> LinkFresh {
+        let mut smart = self.smart;
+        let read = Document::open(&self.path).ok().map(|o| {
+            smart.contents = o.doc.to_contents(smart.contents.id, file_name(&self.path));
+            let job = smart.job(smart.transform(self.offset), self.offset, self.limit);
+            (smart.contents, job.run())
+        });
+        LinkFresh {
+            layer: self.layer,
+            rev: self.rev,
+            name: self.name,
+            path: self.path,
+            stamp: self.stamp,
+            read,
+        }
+    }
+}
+
 /// What became of the linked files (see [`Document::update_links`]).
 #[derive(Default, Debug, PartialEq)]
 pub struct LinkReport {
@@ -895,9 +956,19 @@ impl Document {
         let opened = Self::open(path)?;
         let contents = opened.doc.to_contents(next_rev(), file_name(path));
         let (w, h) = contents.size();
-        let (cw, ch) = (self.canvas.0 as f64, self.canvas.1 as f64);
+        // Fitted and centered in the active layer's artboard, or the canvas.
+        let (x0, y0, cw, ch) = match self.artboard_of(self.active) {
+            Some(b) => self.layers[b]
+                .artboard_rect()
+                .map_or((0, 0, 0, 0), |r| (r.x, r.y, r.w, r.h)),
+            None => (0, 0, self.canvas.0, self.canvas.1),
+        };
+        let (cw, ch) = (f64::from(cw), f64::from(ch));
         let k = (cw / w.max(1) as f64).min(ch / h.max(1) as f64).min(1.0);
-        let (tx, ty) = ((cw - w as f64 * k) / 2.0, (ch - h as f64 * k) / 2.0);
+        let (tx, ty) = (
+            x0 as f64 + (cw - w as f64 * k) / 2.0,
+            y0 as f64 + (ch - h as f64 * k) / 2.0,
+        );
         // Whole pixels when not reduced: the file shows as it is.
         let (tx, ty) = if k == 1.0 {
             (tx.floor(), ty.floor())
@@ -973,57 +1044,96 @@ impl Document {
         true
     }
 
-    /// Linked smart objects whose file changed are shown again (one undo
-    /// step); those whose file is missing keep their last copy.
+    /// Linked smart objects whose file changed show it again, as one undo
+    /// step; their files are read here (the app reads them on another
+    /// thread: see [`Self::stale_links`]).
+    #[cfg(test)]
     pub fn update_links(&mut self) -> LinkReport {
-        let mut report = LinkReport::default();
-        let mut fresh: Vec<(usize, Option<Contents>, bool)> = Vec::new();
-        for (i, l) in self.layers.iter().enumerate() {
-            let Some(link) = l.smart.as_ref().and_then(|s| s.link.as_ref()) else {
+        let (reads, missing) = self.stale_links();
+        let mut report = self.put_links(reads.into_iter().map(LinkRead::run).collect());
+        report.missing.splice(0..0, missing);
+        report
+    }
+
+    /// The linked files that changed, to read again ([`LinkRead::run`], on
+    /// any thread, then [`Self::put_links`]); and the names of the layers
+    /// whose file is missing (marked so, their last copy kept: the
+    /// document doesn't change).
+    pub fn stale_links(&mut self) -> (Vec<LinkRead>, Vec<String>) {
+        let limit = self.shape_limit();
+        let (mut reads, mut missing) = (Vec::new(), Vec::new());
+        for l in &mut self.layers {
+            let Some(s) = l.smart.as_deref_mut() else {
+                continue;
+            };
+            let Some(link) = &mut s.link else {
                 continue;
             };
             let Some(stamp) = std::fs::metadata(&link.path)
                 .ok()
                 .map(|m| m.modified().ok())
             else {
-                if !link.missing {
-                    fresh.push((i, None, true));
-                }
-                report.missing.push(l.name.clone());
+                link.missing = true;
+                missing.push(l.name.clone());
                 continue;
             };
             if stamp == link.modified && !link.missing {
                 continue;
             }
-            let id = l.smart.as_ref().map_or(0, |s| s.contents.id);
-            match Self::open(&link.path) {
-                Ok(o) => {
-                    fresh.push((i, Some(o.doc.to_contents(id, file_name(&link.path))), false));
-                    report.updated.push(l.name.clone());
-                }
-                Err(_) => report.missing.push(l.name.clone()),
-            }
+            reads.push(LinkRead {
+                layer: l.id,
+                rev: l.rev,
+                name: l.name.clone(),
+                path: link.path.clone(),
+                stamp,
+                smart: s.clone(),
+                offset: l.offset,
+                limit,
+            });
         }
-        if fresh.iter().any(|(_, c, _)| c.is_some()) {
-            self.checkpoint(t!("smart-hist-update-links"));
-        }
+        (reads, missing)
+    }
+
+    /// The linked files read again shown, as one undo step (rendered
+    /// again here when the smart object changed meanwhile).
+    pub fn put_links(&mut self, fresh: Vec<LinkFresh>) -> LinkReport {
+        let mut report = LinkReport::default();
         let limit = self.shape_limit();
-        for (i, contents, missing) in fresh {
-            let layer = &mut self.layers[i];
-            let Some(s) = layer.smart.as_deref_mut() else {
+        let mut stepped = false;
+        for f in fresh {
+            let Some(i) = self.layer_index(f.layer) else {
                 continue;
             };
-            if let Some(link) = &mut s.link {
-                link.missing = missing;
-                if !missing {
-                    link.modified = modified_time(&link.path);
+            let Some((contents, render)) = f.read else {
+                report.missing.push(f.name);
+                continue;
+            };
+            let same_link = |s: &SmartObject| s.link.as_ref().is_some_and(|l| l.path == f.path);
+            if !self.layers[i].smart.as_deref().is_some_and(same_link) {
+                continue;
+            }
+            if !stepped {
+                self.checkpoint(t!("smart-hist-update-links"));
+                stepped = true;
+            }
+            let layer = &mut self.layers[i];
+            let unchanged = layer.rev == f.rev;
+            if let Some(s) = layer.smart.as_deref_mut() {
+                s.contents = contents;
+                if let Some(link) = &mut s.link {
+                    link.missing = false;
+                    link.modified = f.stamp;
                 }
             }
-            if let Some(c) = contents {
-                s.contents = c;
+            if unchanged {
+                let old = layer.offset;
+                layer.put_smart(render);
+                layer.keep_masks(old);
+            } else {
                 layer.render_smart(limit);
             }
             self.modified = true;
+            report.updated.push(f.name);
         }
         report
     }
@@ -1130,7 +1240,7 @@ impl Document {
 
     /// Whether the targeted mask is the active smart object's filter mask.
     pub fn filter_mask_targeted(&self) -> bool {
-        self.filter_mask_target && self.mask_targeted()
+        self.filter_mask_target && self.quick_mask.is_none() && self.mask_targeted()
     }
 
     /// Targets the active smart object's filter mask (painting tools,
@@ -1553,6 +1663,83 @@ mod tests {
             doc.active_layer().pixel_at(100, 75).is_some(),
             "its last copy"
         );
+    }
+
+    /// Placed with a layer of an artboard active: fitted and centered in
+    /// that artboard.
+    #[test]
+    fn placed_files_fit_the_active_artboard() {
+        let dir = std::env::temp_dir().join("atelier-smart-place-artboard");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("photo.png");
+        RgbaImage::from_pixel(1920, 1080, Rgba([200, 0, 0, 255]))
+            .save(&path)
+            .unwrap();
+        let white = crate::document::ArtboardBackground::White;
+        let mut doc = Document::with_artboard(1000, 1000, white);
+        let name = doc.new_artboard_name();
+        let board = PixelRect {
+            x: 1100,
+            y: 0,
+            w: 1000,
+            h: 1000,
+        };
+        doc.add_artboard("new".into(), name, board, white);
+        doc.active = doc.artboards()[1];
+        doc.place_file(&path, false).unwrap();
+        assert_eq!(doc.artboard_of(doc.active), Some(doc.artboards()[1]));
+        let r = doc.active_layer().rect();
+        assert_eq!((r.x, r.w), (1100, 1000), "{r:?}");
+        assert!(r.y > 0 && r.bottom() < 1000, "{r:?}");
+    }
+
+    /// Linked files read on another thread: a smart object changed
+    /// meanwhile is rendered again as it is now; a missing file changes
+    /// nothing in the document.
+    #[test]
+    fn links_read_later_and_missing_files() {
+        let dir = std::env::temp_dir().join("atelier-smart-links-later");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("logo.png");
+        RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255]))
+            .save(&path)
+            .unwrap();
+        let mut doc = Document::new(RgbaImage::from_pixel(100, 100, Rgba([255; 4])), None);
+        doc.place_file(&path, true).unwrap();
+        doc.modified = false;
+        // Changed: read, while the smart object moves.
+        if let Some(l) = doc
+            .active_layer_mut()
+            .smart
+            .as_deref_mut()
+            .and_then(|s| s.link.as_mut())
+        {
+            l.modified = None;
+        }
+        RgbaImage::from_pixel(20, 20, Rgba([0, 255, 0, 255]))
+            .save(&path)
+            .unwrap();
+        let (reads, missing) = doc.stale_links();
+        assert_eq!((reads.len(), missing.len()), (1, 0));
+        let fresh: Vec<LinkFresh> = reads.into_iter().map(LinkRead::run).collect();
+        let i = doc.active;
+        let before = doc.active_layer().rect();
+        doc.edit_smart(i, "move".into(), |s| s.map = shift_map(s.map, [10.0, 0.0]));
+        let moved = doc.active_layer().rect();
+        assert_eq!(moved.x, before.x + 10);
+        let report = doc.put_links(fresh);
+        assert_eq!(report.updated.len(), 1);
+        assert_eq!(doc.active_layer().rect(), moved, "the move kept");
+        let (x, y) = (moved.x + 5, moved.y + 5);
+        assert_eq!(doc.active_layer().pixel_at(x, y), Some([0, 255, 0, 255]));
+        assert!(doc.stale_links().0.is_empty(), "up to date");
+        // Missing: reported, nothing to save.
+        doc.modified = false;
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(doc.update_links().missing.len(), 1);
+        assert!(!doc.modified);
     }
 
     #[test]

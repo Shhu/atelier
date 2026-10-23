@@ -10,7 +10,7 @@
 //! are on the pasteboard: the view shows them around the boards.
 
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use image::RgbaImage;
 
@@ -461,7 +461,7 @@ impl Document {
             for (name, image) in render() {
                 let stem = artboard_file_stem(&format!("{}{name}", files.prefix), &mut used);
                 let ext = files.format.extensions()[0];
-                let path = files.folder.join(format!("{stem}.{ext}"));
+                let path = unused_artboard_path(&files.folder, &stem, ext, &mut used);
                 let profile = profile.as_deref().map(Vec::as_slice);
                 super::file_io::export(&image, &path, files.format, files.quality, profile)?;
                 written.push(path);
@@ -510,10 +510,10 @@ impl Document {
 }
 
 /// A file name made of `name`: the characters file systems refuse
-/// replaced, numbered if already `used` (whatever the case).
+/// replaced, never hidden, empty or a Windows device name, numbered if
+/// already `used` (whatever the case).
 pub fn artboard_file_stem(name: &str, used: &mut Vec<String>) -> String {
     let clean: String = name
-        .trim()
         .chars()
         .map(|c| {
             if c.is_control() || "/\\:*?\"<>|".contains(c) {
@@ -523,6 +523,25 @@ pub fn artboard_file_stem(name: &str, used: &mut Vec<String>) -> String {
             }
         })
         .collect();
+    // Windows drops trailing dots and spaces; a leading dot hides a file.
+    let clean = clean.trim_matches(|c: char| c.is_whitespace() || c == '.');
+    let device = |s: &str| {
+        let base = s
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim_end()
+            .to_ascii_uppercase();
+        matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (base.len() == 4
+                && (base.starts_with("COM") || base.starts_with("LPT"))
+                && base.as_bytes()[3].is_ascii_digit())
+    };
+    let clean = match clean {
+        "" => t!("artboard-name", number = 1),
+        c if device(c) => format!("{c}_"),
+        c => c.to_string(),
+    };
     let mut stem = clean.clone();
     let mut n = 2;
     while used.contains(&stem.to_lowercase()) {
@@ -531,6 +550,32 @@ pub fn artboard_file_stem(name: &str, used: &mut Vec<String>) -> String {
     }
     used.push(stem.to_lowercase());
     stem
+}
+
+/// The file `stem`.`ext` in `folder`, numbered while one of that name
+/// exists ("Artboard 1-2.png"): an export never replaces a file. The name
+/// is then `used`.
+pub fn unused_artboard_path(
+    folder: &Path,
+    stem: &str,
+    ext: &str,
+    used: &mut Vec<String>,
+) -> PathBuf {
+    let mut path = folder.join(format!("{stem}.{ext}"));
+    let mut n = 2;
+    while path.exists() || (n > 2 && used.contains(&path_stem(&path))) {
+        path = folder.join(format!("{stem}-{n}.{ext}"));
+        n += 1;
+    }
+    used.push(path_stem(&path));
+    path
+}
+
+fn path_stem(path: &Path) -> String {
+    path.file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase()
 }
 
 #[cfg(test)]
@@ -711,8 +756,12 @@ mod tests {
             },
         };
         let which = doc.artboards();
-        let written = doc.export_artboards_later(&which, files)().unwrap();
+        let written = doc.export_artboards_later(&which, files.clone())().unwrap();
         assert_eq!(written.len(), 2);
+        // Again: numbered, the first files kept.
+        let again = doc.export_artboards_later(&which, files)().unwrap();
+        assert!(again.iter().all(|p| !written.contains(p) && p.exists()));
+        assert!(written.iter().all(|p| p.exists()));
         for (path, &i) in written.iter().zip(&which) {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             assert!(name.starts_with("doc_") && name.ends_with(".png"), "{name}");
@@ -727,6 +776,12 @@ mod tests {
         let mut used = Vec::new();
         assert_eq!(artboard_file_stem("a/b", &mut used), "a_b");
         assert_eq!(artboard_file_stem("A_B", &mut used), "A_B-2");
+        // Never hidden, empty or a device.
+        let blank = artboard_file_stem("   ", &mut used);
+        assert!(!blank.is_empty() && !blank.starts_with('.'));
+        assert_eq!(artboard_file_stem(".hidden. ", &mut used), "hidden");
+        assert_eq!(artboard_file_stem("con", &mut used), "con_");
+        assert_eq!(artboard_file_stem("LPT1.txt", &mut used), "LPT1.txt_");
     }
 
     #[test]

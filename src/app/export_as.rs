@@ -76,6 +76,24 @@ fn preview_of(
     proof: Option<&crate::cms::Converter>,
     srgb: Option<&crate::cms::Profile>,
 ) -> Preview {
+    // A large export is previewed smaller, its file size estimated from
+    // that one's.
+    const EXACT: f64 = 4096.0 * 4096.0;
+    let area = |o: &ExportOptions| {
+        let (w, h) = o.size(flat.dimensions());
+        w as f64 * h as f64
+    };
+    if area(options) > EXACT {
+        // A little under, for the rounding of the sides.
+        let f = (EXACT / area(options)).sqrt() as f32 * 0.99;
+        let reduced = ExportOptions {
+            scale: options.scale * f,
+            ..options.clone()
+        };
+        let k = area(options) / area(&reduced);
+        let (shown, bytes) = preview_of(flat, &reduced, icc, proof, srgb);
+        return (shown, bytes.map(|b| (b as f64 * k) as usize));
+    }
     let image = options.render(flat.clone());
     let cmyk = proof.filter(|_| options.use_proof && crate::document::has_cmyk(options.format));
     let (shown, bytes) = match (options.format, cmyk) {
@@ -127,13 +145,13 @@ fn preview_of(
     )
 }
 
-/// "1.2 MB", "350 KB".
+/// "1.2 MB", "350 KB" ("1,2 Mo" in French).
 fn file_size(bytes: usize) -> String {
     let kb = bytes as f64 / 1024.0;
     if kb < 1024.0 {
-        format!("{} KB", i18n::decimal(kb.max(0.1), 1))
+        t!("words3-size-kb", size = i18n::decimal(kb.max(0.1), 1))
     } else {
-        format!("{} MB", i18n::decimal(kb / 1024.0, 1))
+        t!("models-size-mb", size = i18n::decimal(kb / 1024.0, 1))
     }
 }
 
@@ -290,36 +308,29 @@ impl AtelierApp {
             )
         };
         if options.use_proof
+            && options.format == ExportFormat::Psd
             && crate::document::has_cmyk(options.format)
             && let Some(proof) = self.proof_converter()
         {
             let c = proof.conversion();
-            if options.format == ExportFormat::Psd {
-                return doc
-                    .export_cmyk(path, ExportFormat::Psd, options.quality, &c)
-                    .map_err(failed);
-            }
-            let image = options.render(doc.flatten());
-            let bytes = options.encode_cmyk(&image, &c).map_err(failed)?;
-            crate::export::write(path, &bytes).map_err(failed)?;
-            return Ok(Vec::new());
+            return doc
+                .export_cmyk(path, ExportFormat::Psd, options.quality, &c)
+                .map_err(failed);
         }
         if options.format == ExportFormat::Psd {
             return doc
                 .export(path, ExportFormat::Psd, options.quality)
                 .map_err(failed);
         }
-        let mut image = options.render(doc.flatten());
-        let srgb = self.srgb_source(options);
         let icc = doc.icc_profile.as_deref().map(Vec::as_slice);
-        let icc = in_srgb(&mut image, srgb.as_ref()).or(icc);
-        let bytes = options.encode(&image, icc).map_err(failed)?;
-        crate::export::write(path, &bytes).map_err(failed)?;
+        let (proof, srgb) = (self.proof_converter(), self.srgb_source(options));
+        let bytes = export_bytes(doc.flatten(), options, icc, proof.as_ref(), srgb.as_ref());
+        crate::export::write(path, &bytes.map_err(failed)?).map_err(failed)?;
         Ok(Vec::new())
     }
 
     /// The document's profile, when Convert to sRGB has to convert from it.
-    fn srgb_source(&self, options: &ExportOptions) -> Option<crate::cms::Profile> {
+    pub(super) fn srgb_source(&self, options: &ExportOptions) -> Option<crate::cms::Profile> {
         let doc = self.doc.as_ref()?;
         let from = self.color.profile_of(doc);
         (options.srgb && from != *crate::cms::srgb()).then_some(from)
@@ -358,6 +369,26 @@ impl AtelierApp {
         let (dir, stem) = (self.current_dir(), self.file_stem());
         if let Some(path) = files::ask_save_path(&title, &filters, dir, &stem) {
             self.export_to(&options, &path);
+        }
+    }
+}
+
+/// The file of an image export (not a PSD): `flat` at its size, in CMYK
+/// with Use Proof Setup (`proof`), else converted to sRGB from `srgb`
+/// if given; `icc`: the document's profile.
+pub(super) fn export_bytes(
+    flat: RgbaImage,
+    options: &ExportOptions,
+    icc: Option<&[u8]>,
+    proof: Option<&crate::cms::Converter>,
+    srgb: Option<&crate::cms::Profile>,
+) -> Result<Vec<u8>, crate::document::FileError> {
+    let mut image = options.render(flat);
+    match proof.filter(|_| options.use_proof && crate::document::has_cmyk(options.format)) {
+        Some(proof) => options.encode_cmyk(&image, &proof.conversion()),
+        None => {
+            let icc = in_srgb(&mut image, srgb).or(icc);
+            options.encode(&image, icc)
         }
     }
 }
@@ -438,6 +469,18 @@ fn export_settings(
     gap_between_blocks(ui);
     block(ui, |ui| {
         ui_kit::section(ui, &t!("actions-export-metadata"));
+        // GIF and PSD files get none.
+        let room = !matches!(d.options.format, ExportFormat::Gif | ExportFormat::Psd);
+        if !room {
+            help(
+                ui,
+                &t!(
+                    "files3-export-no-metadata",
+                    format = d.options.format.name()
+                ),
+            );
+            return;
+        }
         let mut copyright = d.options.copyright.is_some();
         let label = |on: bool| {
             if on {
@@ -538,7 +581,10 @@ fn image_settings(ui: &mut egui::Ui, o: &mut ExportOptions, canvas: (u32, u32), 
             });
             let mut scale = o.scale;
             let label = t!("actions-scale");
-            if ui_kit::number_field(ui, &label, &mut scale, 1.0..=1000.0, " %", width).changed() {
+            // No side beyond what Atelier opens.
+            let most = (MAX_DIMENSION as f32 * 100.0 / cw.max(ch).max(1) as f32).min(1000.0);
+            let suffix = crate::i18n::percent("");
+            if ui_kit::number_field(ui, &label, &mut scale, 1.0..=most, &suffix, width).changed() {
                 o.scale = scale;
             }
             ui_kit::combo(

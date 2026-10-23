@@ -364,6 +364,7 @@ fn grabbing_another_element_with_fit_canvas_does_not_jump() {
     let mut h = app_with(d);
     h.state_mut().tool = Tool::Transform;
     h.state_mut().fit_canvas = true;
+    h.state_mut().auto_select = true;
     h.run_steps(1);
     let (from, to) = (screen(&h, 125.0, 125.0), screen(&h, 135.0, 125.0));
     drag(&mut h, from, to, Modifiers::NONE);

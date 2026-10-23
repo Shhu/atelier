@@ -36,6 +36,9 @@ const PREVIEW_SIDE: u32 = 3072;
 const OPTIONS_WIDTH: f32 = 272.0;
 /// Steps kept by the workspace's own undo.
 const MAX_UNDO: usize = 64;
+/// Memory the workspace's undo may hold (bytes): fewer steps of a large
+/// mesh.
+const UNDO_BUDGET: usize = 256 << 20;
 /// The result being computed shows its progress after this delay (s).
 const PROGRESS_DELAY: f64 = 0.3;
 /// Largest brush, in pixels.
@@ -324,6 +327,8 @@ struct Workspace {
     /// The source reduced for the preview: a pixel per `factor` × `factor`.
     reduced: Arc<RgbaImage>,
     factor: u32,
+    /// The canvas's color table: the previews look as the canvas does.
+    lut: Option<Arc<crate::cms::Lut>>,
     /// The result, the original (Preview off), the other layers, the
     /// freeze mask (a texel per node).
     preview: Option<TextureHandle>,
@@ -429,10 +434,11 @@ impl Workspace {
     /// An undo step, before a change.
     fn push_undo(&mut self, snapshot: Snapshot) {
         self.undo.push(snapshot);
-        if self.undo.len() > MAX_UNDO {
-            self.undo.remove(0);
-        }
         self.redo.clear();
+        let mut bytes: usize = self.undo.iter().map(Snapshot::bytes).sum();
+        while self.undo.len() > 1 && (self.undo.len() > MAX_UNDO || bytes > UNDO_BUDGET) {
+            bytes -= self.undo.remove(0).bytes();
+        }
     }
 
     /// Ctrl+Z (`true`) or Shift+Ctrl+Z inside the workspace.
@@ -454,7 +460,8 @@ impl Workspace {
         let frame = self.frame();
         let render = |r: [u32; 4]| {
             let mesh = Some(&self.editor.mesh);
-            let rgba = liquify::render_preview(&self.reduced, self.factor, mesh, frame, r);
+            let mut rgba = liquify::render_preview(&self.reduced, self.factor, mesh, frame, r);
+            color_ui::show_through(self.lut.as_deref(), &mut rgba, true);
             let size = [(r[2] - r[0]) as usize, (r[3] - r[1]) as usize];
             ColorImage::from_rgba_premultiplied(size, &rgba)
         };
@@ -492,7 +499,9 @@ impl Workspace {
         }
         if !self.preview_on && self.original.is_none() {
             let size = [tw as usize, th as usize];
-            let image = ColorImage::from_rgba_unmultiplied(size, self.reduced.as_raw());
+            let mut original = self.reduced.as_raw().clone();
+            color_ui::show_through(self.lut.as_deref(), &mut original, false);
+            let image = ColorImage::from_rgba_unmultiplied(size, &original);
             self.original = Some(ctx.load_texture("liquify-original", image, PREVIEW_OPTIONS));
         }
     }
@@ -552,6 +561,9 @@ impl AtelierApp {
     /// [`Self::open_liquify`], the distortion starting from `mesh` (a
     /// smart filter edited again).
     pub(super) fn open_liquify_with(&mut self, mesh: Option<&Mesh>) {
+        if self.refuse_hidden_target() {
+            return;
+        }
         let selection = self.selection.clone();
         // On a smart object: a smart filter, over what the filters below
         // it give.
@@ -564,9 +576,8 @@ impl AtelierApp {
         // As for the other filters, the layer is enlarged to the canvas
         // (its pixels don't change; a text or a shape stays editable until
         // the result applies).
-        if !doc.mask_targeted() && !doc.active_layer().is_live() {
-            doc.expand_active_to_canvas();
-        }
+        self.enlarge_for_dialog();
+        let Some(doc) = &mut self.doc else { return };
         let Some(target) = smart.or_else(|| active_target(doc, selection.as_ref())) else {
             self.status = t!("status-selection-empty");
             return;
@@ -592,6 +603,7 @@ impl AtelierApp {
             clip: target.clip,
             reduced,
             factor,
+            lut: self.color.shown().1,
             preview: None,
             original: None,
             backdrop: None,
@@ -614,6 +626,9 @@ impl AtelierApp {
 
     /// Last Filter after a Liquify: its mesh again, without the workspace.
     pub(super) fn liquify_again(&mut self) {
+        if self.refuse_hidden_target() {
+            return;
+        }
         if let Some(mesh) = self.liquify.last.clone() {
             self.start_liquify(mesh, None);
         }
@@ -744,7 +759,8 @@ impl AtelierApp {
             let (w, h) = ws.source.dimensions();
             let (x, y) = ws.offset;
             let others = doc.composite(PixelRect { x, y, w, h }, Some(doc.active));
-            let others = reduce_rgba(&others, ws.factor);
+            let mut others = reduce_rgba(&others, ws.factor);
+            color_ui::show_through(ws.lut.as_deref(), others.as_mut(), false);
             let size = [others.width() as usize, others.height() as usize];
             let image = ColorImage::from_rgba_unmultiplied(size, others.as_raw());
             ws.backdrop = Some(ctx.load_texture("liquify-backdrop", image, PREVIEW_OPTIONS));
@@ -802,12 +818,12 @@ impl AtelierApp {
         if ws.revert.is_some() {
             revert_window(ctx, &mut ws);
         }
-        if out.ok {
+        if out.ok && !ws.editor.mesh.is_identity() {
             let frame = (ws.offset, ws.source.dimensions());
-            if !ws.editor.mesh.is_identity() {
-                self.start_liquify(Arc::new(ws.editor.mesh.clone()), Some(frame));
-            }
-        } else if !out.cancel {
+            self.start_liquify(Arc::new(ws.editor.mesh.clone()), Some(frame));
+        } else if out.ok || out.cancel {
+            self.shrink_after_preview();
+        } else {
             self.liquify.workspace = Some(ws);
         }
     }
@@ -998,7 +1014,7 @@ fn canvas(ui: &mut egui::Ui, ws: &mut Workspace, settings: &Settings, size: Vec2
     {
         let (scroll, pinch) = ctx.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
         let wheel_zoom = if alt { scroll.y + scroll.x } else { 0.0 };
-        let factor = pinch * (wheel_zoom * 0.0015).exp();
+        let factor = pinch * (wheel_zoom * WHEEL_ZOOM_RATE).exp();
         if factor != 1.0 {
             ws.zoom_around(ws.zoom * factor, pos, area.center());
         }
@@ -1197,6 +1213,9 @@ fn brush_input(
     if points.is_empty() {
         points.push((last, None));
     }
+    // A fast pointer gives many events a frame: they make one path, dabbed
+    // at the brush's spacing (not a whole dab per event).
+    points = spaced(points, last, settings.brush.spacing());
     // A frame that took long counts for no more than a tenth of a second.
     let dt = ((now - since) as f32).min(0.1) / points.len() as f32;
     for (at, force) in points {
@@ -1217,6 +1236,28 @@ fn brush_input(
     ws.stroke = Some((last, now));
     // The tools over time go on while held still.
     ctx.request_repaint();
+}
+
+/// The points of `path` (after `from`) at least `spacing` apart, the last
+/// one always kept, with the latest pressure of those dropped.
+fn spaced(
+    path: Vec<([f32; 2], Option<f32>)>,
+    from: [f32; 2],
+    spacing: f32,
+) -> Vec<([f32; 2], Option<f32>)> {
+    let n = path.len();
+    let mut kept: Vec<([f32; 2], Option<f32>)> = Vec::with_capacity(n);
+    let (mut previous, mut force) = (from, None);
+    for (k, (at, f)) in path.into_iter().enumerate() {
+        force = f.or(force);
+        let far = (at[0] - previous[0]).hypot(at[1] - previous[1]) >= spacing;
+        if far || k + 1 == n {
+            kept.push((at, force));
+            previous = at;
+            force = None;
+        }
+    }
+    kept
 }
 
 /// Paints the freeze mask (else the mesh).
@@ -1716,6 +1757,22 @@ mod tests {
         assert_eq!(pixels(&h), once);
         h.state_mut().undo();
         assert_eq!(pixels(&h), original);
+    }
+
+    #[test]
+    fn many_pointer_events_make_dabs_at_the_brush_spacing() {
+        // Sixteen events a pixel apart, a spacing of 4: four points, the
+        // last one kept, the pressure of those dropped carried along.
+        let path: Vec<([f32; 2], Option<f32>)> = (1..=16)
+            .map(|i| ([i as f32, 0.0], (i == 2).then_some(0.5)))
+            .collect();
+        let kept = spaced(path, [0.0, 0.0], 4.0);
+        let xs: Vec<f32> = kept.iter().map(|(p, _)| p[0]).collect();
+        assert_eq!(xs, [4.0, 8.0, 12.0, 16.0]);
+        assert_eq!(kept[0].1, Some(0.5));
+        // Slow: every event.
+        let kept = spaced(vec![([10.0, 0.0], None)], [0.0, 0.0], 4.0);
+        assert_eq!(kept.len(), 1);
     }
 
     #[test]

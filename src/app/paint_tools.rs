@@ -57,6 +57,22 @@ pub(super) struct PaintTools {
     last_dab: f64,
     /// Previews of the brush presets, made on first use.
     pub previews: Vec<PresetPreview>,
+    /// A painting tool was used on this text or shape layer (its id): asks
+    /// to rasterize it first.
+    pub rasterize_confirm: Option<u64>,
+    /// Alt + right drag under way: where it started (screen), and the size
+    /// and hardness then.
+    size_drag: Option<(Pos2, f32, f32)>,
+    pub bucket: BucketSettings,
+}
+
+/// Options of the Paint Bucket (besides its tolerance and Contiguous).
+pub(super) struct BucketSettings {
+    pub mode: BlendMode,
+    pub opacity: f32,
+    pub anti_alias: bool,
+    /// Compares the colors seen, all layers together.
+    pub all_layers: bool,
 }
 
 /// Previews of a brush preset: a stroke and its tip.
@@ -116,6 +132,14 @@ impl Default for PaintTools {
             brush_at: None,
             last_dab: 0.0,
             previews: Vec::new(),
+            rasterize_confirm: None,
+            size_drag: None,
+            bucket: BucketSettings {
+                mode: BlendMode::Normal,
+                opacity: 1.0,
+                anti_alias: true,
+                all_layers: false,
+            },
         }
     }
 }
@@ -313,7 +337,7 @@ impl AtelierApp {
         released: bool,
         shift: bool,
     ) {
-        if start && (self.refuse_if_locked() || self.retouch_refuses()) {
+        if start && (self.paint_refuses() || self.retouch_refuses()) {
             return;
         }
         // Shift + click: straight line from the end of the previous stroke.
@@ -336,12 +360,6 @@ impl AtelierApp {
                 );
             let step = self.tool.name();
             let Some(doc) = &mut self.doc else { return };
-            if doc.active_layer().text.is_some() && !on_mask {
-                self.status = t!(
-                    "canvas-status-text-rasterized",
-                    name = doc.active_layer().name.as_str()
-                );
-            }
             doc.checkpoint(step);
             // The layer grows to the canvas, or its targeted mask stands in for it.
             if !doc.begin_paint() {
@@ -355,14 +373,15 @@ impl AtelierApp {
                 sel.clip(doc.active_layer(), canvas)
                     .unwrap_or([0; 4].into())
             });
-            let visible = sample_all.then(|| doc.composite(doc.active_layer().rect(), None));
+            let visible =
+                sample_all.then(|| (*doc.composite_shared(doc.active_layer().rect())).clone());
             let stroke = Stroke::begin(doc.active_layer().shared_image(), mode, settings)
                 .with_clip(clip)
                 .with_source(visible);
             let at = line_from.or(pointer.map(|p| view.to_image(p)));
-            let stroke = self
-                .retouch
-                .prepare(self.tool, doc, stroke, at.unwrap_or_default());
+            let stroke =
+                self.retouch
+                    .prepare(self.tool, doc, &self.parked, stroke, at.unwrap_or_default());
             self.stroke = Some(stroke);
             self.paint.pressure = None;
             self.paint.brush_at = None;
@@ -409,7 +428,7 @@ impl AtelierApp {
         {
             self.paint.last_dab = now;
             if let (Some(stroke), Some(doc)) = (&mut self.stroke, &mut self.doc)
-                && let Some(r) = stroke.repeat(doc.active_layer_mut().pixels_mut())
+                && let Some(r) = doc.active_layer_mut().paint(|px| stroke.repeat(px))
             {
                 self.stroke_dirty = Some(self.stroke_dirty.map_or(r, |d| d.union(r)));
                 let offset = doc.active_layer().offset;
@@ -432,16 +451,66 @@ impl AtelierApp {
         let layer = doc.active_layer_mut();
         let offset = layer.offset;
         let (lx, ly) = (at.x - offset.0 as f32, at.y - offset.1 as f32);
-        if let Some(r) = stroke.add_point(layer.pixels_mut(), lx, ly, pressure) {
+        if let Some(r) = layer.paint(|px| stroke.add_point(px, lx, ly, pressure)) {
             self.stroke_dirty = Some(self.stroke_dirty.map_or(r, |d| d.union(r)));
             self.retouch.dabbed(r);
             sync_paint(doc, offset, r);
         }
     }
 
+    /// Alt + right drag with a brush tool, like Photoshop: left and right
+    /// change its size, up and down its hardness. Whether one is under way.
+    pub(super) fn brush_size_drag(
+        &mut self,
+        hovered: bool,
+        pointer: Option<Pos2>,
+        zoom: f32,
+    ) -> bool {
+        let (pressed, down, alt) = self.ctx.input(|i| {
+            let p = &i.pointer;
+            (p.secondary_pressed(), p.secondary_down(), i.modifiers.alt)
+        });
+        if pressed
+            && alt
+            && hovered
+            && self.stroke.is_none()
+            && self.tool.sized_brush()
+            && let Some(p) = pointer
+        {
+            self.paint.size_drag = Some((p, self.brush_size, self.hardness));
+        }
+        let Some((from, size, hardness)) = self.paint.size_drag else {
+            return false;
+        };
+        if !down {
+            self.paint.size_drag = None;
+            return false;
+        }
+        if let Some(p) = pointer {
+            let d = p - from;
+            // The tip's edge follows the pointer.
+            self.brush_size = (size + 2.0 * d.x / zoom).round().clamp(1.0, MAX_BRUSH_SIZE);
+            if matches!(self.paint.tip, Tip::Round) {
+                self.hardness = (hardness + d.y / 200.0).clamp(0.0, 1.0);
+            }
+            let size = t!(
+                "status-brush-size",
+                value = format!("{:.0}", self.brush_size)
+            );
+            let hardness = t!(
+                "status-hardness",
+                value = format!("{:.0}", self.hardness * 100.0)
+            );
+            self.status = format!("{size} — {hardness}");
+        }
+        true
+    }
+
     /// Outline of the brush tip under the pointer (its angle and roundness);
     /// `false` when too small to show (a crosshair then).
     pub(super) fn draw_brush_cursor(&self, painter: &Painter, pos: Pos2, view: View) -> bool {
+        // Resized with Alt + right drag: where the drag started.
+        let pos = self.paint.size_drag.map_or(pos, |d| d.0);
         let radius = self.brush_size * 0.5 * view.zoom;
         if radius < 3.0 {
             return false;
@@ -499,6 +568,128 @@ impl AtelierApp {
         true
     }
 
+    /// Before a painting tool changes the active layer: refused, with a
+    /// message, when it is locked or hidden (with its group); a text or
+    /// shape layer must first be rasterized, which is asked.
+    pub(super) fn paint_refuses(&mut self) -> bool {
+        // Quick Mask Mode: the tools paint the mask.
+        if self.doc.as_ref().is_some_and(|d| d.quick_mask().is_some()) {
+            return false;
+        }
+        if self.refuse_if_locked() {
+            return true;
+        }
+        let Some(doc) = &self.doc else { return true };
+        let layer = doc.active_layer();
+        if !doc.shown(doc.active) {
+            self.status = t!("tools3-status-layer-hidden", name = layer.name.as_str());
+            return true;
+        }
+        if !doc.mask_targeted() && (layer.text.is_some() || layer.shape.is_some()) {
+            self.paint.rasterize_confirm = Some(layer.id);
+            return true;
+        }
+        false
+    }
+
+    /// Paint Bucket at `at` (canvas), with the foreground color.
+    pub(super) fn bucket_fill(&mut self, at: Pos2) {
+        if self.paint_refuses() {
+            return;
+        }
+        if self
+            .doc
+            .as_ref()
+            .is_some_and(|d| !d.mask_targeted() && !d.active_layer().paintable())
+        {
+            self.status = self.nothing_to_paint();
+            return;
+        }
+        let color = self.primary.to_srgba_unmultiplied();
+        let tolerance = (self.bucket_tolerance * 255.0).round() as u8;
+        let contiguous = self.bucket_contiguous;
+        let b = &self.paint.bucket;
+        let mode = b.mode;
+        let blend = move |d, s, x, y| blend_pixel(d, s, mode, x, y);
+        let style = crate::pixel_ops::BucketStyle {
+            sample: None,
+            anti_alias: b.anti_alias,
+            opacity: b.opacity,
+            blend: &blend,
+        };
+        let Some(doc) = &mut self.doc else { return };
+        if doc.fill_at_with(
+            at.x.floor() as i64,
+            at.y.floor() as i64,
+            color,
+            tolerance,
+            self.selection.as_ref(),
+            contiguous,
+            &style,
+            b.all_layers,
+        ) {
+            self.reset_pending();
+        }
+    }
+
+    /// A painting tool is chosen and the active layer is locked or hidden:
+    /// it would be refused (see `paint_refuses`).
+    pub(super) fn paint_blocked(&self) -> bool {
+        let paints = self.tool.sized_brush()
+            || matches!(self.tool, Tool::Gradient | Tool::Bucket | Tool::RedEye);
+        let Some(doc) = self.doc.as_ref().filter(|_| paints) else {
+            return false;
+        };
+        if doc.quick_mask().is_some() {
+            return false;
+        }
+        doc.active_layer().locked || !doc.shown(doc.active)
+    }
+
+    /// Asks to rasterize the text or shape layer a painting tool was used on.
+    pub(super) fn rasterize_confirm_window(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.paint.rasterize_confirm else {
+            return;
+        };
+        let Some(layer) = self
+            .doc
+            .as_ref()
+            .map(Document::active_layer)
+            .filter(|l| l.id == id)
+        else {
+            self.paint.rasterize_confirm = None;
+            return;
+        };
+        let text = if layer.text.is_some() {
+            t!("tools3-rasterize-text", name = layer.name.as_str())
+        } else {
+            t!("tools3-rasterize-shape", name = layer.name.as_str())
+        };
+        let center = ctx.content_rect().center();
+        let out = super::dialogs::floating_dialog(
+            ctx,
+            super::dialogs::DialogSpec {
+                pivot: egui::Align2::CENTER_CENTER,
+                width: 400.0,
+                ok: t!("tools3-rasterize-ok"),
+                ..super::dialogs::DialogSpec::new(
+                    "rasterize_confirm",
+                    t!("vector-menu-rasterize"),
+                    center,
+                )
+            },
+            |ui| {
+                ui.label(text);
+            },
+        );
+        if out.ok || out.cancel {
+            self.paint.rasterize_confirm = None;
+        }
+        if out.ok {
+            self.run(Action::Rasterize);
+        }
+    }
+
     // ------------------------------------------------------------ gradient
 
     /// Gradient tool: drag from the start to the end (Shift: by 45°), the
@@ -513,7 +704,7 @@ impl AtelierApp {
         shift: bool,
     ) {
         if start
-            && !self.refuse_if_locked()
+            && !self.paint_refuses()
             && let Some(p) = pointer
         {
             let at = view.to_image(p);
@@ -549,7 +740,6 @@ impl AtelierApp {
         };
         let mode = g.mode;
         let Some(doc) = &mut self.doc else { return };
-        let text = doc.active_layer().text.is_some() && !doc.mask_targeted();
         doc.checkpoint(t!("paint-tool-gradient"));
         if !doc.begin_paint() {
             doc.discard_step();
@@ -577,12 +767,6 @@ impl AtelierApp {
         if !changed {
             doc.discard_step();
             return;
-        }
-        if text {
-            self.status = t!(
-                "canvas-status-text-rasterized",
-                name = doc.active_layer().name.as_str()
-            );
         }
         self.reset_pending();
     }

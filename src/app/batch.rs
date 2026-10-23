@@ -221,6 +221,11 @@ struct BatchRun {
     quality: u8,
     /// Close the documents it opened.
     close: bool,
+    /// Open documents are processed as copies, left untouched (Image
+    /// Processor).
+    copies: bool,
+    /// Files written so far: two documents never go to the same file.
+    written: std::collections::HashSet<PathBuf>,
     log: Option<PathBuf>,
     errors: usize,
     serial: u32,
@@ -253,11 +258,17 @@ impl Automate {
     }
 }
 
-/// The images Atelier opens in `folder` (and its subfolders), by name.
+/// The images Atelier opens in `folder` (and its subfolders), by name:
+/// each file once, even when links lead to a folder twice (or in a loop).
 fn images_in(folder: &Path, subfolders: bool) -> Vec<PathBuf> {
     let mut found = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut visited = std::collections::HashSet::new();
     let mut dirs = vec![folder.to_path_buf()];
     while let Some(dir) = dirs.pop() {
+        if !visited.insert(std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -267,6 +278,8 @@ fn images_in(folder: &Path, subfolders: bool) -> Vec<PathBuf> {
                 if subfolders {
                     dirs.push(path);
                 }
+            } else if !seen.insert(std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone())) {
+                continue;
             } else if crate::camera_raw::raw::is_raw(&path)
                 || path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
                     files::OPEN_EXTENSIONS
@@ -769,6 +782,8 @@ impl AtelierApp {
             save_in_place: d.destination == Destination::SaveAndClose,
             quality: d.quality,
             close: d.destination != Destination::None,
+            copies: false,
+            written: Default::default(),
             log: d.log.then(|| d.log_file.clone()).flatten(),
             errors: 0,
             serial: d.serial,
@@ -825,6 +840,8 @@ impl AtelierApp {
             save_in_place: false,
             quality: d.quality,
             close: true,
+            copies: true,
+            written: Default::default(),
             log: None,
             errors: 0,
             serial: 1,
@@ -859,18 +876,46 @@ impl AtelierApp {
         let Some(item) = run.items.pop_front() else {
             return self.end_batch();
         };
-        let action = run.action;
+        let (action, copies) = (run.action, run.copies);
         let (current, error) = match item {
             Item::Tab(uid) => match (0..self.tab_count())
                 .find(|&i| self.tab(i).is_some_and(|(d, _)| d.uid() == uid))
             {
                 Some(i) => {
                     self.switch_tab(i);
-                    (self.current_document(false), None)
+                    match self
+                        .doc
+                        .as_ref()
+                        .filter(|_| copies)
+                        .map(Document::duplicate)
+                    {
+                        Some(copy) => {
+                            self.add_tab(copy);
+                            (self.current_document(true), None)
+                        }
+                        None => (self.current_document(false), None),
+                    }
                 }
                 // Closed meanwhile.
                 None => (None, None),
             },
+            // Already open: a copy of its own, the tab and its unsaved
+            // changes left as they are.
+            Item::File(path)
+                if self.tab_of(&path).is_some() && !crate::camera_raw::raw::is_raw(&path) =>
+            {
+                match Document::open(&path) {
+                    Ok(opened) => {
+                        self.add_tab(opened.doc);
+                        (self.current_document(true), None)
+                    }
+                    Err(e) => {
+                        let shown = path.display().to_string();
+                        let error = t!("status-open-failed", path = shown, error = e.to_string());
+                        (None, Some(error))
+                    }
+                }
+            }
             Item::File(path) => {
                 let was_open = self.tab_of(&path).is_some();
                 self.open_path(&path);
@@ -919,7 +964,11 @@ impl AtelierApp {
         // The action failed: logged, and the document isn't saved.
         let failed = self.actions.take_batch_error();
         if let Some(error) = &failed
-            && !self.batch_error(format!("{}: {error}", cur.name))
+            && !self.batch_error(t!(
+                "words3-label-value",
+                label = cur.name.as_str(),
+                value = error.as_str()
+            ))
         {
             return;
         }
@@ -929,22 +978,41 @@ impl AtelierApp {
         let (outputs, serial) = (run.outputs.clone(), run.serial);
         let (save_in_place, quality, close) = (run.save_in_place, run.quality, run.close);
         let on_document = self.doc.as_ref().is_some_and(|d| d.uid() == cur.uid);
+        let mut saved = false;
         if on_document && failed.is_none() {
             for output in &outputs {
                 if let Err(e) = self.save_output(output, &cur, serial)
-                    && !self.batch_error(format!("{}: {e}", cur.name))
+                    && !self.batch_error(t!(
+                        "words3-label-value",
+                        label = cur.name.as_str(),
+                        value = e.to_string()
+                    ))
                 {
                     return;
                 }
             }
-            if save_in_place
-                && let Err(e) = self.save_in_place(quality)
-                && !self.batch_error(format!("{}: {e}", cur.name))
-            {
-                return;
+            if save_in_place {
+                match self.save_in_place(quality) {
+                    Ok(()) => saved = true,
+                    Err(e) => {
+                        if !self.batch_error(t!(
+                            "words3-label-value",
+                            label = cur.name.as_str(),
+                            value = e.to_string()
+                        )) {
+                            return;
+                        }
+                    }
+                }
             }
         }
-        if close && (cur.opened || (save_in_place && failed.is_none())) {
+        // A document the batch didn't open is closed only once saved: its
+        // work is never lost.
+        let unsaved = self
+            .doc
+            .as_ref()
+            .is_some_and(|d| d.uid() == cur.uid && d.modified);
+        if close && (cur.opened || (save_in_place && saved && !unsaved)) {
             self.close_by_uid(cur.uid);
         }
         if let Some(run) = &mut self.automate.run {
@@ -975,6 +1043,17 @@ impl AtelierApp {
             Some(parts) => folder.join(batch_name(parts, &stem, serial, ext, today())),
             None => export_as::unused_path(&folder, &stem, ext),
         };
+        if self
+            .automate
+            .run
+            .as_ref()
+            .is_some_and(|r| r.written.contains(&path))
+        {
+            return Err(t!(
+                "smart3-batch-written-twice",
+                name = files::file_name(&path)
+            ));
+        }
         if path.exists() && !o.overwrite {
             return Err(t!("actions-error-exists", name = files::file_name(&path)));
         }
@@ -1007,6 +1086,11 @@ impl AtelierApp {
             doc.undo();
             self.reset_pending();
         }
+        if result.is_ok()
+            && let Some(run) = &mut self.automate.run
+        {
+            run.written.insert(path.clone());
+        }
         result.map(|_| path)
     }
 
@@ -1018,6 +1102,16 @@ impl AtelierApp {
         let Some(path) = doc.path.clone() else {
             return Err(t!("actions-error-no-folder"));
         };
+        // Never a Photoshop file replaced by one holding less.
+        if crate::document::is_psd(&path) {
+            let losses = doc.psd_losses();
+            if !losses.is_empty() {
+                return Err(t!(
+                    "files3-status-psd-would-lose",
+                    notes = losses.join(" · ")
+                ));
+            }
+        }
         if crate::document::is_native(&path) || crate::document::is_psd(&path) {
             return doc.save(&path).map(|_| ()).map_err(|e| e.to_string());
         }
@@ -1031,7 +1125,7 @@ impl AtelierApp {
         };
         self.write_export(&options, &path)?;
         if let Some(doc) = &mut self.doc {
-            doc.modified = false;
+            doc.mark_saved();
         }
         Ok(())
     }
@@ -1459,6 +1553,133 @@ mod tests {
         h.state_mut().start_processor(&d);
         run(&mut h);
         assert!(dest.join("JPEG/photo-2.jpg").exists());
+    }
+
+    /// Save and Close with Log Errors: a document that can't be saved is
+    /// logged and stays open, its work kept.
+    #[test]
+    fn save_and_close_keeps_documents_it_could_not_save() {
+        let dir = folder("save-close-log");
+        let mut h = app();
+        let mut doc = Document::new(RgbaImage::from_pixel(8, 8, Rgba([10, 10, 10, 255])), None);
+        doc.modified = true;
+        h.state_mut().add_tab(doc);
+        let d = BatchDialog {
+            source: Source::Opened,
+            destination: Destination::SaveAndClose,
+            log: true,
+            log_file: Some(dir.join("log.txt")),
+            ..BatchDialog::default()
+        };
+        h.state_mut().start_batch(&d);
+        run(&mut h);
+        let log = std::fs::read_to_string(dir.join("log.txt")).unwrap();
+        assert_eq!(log.lines().count(), 1);
+        assert_eq!(h.state().tab_count(), 1, "the unsaved document stays open");
+    }
+
+    #[test]
+    fn links_to_a_folder_twice_list_each_image_once() {
+        let src = folder("links");
+        png(&src.join("a.png"), (2, 2), 0);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&src, src.join("loop")).unwrap();
+            std::fs::create_dir_all(src.join("sub")).unwrap();
+            std::os::unix::fs::symlink(src.join("a.png"), src.join("sub/b.png")).unwrap();
+        }
+        assert_eq!(images_in(&src, true), [src.join("a.png")]);
+    }
+
+    /// A file of the folder already open with unsaved changes: the batch
+    /// works on a copy of its own, the tab is left as it was.
+    #[test]
+    fn batch_leaves_an_open_copy_of_a_file_alone() {
+        let src = folder("open-copy");
+        let path = src.join("x.png");
+        png(&path, (4, 4), 40);
+        let mut h = app();
+        h.state_mut().open_path(&path);
+        h.state_mut().doc.as_mut().unwrap().modified = true;
+        let uid = h.state().doc.as_ref().unwrap().uid();
+        let d = BatchDialog {
+            folder: Some(src.clone()),
+            destination: Destination::SaveAndClose,
+            ..BatchDialog::default()
+        };
+        h.state_mut().start_batch(&d);
+        run(&mut h);
+        assert_eq!(value(&path), 215, "the file was processed");
+        assert_eq!(h.state().tab_count(), 1);
+        let doc = h.state().doc.as_ref().unwrap();
+        assert!(doc.uid() == uid && doc.modified);
+        let pixel = doc.flatten().get_pixel(0, 0).0;
+        assert_eq!(pixel[0], 40, "the tab is untouched");
+    }
+
+    /// The Image Processor on open documents works on copies: the
+    /// documents keep their pixels, size and history.
+    #[test]
+    fn image_processor_leaves_open_documents_untouched() {
+        let (src, dest) = (folder("processor-open-src"), folder("processor-open-dest"));
+        let path = src.join("photo.png");
+        png(&path, (200, 100), 90);
+        let mut h = app();
+        h.state_mut().open_path(&path);
+        let d = ProcessorDialog {
+            opened: true,
+            same_location: false,
+            dest: Some(dest.clone()),
+            jpeg: ProcessorFormat {
+                on: false,
+                fit: false,
+                width: 1,
+                height: 1,
+            },
+            psd: ProcessorFormat {
+                on: true,
+                fit: true,
+                width: 100,
+                height: 100,
+            },
+            run_action: true,
+            ..ProcessorDialog::default()
+        };
+        h.state_mut().start_processor(&d);
+        run(&mut h);
+        assert!(dest.join("PSD/photo.psd").exists());
+        assert_eq!(h.state().tab_count(), 1);
+        let doc = h.state().doc.as_ref().unwrap();
+        assert_eq!((doc.width(), doc.height()), (200, 100));
+        assert_eq!(doc.flatten().get_pixel(0, 0).0[0], 90);
+        assert!(!doc.modified && !doc.can_undo());
+    }
+
+    /// Two images named alike, a naming without serial and Override: the
+    /// second is logged instead of replacing the first.
+    #[test]
+    fn two_documents_never_go_to_the_same_file() {
+        let (src, dest) = (folder("same-name-src"), folder("same-name-dest"));
+        png(&src.join("a/x.png"), (4, 4), 10);
+        png(&src.join("b/x.png"), (4, 4), 20);
+        let log = dest.join("log.txt");
+        let d = BatchDialog {
+            naming: [
+                Some(NamePart::DocumentName),
+                Some(NamePart::Extension),
+                None,
+                None,
+            ],
+            overwrite: true,
+            log: true,
+            log_file: Some(log.clone()),
+            ..batch(&src, &dest)
+        };
+        let mut h = app();
+        h.state_mut().start_batch(&d);
+        run(&mut h);
+        assert_eq!(value(&dest.join("x.png")), 245, "the first one stays");
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
     }
 
     #[test]

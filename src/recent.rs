@@ -2,8 +2,10 @@
 //! folder (one path per line, see [`encode`]), with what the start screen
 //! shows of them.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
+use std::time::Duration;
 
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 
@@ -25,9 +27,20 @@ pub struct Recent {
     paths: Vec<PathBuf>,
     /// Existing files with their dimensions; `None`: to read again.
     entries: Option<Vec<Entry>>,
-    /// Thumbnails decoded in the background.
-    thumbs: Option<Receiver<(PathBuf, ColorImage)>>,
+    /// Dimensions, then thumbnails, read in the background.
+    thumbs: Option<Receiver<Found>>,
 }
+
+/// What the background thread found.
+enum Found {
+    /// The files that exist, with their dimensions, in the list's order.
+    Sizes(Vec<(PathBuf, (u32, u32))>),
+    Thumb(PathBuf, ColorImage),
+}
+
+/// How long the start screen waits for the dimensions before showing the
+/// list without them (they come later; slow or network drives).
+const SIZES_WAIT: Duration = Duration::from_millis(100);
 
 impl Recent {
     pub fn load() -> Self {
@@ -52,6 +65,18 @@ impl Recent {
         self.paths.retain(|p| *p != path);
         self.paths.insert(0, path);
         self.paths.truncate(MAX);
+        self.entries = None;
+        self.save();
+    }
+
+    /// The listed files, most recent first (File › Open Recent).
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+
+    /// Clear Recent File List.
+    pub fn clear(&mut self) {
+        self.paths.clear();
         self.entries = None;
         self.save();
     }
@@ -86,47 +111,69 @@ impl Recent {
 
     /// The files that still exist, with their dimensions; thumbnails arrive
     /// as they are decoded.
+    /// The files read off the UI thread (a drive may be slow or gone): a
+    /// damaged file costs its entry, never the app.
     pub fn entries(&mut self, ctx: &egui::Context) -> &[Entry] {
+        let mut first = false;
         let entries = self.entries.get_or_insert_with(|| {
-            let entries: Vec<Entry> = self
-                .paths
-                .iter()
-                .filter_map(|path| {
-                    let size = crate::document::file_size(path)?;
-                    Some(Entry {
-                        path: path.clone(),
-                        size,
-                        thumb: None,
-                    })
-                })
-                .collect();
             let (tx, rx) = channel();
-            let paths: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
+            let paths = self.paths.clone();
             let repaint = ctx.clone();
             std::thread::spawn(move || {
+                let sizes: Vec<(PathBuf, (u32, u32))> = paths
+                    .into_iter()
+                    .filter_map(|path| {
+                        let size = catch_unwind(|| crate::document::file_size(&path));
+                        Some((path.clone(), size.ok()??))
+                    })
+                    .collect();
+                let paths: Vec<PathBuf> = sizes.iter().map(|(p, _)| p.clone()).collect();
+                if tx.send(Found::Sizes(sizes)).is_err() {
+                    return;
+                }
+                repaint.request_repaint();
                 for path in paths {
-                    let Some(small) = crate::document::file_thumbnail(&path, THUMB.0, THUMB.1)
-                    else {
+                    let thumb = catch_unwind(AssertUnwindSafe(|| {
+                        crate::document::file_thumbnail(&path, THUMB.0, THUMB.1)
+                    }));
+                    let Ok(Some(small)) = thumb else {
                         continue;
                     };
                     let image = ColorImage::from_rgba_unmultiplied(
                         [small.width() as usize, small.height() as usize],
                         small.as_raw(),
                     );
-                    if tx.send((path, image)).is_err() {
+                    if tx.send(Found::Thumb(path, image)).is_err() {
                         return;
                     }
                     repaint.request_repaint();
                 }
             });
             self.thumbs = Some(rx);
-            entries
+            first = true;
+            Vec::new()
         });
         if let Some(rx) = &self.thumbs {
-            for (path, image) in rx.try_iter() {
-                if let Some(entry) = entries.iter_mut().find(|e| e.path == path) {
-                    let name = format!("recent-{}", path.display());
-                    entry.thumb = Some(ctx.load_texture(name, image, TextureOptions::LINEAR));
+            let waited = first.then(|| rx.recv_timeout(SIZES_WAIT).ok()).flatten();
+            for found in waited.into_iter().chain(rx.try_iter()) {
+                match found {
+                    Found::Sizes(sizes) => {
+                        *entries = sizes
+                            .into_iter()
+                            .map(|(path, size)| Entry {
+                                path,
+                                size,
+                                thumb: None,
+                            })
+                            .collect();
+                    }
+                    Found::Thumb(path, image) => {
+                        if let Some(entry) = entries.iter_mut().find(|e| e.path == path) {
+                            let name = format!("recent-{}", path.display());
+                            let options = TextureOptions::LINEAR;
+                            entry.thumb = Some(ctx.load_texture(name, image, options));
+                        }
+                    }
                 }
             }
         }
@@ -234,6 +281,32 @@ mod tests {
             Some(Path::new("/old/list/a.png"))
         );
         assert_eq!(decode(b"  "), None);
+    }
+
+    #[test]
+    fn entries_are_read_off_the_ui_thread_and_damaged_files_skipped() {
+        let dir = std::env::temp_dir().join("atelier-recent-entries");
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.png");
+        image::RgbaImage::new(3, 2).save(&good).unwrap();
+        let damaged = dir.join("damaged.psd");
+        std::fs::write(&damaged, b"8BPS\0\x01garbage").unwrap();
+        let gone = dir.join("gone.png");
+        let mut recent = Recent::with_paths(vec![damaged, gone, good.clone()]);
+        let ctx = egui::Context::default();
+        let mut entries = Vec::new();
+        for _ in 0..100 {
+            entries = recent
+                .entries(&ctx)
+                .iter()
+                .map(|e| (e.path.clone(), e.size))
+                .collect();
+            if !entries.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(entries, [(good, (3, 2))]);
     }
 
     #[cfg(unix)]

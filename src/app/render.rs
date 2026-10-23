@@ -151,9 +151,10 @@ impl GpuImage {
 }
 
 /// Number of reduced copies to keep for a zoom (physical pixels per image
-/// pixel): enough to never reduce one more than twice.
+/// pixel): enough to never reduce one more than twice. At exactly 50 %, the
+/// copy reduced twice is shown pixel for pixel.
 pub(super) fn levels_for(zoom: f32) -> usize {
-    if zoom >= 0.5 {
+    if zoom > 0.5 {
         0
     } else {
         ((1.0 / zoom).log2().floor() as usize).min(8)
@@ -334,12 +335,42 @@ pub(super) struct CanvasView {
     /// What the colors are shown through (see `ColorUi::canvas_lut`).
     display: u64,
     sources: compose::LevelCache,
+    /// The reductions of the level shown before, to go back to it at once.
+    spare: Option<compose::LevelCache>,
+    /// The reductions of this level being made on a worker thread (the
+    /// level changed): meanwhile, `stale` shows.
+    pending: Option<std::thread::JoinHandle<compose::LevelCache>>,
     /// The layers as last composited.
     sigs: Vec<compose::Sig>,
-    /// Tiles (column, row, in tiles of the level) and whether each must be
-    /// composited again.
-    tiles: HashMap<(i64, i64), (TextureHandle, bool)>,
+    /// Tiles (column, row, in tiles of the level).
+    tiles: Tiles,
+    /// The tiles of the level shown before, drawn where this one has none
+    /// yet (never an empty canvas while zooming): their level, and them.
+    stale: Option<(u32, Tiles)>,
     hot: Option<Hot>,
+    /// Frames drawn: the tiles waiting the longest are composited first.
+    frame: u64,
+    /// The views of other documents (tabs), to come back to them at once.
+    others: Vec<CanvasView>,
+}
+
+/// The tiles of a view (column, row, in tiles of its level).
+type Tiles = HashMap<(i64, i64), Tile>;
+
+/// A tile to composite: which, the part of it, and its urgency (see
+/// `draw_document`).
+type Todo = ((i64, i64), PixelRect, (bool, u64, i64));
+
+/// Parts of a snapshot made by bands: their first row, and their pixels.
+type SnapParts = HashMap<(i64, i64), Vec<(i64, Vec<Snap>)>>;
+
+/// A composited tile on the GPU.
+struct Tile {
+    tex: TextureHandle,
+    /// Part to composite again (pixels of the level), if any.
+    dirty: Option<PixelRect>,
+    /// Frame since which it waits.
+    since: u64,
 }
 
 /// Composite of the nodes under the one that keeps changing (opacity
@@ -348,12 +379,33 @@ struct Hot {
     node: usize,
     /// Fingerprint of the layers under it.
     below: u64,
-    snaps: HashMap<(i64, i64), Arc<Vec<compose::blend::Px>>>,
+    snaps: HashMap<(i64, i64), Arc<Vec<Snap>>>,
+}
+
+/// A premultiplied pixel of a snapshot, in 16 bits (half the memory of
+/// floats, and as precise as the screen needs).
+type Snap = [u16; 4];
+
+fn to_snap(px: &[compose::blend::Px]) -> Vec<Snap> {
+    px.iter()
+        .map(|p| p.map(|v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16))
+        .collect()
+}
+
+fn from_snap(snap: &[Snap]) -> Vec<compose::blend::Px> {
+    snap.iter().map(|p| p.map(|v| v as f32 / 65535.0)).collect()
 }
 
 /// Composites the tiles still to do for at most this long per frame, the
 /// rest on the next ones (the view stays responsive).
 const TILE_BUDGET: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// Below this many layer pixels, a new level's reductions are made at
+/// once (see [`view_for`]).
+const AT_ONCE_PIXELS: u64 = 1 << 22;
+
+/// Views of other documents kept (see [`CanvasView::others`]).
+const KEPT_VIEWS: usize = 2;
 
 impl CanvasView {
     fn new(doc: u64, canvas: PixelRect, level: u32, channel: Option<usize>, display: u64) -> Self {
@@ -364,10 +416,142 @@ impl CanvasView {
             channel,
             display,
             sources: compose::LevelCache::new(level),
+            spare: None,
+            pending: None,
             sigs: Vec::new(),
             tiles: HashMap::new(),
+            stale: None,
             hot: None,
+            frame: 0,
+            others: Vec::new(),
         }
+    }
+
+    /// Box of tile `t` (pixels of the level).
+    fn tile_rect((tx, ty): (i64, i64)) -> PixelRect {
+        let side = compose::TILE as i64;
+        PixelRect {
+            x: tx * side,
+            y: ty * side,
+            w: compose::TILE,
+            h: compose::TILE,
+        }
+    }
+
+    /// Marks `area` (pixels of the level) to composite again.
+    fn mark(&mut self, area: Option<PixelRect>) {
+        let frame = self.frame;
+        for (&t, tile) in self.tiles.iter_mut() {
+            let own = Self::tile_rect(t);
+            let Some(part) = area.map_or(Some(own), |a| intersect(own, a)) else {
+                continue;
+            };
+            if tile.dirty.is_none() {
+                tile.since = frame;
+            }
+            tile.dirty = Some(tile.dirty.map_or(part, |d| d.union(part)));
+        }
+    }
+}
+
+/// `slot` brought to show document `uid` at `level`… (see
+/// [`CanvasView`]). Another level of the same document: its reductions are
+/// made on a worker thread from `layers` while the former tiles show.
+#[allow(clippy::too_many_arguments)]
+fn view_for(
+    slot: &mut Option<CanvasView>,
+    uid: u64,
+    canvas: PixelRect,
+    level: u32,
+    channel: Option<usize>,
+    display: u64,
+    layers: &[Layer],
+    held: bool,
+) {
+    // Another document: its own view if kept, the current one kept.
+    if slot.as_ref().is_some_and(|v| v.doc != uid) {
+        let mut old = slot.take().expect("checked");
+        let mut others = std::mem::take(&mut old.others);
+        // Kept lighter: its tiles and the reductions of its level only.
+        (old.pending, old.spare, old.stale) = (None, None, None);
+        others.insert(0, old);
+        let found = others.iter().position(|v| v.doc == uid);
+        let mut view = found.map(|k| others.remove(k));
+        others.truncate(KEPT_VIEWS);
+        if let Some(v) = &mut view {
+            v.others = others;
+        } else {
+            let mut v = CanvasView::new(uid, canvas, level, channel, display);
+            v.others = others;
+            view = Some(v);
+        }
+        *slot = view;
+    }
+    let Some(v) = slot.as_mut() else {
+        *slot = Some(CanvasView::new(uid, canvas, level, channel, display));
+        return;
+    };
+    if v.canvas != canvas {
+        let others = std::mem::take(&mut v.others);
+        *v = CanvasView::new(uid, canvas, level, channel, display);
+        v.others = others;
+        return;
+    }
+    if v.level != level {
+        let mut next = CanvasView::new(uid, canvas, level, channel, display);
+        next.others = std::mem::take(&mut v.others);
+        let old = std::mem::replace(v, next);
+        // Its tiles while the new ones come (those of a view that was
+        // itself still waiting are older still).
+        v.stale = match &old.pending {
+            None => Some((old.level, old.tiles)),
+            Some(_) => old.stale,
+        };
+        let (finer, spare) = match (old.pending.is_some(), old.spare) {
+            // Still waiting: what it had before is what there is.
+            (true, Some(s)) => (s, None),
+            (_, spare) => (old.sources, spare),
+        };
+        // Pixels to reduce (a few milliseconds' worth: at once).
+        let work: u64 = layers
+            .iter()
+            .map(|l| u64::from(l.image().width()) * u64::from(l.image().height()))
+            .sum();
+        match spare {
+            Some(s) if compose::Sources::level(&s) == level => {
+                v.sources = s;
+                v.spare = Some(finer);
+            }
+            _ if level == 0 || work < AT_ONCE_PIXELS => v.spare = Some(finer),
+            _ => {
+                let seed = (compose::Sources::level(&finer) + 1 == level).then(|| finer.clone());
+                let layers = layers.to_vec();
+                let job = std::thread::Builder::new()
+                    .name("level".into())
+                    .spawn(move || {
+                        let mut cache = match seed {
+                            Some(finer) => finer.coarser(),
+                            None => compose::LevelCache::new(level),
+                        };
+                        let opts = compose::Options {
+                            held,
+                            later_styles: true,
+                            ..Default::default()
+                        };
+                        compose::plan(&layers, canvas, &mut cache, &opts);
+                        cache
+                    });
+                v.pending = job.ok();
+                v.spare = Some(finer);
+            }
+        }
+        return;
+    }
+    if (v.channel, v.display) != (channel, display) {
+        // The same composite shown otherwise: the tiles stay until redone.
+        v.channel = channel;
+        v.display = display;
+        v.sigs.clear();
     }
 }
 
@@ -408,6 +592,7 @@ fn view_options<'a>(
 ) -> compose::Options<'a> {
     let mut opts = compose::Options {
         held: doc.effects_held(),
+        later_styles: true,
         hidden: skip,
         blend,
         mask_view: mask_view.then_some(doc.active),
@@ -481,15 +666,50 @@ impl AtelierApp {
             })
             .collect();
         opts.placed_mask = xform.mask_preview.as_ref().map(|p| p.placed());
-        let sigs = compose::signatures(&layers, &opts);
         let canvas = doc.full_rect();
-        if canvas_view.as_ref().is_none_or(|v| {
-            (v.doc, v.canvas, v.level, v.channel, v.display)
-                != (uid, canvas, level, channel, display)
-        }) {
-            *canvas_view = Some(CanvasView::new(uid, canvas, level, channel, display));
-        }
+        view_for(
+            canvas_view,
+            uid,
+            canvas,
+            level,
+            channel,
+            display,
+            &layers,
+            opts.held,
+        );
         let cv = canvas_view.as_mut().expect("set above");
+        cv.frame += 1;
+        // Tiles of the visible part of the frame.
+        let b = 1i64 << level;
+        let tile = compose::TILE as i64 * b;
+        let shown = view
+            .rect_to_screen(to_rect(frame))
+            .intersect(painter.clip_rect());
+        let (a, z) = (view.to_image(shown.min), view.to_image(shown.max));
+        let range = |from: f32, to: f32| {
+            (from.floor() as i64).div_euclid(tile)..=((to.ceil() as i64 - 1).div_euclid(tile))
+        };
+        let (cols, rows) = (range(a.x, z.x), range(a.y, z.y));
+        let visible: Vec<(i64, i64)> = if shown.is_positive() {
+            rows.clone()
+                .flat_map(|ty| cols.clone().map(move |tx| (tx, ty)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // The reductions of a new level are being made: the former tiles
+        // show meanwhile.
+        if let Some(job) = cv.pending.take_if(|j| j.is_finished()) {
+            cv.sources = job
+                .join()
+                .unwrap_or_else(|_| compose::LevelCache::new(level));
+        }
+        if cv.pending.is_some() {
+            ctx.request_repaint();
+            paint_tiles(painter, view, cv, &visible);
+            return;
+        }
+        let sigs = compose::signatures(&layers, &opts);
         // Area painted since the last frame: on the active layer.
         let active_id = doc.active_layer().id;
         let feather = layers[doc.active]
@@ -508,52 +728,40 @@ impl AtelierApp {
             })
             .into_iter()
             .collect();
+        crate::document::note_painted(uid, &strokes);
         let dirty = if cv.sigs.is_empty() {
             compose::Dirty::All
         } else {
             compose::dirty_area(&cv.sigs, &sigs, &strokes)
         };
-        let b = 1i64 << level;
-        let tile = compose::TILE as i64 * b;
         match dirty {
             compose::Dirty::Nothing => {}
-            compose::Dirty::All => cv.tiles.values_mut().for_each(|t| t.1 = true),
-            compose::Dirty::Area(a) => {
-                for (&(tx, ty), t) in cv.tiles.iter_mut() {
-                    let r = PixelRect {
-                        x: tx * tile,
-                        y: ty * tile,
-                        w: tile as u32,
-                        h: tile as u32,
-                    };
-                    if intersect(r, a).is_some() {
-                        t.1 = true;
-                    }
-                }
-            }
+            compose::Dirty::All => cv.mark(None),
+            compose::Dirty::Area(a) => cv.mark(Some(reduced(a, level))),
         }
-        // Tiles of the visible part of the frame.
-        let shown = view
-            .rect_to_screen(to_rect(frame))
-            .intersect(painter.clip_rect());
-        if !shown.is_positive() {
-            cv.sigs = sigs;
-            return;
-        }
-        let (a, z) = (view.to_image(shown.min), view.to_image(shown.max));
-        let range = |from: f32, to: f32| {
-            (from.floor() as i64).div_euclid(tile)..=((to.ceil() as i64 - 1).div_euclid(tile))
-        };
-        let (cols, rows) = (range(a.x, z.x), range(a.y, z.y));
-        let visible: Vec<(i64, i64)> = rows
-            .clone()
-            .flat_map(|ty| cols.clone().map(move |tx| (tx, ty)))
-            .collect();
-        let todo: Vec<(i64, i64)> = visible
+        // What to composite, most urgent first: under the brush, then the
+        // missing tiles, then those waiting the longest, nearest the
+        // pointer first.
+        let brush: Vec<PixelRect> = strokes.iter().map(|(_, r)| reduced(*r, level)).collect();
+        let focus = ctx
+            .pointer_hover_pos()
+            .filter(|p| shown.contains(*p))
+            .unwrap_or(shown.center());
+        let focus = view.to_image(focus) / tile as f32;
+        let mut todo: Vec<Todo> = visible
             .iter()
-            .copied()
-            .filter(|t| cv.tiles.get(t).is_none_or(|t| t.1))
+            .filter_map(|&t| {
+                let own = CanvasView::tile_rect(t);
+                let (part, since) = match cv.tiles.get(&t) {
+                    Some(tile) => (tile.dirty?, tile.since),
+                    None => (own, 0),
+                };
+                let under = brush.iter().any(|r| intersect(*r, part).is_some());
+                let d = vec2(t.0 as f32 + 0.5 - focus.x, t.1 as f32 + 0.5 - focus.y);
+                Some((t, part, (!under, since, (d.length_sq() * 16.0) as i64)))
+            })
             .collect();
+        todo.sort_by_key(|(_, _, k)| *k);
         if !todo.is_empty() {
             for (id, rect) in &strokes {
                 cv.sources.hint(compose::Hint {
@@ -561,15 +769,14 @@ impl AtelierApp {
                     rect: *rect,
                 });
             }
-            let plan = compose::plan(&layers, doc.full_rect(), &mut cv.sources, &opts);
+            let plan = compose::plan(&layers, canvas, &mut cv.sources, &opts);
             cv.sources.retain_used();
             update_hot(cv, &sigs, &plan, dirty);
-            let n = plan.nodes.len();
-            let hot = cv.hot.as_ref().map(|h| (h.node, &h.snaps));
-            let start = std::time::Instant::now();
             let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+            let work = compose_work(cv, &plan, &todo, threads);
+            let start = std::time::Instant::now();
             let mut done = Vec::new();
-            for batch in todo.chunks(threads.max(1)) {
+            for batch in work.chunks(threads.max(1)) {
                 if start.elapsed() > TILE_BUDGET && !done.is_empty() {
                     ctx.request_repaint();
                     break;
@@ -577,75 +784,66 @@ impl AtelierApp {
                 let results: Vec<std::sync::Mutex<Option<TileResult>>> =
                     batch.iter().map(|_| std::sync::Mutex::new(None)).collect();
                 compose::parallel(batch.len(), |k| {
-                    let (tx, ty) = batch[k];
-                    let rect = PixelRect {
-                        x: tx * compose::TILE as i64,
-                        y: ty * compose::TILE as i64,
-                        w: compose::TILE,
-                        h: compose::TILE,
-                    };
-                    let mut snap = None;
-                    let buf = match hot {
-                        Some((node, snaps)) if node < n => {
-                            let mut buf = match snaps.get(&(tx, ty)) {
-                                Some(px) => compose::Buf {
-                                    rect,
-                                    px: px.to_vec(),
-                                },
-                                None => {
-                                    let mut buf = compose::Buf::transparent(rect);
-                                    plan.draw(0..node, &mut buf);
-                                    snap = Some(Arc::new(buf.px.clone()));
-                                    buf
-                                }
-                            };
-                            plan.draw(node..n, &mut buf);
-                            buf
-                        }
-                        _ => {
-                            let mut buf = compose::Buf::transparent(rect);
-                            plan.draw(0..n, &mut buf);
-                            buf
-                        }
-                    };
-                    let pixels = buf
-                        .px
-                        .iter()
-                        .map(|p| {
-                            let [r, g, b, a] = compose::premultiplied(*p);
-                            match (channel, &lut) {
-                                // A channel alone: its value in gray, over
-                                // white where transparent.
-                                (Some(c), _) => Color32::from_gray([r, g, b][c] + (255 - a)),
-                                (None, Some(lut)) => color_ui::shown(lut, *p),
-                                (None, None) => Color32::from_rgba_premultiplied(r, g, b, a),
-                            }
-                        })
-                        .collect();
-                    let size = [compose::TILE as usize; 2];
-                    *results[k].lock().expect("tile") = Some(TileResult {
-                        image: ColorImage::new(size, pixels),
-                        snap,
-                    });
+                    let result = composite_part(&plan, &batch[k], channel, lut.as_deref());
+                    *results[k].lock().expect("tile") = Some(result);
                 });
-                done.extend(batch.iter().copied().zip(results));
+                done.extend(batch.iter().zip(results));
             }
-            for ((tx, ty), result) in done {
+            let mut snaps: SnapParts = HashMap::new();
+            let mut whole: HashMap<(i64, i64), Vec<(PixelRect, ColorImage)>> = HashMap::new();
+            for (item, result) in done {
                 let Some(result) = result.into_inner().expect("tile") else {
                     continue;
                 };
-                if let (Some(snap), Some(hot)) = (result.snap, &mut cv.hot) {
-                    hot.snaps.insert((tx, ty), snap);
+                if let Some(snap) = result.snap {
+                    snaps
+                        .entry(item.tile)
+                        .or_default()
+                        .push((item.rect.y, snap));
                 }
-                match cv.tiles.get_mut(&(tx, ty)) {
-                    Some(t) => {
-                        t.0.set(result.image, IMAGE_TEX_OPTIONS);
-                        t.1 = false;
+                let t = item.tile;
+                match cv.tiles.get_mut(&t) {
+                    Some(tile) => {
+                        let own = CanvasView::tile_rect(t);
+                        let pos = [
+                            (item.rect.x - own.x) as usize,
+                            (item.rect.y - own.y) as usize,
+                        ];
+                        tile.tex.set_partial(pos, result.image, IMAGE_TEX_OPTIONS);
+                        if item.last {
+                            tile.dirty = None;
+                        }
                     }
-                    None => {
-                        let name = format!("tile-{tx}-{ty}");
-                        let tex = ctx.load_texture(name, result.image, IMAGE_TEX_OPTIONS);
-                        cv.tiles.insert((tx, ty), (tex, false));
+                    None => whole.entry(t).or_default().push((item.rect, result.image)),
+                }
+            }
+            // New tiles: whole, from their bands.
+            for (t, mut parts) in whole {
+                let own = CanvasView::tile_rect(t);
+                if parts.iter().map(|(r, _)| r.h).sum::<u32>() != own.h {
+                    continue;
+                }
+                parts.sort_by_key(|(r, _)| r.y);
+                let pixels: Vec<Color32> = parts.into_iter().flat_map(|(_, i)| i.pixels).collect();
+                let image = ColorImage::new([compose::TILE as usize; 2], pixels);
+                let name = format!("tile-{}-{}", t.0, t.1);
+                let tex = ctx.load_texture(name, image, IMAGE_TEX_OPTIONS);
+                let since = cv.frame;
+                cv.tiles.insert(
+                    t,
+                    Tile {
+                        tex,
+                        dirty: None,
+                        since,
+                    },
+                );
+            }
+            if let Some(hot) = &mut cv.hot {
+                for (t, mut parts) in snaps {
+                    parts.sort_by_key(|(y, _)| *y);
+                    let snap: Vec<Snap> = parts.into_iter().flat_map(|(_, s)| s).collect();
+                    if snap.len() == (compose::TILE * compose::TILE) as usize {
+                        hot.snaps.insert(t, Arc::new(snap));
                     }
                 }
             }
@@ -658,35 +856,239 @@ impl AtelierApp {
                 && ty >= rows.start() - 2
                 && ty <= rows.end() + 2
         };
-        cv.tiles.retain(|t, _| near(t));
-        // Snapshots (1 MiB each) only for what is shown.
+        if !visible.is_empty() {
+            cv.tiles.retain(|t, _| near(t));
+        }
+        // Snapshots only for what is shown.
         if let Some(h) = &mut cv.hot {
             h.snaps.retain(|t, _| visible.contains(t));
         }
-        let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
-        for t in &visible {
-            if let Some((tex, _)) = cv.tiles.get(t) {
-                let r = Rect::from_min_size(
-                    pos2((t.0 * tile) as f32, (t.1 * tile) as f32),
-                    Vec2::splat(tile as f32),
+        if visible.iter().all(|t| cv.tiles.contains_key(t)) {
+            cv.stale = None;
+        }
+        // Styles drawn on a worker thread: shown as soon as they are ready.
+        if crate::document::styles_pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
+        paint_tiles(painter, view, cv, &visible);
+    }
+}
+
+/// Draws the tiles of `visible`, and where one is missing, what the former
+/// level's tiles show there.
+fn paint_tiles(painter: &Painter, view: View, cv: &CanvasView, visible: &[(i64, i64)]) {
+    let full = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
+    let side = |level: u32| (compose::TILE as i64) << level;
+    let canvas_rect = |t: (i64, i64), level: u32| {
+        let s = side(level);
+        Rect::from_min_size(
+            pos2((t.0 * s) as f32, (t.1 * s) as f32),
+            Vec2::splat(s as f32),
+        )
+    };
+    for &t in visible {
+        let r = canvas_rect(t, cv.level);
+        if let Some(tile) = cv.tiles.get(&t) {
+            painter.image(tile.tex.id(), view.rect_to_screen(r), full, Color32::WHITE);
+            continue;
+        }
+        let Some((level, stale)) = &cv.stale else {
+            continue;
+        };
+        let s = side(*level);
+        let (x0, y0) = (
+            (r.min.x as i64).div_euclid(s),
+            (r.min.y as i64).div_euclid(s),
+        );
+        let (x1, y1) = (
+            (r.max.x as i64 - 1).div_euclid(s),
+            (r.max.y as i64 - 1).div_euclid(s),
+        );
+        for ty in y0..=y1 {
+            for tx in x0..=x1 {
+                let Some(old) = stale.get(&(tx, ty)) else {
+                    continue;
+                };
+                let o = canvas_rect((tx, ty), *level);
+                let part = o.intersect(r);
+                if !part.is_positive() {
+                    continue;
+                }
+                let uv = Rect::from_min_max(
+                    ((part.min - o.min) / o.size()).to_pos2(),
+                    ((part.max - o.min) / o.size()).to_pos2(),
                 );
-                painter.image(tex.id(), view.rect_to_screen(r), uv, Color32::WHITE);
+                painter.image(old.tex.id(), view.rect_to_screen(part), uv, Color32::WHITE);
             }
         }
     }
+}
 
+/// `r` (canvas pixels) in pixels of `level`: the blocks it touches.
+fn reduced(r: PixelRect, level: u32) -> PixelRect {
+    let b = 1i64 << level;
+    let (x0, y0) = (r.x.div_euclid(b), r.y.div_euclid(b));
+    let (x1, y1) = (-(-r.right()).div_euclid(b), -(-r.bottom()).div_euclid(b));
+    PixelRect {
+        x: x0,
+        y: y0,
+        w: (x1 - x0) as u32,
+        h: (y1 - y0) as u32,
+    }
+}
+
+/// Part of a tile to composite: its tile, area (pixels of the level),
+/// whether it is the last part of the tile, and the hot node with the
+/// snapshot of the nodes under it to start from (`None`: to make).
+struct Work {
+    tile: (i64, i64),
+    rect: PixelRect,
+    last: bool,
+    hot: Option<(usize, Option<Arc<Vec<Snap>>>)>,
+}
+
+/// Rows of a band at least (fewer: not worth a thread).
+const MIN_BAND_ROWS: u32 = 16;
+
+/// The parts of the tiles `todo` to composite, cut into bands of rows when
+/// there are fewer tiles than `threads` (all the cores work on a stroke).
+fn compose_work(cv: &CanvasView, plan: &compose::Plan, todo: &[Todo], threads: usize) -> Vec<Work> {
+    let n = plan.nodes.len();
+    let hot = cv.hot.as_ref().filter(|h| h.node < n);
+    let rows: u32 = todo.iter().map(|(_, r, _)| r.h).sum();
+    let per = rows.div_ceil(threads.max(1) as u32).max(MIN_BAND_ROWS);
+    let mut out = Vec::new();
+    for &(t, part, _) in todo {
+        let own = CanvasView::tile_rect(t);
+        let snap = hot.map(|h| (h.node, h.snaps.get(&t).cloned()));
+        // A tile without its snapshot is made whole (the snapshot with it);
+        // a new tile too.
+        let whole = matches!(snap, Some((_, None))) || !cv.tiles.contains_key(&t);
+        let part = if whole { own } else { part };
+        let bands = if todo.len() < threads {
+            part.h.div_ceil(per)
+        } else {
+            1
+        };
+        let h = part.h.div_ceil(bands.max(1));
+        let mut y = part.y;
+        while y < part.bottom() {
+            let rh = h.min((part.bottom() - y) as u32);
+            out.push(Work {
+                tile: t,
+                rect: PixelRect { y, h: rh, ..part },
+                last: y + rh as i64 >= part.bottom(),
+                hot: snap.clone(),
+            });
+            y += rh as i64;
+        }
+    }
+    out
+}
+
+/// Composites a part of a tile, for the screen.
+fn composite_part(
+    plan: &compose::Plan,
+    work: &Work,
+    channel: Option<usize>,
+    lut: Option<&crate::cms::Lut>,
+) -> TileResult {
+    let n = plan.nodes.len();
+    let rect = work.rect;
+    let mut snap = None;
+    let buf = match &work.hot {
+        Some((node, saved)) => {
+            let mut buf = match saved {
+                Some(px) => {
+                    let own = CanvasView::tile_rect(work.tile);
+                    let (side, w) = (compose::TILE as usize, rect.w as usize);
+                    let x0 = (rect.x - own.x) as usize;
+                    let rows = (rect.y - own.y) as usize..(rect.bottom() - own.y) as usize;
+                    let px: Vec<Snap> = rows
+                        .flat_map(|y| px[y * side + x0..y * side + x0 + w].iter().copied())
+                        .collect();
+                    compose::Buf {
+                        rect,
+                        px: from_snap(&px),
+                    }
+                }
+                None => {
+                    let mut buf = compose::Buf::transparent(rect);
+                    plan.draw(0..*node, &mut buf);
+                    snap = Some(to_snap(&buf.px));
+                    buf
+                }
+            };
+            plan.draw(*node..n, &mut buf);
+            buf
+        }
+        None => {
+            let mut buf = compose::Buf::transparent(rect);
+            plan.draw(0..n, &mut buf);
+            buf
+        }
+    };
+    let pixels = buf
+        .px
+        .iter()
+        .map(|p| {
+            let [r, g, b, a] = compose::premultiplied(*p);
+            match (channel, lut) {
+                // A channel alone: its value in gray, over white where
+                // transparent.
+                (Some(c), _) => Color32::from_gray([r, g, b][c] + (255 - a)),
+                (None, Some(lut)) => color_ui::shown(lut, *p),
+                (None, None) => Color32::from_rgba_premultiplied(r, g, b, a),
+            }
+        })
+        .collect();
+    TileResult {
+        image: ColorImage::new([rect.w as usize, rect.h as usize], pixels),
+        snap,
+    }
+}
+
+impl AtelierApp {
     /// Layer `i` (a group: with its layers) on its own, as the view shows
     /// it (see [`Lifted`]); its canvas box.
     pub(super) fn lifted(&mut self, ctx: &egui::Context, i: usize) -> Option<(&GpuImage, Rect)> {
         let mut slot = self.lifted.take();
-        let rect = self.lift(ctx, &mut slot, i);
+        let mut sources = self.take_sources();
+        let rect = self.lift(ctx, &mut slot, i, sources.as_mut());
+        self.put_sources(sources);
         self.lifted = slot;
         Some((&self.lifted.as_ref()?.gpu, rect?))
     }
 
-    /// `slot` brought to show layer `i` (see [`Self::lifted`]); its canvas
-    /// box.
-    fn lift(&self, ctx: &egui::Context, slot: &mut Option<Lifted>, i: usize) -> Option<Rect> {
+    /// The view's reductions, to composite at its level without making
+    /// them again (given back with [`Self::put_sources`]).
+    fn take_sources(&mut self) -> Option<compose::LevelCache> {
+        let uid = self.doc.as_ref()?.uid();
+        let v = self
+            .canvas_view
+            .as_mut()
+            .filter(|v| v.doc == uid && v.pending.is_none())?;
+        Some(std::mem::replace(
+            &mut v.sources,
+            compose::LevelCache::new(v.level),
+        ))
+    }
+
+    fn put_sources(&mut self, sources: Option<compose::LevelCache>) {
+        if let (Some(s), Some(v)) = (sources, &mut self.canvas_view) {
+            v.sources = s;
+        }
+    }
+
+    /// `slot` brought to show layer `i` (see [`Self::lifted`]), with the
+    /// view's reductions when at its level; its canvas box.
+    fn lift(
+        &self,
+        ctx: &egui::Context,
+        slot: &mut Option<Lifted>,
+        i: usize,
+        view_sources: Option<&mut compose::LevelCache>,
+    ) -> Option<Rect> {
         let doc = self.doc.as_ref()?;
         let layers = doc.render_layers();
         let level = render_level(self.zoom);
@@ -727,7 +1129,10 @@ impl AtelierApp {
             let extent = layers[block.clone()]
                 .iter()
                 .filter(|l| !l.is_group())
-                .map(|l| l.extent(opts.held).unwrap_or(doc.full_rect()))
+                .map(|l| {
+                    let styles = l.styles_shown(opts.held, opts.later_styles);
+                    l.extent_with(styles.as_deref()).unwrap_or(doc.full_rect())
+                })
                 .reduce(PixelRect::union)?;
             let b = 1i64 << level;
             let r = PixelRect {
@@ -739,8 +1144,12 @@ impl AtelierApp {
             if r.w == 0 || r.h == 0 || r.w as u64 * r.h as u64 > 1 << 26 {
                 return None;
             }
-            let mut sources = compose::LevelCache::new(level);
-            let image = compose::plan(&layers, doc.full_rect(), &mut sources, &opts).render(r);
+            let mut own = compose::LevelCache::new(level);
+            let sources = match view_sources {
+                Some(s) if compose::Sources::level(s) == level => s,
+                _ => &mut own,
+            };
+            let image = compose::plan(&layers, doc.full_rect(), sources, &opts).render(r);
             let rect = Rect::from_min_size(
                 pos2((r.x * b) as f32, (r.y * b) as f32),
                 vec2((r.w as i64 * b) as f32, (r.h as i64 * b) as f32),
@@ -787,7 +1196,9 @@ impl AtelierApp {
         } else {
             self.xform.take_lifted(id)
         };
-        let rect = self.lift(ctx, &mut slot, i);
+        let mut sources = self.take_sources();
+        let rect = self.lift(ctx, &mut slot, i, sources.as_mut());
+        self.put_sources(sources);
         let placed = rect.zip(slot.as_mut()).map(|(rect, l)| {
             let bounds = |r: Rect| [r.min.x, r.min.y, r.max.x, r.max.y].map(f64::from);
             let key = hash_of((
@@ -796,6 +1207,29 @@ impl AtelierApp {
                 t.fingerprint(),
                 bounds(visible).map(f64::to_bits),
             ));
+            if l.placed.as_ref().is_none_or(|p| p.key != key)
+                && let Some((dx, dy)) = translation(t)
+            {
+                // Only moved: the image as it is, in its new place (to the
+                // nearest pixel of the level), nothing to resample.
+                let b = 1i64 << l.level;
+                let (iw, ih) = l.image.dimensions();
+                let at = (
+                    ((f64::from(rect.min.x) + dx) / b as f64).round() as i64,
+                    ((f64::from(rect.min.y) + dy) / b as f64).round() as i64,
+                );
+                l.placed = Some(PlacedImage {
+                    key,
+                    image: Arc::clone(&l.image),
+                    at,
+                    rect: PixelRect {
+                        x: at.0 * b,
+                        y: at.1 * b,
+                        w: iw * b as u32,
+                        h: ih * b as u32,
+                    },
+                });
+            }
             if l.placed.as_ref().is_none_or(|p| p.key != key) {
                 let b = 1u32 << l.level;
                 let reach = t.bounds(bounds(rect)).unwrap_or(bounds(visible));
@@ -830,14 +1264,33 @@ impl AtelierApp {
     }
 }
 
-/// A composited tile, and the composite of the nodes under the hot one.
+/// The offset of a transform that only moves (by whole pixels or not).
+fn translation(t: &xform::Transform) -> Option<(f64, f64)> {
+    let [x0, y0, x1, y1] = t.src;
+    let first = t.forward([x0, y0])?;
+    let d = (first[0] - x0, first[1] - y0);
+    // At the thirds too (the control points of a warp).
+    (0..16)
+        .all(|k| {
+            let (i, j) = ((k % 4) as f64 / 3.0, (k / 4) as f64 / 3.0);
+            let p = [x0 + (x1 - x0) * i, y0 + (y1 - y0) * j];
+            t.forward(p).is_some_and(|q| {
+                (q[0] - p[0] - d.0).abs() < 1e-6 && (q[1] - p[1] - d.1).abs() < 1e-6
+            })
+        })
+        .then_some(d)
+}
+
+/// A composited part of a tile, and the composite of the nodes under the
+/// hot one there.
 struct TileResult {
     image: ColorImage,
-    snap: Option<Arc<Vec<compose::blend::Px>>>,
+    snap: Option<Vec<Snap>>,
 }
 
 /// Level of reduction composited for a zoom (physical pixels per image
-/// pixel): each of its pixels then covers one or two of the screen.
+/// pixel): each of its pixels then covers between half a pixel and one
+/// pixel of the screen (more when zoomed in past 100 %).
 pub(super) fn render_level(zoom: f32) -> u32 {
     levels_for(zoom) as u32
 }

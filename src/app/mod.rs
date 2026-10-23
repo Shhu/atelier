@@ -21,6 +21,8 @@ mod filters_ui;
 mod gradient_editor;
 mod history_panel;
 #[cfg(test)]
+mod history_tests;
+#[cfg(test)]
 mod input_tests;
 mod keys;
 mod layer_style;
@@ -64,6 +66,8 @@ mod status_bar;
 mod tabs;
 mod titlebar;
 mod toolbar;
+#[cfg(test)]
+mod tools_tests;
 mod transform;
 #[cfg(test)]
 mod transform_tests;
@@ -76,6 +80,7 @@ mod ui_tests;
 mod vector_tests;
 mod vector_tools;
 mod welcome;
+mod workspace;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -175,6 +180,17 @@ const SHORTCUT_FILL_SECONDARY: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND, Key::Delete);
 const SHORTCUT_COPY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::C);
 const SHORTCUT_PASTE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::V);
+// Display only, like Copy and Paste (see `clipboard_action`).
+const SHORTCUT_COPY_MERGED: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::C);
+const SHORTCUT_PASTE_IN_PLACE: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::V);
+const SHORTCUT_PASTE_INTO: KeyboardShortcut = KeyboardShortcut::new(
+    Modifiers::COMMAND
+        .plus(Modifiers::SHIFT)
+        .plus(Modifiers::ALT),
+    Key::V,
+);
 const SHORTCUT_CUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::X);
 const SHORTCUT_SELECT_ALL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::A);
 const SHORTCUT_DESELECT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
@@ -251,6 +267,9 @@ const ZOOM_LEVELS: [f32; 22] = [
     0.0313, 0.0417, 0.0625, 0.0833, 0.125, 0.1667, 0.25, 0.3333, 0.5, 0.6667, 1.0, 2.0, 3.0, 4.0,
     5.0, 6.0, 7.0, 8.0, 12.0, 16.0, 32.0, 64.0,
 ];
+/// Zoom with Alt+wheel, per point scrolled: egui's for Ctrl+wheel, about
+/// ×1.22 per notch.
+const WHEEL_ZOOM_RATE: f32 = 1.0 / 200.0;
 /// Delay (s) to type two opacity digits in a row (4 then 5: 45%).
 const DIGIT_DELAY: f64 = 0.6;
 
@@ -596,8 +615,14 @@ enum Action {
     MakeTransparent,
     Adjust(AdjustKind),
     Copy,
+    /// Edit › Copy Merged: the visible layers together.
+    CopyMerged,
     Cut,
     Paste,
+    /// Edit › Paste Special › Paste in Place: where the copy came from.
+    PasteInPlace,
+    /// Edit › Paste Special › Paste Into: masked by the selection.
+    PasteInto,
     SelectAll,
     Deselect,
     Reselect,
@@ -694,6 +719,8 @@ enum Action {
     Artboard(artboard_tool::Command),
     /// Color Settings, profiles, Proof Setup, Proof Colors, Image › Mode.
     Color(color_ui::Command),
+    /// File › Open Recent, the Window menu's workspace, the Help menu.
+    Workspace(workspace::Command),
 }
 
 pub struct AtelierApp {
@@ -759,6 +786,9 @@ pub struct AtelierApp {
     object_select: object_select::ObjectSelect,
     /// Last tool used of each group of tools sharing a shortcut key.
     group_tool: HashMap<usize, Tool>,
+    /// Brush size and hardness of each tool used, like Photoshop (a tool
+    /// first used takes those of the one before).
+    tool_brushes: Vec<(Tool, f32, f32)>,
     /// Fill… window open (Shift+F5).
     fill_dialog: Option<FillDialog>,
     /// Image Size window open (Ctrl+Alt+I).
@@ -785,6 +815,8 @@ pub struct AtelierApp {
     typing: bool,
     /// V is held as a plain key, not as Ctrl+V (see `paste_released`).
     plain_v: bool,
+    /// Where the last copy came from (Paste in Place).
+    last_copy: Option<files::CopiedFrom>,
     /// A Shift+Ctrl cut came without its key (see `shift_ctrl_cut`).
     cut_key: bool,
     /// Paint bucket tolerance (0..1).
@@ -809,6 +841,9 @@ pub struct AtelierApp {
     transform_angle: f32,
     /// Rotation in progress with the mouse: (pointer angle at the start, start angle).
     rotate_drag: Option<(f32, f32)>,
+    /// The pending transform is a Free Transform (Ctrl+T, a handle or a
+    /// turn), not just a move: a drag outside its frame turns it.
+    free_transform: bool,
     keep_ratio: bool,
     fit_canvas: bool,
     resize_filter: ResizeFilter,
@@ -824,6 +859,17 @@ pub struct AtelierApp {
     guides: Snap,
     /// Ctrl held: free move, without snapping (like Photoshop).
     snap_off: bool,
+    /// The left button's drag in progress pans the view (Space or the Hand
+    /// tool at its press).
+    space_pan: bool,
+    /// Move tool: a click picks the layer under the pointer (Ctrl inverts).
+    auto_select: bool,
+    /// Alt+arrows: the layer was duplicated for this series (Alt held).
+    alt_nudge_copied: bool,
+    /// Move tool, Alt+drag: where it started, until the copy is made.
+    alt_drag_copy: Option<Pos2>,
+    /// Layers under the pointer at the right click (Move tool's menu).
+    menu_layers: Vec<usize>,
 
     /// Last series of property edits: (layer, property) and length of the
     /// history right after it was recorded.
@@ -911,6 +957,8 @@ pub struct AtelierApp {
     artboards: artboard_tool::Artboards,
     /// File › New window.
     new_doc: new_document::NewDocument,
+    /// Panels shown and their sizes, Help windows, alerts.
+    workspace: workspace::Workspace,
 }
 
 /// Processing previewed on a layer while a window is open.
@@ -1112,6 +1160,7 @@ impl Action {
         !matches!(
             self,
             Action::Copy
+                | Action::CopyMerged
                 | Action::SelectAll
                 | Action::Deselect
                 | Action::Reselect
@@ -1144,6 +1193,7 @@ impl Action {
                         | color_ui::Command::GamutWarning
                         | color_ui::Command::Settings
                 )
+                | Action::Workspace(_)
         )
     }
 }
@@ -1309,6 +1359,7 @@ impl AtelierApp {
             models_window: None,
             object_select: Default::default(),
             group_tool: HashMap::new(),
+            tool_brushes: Vec::new(),
             select_move: None,
             selection_outline: None,
             fill_dialog: None,
@@ -1321,6 +1372,7 @@ impl AtelierApp {
             focus_name: false,
             typing: false,
             plain_v: false,
+            last_copy: None,
             cut_key: false,
             hardness: 0.8,
             opacity: 1.0,
@@ -1332,6 +1384,7 @@ impl AtelierApp {
             transform_rect: None,
             transform_angle: 0.0,
             rotate_drag: None,
+            free_transform: false,
             keep_ratio: true,
             fit_canvas: false,
             resize_filter: ResizeFilter::Lanczos,
@@ -1341,6 +1394,11 @@ impl AtelierApp {
             snap_targets: None,
             guides: Snap::default(),
             snap_off: false,
+            space_pan: false,
+            auto_select: false,
+            alt_nudge_copied: false,
+            alt_drag_copy: None,
+            menu_layers: Vec::new(),
             prop_session: None,
             confirm: None,
             flatten_confirm: false,
@@ -1383,6 +1441,7 @@ impl AtelierApp {
             smart: Default::default(),
             artboards: Default::default(),
             new_doc: Default::default(),
+            workspace: Default::default(),
             history: Default::default(),
             channels: Default::default(),
         };
@@ -1395,6 +1454,14 @@ impl AtelierApp {
     fn set_tool(&mut self, tool: Tool) {
         if tool != self.tool {
             self.commit_pending();
+            let (size, hardness) = (self.brush_size, self.hardness);
+            match self.tool_brushes.iter_mut().find(|b| b.0 == self.tool) {
+                Some(b) => (b.1, b.2) = (size, hardness),
+                None => self.tool_brushes.push((self.tool, size, hardness)),
+            }
+            if let Some(&(_, size, hardness)) = self.tool_brushes.iter().find(|b| b.0 == tool) {
+                (self.brush_size, self.hardness) = (size, hardness);
+            }
             self.tool = tool;
             // Gestures of the previous tool don't resume when it comes back.
             self.lasso = None;
@@ -1484,6 +1551,7 @@ impl AtelierApp {
         self.transform_rect = None;
         self.transform_angle = 0.0;
         self.rotate_drag = None;
+        self.free_transform = false;
         self.drag = None;
         self.cancel_transform_extras();
     }
@@ -1494,10 +1562,19 @@ impl AtelierApp {
         let Some(m) = self.select_move.take() else {
             return;
         };
+        let floating = m.floating.is_some();
         if let (Some((id, _)), Some(doc)) = (m.floating, &mut self.doc) {
             doc.drop_floating(id);
         }
-        self.clip_selection();
+        if let Some(canvas) = self.doc.as_ref().map(Document::full_rect) {
+            self.selection = self.selection.take().and_then(|s| s.within(canvas));
+        }
+        if floating || !m.moved {
+            // Moved with its pixels: in their step.
+            self.sync_selection();
+        } else {
+            self.commit_selection(Some(t!("hist3-move-selection")));
+        }
     }
 
     /// Ctrl+Z during a selection move: everything goes back to how it was
@@ -1513,6 +1590,7 @@ impl AtelierApp {
             doc.undo();
         }
         self.selection = Some(m.selection);
+        self.sync_selection();
         true
     }
 
@@ -1526,11 +1604,12 @@ impl AtelierApp {
             && self
                 .prop_session
                 .is_some_and(|(k, step)| Some(k) == key && step == doc.history_step());
-        if !same_series {
+        if same_series {
+            doc.mark_modified();
+        } else {
             doc.checkpoint(name);
             self.prop_session = key.map(|k| (k, doc.history_step()));
         }
-        doc.modified = true;
     }
 
     /// Arrow keys, like Photoshop: with a selection tool, they nudge the
@@ -1560,6 +1639,12 @@ impl AtelierApp {
         if self.doc.is_none() || self.refuse_if_locked() {
             return;
         }
+        // Move tool, Alt: the first arrow of the series moves a copy.
+        let alt = self.ctx.input(|i| i.modifiers.alt);
+        if alt && self.tool == Tool::Transform && !self.alt_nudge_copied {
+            self.alt_nudge_copied = true;
+            self.run(Action::Duplicate);
+        }
         let id = self
             .doc
             .as_ref()
@@ -1585,7 +1670,7 @@ impl AtelierApp {
         let layer = doc.active_layer();
         let (x, y) = layer.offset;
         self.status = t!(
-            "status-layer-moved",
+            "canvas-status-layer-moved",
             name = layer.name.as_str(),
             x = signed(x as f32),
             y = signed(y as f32)
@@ -1608,27 +1693,6 @@ impl AtelierApp {
         } else {
             self.primary = color;
             self.status = t!("status-foreground-color", hex = hex);
-        }
-    }
-
-    /// Paint bucket at the given point, with the foreground color.
-    fn bucket_fill(&mut self, at: Pos2) {
-        if self.refuse_if_locked() {
-            return;
-        }
-        let color = self.primary.to_srgba_unmultiplied();
-        let tolerance = (self.bucket_tolerance * 255.0).round() as u8;
-        let contiguous = self.bucket_contiguous;
-        let Some(doc) = &mut self.doc else { return };
-        if doc.fill_at(
-            at.x.floor() as i64,
-            at.y.floor() as i64,
-            color,
-            tolerance,
-            self.selection.as_ref(),
-            contiguous,
-        ) {
-            self.reset_pending();
         }
     }
 
@@ -1665,6 +1729,7 @@ impl AtelierApp {
     }
 
     /// Drops the selection, keeping it for Reselect.
+    /// (Its step is recorded by the caller, see `commit_selection`.)
     fn deselect(&mut self) {
         if let Some(sel) = self.selection.take() {
             self.last_selection = Some(sel);
@@ -1672,10 +1737,12 @@ impl AtelierApp {
     }
 
     /// The canvas coordinates changed: the selection, and the one kept for
-    /// Reselect, no longer apply.
+    /// Reselect, no longer apply (part of the change's step: undoing it
+    /// brings the selection back).
     fn forget_selection(&mut self) {
         self.selection = None;
         self.last_selection = None;
+        self.sync_selection();
     }
 
     /// Selects the visible pixels of a layer (Ctrl + click on its thumbnail).
@@ -1695,6 +1762,7 @@ impl AtelierApp {
         }
         let (shift, alt) = self.ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
         let mode = self.selection_mode(shift, alt);
+        self.sel.step_name = Some(select_menu::step_label(t!("sel-menu-load")));
         self.apply_selection(found, mode);
     }
 
@@ -1754,7 +1822,13 @@ impl AtelierApp {
 
     /// If the active layer is locked, says so and returns `true`.
     fn refuse_if_locked(&mut self) -> bool {
-        let Some(layer) = self.doc.as_ref().map(Document::active_layer) else {
+        // In Quick Mask Mode, the tools edit the mask, not the layer.
+        let Some(layer) = self
+            .doc
+            .as_ref()
+            .filter(|d| d.quick_mask().is_none())
+            .map(Document::active_layer)
+        else {
             return false;
         };
         if layer.locked {
@@ -1787,39 +1861,35 @@ impl AtelierApp {
 
     fn undo(&mut self) {
         self.finish_stroke();
-        if self.cancel_select_move() || self.quick_mask_undo(false) {
+        if self.cancel_select_move() {
             return;
         }
         // A transform or crop being prepared: only it is undone, like
-        // Photoshop (it isn't in the history yet).
+        // Photoshop (it isn't in the history yet): Free Transform goes back
+        // to before its last drag, and is cancelled once there is none.
         if self.transform_rect.is_some() || self.canvas_rect.is_some() {
+            if self.transform_pending() && self.undo_transform_edit() {
+                return;
+            }
             self.reset_pending();
             return;
         }
         self.reset_pending();
+        self.settle_selection();
         if self.doc.as_mut().is_some_and(Document::undo) {
             self.reset_pending();
-            self.clip_selection();
+            self.pull_selection();
         }
     }
 
     fn redo(&mut self) {
         self.finish_stroke();
-        if self.quick_mask_undo(true) {
-            return;
-        }
         self.finish_select_move();
         self.reset_pending();
+        self.settle_selection();
         if self.doc.as_mut().is_some_and(Document::redo) {
             self.reset_pending();
-            self.clip_selection();
-        }
-    }
-
-    /// Keeps the selection within the canvas (after its size changed).
-    fn clip_selection(&mut self) {
-        if let Some(canvas) = self.doc.as_ref().map(Document::full_rect) {
-            self.selection = self.selection.take().and_then(|s| s.within(canvas));
+            self.pull_selection();
         }
     }
 
@@ -1861,23 +1931,49 @@ impl AtelierApp {
         };
         if let Some(doc) = &mut self.doc {
             doc.hold_effects(false);
+            // Covered pixels may come out the same (a transparent or
+            // off-image clone source): no step then. The healing may reach
+            // a little beyond the dabs.
+            let margin = self.brush_size.ceil() as u32;
+            let changed = stroke.painted() && stroke.changes(doc.active_layer().image(), margin);
             // A targeted mask gets its place back.
             doc.end_paint();
-            if !stroke.painted() {
+            if !changed {
                 doc.discard_step();
                 self.stroke_dirty = None;
+                if stroke.painted() && self.tool.clones() {
+                    let sample = match self.tool {
+                        Tool::CloneStamp => self.retouch.clone_sample,
+                        _ => self.retouch.heal_sample,
+                    };
+                    self.status = t!("tools3-status-source-empty", sample = sample.label());
+                }
             }
         }
     }
 
     fn run(&mut self, action: Action) {
+        // A selection still being computed applies first: the command
+        // works with it, as if it had been computed at once.
+        self.wait_select_job();
         if action.modifies_active() && self.refuse_if_locked() {
             return;
         }
         if action.commits_pending() {
             self.commit_pending();
         }
-        self.record_action(action);
+        let recorded = self.recorded_action(action);
+        let before = self.doc.as_ref().map(|d| (d.uid(), d.history_step()));
+        let recording = self.actions.recording_len();
+        self.run_action(action);
+        // Recorded once it did something, like Photoshop.
+        match recorded {
+            Some(command) => self.record_done(command, before),
+            None => self.tell_unrecorded(action, recording, before),
+        }
+    }
+
+    fn run_action(&mut self, action: Action) {
         match action {
             Action::Transform(cmd) => self.transform_command(cmd),
             Action::Align(op) => {
@@ -1892,17 +1988,23 @@ impl AtelierApp {
                 self.copy_to_clipboard();
             }
             Action::Cut => {
+                // Part of the Cut: not recorded on its own.
                 if self.selection.is_some() && self.copy_to_clipboard() {
-                    self.run(Action::ClearSelection);
+                    self.muted(|app| app.run(Action::ClearSelection));
                 }
             }
             Action::SelectAll => {
                 self.selection = self.doc.as_ref().map(|d| d.full_rect().into());
+                self.commit_selection(Some(t!("hist3-select-all")));
             }
-            Action::Deselect => self.deselect(),
+            Action::Deselect => {
+                self.deselect();
+                self.commit_selection(Some(t!("hist3-deselect")));
+            }
             Action::Reselect => {
                 if let (Some(sel), Some(doc)) = (self.last_selection.clone(), &self.doc) {
                     self.selection = sel.within(doc.full_rect());
+                    self.commit_selection(Some(t!("hist3-reselect")));
                 }
             }
             Action::ClearSelection => {
@@ -1928,7 +2030,12 @@ impl AtelierApp {
                     self.apply_canvas();
                 }
             }
-            Action::Paste => self.paste_from_clipboard(),
+            Action::Paste => self.paste_from_clipboard(files::PasteMode::Centered),
+            Action::CopyMerged => {
+                self.copy_merged();
+            }
+            Action::PasteInPlace => self.paste_from_clipboard(files::PasteMode::InPlace),
+            Action::PasteInto => self.paste_from_clipboard(files::PasteMode::Into),
             // No settings: applied at once, like Photoshop.
             // Not on a smart object, like Photoshop.
             Action::Adjust(_) if self.smart_filters_apply() => {
@@ -1998,6 +2105,12 @@ impl AtelierApp {
             Action::SetLanguage(lang) => i18n::choose(lang),
             Action::AiModels => {
                 self.models_window.get_or_insert_default();
+                // Partial downloads left by a run stopped while downloading.
+                std::thread::spawn(|| {
+                    for model in crate::ai::models::Model::ALL {
+                        model.remove_orphans();
+                    }
+                });
             }
             Action::Quit => {
                 self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2037,9 +2150,9 @@ impl AtelierApp {
             | Action::FillSecondaryKeep => {
                 let primary = matches!(action, Action::FillPrimary | Action::FillPrimaryKeep);
                 let (color, which) = if primary {
-                    (self.primary, t!("status-fill-foreground-color"))
+                    (self.primary, t!("dialog-fill-with-foreground"))
                 } else {
-                    (self.secondary, t!("status-fill-background-color"))
+                    (self.secondary, t!("dialog-fill-with-background"))
                 };
                 let keep = matches!(action, Action::FillPrimaryKeep | Action::FillSecondaryKeep);
                 self.fill(color, &which, 1.0, keep);
@@ -2063,6 +2176,7 @@ impl AtelierApp {
                         ..sel
                     }
                     .within(doc.full_rect());
+                    self.commit_selection(Some(t!("hist3-inverse")));
                 }
             }
             Action::ImageSize => {
@@ -2206,6 +2320,7 @@ impl AtelierApp {
             Action::NewDocument => self.new_document(),
             Action::Artboard(command) => self.artboard_command(command),
             Action::Color(command) => self.color_command(command),
+            Action::Workspace(command) => self.workspace_command(command),
         }
     }
 
@@ -2225,7 +2340,7 @@ impl AtelierApp {
             w,
             h,
         });
-        self.status = t!("status-canvas-size", width = w, height = h);
+        self.status = t!("status-canvas-resized", width = w, height = h);
         // The selection's coordinates no longer make sense.
         self.forget_selection();
         self.after_geometry_change(r.center() - old_center);
@@ -2241,6 +2356,7 @@ impl AtelierApp {
             return;
         };
         let r = self.transform_rect.take().unwrap_or(src);
+        self.free_transform = false;
         let angle = self.transform_angle;
         // Placed as previewed: the frame's edges rounded to pixels.
         let frame = round_rect(r);
@@ -2314,12 +2430,21 @@ impl AtelierApp {
             );
             self.after_geometry_change(frame.center() - old_center);
         } else {
+            // Where the element is: the corner of its turned box.
+            let corners = [
+                frame.left_top(),
+                frame.right_top(),
+                frame.left_bottom(),
+                frame.right_bottom(),
+            ]
+            .map(|p| canvas::rotate_around(p, frame.center(), angle));
+            let corner = round_rect(Rect::from_points(&corners)).min;
             self.status = t!(
                 "status-element-placed",
                 width = w,
                 height = h,
-                x = at.0,
-                y = at.1,
+                x = corner.x as i64,
+                y = corner.y as i64,
                 rotated = turned
             );
             // The canvas doesn't change: a crop frame being prepared stays.
@@ -2388,6 +2513,7 @@ impl AtelierApp {
             || self.transform_busy()
             || self.confirm.is_some()
             || self.flatten_confirm
+            || self.paint.rasterize_confirm.is_some()
             || self.fill_dialog.is_some()
             || self.retouch.busy()
             || self.retouch.dialog.is_some()
@@ -2408,9 +2534,13 @@ impl AtelierApp {
             || self.new_doc.is_open()
             || self.actions_modal()
             || self.automate.modal()
+            || self.workspace.modal()
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.modifiers.alt) {
+            self.alt_nudge_copied = false;
+        }
         let paste = self.paste_released(ctx);
         let cut = self.shift_ctrl_cut(ctx);
         if self.modal_open() || self.automate.running() {
@@ -2452,6 +2582,20 @@ impl AtelierApp {
         if ctx.input_mut(|i| consume_exact(i, palette::SHORTCUT_PALETTE)) {
             self.palette.open();
             return;
+        }
+        // Tab / Shift+Tab: the panels hide or show (not the keyboard focus).
+        for (shortcut, command) in [
+            (workspace::SHORTCUT_PANELS, workspace::Command::TogglePanels),
+            (
+                workspace::SHORTCUT_SIDE_PANEL,
+                workspace::Command::ToggleSidePanel,
+            ),
+        ] {
+            if ctx.input_mut(|i| consume_exact(i, shortcut)) {
+                ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+                self.run(Action::Workspace(command));
+                return;
+            }
         }
         if let Some(n) = ctx.input_mut(channels_panel::channel_shortcut) {
             self.show_channel(n);
@@ -2563,8 +2707,12 @@ impl AtelierApp {
             key_typed(i, Modifiers::NONE, Key::Delete)
                 || key_typed(i, Modifiers::NONE, Key::Backspace)
         });
+        // Without a selection, the layer goes, like Photoshop (not the one
+        // being transformed or cropped).
         if delete && self.selection.is_some() {
             self.run(Action::ClearSelection);
+        } else if delete && self.transform_rect.is_none() && self.canvas_rect.is_none() {
+            self.run(Action::Delete);
         }
         // Fills, like Photoshop, with Backspace or Delete. (On Windows,
         // egui-winit turns Shift+Delete into a cut: see `clipboard_action`.)
@@ -2614,8 +2762,10 @@ impl AtelierApp {
                 tool,
                 bracket_press(i),
                 digit_press(i, Modifiers::NONE),
-                i.key_pressed(Key::Enter),
-                i.key_pressed(Key::Escape),
+                // Not a key repeat: holding the key that has just closed a
+                // dialog mustn't go on to the canvas.
+                fresh_press(i, Key::Enter),
+                fresh_press(i, Key::Escape),
             )
         });
         if let Some((tool, shift)) = tool {
@@ -2645,12 +2795,9 @@ impl AtelierApp {
             Some(ToolWindow::ColorRange) => self.close_color_range(enter),
             Some(ToolWindow::SelectMask) => self.close_select_mask(enter),
             None if enter => self.commit_pending(),
-            None => {
-                self.reset_pending();
-                if self.tool.selects() {
-                    self.deselect();
-                }
-            }
+            // Never a deselect (Ctrl+D): a reflex Esc mustn't lose a
+            // selection built with care.
+            None => self.reset_pending(),
         }
     }
 
@@ -2722,22 +2869,30 @@ impl AtelierApp {
         action
     }
 
-    /// Paste on the release of V: egui-winit swallows the press of Ctrl+V
-    /// when the clipboard holds an image (it only reports text). A release
-    /// without its plain press is a paste, even if Ctrl was let go first.
+    /// Paste on the release of V (or of Insert, Windows' Shift+Insert):
+    /// egui-winit swallows the press of Ctrl+V when the clipboard holds an
+    /// image (it only reports text). A release without its plain press is a
+    /// paste, even if Ctrl was let go first.
     fn paste_released(&mut self, ctx: &egui::Context) -> bool {
         let mut paste = false;
         ctx.input(|i| {
             for e in &i.events {
                 if let egui::Event::Key {
-                    key: Key::V,
+                    key: key @ (Key::V | Key::Insert),
                     pressed,
                     modifiers,
                     ..
                 } = e
                 {
+                    if *key == Key::Insert && !cfg!(windows) {
+                        continue;
+                    }
                     if *pressed {
-                        self.plain_v = !modifiers.command;
+                        self.plain_v = if *key == Key::V {
+                            !modifiers.command
+                        } else {
+                            !modifiers.shift
+                        };
                     } else {
                         paste |= !self.plain_v;
                         self.plain_v = false;
@@ -2845,21 +3000,23 @@ fn bracket_press(input: &egui::InputState) -> Option<(bool, Modifiers)> {
     })
 }
 
+/// The digit row, 0 to 9.
+const DIGIT_KEYS: [Key; 10] = [
+    Key::Num0,
+    Key::Num1,
+    Key::Num2,
+    Key::Num3,
+    Key::Num4,
+    Key::Num5,
+    Key::Num6,
+    Key::Num7,
+    Key::Num8,
+    Key::Num9,
+];
+
 /// Digit typed with exactly `modifiers`. The physical key is read: on an
 /// AZERTY keyboard, the digit row gives & é " ' … without Shift.
 fn digit_press(input: &egui::InputState, modifiers: Modifiers) -> Option<u32> {
-    const DIGITS: [Key; 10] = [
-        Key::Num0,
-        Key::Num1,
-        Key::Num2,
-        Key::Num3,
-        Key::Num4,
-        Key::Num5,
-        Key::Num6,
-        Key::Num7,
-        Key::Num8,
-        Key::Num9,
-    ];
     input.events.iter().find_map(|e| match e {
         egui::Event::Key {
             key,
@@ -2869,7 +3026,7 @@ fn digit_press(input: &egui::InputState, modifiers: Modifiers) -> Option<u32> {
             modifiers: m,
         } if m.matches_exact(modifiers) => {
             let key = physical_key.unwrap_or(*key);
-            DIGITS.iter().position(|&d| d == key).map(|n| n as u32)
+            DIGIT_KEYS.iter().position(|&d| d == key).map(|n| n as u32)
         }
         _ => None,
     })
@@ -2892,8 +3049,11 @@ fn brush_size_step(size: f32, up: bool) -> f32 {
         let st = step(size - 0.5);
         (size / st).ceil() * st - st
     };
-    next.clamp(1.0, 500.0)
+    next.clamp(1.0, MAX_BRUSH_SIZE)
 }
+
+/// Largest brush, in pixels.
+const MAX_BRUSH_SIZE: f32 = 5000.0;
 
 /// Snap guides, as View › Snap To says: edges and center of the canvas and
 /// of the other visible elements (not the ones being moved), ruler guides
@@ -2925,8 +3085,11 @@ fn snap_targets(doc: &Document, moving: &[usize], view: &rulers::ViewSettings) -
 fn clipboard_action(input: &egui::InputState, paste: bool) -> Option<Action> {
     let m = input.modifiers;
     let clipboard = input.events.iter().find_map(|e| match e {
-        // Ctrl+Alt+C.
-        egui::Event::Copy if m.alt => Some(Action::CanvasSize),
+        // Exactly Ctrl+Alt+C.
+        egui::Event::Copy if m.alt && !m.shift => Some(Action::CanvasSize),
+        egui::Event::Copy if m.shift && !m.alt => Some(Action::CopyMerged),
+        // Other shortcuts (Alt+Shift+Ctrl+C), not a copy.
+        egui::Event::Copy if m.alt || m.shift => None,
         egui::Event::Copy => Some(Action::Copy),
         // Shift+Ctrl+X, or Shift+Ctrl+Delete on Windows: told apart when the
         // key is released (see `shift_ctrl_cut`).
@@ -2941,7 +3104,13 @@ fn clipboard_action(input: &egui::InputState, paste: bool) -> Option<Action> {
         egui::Event::Cut => Some(Action::Cut),
         _ => None,
     });
-    clipboard.or(paste.then_some(Action::Paste))
+    // Shift+Ctrl+V, Alt+Shift+Ctrl+V (Shift+Insert: a plain paste).
+    let paste = paste.then_some(match (m.command && m.shift, m.alt) {
+        (true, true) => Action::PasteInto,
+        (true, false) => Action::PasteInPlace,
+        _ => Action::Paste,
+    });
+    clipboard.or(paste)
 }
 
 /// The first of `shortcuts` pressed in this frame (consumed). Modifiers must
@@ -2959,12 +3128,30 @@ fn take_shortcut(
 fn consume_exact(input: &mut egui::InputState, shortcut: KeyboardShortcut) -> bool {
     let mut found = false;
     input.events.retain(|e| {
-        let hit = matches!(e, egui::Event::Key { key, pressed: true, modifiers, .. }
-            if *key == shortcut.logical_key && modifiers.matches_exact(shortcut.modifiers));
+        let hit = matches!(e, egui::Event::Key { key, physical_key, pressed: true, modifiers, .. }
+            if shortcut_key(*key, *physical_key) == shortcut.logical_key
+                && modifiers.matches_exact(shortcut.modifiers));
         found |= hit;
         !hit
     });
     found
+}
+
+/// The key a shortcut is matched with. The digit row by its place, like
+/// Windows' key codes: on an AZERTY keyboard it types & é " ' ( - …, and
+/// Ctrl+4 must not be Ctrl+' (Grid), nor Ctrl+6 Ctrl+− (Zoom Out).
+fn shortcut_key(key: Key, physical: Option<Key>) -> Key {
+    match physical {
+        Some(p) if DIGIT_KEYS.contains(&p) => p,
+        _ => key,
+    }
+}
+
+/// `key` pressed in this frame, whatever the modifiers, key repeat aside.
+fn fresh_press(input: &egui::InputState, key: Key) -> bool {
+    input.events.iter().any(
+        |e| matches!(e, egui::Event::Key { key: k, pressed: true, repeat: false, .. } if *k == key),
+    )
 }
 
 /// `key` pressed in this frame with exactly `modifiers`, key repeat aside
@@ -3078,17 +3265,21 @@ impl eframe::App for AtelierApp {
                     }),
             )
             .show(ui, |ui| self.title_bar(ui));
-        egui::Panel::top("options_bar")
-            .frame(
-                egui::Frame::new()
-                    .fill(color::OPTIONS)
-                    .inner_margin(egui::Margin::symmetric(12, 8)),
-            )
-            .show(ui, |ui| {
-                // 46 px with the margins; wraps when the window is too narrow.
-                ui.set_min_height(28.0);
-                ui.horizontal_wrapped(|ui| self.options_bar(ui));
-            });
+        // Tab hides the bars and panels around the canvas.
+        let chrome = self.chrome_shown();
+        if chrome {
+            egui::Panel::top("options_bar")
+                .frame(
+                    egui::Frame::new()
+                        .fill(color::OPTIONS)
+                        .inner_margin(egui::Margin::symmetric(12, 8)),
+                )
+                .show(ui, |ui| {
+                    // 46 px with the margins; wraps when the window is too narrow.
+                    ui.set_min_height(28.0);
+                    ui.horizontal_wrapped(|ui| self.options_bar(ui));
+                });
+        }
         egui::Panel::bottom("status_bar")
             .exact_size(28.0)
             .frame(
@@ -3097,25 +3288,34 @@ impl eframe::App for AtelierApp {
                     .inner_margin(egui::Margin::symmetric(12, 0)),
             )
             .show(ui, |ui| self.status_bar(ui));
-        egui::Panel::left("toolbar")
-            .resizable(false)
-            .exact_size(52.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(color::BG1)
-                    .inner_margin(egui::Margin {
-                        left: 8,
-                        right: 8,
-                        top: 8,
-                        bottom: 12,
-                    }),
-            )
-            .show(ui, |ui| self.toolbar(ui));
-        egui::Panel::right("side_panel")
-            .resizable(false)
-            .exact_size(312.0)
-            .frame(egui::Frame::new().fill(color::BG2))
-            .show(ui, |ui| self.right_panel(ui));
+        // Two columns of tools when one doesn't fit.
+        let tool_columns = toolbar::columns(ui.available_height());
+        if chrome {
+            egui::Panel::left("toolbar")
+                .resizable(false)
+                .exact_size(toolbar::width(tool_columns))
+                .frame(
+                    egui::Frame::new()
+                        .fill(color::BG1)
+                        .inner_margin(egui::Margin {
+                            left: 8,
+                            right: 8,
+                            top: 8,
+                            bottom: 12,
+                        }),
+                )
+                .show(ui, |ui| self.toolbar(ui, tool_columns));
+        }
+        if self.side_shown() {
+            let side = egui::Panel::right("side_panel")
+                .resizable(false)
+                .exact_size(self.workspace.layout.side_width)
+                .frame(egui::Frame::new().fill(color::BG2))
+                .show(ui, |ui| self.right_panel(ui));
+            self.side_panel_grip(ui, side.response.rect);
+        }
+        // Where dialogs and floating panels go: around the canvas area.
+        dialogs::set_work_area(&ctx, ui.available_rect_before_wrap());
         egui::CentralPanel::no_frame().show(ui, |ui| self.canvas(ui));
 
         // Closing the window with unsaved changes: asks for each document,
@@ -3145,6 +3345,7 @@ impl eframe::App for AtelierApp {
         self.export_window(&ctx);
         self.confirm_window(&ctx);
         self.flatten_confirm_window(&ctx);
+        self.rasterize_confirm_window(&ctx);
         self.split_window(&ctx);
         self.select_windows(&ctx);
         self.palette_window(&ctx);
@@ -3160,10 +3361,13 @@ impl eframe::App for AtelierApp {
         self.color_windows(&ctx);
         self.artboard_windows(&ctx);
         self.new_document_window(&ctx);
+        self.workspace_windows(&ctx);
         // Last: it may open over another dialog.
         self.color_picker_window(&ctx);
         titlebar::resize_grips(&ctx);
         self.keep_focus_on_text(&ctx);
+        self.settle_selection();
+        self.trim_histories();
     }
 }
 

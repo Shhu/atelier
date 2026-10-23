@@ -117,9 +117,9 @@ fn be16(data: &[u8], at: usize) -> Option<usize> {
 }
 
 /// Decodes a lossless JPEG stream: its samples, the components of each
-/// pixel together, rows from the top; `None` if it is not one or is
-/// damaged.
-pub fn decode(data: &[u8]) -> Option<Vec<u16>> {
+/// pixel together, rows from the top; `None` if it is not one, is
+/// damaged, or holds more than `limit` samples.
+pub fn decode(data: &[u8], limit: usize) -> Option<Vec<u16>> {
     if data.get(..2)? != [0xFF, 0xD8] {
         return None;
     }
@@ -169,6 +169,9 @@ pub fn decode(data: &[u8]) -> Option<Vec<u16>> {
                 let predictor = *segment.get(1 + 2 * ns)? as u32;
                 let transform = (*segment.get(3 + 2 * ns)? & 0x0F) as u32;
                 if ns != components || components == 0 || width == 0 || height == 0 {
+                    return None;
+                }
+                if width * height * components > limit {
                     return None;
                 }
                 let scan = data.get(at + len..)?;
@@ -382,6 +385,11 @@ pub mod tests {
         let (w, h, n) = (13, 7, 2);
         let samples: Vec<u16> = (0..w * h * n).map(|i| ((i * 7919) % 4096) as u16).collect();
         let jpeg = encode(&samples, w, h, n, 12);
-        assert_eq!(super::decode(&jpeg).expect("decoded"), samples);
+        assert_eq!(
+            super::decode(&jpeg, samples.len()).expect("decoded"),
+            samples
+        );
+        // A frame larger than the tile it is for: refused, not decoded.
+        assert!(super::decode(&jpeg, samples.len() - 1).is_none());
     }
 }

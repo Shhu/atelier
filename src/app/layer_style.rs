@@ -75,6 +75,7 @@ impl AtelierApp {
             Action::InvertMask => doc.invert_mask(),
             Action::MaskSelection => {
                 let found = doc.mask_selection(doc.active);
+                self.sel.step_name = Some(select_menu::step_label(t!("sel-menu-load")));
                 self.apply_selection(found, SelectMode::Replace);
                 return;
             }

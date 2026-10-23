@@ -6,6 +6,7 @@
 //! of the image, its edge pixels repeat.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
@@ -497,6 +498,37 @@ fn intersect(a: [u32; 4], b: [u32; 4]) -> Option<[u32; 4]> {
     (r[0] < r[2] && r[1] < r[3]).then_some(r)
 }
 
+// ------------------------------------------------------------ cancel
+
+thread_local! {
+    /// Cancel flag of the filter being applied on this thread, if any.
+    static CANCEL: std::cell::RefCell<Option<Arc<AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f`, the filters it applies stopping early (their result is then
+/// meaningless) once `flag` is set: a filter being applied, cancelled.
+pub fn cancellable<T>(flag: Option<Arc<AtomicBool>>, f: impl FnOnce() -> T) -> T {
+    let before = CANCEL.with(|c| c.replace(flag));
+    let out = f();
+    CANCEL.with(|c| *c.borrow_mut() = before);
+    out
+}
+
+/// The computation running on this thread was cancelled (see
+/// [`cancellable`]).
+pub fn cancel_requested() -> bool {
+    cancelled(&cancel_flag())
+}
+
+fn cancel_flag() -> Option<Arc<AtomicBool>> {
+    CANCEL.with(|c| c.borrow().clone())
+}
+
+fn cancelled(flag: &Option<Arc<AtomicBool>>) -> bool {
+    flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
+}
+
 // ------------------------------------------------------------ parallel loops
 
 /// Runs `f(first_row, band)` on bands of whole rows (`row` elements each)
@@ -509,9 +541,11 @@ pub fn par_rows<T: Send>(data: &mut [T], row: usize, f: impl Fn(usize, &mut [T])
     }
     let per = rows.div_ceil(n);
     let f = &f;
+    let flag = cancel_flag();
     std::thread::scope(|s| {
         for (i, band) in data.chunks_mut(per * row).enumerate() {
-            s.spawn(move || f(i * per, band));
+            let flag = flag.clone();
+            s.spawn(move || cancellable(flag, || f(i * per, band)));
         }
     });
 }
@@ -539,9 +573,11 @@ fn par_columns<T: Send>(
     }
     let per = blocks.len().div_ceil(threads().max(1));
     let f = &f;
+    let flag = cancel_flag();
     std::thread::scope(|s| {
         for group in blocks.chunks_mut(per) {
-            s.spawn(move || group.iter_mut().for_each(|b| f(b)));
+            let flag = flag.clone();
+            s.spawn(move || cancellable(flag, || group.iter_mut().for_each(|b| f(b))));
         }
     });
 }
@@ -1025,6 +1061,38 @@ impl Tile {
     fn plane(&self, f: impl Fn([u8; 4]) -> f32) -> Vec<f32> {
         self.px.iter().map(|&p| f(p)).collect()
     }
+
+    /// The tile with the colors of (partly) transparent pixels mixed, by
+    /// their transparency, with those of the visible pixels around them: the
+    /// filters that read straight colors then don't depend on the hidden
+    /// colors of fully transparent pixels (black, or anything left by
+    /// painting or a file).
+    fn visible_colors(&self) -> Tile {
+        let mut px = self.px.clone();
+        if self.px.iter().all(|p| p[3] == 255) {
+            return Tile { px, ..*self };
+        }
+        let alpha = self.plane(|p| p[3] as f32);
+        let mut weights = alpha.clone();
+        gauss_plane(&mut weights, self.w, self.h, 3.0);
+        for c in 0..3 {
+            let mut sums = self.plane(|p| p[c] as f32 * p[3] as f32);
+            gauss_plane(&mut sums, self.w, self.h, 3.0);
+            for (i, p) in px.iter_mut().enumerate() {
+                let a = alpha[i];
+                if a < 255.0 {
+                    let around = if weights[i] > 1e-3 {
+                        sums[i] / weights[i]
+                    } else {
+                        0.0
+                    };
+                    let v = (a * p[c] as f32 + (255.0 - a) * around) / 255.0;
+                    p[c] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        Tile { px, ..*self }
+    }
 }
 
 /// Runs `f` on tiles of `image` (read from a copy of it) and writes the
@@ -1034,7 +1102,11 @@ fn by_tiles(image: &mut RgbaImage, halo: usize, f: impl Fn(&Tile) -> Vec<[u8; 4]
     let w = image.width() as usize;
     par_rows(image.as_mut(), w * 4, |y0, band| {
         let rows = band.len() / (w * 4);
+        let cancel = cancel_flag();
         for x0 in (0..w).step_by(TILE) {
+            if cancelled(&cancel) {
+                return;
+            }
             let tw = TILE.min(w - x0);
             let out = f(&Tile::gather(&src, (x0, y0), (tw, rows), halo));
             for (y, line) in out.chunks_exact(tw).enumerate() {
@@ -1171,7 +1243,11 @@ fn surface_blur_tile(t: &Tile, r: usize, threshold: f32) -> Vec<[u8; 4]> {
             let (lo, hi) = (0..iw * ih).fold((255.0f32, 0.0f32), |(lo, hi), i| {
                 (lo.min(inner(i)), hi.max(inner(i)))
             });
+            let cancel = cancel_flag();
             for k in 0..levels {
+                if cancelled(&cancel) {
+                    break;
+                }
                 let level = k as f32 * step;
                 if level < lo - step || level > hi + step {
                     continue;
@@ -1210,24 +1286,47 @@ fn median_tile(t: &Tile, r: usize, threshold: Option<u8>) -> Vec<[u8; 4]> {
     let rank = (k * k / 2) as u32;
     let mut out = vec![[0u8; 4]; iw * ih];
     let mut hist = [0u32; 256];
+    let cancel = cancel_flag();
     for c in 0..4 {
+        // The window snakes through the tile (right along even rows, left
+        // along odd ones): each step swaps one row or column of it.
+        hist.fill(0);
+        for wy in 0..k {
+            for p in &px[wy * t.w..wy * t.w + k] {
+                hist[p[c] as usize] += 1;
+            }
+        }
+        // Median: the value with `rank` values below it; `below` counts them.
+        let (mut median, mut below) = (0usize, 0u32);
+        let swap = |hist: &mut [u32; 256], gone: u8, new: u8, below: &mut u32, median: usize| {
+            hist[gone as usize] -= 1;
+            hist[new as usize] += 1;
+            *below =
+                *below - u32::from((gone as usize) < median) + u32::from((new as usize) < median);
+        };
+        let mut x = 0;
         for y in 0..ih {
-            hist.fill(0);
-            for wy in y..y + k {
-                for p in &px[wy * t.w..wy * t.w + k] {
-                    hist[p[c] as usize] += 1;
+            if cancelled(&cancel) {
+                return out;
+            }
+            if y > 0 {
+                for wx in x..x + k {
+                    let (gone, new) = (px[(y - 1) * t.w + wx][c], px[(y + k - 1) * t.w + wx][c]);
+                    swap(&mut hist, gone, new, &mut below, median);
                 }
             }
-            // Median: the value with `rank` values below it; `below` counts them.
-            let (mut median, mut below) = (0usize, 0u32);
-            for x in 0..iw {
-                if x > 0 {
+            for step in 0..iw {
+                if step > 0 {
+                    let (gone_x, new_x) = if y % 2 == 0 {
+                        x += 1;
+                        (x - 1, x + k - 1)
+                    } else {
+                        x -= 1;
+                        (x + k, x)
+                    };
                     for wy in y..y + k {
-                        let (gone, new) = (px[wy * t.w + x - 1][c], px[wy * t.w + x + k - 1][c]);
-                        hist[gone as usize] -= 1;
-                        hist[new as usize] += 1;
-                        below = below - u32::from((gone as usize) < median)
-                            + u32::from((new as usize) < median);
+                        let (gone, new) = (px[wy * t.w + gone_x][c], px[wy * t.w + new_x][c]);
+                        swap(&mut hist, gone, new, &mut below, median);
                     }
                 }
                 while below > rank {
@@ -1262,7 +1361,11 @@ fn extreme_tile(t: &Tile, r: usize, max: bool, round: bool) -> Vec<[u8; 4]> {
     let mut out = vec![if max { [0; 4] } else { [255; 4] }; iw * ih];
     if round {
         // Rows of the disc: each one over its own half-width.
+        let cancel = cancel_flag();
         for dy in -(r as i64)..=r as i64 {
+            if cancelled(&cancel) {
+                break;
+            }
             let half = ((r * r) as f64 - (dy * dy) as f64).sqrt().floor() as usize;
             for y in 0..ih {
                 let ty = (y as i64 + r as i64 + dy) as usize;
@@ -1323,6 +1426,7 @@ fn running_extreme(line: &[[u8; 4]], r: usize, max: bool) -> Vec<[u8; 4]> {
 /// Emboss: 128 gray plus the difference between the two sides of each
 /// pixel, `height` apart in the direction of the light.
 fn emboss_tile(t: &Tile, angle: f32, height: f32, amount: f32) -> Vec<[u8; 4]> {
+    let t = &t.visible_colors();
     let (iw, ih) = t.inner();
     let theta = angle.to_radians();
     let (ux, uy) = (theta.cos() * height / 2.0, -theta.sin() * height / 2.0);
@@ -1359,6 +1463,7 @@ fn emboss_tile(t: &Tile, angle: f32, height: f32, amount: f32) -> Vec<[u8; 4]> {
 /// Find Edges: white, with the edges of each channel drawn darker the
 /// sharper they are.
 fn find_edges_tile(t: &Tile) -> Vec<[u8; 4]> {
+    let t = &t.visible_colors();
     let (iw, ih) = t.inner();
     let mut out = Vec::with_capacity(iw * ih);
     for y in 1..=ih {
@@ -1394,6 +1499,7 @@ const REDUCE_NOISE_HALO: usize = 20;
 /// details whose contrast stands above the noise are kept), color noise
 /// blurred away, details sharpened back.
 fn reduce_noise_tile(t: &Tile, n: &ReduceNoise) -> Vec<[u8; 4]> {
+    let t = &t.visible_colors();
     let (w, h) = (t.w, t.h);
     let mut y = t.plane(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32);
     let mut cb: Vec<f32> = t.px.iter().zip(&y).map(|(p, y)| p[2] as f32 - y).collect();
@@ -1807,6 +1913,48 @@ mod tests {
                     p.0[0] >= 250 && p.0[1] <= 3 && p.0[2] <= 3,
                     "{filter:?}: {p:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_colors_do_not_change_visible_pixels() {
+        // The same visible disc, with black or white hidden colors around.
+        let disc = |hidden: u8| {
+            RgbaImage::from_fn(40, 40, |x, y| {
+                if (x as i32 - 20).pow(2) + (y as i32 - 20).pow(2) < 100 {
+                    Rgba([200, 120, 40, 255])
+                } else {
+                    Rgba([hidden, hidden, hidden, 0])
+                }
+            })
+        };
+        for kind in [
+            FilterKind::BoxBlur,
+            FilterKind::GaussianBlur,
+            FilterKind::MotionBlur,
+            FilterKind::SurfaceBlur,
+            FilterKind::DustAndScratches,
+            FilterKind::Median,
+            FilterKind::ReduceNoise,
+            FilterKind::Mosaic,
+            FilterKind::SmartSharpen,
+            FilterKind::UnsharpMask,
+            FilterKind::Emboss,
+            FilterKind::FindEdges,
+            FilterKind::HighPass,
+            FilterKind::Maximum,
+            FilterKind::Minimum,
+        ] {
+            let filter = kind.initial();
+            let (mut a, mut b) = (disc(0), disc(255));
+            filter.apply(&mut a, (0, 0));
+            filter.apply(&mut b, (0, 0));
+            for (p, q) in a.pixels().zip(b.pixels()) {
+                if p[3] > 0 || q[3] > 0 {
+                    let d = (0..4).map(|c| p[c].abs_diff(q[c])).max().unwrap();
+                    assert!(d <= 2, "{kind:?}: {p:?} vs {q:?}");
+                }
             }
         }
     }

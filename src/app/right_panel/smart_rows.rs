@@ -97,7 +97,11 @@ fn eye(ui: &mut Ui, rect: Rect, id: Id, on: bool, dimmed: bool) -> Response {
         (true, false) => (icon::EYE, color::MUTED),
         _ => (icon::EYE_SLASH, color::DISABLED),
     };
-    row_icon(ui, r, id, glyph, fg, &t!("panel-visibility-tip"))
+    let tip = t!(
+        "input3-visibility-tip",
+        alt_click = keys::click(ui.ctx(), Modifiers::ALT)
+    );
+    row_icon(ui, r, id, glyph, fg, &tip)
 }
 
 /// The Smart Filters row: eye, filter mask thumbnail, title.
@@ -161,7 +165,10 @@ fn header_row(
         );
         let response = ui
             .interact(thumb, Id::new(("smart_mask", layer.id)), Sense::click())
-            .on_hover_text(t!("smart-filter-mask-tip"));
+            .on_hover_text(t!(
+                "input3-filter-mask-tip",
+                shift_click = keys::click(ui.ctx(), Modifiers::SHIFT)
+            ));
         if response.clicked() {
             select(click);
             let shift = ui.input(|inp| inp.modifiers.shift);

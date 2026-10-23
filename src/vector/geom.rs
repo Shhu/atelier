@@ -241,6 +241,53 @@ impl SubPath {
         (0..self.segment_count()).map(|i| self.segment(i))
     }
 
+    /// The same outline with each segment cut in `n` (at equal steps of
+    /// its parameter): mapped through a curved map, its points then follow
+    /// the curve closely.
+    pub fn subdivided(&self, n: usize) -> SubPath {
+        let count = self.segment_count();
+        if n < 2 || count == 0 {
+            return self.clone();
+        }
+        let mut anchors = self.anchors.clone();
+        let mut out: Vec<Anchor> = Vec::with_capacity(self.anchors.len() * n);
+        for i in 0..count {
+            let mut rest = self.segment(i);
+            for k in 0..n - 1 {
+                let (left, right) = split_cubic(rest, 1.0 / (n - k) as f32);
+                // The segment's start gets its new outgoing handle.
+                if k == 0 {
+                    anchors[i].after = left[1];
+                    out.push(anchors[i]);
+                } else {
+                    out.last_mut().expect("pushed").after = left[1];
+                }
+                out.push(Anchor {
+                    p: left[3],
+                    before: left[2],
+                    after: right[1],
+                    smooth: true,
+                });
+                rest = right;
+            }
+            out.last_mut().expect("pushed").after = rest[1];
+            let next = (i + 1) % anchors.len();
+            anchors[next].before = rest[2];
+            if next == 0 {
+                // Closed: the first anchor gets its new incoming handle.
+                out[0].before = rest[2];
+            }
+        }
+        if !self.closed {
+            out.push(anchors[count]);
+        }
+        SubPath {
+            anchors: out,
+            closed: self.closed,
+            op: self.op,
+        }
+    }
+
     /// Exact box of the outline (handles excluded).
     pub fn bounds(&self) -> Option<Bounds> {
         let first = self.anchors.first()?.p;
@@ -445,6 +492,14 @@ pub fn cubic_at([p0, c1, c2, p3]: &Cubic, t: f32) -> Pt {
     p0.mul(u * u * u) + c1.mul(3.0 * u * u * t) + c2.mul(3.0 * u * t * t) + p3.mul(t * t * t)
 }
 
+/// A cubic cut at `t` (de Casteljau): the two parts.
+pub fn split_cubic([p0, c1, c2, p3]: Cubic, t: f32) -> (Cubic, Cubic) {
+    let (a, b, c) = (p0.lerp(c1, t), c1.lerp(c2, t), c2.lerp(p3, t));
+    let (d, e) = (a.lerp(b, t), b.lerp(c, t));
+    let m = d.lerp(e, t);
+    ([p0, a, d, m], [m, e, c, p3])
+}
+
 /// Exact box of a cubic: its ends and the extrema of each coordinate.
 pub fn cubic_bounds(c: &Cubic) -> Bounds {
     let mut b = Bounds::of(c[0], c[3]);
@@ -556,6 +611,26 @@ mod tests {
         Path {
             subpaths: vec![SubPath::new(anchors, true)],
         }
+    }
+
+    #[test]
+    fn subdividing_keeps_the_outline() {
+        let path = circle();
+        let sub = path.subpaths[0].subdivided(3);
+        assert_eq!(sub.anchors.len(), 12);
+        assert!(sub.closed);
+        for (i, s) in path.subpaths[0].segments().enumerate() {
+            for k in 0..3 {
+                let part = sub.segment(i * 3 + k);
+                for j in 0..=4 {
+                    let t = j as f32 / 4.0;
+                    let (a, b) = (cubic_at(&part, t), cubic_at(&s, (k as f32 + t) / 3.0));
+                    assert!(close(a.x, b.x) && close(a.y, b.y), "{a:?} {b:?}");
+                }
+            }
+        }
+        let open = SubPath::new(path.subpaths[0].anchors.clone(), false).subdivided(2);
+        assert_eq!(open.anchors.len(), 7);
     }
 
     #[test]

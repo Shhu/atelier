@@ -12,6 +12,7 @@ use image::{GrayImage, Luma, RgbaImage};
 use super::smart::{target_mask, target_mask_mut};
 use super::{Document, Layer, LayerKind, PixelRect, intersect, next_rev};
 use crate::i18n::t;
+use crate::mask_ops::par_rows;
 use crate::pixel_ops::blur;
 use crate::selection::Selection;
 
@@ -162,20 +163,26 @@ impl Mask {
             return (Arc::clone(&f.image), (x - f.margin, y - f.margin));
         }
         let m = self.margin();
-        let (w, h) = (
-            (self.image.width() as i64 + 2 * m) as usize,
-            (self.image.height() as i64 + 2 * m) as usize,
-        );
-        let mut field = vec![self.default as f32; w * h];
-        for (px, py, p) in self.image.enumerate_pixels() {
-            field[(py as usize + m as usize) * w + px as usize + m as usize] = p.0[0] as f32;
-        }
-        blur(&mut field, w, h, self.feather);
-        let image = GrayImage::from_fn(w as u32, h as u32, |px, py| {
-            Luma([field[py as usize * w + px as usize]
-                .round()
-                .clamp(0.0, 255.0) as u8])
+        let (iw, mu) = (self.image.width() as usize, m as usize);
+        let (w, h) = (iw + 2 * mu, self.image.height() as usize + 2 * mu);
+        // Blurred as a difference from the default value: everything around
+        // the image (its margin, and beyond) counts as the default.
+        let d = self.default as f32;
+        let mut field = vec![0.0f32; w * h];
+        let raw = self.image.as_raw();
+        par_rows(&mut field, w, |first, band| {
+            for (i, line) in band.chunks_exact_mut(w).enumerate() {
+                let Some(py) = (first + i).checked_sub(mu).filter(|&y| y * iw < raw.len()) else {
+                    continue;
+                };
+                let row = &raw[py * iw..][..iw];
+                for (f, &v) in line[mu..mu + iw].iter_mut().zip(row) {
+                    *f = v as f32 - d;
+                }
+            }
         });
+        blur(&mut field, w, h, self.feather);
+        let image = GrayImage::from_raw(w as u32, h as u32, to_gray(&field, d)).expect("size");
         let image = Arc::new(image);
         *self.feathered.borrow_mut() = Some(Feathered {
             rev: key.0,
@@ -184,6 +191,64 @@ impl Mask {
             margin: m,
         });
         (image, (x - m, y - m))
+    }
+
+    /// The pixels of `area` (image coordinates) just changed, from revision
+    /// `before`: a feathered image of `before` is redone around them only
+    /// (painting a feathered mask). Exact: the blur reaches no further.
+    fn refeather(&self, before: u64, area: PixelRect) {
+        let mut cache = self.feathered.borrow_mut();
+        let m = self.margin();
+        let (iw, ih) = (self.image.width() as i64, self.image.height() as i64);
+        let Some(f) = cache.as_mut().filter(|f| {
+            (f.rev, f.feather, f.margin) == (before, self.feather.to_bits(), m)
+                && f.image.dimensions() == ((iw + 2 * m) as u32, (ih + 2 * m) as u32)
+        }) else {
+            return;
+        };
+        // Reach of the blur: three box passes (see `blur`).
+        let reach = 3 * (self.feather / 1.7).round() as i64;
+        let (fw, fh) = (iw + 2 * m, ih + 2 * m);
+        // In the feathered image: what changes, and what that reads.
+        let (x0, y0) = ((area.x + m - reach).max(0), (area.y + m - reach).max(0));
+        let (x1, y1) = (
+            (area.right() + m + reach).min(fw),
+            (area.bottom() + m + reach).min(fh),
+        );
+        if x0 >= x1 || y0 >= y1 {
+            f.rev = self.rev;
+            return;
+        }
+        let (rx, ry) = (x0 - reach, y0 - reach);
+        let (rw, rh) = (
+            (x1 - x0 + 2 * reach) as usize,
+            (y1 - y0 + 2 * reach) as usize,
+        );
+        let d = self.default as f32;
+        let raw = self.image.as_raw();
+        let mut field = vec![0.0f32; rw * rh];
+        for (j, line) in field.chunks_exact_mut(rw).enumerate() {
+            let py = ry + j as i64 - m;
+            if !(0..ih).contains(&py) {
+                continue;
+            }
+            for (i, v) in line.iter_mut().enumerate() {
+                let px = rx + i as i64 - m;
+                if (0..iw).contains(&px) {
+                    *v = raw[(py * iw + px) as usize] as f32 - d;
+                }
+            }
+        }
+        blur(&mut field, rw, rh, self.feather);
+        let image = Arc::make_mut(&mut f.image);
+        let out = image.as_mut();
+        for y in y0..y1 {
+            let from = ((y - ry) as usize * rw) + (x0 - rx) as usize;
+            let part = to_gray(&field[from..from + (x1 - x0) as usize], d);
+            let at = (y * fw + x0) as usize;
+            out[at..at + part.len()].copy_from_slice(&part);
+        }
+        f.rev = self.rev;
     }
 
     /// Fingerprint of what the mask does (cache keys).
@@ -212,23 +277,61 @@ impl Mask {
         } else {
             self.default
         };
-        1.0 - self.density.clamp(0.0, 1.0) * (1.0 - v as f32 / 255.0)
+        self.effects()[v as usize]
+    }
+
+    /// Effect (0..1) of each mask value, density applied.
+    fn effects(&self) -> [f32; 256] {
+        let density = self.density.clamp(0.0, 1.0);
+        std::array::from_fn(|v| 1.0 - density * (1.0 - v as f32 / 255.0))
+    }
+
+    /// The feathered values over `area` (canvas), row by row: the default
+    /// outside the image.
+    fn values_over(&self, area: PixelRect, layer_offset: (i64, i64)) -> Vec<u8> {
+        let (image, (ox, oy)) = self.shaped(layer_offset);
+        let (w, h) = (area.w as usize, area.h as usize);
+        let mut out = vec![self.default; w * h];
+        let (iw, ih) = (image.width() as i64, image.height() as i64);
+        // Columns of `area` over the image.
+        let (x0, x1) = ((ox - area.x).max(0), (ox + iw - area.x).min(area.w as i64));
+        if w == 0 || x0 >= x1 {
+            return out;
+        }
+        let raw = image.as_raw();
+        par_rows(&mut out, w, |first, band| {
+            for (j, row) in band.chunks_exact_mut(w).enumerate() {
+                let ly = area.y + (first + j) as i64 - oy;
+                if (0..ih).contains(&ly) {
+                    let from = (ly * iw + area.x + x0 - ox) as usize;
+                    let len = (x1 - x0) as usize;
+                    row[x0 as usize..x1 as usize].copy_from_slice(&raw[from..from + len]);
+                }
+            }
+        });
+        out
     }
 
     /// `image` (a layer at `layer_offset`) with its opacity multiplied by
     /// the mask.
     pub fn apply_to(&self, image: &RgbaImage, layer_offset: (i64, i64)) -> RgbaImage {
         let mut out = image.clone();
-        for (x, y, p) in out.enumerate_pixels_mut() {
-            if p.0[3] > 0 {
-                let v = self.value_at(
-                    layer_offset.0 + x as i64,
-                    layer_offset.1 + y as i64,
-                    layer_offset,
-                );
-                p.0[3] = (p.0[3] as f32 * v).round() as u8;
+        let area = PixelRect {
+            x: layer_offset.0,
+            y: layer_offset.1,
+            w: image.width(),
+            h: image.height(),
+        };
+        let values = self.values_over(area, layer_offset);
+        let effects = self.effects();
+        let w = image.width() as usize;
+        par_rows(out.as_mut(), w.max(1) * 4, |first, band| {
+            for (p, &v) in band.chunks_exact_mut(4).zip(&values[first * w..]) {
+                if p[3] > 0 {
+                    p[3] = (p[3] as f32 * effects[v as usize]).round() as u8;
+                }
             }
-        }
+        });
         out
     }
 
@@ -371,7 +474,34 @@ impl Mask {
         }
         let mut image = GrayImage::from_pixel(u.w, u.h, Luma([self.default]));
         image::imageops::replace(&mut image, &*self.image, own.x - u.x, own.y - u.y);
+        // Its feathered image grows the same way: around the old image,
+        // the default value only adds more of the default.
+        let key = (self.rev, self.feather.to_bits());
+        let feathered = self
+            .feathered
+            .borrow()
+            .clone()
+            .filter(|f| (f.rev, f.feather) == key);
+        let empty = own.w == 0 || own.h == 0;
         self.replace(image, (u.x, u.y), layer_offset);
+        let m = self.margin();
+        let old = match feathered {
+            _ if self.feather <= 0.0 => return,
+            _ if empty => None,
+            Some(f) if f.margin == m => Some(f),
+            _ => return,
+        };
+        let size = (u.w + 2 * m as u32, u.h + 2 * m as u32);
+        let mut grown = GrayImage::from_pixel(size.0, size.1, Luma([self.default]));
+        if let Some(f) = old {
+            image::imageops::replace(&mut grown, &*f.image, own.x - u.x, own.y - u.y);
+        }
+        *self.feathered.borrow_mut() = Some(Feathered {
+            rev: self.rev,
+            feather: key.1,
+            image: Arc::new(grown),
+            margin: m,
+        });
     }
 }
 
@@ -380,6 +510,10 @@ impl Document {
     /// layer's mask: chosen by clicking its thumbnail; always for a layer
     /// without pixels.
     pub fn mask_targeted(&self) -> bool {
+        // In Quick Mask Mode, everything edits the quick mask.
+        if self.quick_mask.is_some() {
+            return true;
+        }
         let layer = self.real_active();
         if self.filter_mask_target {
             return self.mask_target == Some(layer.id) && target_mask(layer, true).is_some();
@@ -531,10 +665,13 @@ impl Document {
         let layer = self.layers.get(i)?;
         let mask = layer.mask.as_ref()?;
         let canvas = self.full_rect();
-        let gray = GrayImage::from_fn(canvas.w, canvas.h, |x, y| {
-            let v = mask.value_at(x as i64, y as i64, layer.offset);
-            Luma([(v * 255.0).round() as u8])
-        });
+        let effects = mask.effects();
+        let values = mask.values_over(canvas, layer.offset);
+        let raw = values
+            .iter()
+            .map(|&v| (effects[v as usize] * 255.0).round() as u8)
+            .collect();
+        let gray = GrayImage::from_raw(canvas.w, canvas.h, raw).expect("size");
         Selection::from_mask(&gray, (canvas.x, canvas.y))
     }
 
@@ -564,6 +701,9 @@ impl Document {
     /// Copies area `area` (canvas) of the painted stand-in into the mask
     /// (all of it with `None`), so the display follows the brush.
     pub fn sync_paint(&mut self, area: Option<PixelRect>) {
+        if self.quick_mask.is_some() {
+            return self.sync_quick_mask(area);
+        }
         let Some(real) = self.swapped.as_deref_mut() else {
             return;
         };
@@ -585,6 +725,15 @@ impl Document {
                 layers[self.active] = (**real).clone();
                 std::borrow::Cow::Owned(layers)
             }
+        }
+    }
+
+    /// Layer `i` as composited (see [`Self::render_layers`]), without
+    /// copying the others.
+    pub fn render_layer(&self, i: usize) -> &Layer {
+        match &self.swapped {
+            Some(real) if i == self.active => real,
+            _ => &self.layers[i],
         }
     }
 
@@ -610,6 +759,9 @@ impl Document {
         if self.swapped.is_some() {
             return Some(std::borrow::Cow::Borrowed(&self.layers[self.active]));
         }
+        if let Some(proxy) = self.quick_mask_stand_in() {
+            return Some(std::borrow::Cow::Owned(proxy));
+        }
         if self.mask_targeted() {
             return Some(std::borrow::Cow::Owned(stand_in(
                 &self.layers[self.active],
@@ -627,6 +779,11 @@ impl Document {
         if self.swapped.is_some() {
             return;
         }
+        if let Some(proxy) = self.quick_mask_stand_in() {
+            let layer = &mut self.layers[self.active];
+            self.swapped = Some(Box::new(std::mem::replace(layer, proxy)));
+            return;
+        }
         let canvas = self.full_rect();
         let layer = &mut self.layers[self.active];
         let offset = layer.offset;
@@ -639,6 +796,13 @@ impl Document {
     }
 
     fn swap_out_mask(&mut self) {
+        if self.quick_mask.is_some() && self.swapped.is_some() {
+            self.sync_quick_mask(None);
+            if let Some(real) = self.swapped.take() {
+                self.layers[self.active] = *real;
+            }
+            return;
+        }
         let Some(mut real) = self.swapped.take() else {
             return;
         };
@@ -670,23 +834,32 @@ fn stand_in(layer: &Layer, area: PixelRect, filter: bool) -> Layer {
         h: mask.image.height(),
     };
     let r = if own.w == 0 || own.h == 0 { area } else { own };
-    let image = RgbaImage::from_fn(r.w, r.h, |px, py| {
-        let (cx, cy) = (r.x + px as i64, r.y + py as i64);
-        let v = if own.contains(cx, cy) {
-            mask.image
-                .get_pixel((cx - own.x) as u32, (cy - own.y) as u32)
-                .0[0]
-        } else {
-            mask.default
-        };
-        image::Rgba([v, v, v, 255])
+    let (w, d) = (r.w as usize, mask.default);
+    let mut raw = vec![255u8; w * r.h as usize * 4];
+    let src = mask.image.as_raw();
+    par_rows(&mut raw, w.max(1) * 4, |first, band| {
+        for (j, row) in band.chunks_exact_mut(w * 4).enumerate() {
+            let cy = r.y + (first + j) as i64;
+            let inside = (own.y..own.bottom()).contains(&cy) && own.w > 0;
+            for (i, p) in row.chunks_exact_mut(4).enumerate() {
+                let cx = r.x + i as i64;
+                let v = if inside && (own.x..own.right()).contains(&cx) {
+                    src[((cy - own.y) * own.w as i64 + cx - own.x) as usize]
+                } else {
+                    d
+                };
+                p[..3].fill(v);
+            }
+        }
     });
+    let image = RgbaImage::from_raw(r.w, r.h, raw).expect("size");
     Layer {
         kind: LayerKind::Pixels,
         image: Arc::new(image),
         rev: next_rev(),
         bounds: std::cell::Cell::new(None),
         styles_cache: RefCell::new(None),
+        styles_job: Default::default(),
         offset: (r.x, r.y),
         effects: Default::default(),
         mask: None,
@@ -718,19 +891,79 @@ fn write_back(proxy: &Layer, real: &mut Layer, area: Option<PixelRect>, filter: 
         mask.replace(image, (p.x, p.y), offset);
         area = None;
     } else if let Some(r) = intersect(area.unwrap_or(p), p) {
+        // Only where the stand-in differs: nothing changes (no new
+        // revision) when nothing was painted.
+        let (pw, mw) = (p.w as usize, mask.image.width() as usize);
+        let (src, own) = (proxy.image.as_raw(), mask.image.as_raw());
+        let (x0, x1) = ((r.x - p.x) as usize, (r.right() - p.x) as usize);
+        // Per row: the columns that changed.
+        let scan = |part: std::ops::Range<usize>| -> Vec<Option<(usize, usize)>> {
+            part.map(|j| {
+                let ly = (r.y - p.y) as usize + j;
+                let new = |lx: usize| gray(src[(ly * pw + lx) * 4..][..4].try_into().expect("4"));
+                let differs = |lx: &usize| new(*lx) != own[ly * mw + lx];
+                let first = (x0..x1).find(differs)?;
+                let last = (x0..x1).rev().find(differs)?;
+                Some((first, last + 1))
+            })
+            .collect()
+        };
+        let rows = if r.w as usize * r.h as usize >= 1 << 16 {
+            crate::mask_ops::par_collect(r.h as usize, scan)
+        } else {
+            scan(0..r.h as usize)
+        };
+        let changed = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(j, c)| c.map(|c| (j, c)));
+        let Some(local) = changed
+            .map(|(j, (a, b))| PixelRect {
+                x: a as i64,
+                y: (r.y - p.y) + j as i64,
+                w: (b - a) as u32,
+                h: 1,
+            })
+            .reduce(PixelRect::union)
+        else {
+            return;
+        };
+        let before = mask.rev();
         let image = mask.pixels_mut();
-        for cy in r.y..r.bottom() {
-            for cx in r.x..r.right() {
-                let (lx, ly) = ((cx - p.x) as u32, (cy - p.y) as u32);
-                image.put_pixel(lx, ly, Luma([gray(proxy.image.get_pixel(lx, ly).0)]));
+        let (lx0, lx1) = (local.x as usize, local.right() as usize);
+        let out = &mut image.as_mut()[local.y as usize * mw..local.bottom() as usize * mw];
+        par_rows(out, mw, |first, band| {
+            for (j, row) in band.chunks_exact_mut(mw).enumerate() {
+                let ly = local.y as usize + first + j;
+                for lx in lx0..lx1 {
+                    row[lx] = gray(src[(ly * pw + lx) * 4..][..4].try_into().expect("4"));
+                }
             }
-        }
+        });
+        mask.refeather(before, local);
+        area = Some(PixelRect {
+            x: x + local.x,
+            y: y + local.y,
+            ..local
+        });
     } else {
         return;
     }
     if filter {
         real.remix_filter_mask(area);
     }
+}
+
+/// Values blurred as a difference from the default `d`, as mask values.
+fn to_gray(field: &[f32], d: f32) -> Vec<u8> {
+    const ROW: usize = 4096;
+    let mut out = vec![0u8; field.len()];
+    par_rows(&mut out, ROW, |first, band| {
+        for (o, v) in band.iter_mut().zip(&field[first * ROW..]) {
+            *o = (v + d).round().clamp(0.0, 255.0) as u8;
+        }
+    });
+    out
 }
 
 /// Mask value of a stand-in pixel.
@@ -855,5 +1088,104 @@ mod tests {
         let edge = flat.get_pixel(5, 5).0;
         assert!(edge[0] > 30 && edge[2] > 30, "{edge:?}");
         assert!(flat.get_pixel(2, 5).0[2] > flat.get_pixel(7, 5).0[2]);
+    }
+
+    /// A feathered mask from scratch (no cache), to compare with.
+    fn fresh(m: &Mask) -> Arc<GrayImage> {
+        let copy = m.clone();
+        *copy.feathered.borrow_mut() = None;
+        copy.shaped((0, 0)).0
+    }
+
+    fn noisy(w: u32, h: u32) -> GrayImage {
+        GrayImage::from_fn(w, h, |x, y| Luma([((x * 37 + y * 91) % 256) as u8]))
+    }
+
+    /// Painting a feathered mask redoes its edges around the dabs only,
+    /// exactly as feathering it all again.
+    #[test]
+    fn feathered_masks_follow_the_brush_exactly() {
+        for default in [0, 255] {
+            let mut m = Mask::new(noisy(80, 60), (0, 0), default, (0, 0));
+            m.feather = 4.0;
+            let _ = m.shaped((0, 0));
+            for area in [(10, 10, 12, 7), (0, 0, 5, 5), (70, 50, 10, 10)] {
+                let before = m.rev();
+                let (x, y, w, h) = area;
+                for py in y..y + h {
+                    for px in x..x + w {
+                        m.pixels_mut().put_pixel(px, py, Luma([200]));
+                    }
+                }
+                let r = PixelRect {
+                    x: x as i64,
+                    y: y as i64,
+                    w,
+                    h,
+                };
+                m.refeather(before, r);
+                let (kept, _) = m.shaped((0, 0));
+                assert!(*kept == *fresh(&m), "default {default}, area {area:?}");
+            }
+            // Grown to a larger area: the same as feathered again.
+            let canvas = PixelRect {
+                x: -20,
+                y: -10,
+                w: 140,
+                h: 90,
+            };
+            m.grown_to(canvas, (0, 0));
+            let (kept, origin) = m.shaped((0, 0));
+            assert_eq!(origin, (-20 - m.margin(), -10 - m.margin()));
+            assert!(*kept == *fresh(&m), "grown, default {default}");
+        }
+    }
+
+    /// Painting a feathered mask through the stand-in: the display reads
+    /// the feathered image kept up to date; a stroke that changes nothing
+    /// leaves the mask's revision as it was.
+    #[test]
+    fn painting_a_feathered_mask() {
+        let mut doc = doc();
+        doc.add_mask(NewMask::RevealAll, None);
+        doc.active_layer_mut().mask.as_mut().unwrap().feather = 2.0;
+        let _ = doc.flatten();
+        assert!(doc.begin_paint());
+        let rev = doc.render_layers()[1].mask.as_ref().unwrap().rev();
+        doc.sync_paint(None);
+        assert_eq!(doc.render_layers()[1].mask.as_ref().unwrap().rev(), rev);
+        doc.active_layer_mut()
+            .pixels_mut()
+            .put_pixel(5, 5, Rgba([0, 0, 0, 255]));
+        doc.sync_paint(Some(PixelRect {
+            x: 5,
+            y: 5,
+            w: 1,
+            h: 1,
+        }));
+        let layers = doc.render_layers();
+        let m = layers[1].mask.as_ref().unwrap();
+        assert_ne!(m.rev(), rev);
+        assert!(*m.shaped((0, 0)).0 == *fresh(m));
+        drop(layers);
+        doc.end_paint();
+        let m = doc.active_layer().mask.as_ref().unwrap();
+        assert!(*m.shaped((0, 0)).0 == *fresh(m));
+        assert!(doc.flatten().get_pixel(5, 5).0[0] > 0, "the dab shows");
+    }
+
+    /// Applying a mask and making a selection of it read the feathered
+    /// image as before (once, not per pixel).
+    #[test]
+    fn mask_values_over_areas() {
+        let mut m = Mask::new(noisy(20, 10), (3, 2), 255, (0, 0));
+        m.feather = 1.5;
+        m.density = 0.6;
+        let image = RgbaImage::from_pixel(30, 20, Rgba([10, 20, 30, 200]));
+        let applied = m.apply_to(&image, (-2, -1));
+        for (x, y, p) in applied.enumerate_pixels() {
+            let v = m.value_at(x as i64 - 2, y as i64 - 1, (-2, -1));
+            assert_eq!(p.0[3], (200.0 * v).round() as u8, "{x}, {y}");
+        }
     }
 }

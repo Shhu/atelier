@@ -381,3 +381,43 @@ fn smart_capture() {
     let image = h.render().expect("render");
     image.save(&out).expect("writing the capture");
 }
+
+/// Edit Contents of a linked smart object opens its file; once saved, the
+/// smart object shows it when its document is back, its file read on
+/// another thread.
+#[test]
+fn linked_edit_contents_opens_the_file_and_links_follow() {
+    let dir = folder("linked-edit");
+    let path = dir.join("logo.atelier");
+    Document::new(RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255])), None)
+        .save(&path)
+        .unwrap();
+    let mut h = app();
+    h.state_mut().place_path(&path, true);
+    h.key_press(egui::Key::Enter);
+    let applied = |app: &AtelierApp| !app.transform_pending() && !app.transform_busy();
+    settle(&mut h, applied);
+    let parent = doc(&h).uid();
+    let steps = doc(&h).history().1;
+    h.state_mut().run(Action::Smart(Command::EditContents));
+    h.run_steps(2);
+    assert_eq!(h.state().tab_count(), 2);
+    assert_eq!(doc(&h).path.as_deref(), Some(path.as_path()));
+    assert!(doc(&h).embedded_in.is_none());
+    // Edited and saved to the file.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    h.state_mut().primary = Color32::from_rgb(255, 0, 0);
+    h.state_mut().run(Action::FillPrimary);
+    h.state_mut().run(Action::Save);
+    h.run_steps(2);
+    assert!(!doc(&h).modified);
+    // Back in the document: the link is read again, as one step.
+    h.state_mut().switch_tab(0);
+    settle(&mut h, |app| !app.links_reading());
+    h.run_steps(2);
+    assert_eq!(doc(&h).uid(), parent);
+    let r = doc(&h).active_layer().rect();
+    let (x, y) = ((r.x + 10) as u32, (r.y + 10) as u32);
+    assert_eq!(doc(&h).flatten().get_pixel(x, y).0, [255, 0, 0, 255]);
+    assert_eq!(doc(&h).history().1, steps + 1);
+}

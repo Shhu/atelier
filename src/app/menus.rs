@@ -35,6 +35,7 @@ impl AtelierApp {
                         Some(&SHORTCUT_OPEN),
                         Action::Open,
                     ),
+                    Submenu(t!("ui3-menu-open-recent"), self.recent_menu()),
                     Item(
                         t!("smart-menu-place-embedded"),
                         true,
@@ -155,10 +156,33 @@ impl AtelierApp {
                         Action::Copy,
                     ),
                     Item(
+                        t!("files3-menu-copy-merged"),
+                        has_doc,
+                        Some(&SHORTCUT_COPY_MERGED),
+                        Action::CopyMerged,
+                    ),
+                    Item(
                         t!("menu-edit-paste"),
                         true,
                         Some(&SHORTCUT_PASTE),
                         Action::Paste,
+                    ),
+                    Submenu(
+                        t!("files3-menu-paste-special"),
+                        vec![
+                            Item(
+                                t!("files3-menu-paste-in-place"),
+                                has_doc,
+                                Some(&SHORTCUT_PASTE_IN_PLACE),
+                                Action::PasteInPlace,
+                            ),
+                            Item(
+                                t!("files3-menu-paste-into"),
+                                has_doc && has_sel,
+                                Some(&SHORTCUT_PASTE_INTO),
+                                Action::PasteInto,
+                            ),
+                        ],
                     ),
                     Item(t!("menu-edit-clear"), has_sel, None, Action::ClearSelection),
                     Separator,
@@ -549,46 +573,8 @@ impl AtelierApp {
                     .chain(self.view_menu_entries())
                     .collect(),
             ),
-            (
-                t!("uip-menu-window"),
-                vec![
-                    MenuEntry::Check(
-                        t!("actions-title"),
-                        true,
-                        self.actions.open,
-                        Some(&actions_panel::SHORTCUT_ACTIONS),
-                        Action::Automate(actions_panel::Command::Panel),
-                    ),
-                    MenuEntry::Check(
-                        t!("xchg-menu-channels"),
-                        true,
-                        self.channels.open,
-                        None,
-                        Action::Channels,
-                    ),
-                    MenuEntry::Check(
-                        t!("xchg-menu-history"),
-                        true,
-                        self.history.open,
-                        None,
-                        Action::History,
-                    ),
-                    MenuEntry::Check(
-                        t!("vector-menu-paths"),
-                        true,
-                        self.vector.panel.open,
-                        None,
-                        Action::Paths,
-                    ),
-                    MenuEntry::Check(
-                        t!("uip-menu-swatches"),
-                        true,
-                        self.colors.panel_open,
-                        None,
-                        Action::Swatches,
-                    ),
-                ],
-            ),
+            (t!("uip-menu-window"), self.window_menu()),
+            (t!("ui3-menu-help"), self.help_menu()),
         ]
     }
 
@@ -722,20 +708,43 @@ impl AtelierApp {
 
 /// Entries of a menu (and of its submenus); the clicked action goes into `action`.
 pub(super) fn menu_entries(ui: &mut egui::Ui, entries: &[MenuEntry], action: &mut Option<Action>) {
+    explained_menu_entries(ui, entries, action, &|_| None);
+}
+
+/// Why a greyed command can't run, for its tooltip.
+pub(super) type Why<'a> = &'a dyn Fn(Action) -> Option<String>;
+
+/// Entries of a menu, a greyed one saying why (`why`) when hovered.
+pub(super) fn explained_menu_entries(
+    ui: &mut egui::Ui,
+    entries: &[MenuEntry],
+    action: &mut Option<Action>,
+    why: Why<'_>,
+) {
     for entry in entries {
         match entry {
             MenuEntry::Separator => {
                 ui.separator();
             }
             MenuEntry::Submenu(label, sub) => {
-                ui.menu_button(label.as_str(), |ui| menu_entries(ui, sub, action));
+                ui.menu_button(label.as_str(), |ui| {
+                    // Never taller than the window: it scrolls.
+                    let most = ui.ctx().content_rect().height() - 16.0;
+                    scrolling_menu(ui, label, most, |ui| {
+                        explained_menu_entries(ui, sub, action, why);
+                    });
+                });
             }
             MenuEntry::Item(label, enabled, shortcut, act) => {
                 let mut button = egui::Button::new(label.as_str());
                 if let Some(s) = shortcut {
                     button = button.shortcut_text(keys::shortcut(ui.ctx(), s));
                 }
-                if ui.add_enabled(*enabled, button).clicked() {
+                let response = ui.add_enabled(*enabled, button);
+                if !*enabled && let Some(text) = why(*act) {
+                    response.clone().on_disabled_hover_text(text);
+                }
+                if response.clicked() {
                     *action = Some(*act);
                 }
             }
@@ -771,10 +780,42 @@ pub(super) fn menu_entries(ui: &mut egui::Ui, entries: &[MenuEntry], action: &mu
                 if let Some(s) = shortcut {
                     button = button.shortcut_text(keys::shortcut(ui.ctx(), s));
                 }
-                if ui.add_enabled(*enabled, button).clicked() {
+                let response = ui.add_enabled(*enabled, button);
+                if !*enabled && let Some(text) = why(*act) {
+                    response.clone().on_disabled_hover_text(text);
+                }
+                if response.clicked() {
                     *action = Some(*act);
                 }
             }
         }
     }
+}
+
+/// A menu's contents, scrolling past `max_height`.
+pub(super) fn scrolling_menu(
+    ui: &mut egui::Ui,
+    salt: &str,
+    max_height: f32,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    // Only when it doesn't fit (its height known from the last frame).
+    let id = egui::Id::new(("menu-height", salt));
+    let height = ui.ctx().data(|d| d.get_temp::<f32>(id));
+    let max_height = max_height.max(80.0);
+    let used = if height.is_some_and(|h| h > max_height) {
+        egui::ScrollArea::vertical()
+            .id_salt(("menu", salt))
+            .max_height(max_height)
+            .show(ui, |ui| {
+                add_contents(ui);
+                ui.min_rect().height()
+            })
+            .inner
+    } else {
+        let top = ui.cursor().top();
+        add_contents(ui);
+        ui.min_rect().bottom() - top
+    };
+    ui.ctx().data_mut(|d| d.insert_temp(id, used));
 }

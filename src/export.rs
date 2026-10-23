@@ -59,9 +59,11 @@ impl ExportOptions {
         }
     }
 
-    /// Size of the exported image for a canvas of `size`.
+    /// Size of the exported image for a canvas of `size`: never larger
+    /// than Atelier opens.
     pub fn size(&self, (w, h): (u32, u32)) -> (u32, u32) {
-        let k = f64::from(self.scale.max(0.0)) / 100.0;
+        let largest = f64::from(crate::document::MAX_DIMENSION) / f64::from(w.max(h).max(1));
+        let k = (f64::from(self.scale.max(0.0)) / 100.0).min(largest);
         let side = |v: u32| ((f64::from(v) * k).round() as u32).max(1);
         (side(w), side(h))
     }
@@ -78,7 +80,6 @@ impl ExportOptions {
     /// The file's bytes, the image already at its export size; `icc`: the
     /// document's color profile.
     pub fn encode(&self, image: &RgbaImage, icc: Option<&[u8]>) -> Result<Vec<u8>, FileError> {
-        let exif = self.copyright.as_deref().map(copyright_exif);
         let icc = icc.filter(|_| self.embed_profile);
         let mut out = Cursor::new(Vec::new());
         crate::document::encode_image(
@@ -87,7 +88,7 @@ impl ExportOptions {
             self.format,
             self.quality,
             icc,
-            exif.as_deref(),
+            self.copyright.as_deref(),
         )?;
         Ok(out.into_inner())
     }
@@ -127,19 +128,16 @@ pub fn write(path: &Path, bytes: &[u8]) -> Result<(), FileError> {
     crate::document::write_atomic(path, |out| Ok(out.write_all(bytes)?))
 }
 
+/// The copyright notice as metadata text: UTF-8 (what readers expect
+/// today), without control characters.
+pub(crate) fn copyright_text(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// EXIF holding a copyright notice: a little-endian TIFF header and one
-/// directory with the Copyright tag (0x8298, ASCII).
-fn copyright_exif(text: &str) -> Vec<u8> {
-    let mut ascii: Vec<u8> = text
-        .chars()
-        .map(|c| {
-            if c.is_ascii() && !c.is_control() {
-                c as u8
-            } else {
-                b'?'
-            }
-        })
-        .collect();
+/// directory with the Copyright tag (0x8298), its text in UTF-8.
+pub(crate) fn copyright_exif(text: &str) -> Vec<u8> {
+    let mut ascii = copyright_text(text).into_bytes();
     ascii.push(0);
     let count = ascii.len() as u32;
     let mut exif = b"II*\0".to_vec();
@@ -165,6 +163,33 @@ fn copyright_exif(text: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exports_stay_within_what_atelier_opens() {
+        let options = ExportOptions {
+            scale: 1000.0,
+            ..ExportOptions::default()
+        };
+        assert_eq!(options.size((6000, 4000)), (30_000, 20_000));
+    }
+
+    #[test]
+    fn the_copyright_keeps_its_accents() {
+        let image = RgbaImage::from_pixel(8, 8, image::Rgba([200, 10, 10, 255]));
+        let text = "© 2026 Élodie Atelier";
+        for format in [ExportFormat::Png, ExportFormat::Jpeg, ExportFormat::WebP] {
+            let options = ExportOptions {
+                format,
+                copyright: Some(text.into()),
+                ..ExportOptions::default()
+            };
+            let file = options.encode(&image, None).unwrap();
+            assert!(
+                file.windows(text.len()).any(|w| w == text.as_bytes()),
+                "{format:?}"
+            );
+        }
+    }
 
     #[test]
     fn scaled_exports_and_their_size() {
@@ -195,7 +220,7 @@ mod tests {
         let marker = jpeg.windows(6).position(|w| w == b"Exif\0\0").unwrap();
         let exif = &jpeg[marker + 6..];
         assert_eq!(&exif[..4], b"II*\0");
-        let text = b"? 2026 Atelier\0";
+        let text = "© 2026 Atelier\0".as_bytes();
         assert_eq!(&exif[26..26 + text.len()], text);
         // Short notices sit in the entry itself.
         let short = copyright_exif("ab");

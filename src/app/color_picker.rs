@@ -4,7 +4,7 @@
 //! current colors, HSB, RGB, Lab, CMYK (working CMYK) and hex values, the
 //! out-of-gamut warning; a click on the image samples it.
 
-use super::dialogs::{DialogSpec, floating_dialog, tool_dialog_pos};
+use super::dialogs::{DialogSpec, floating_dialog, panel_pos};
 use super::keys;
 use super::*;
 use crate::color::{self, Hsb};
@@ -344,7 +344,11 @@ impl AtelierApp {
                 modal: false,
                 footer: false,
                 width: 282.0,
-                ..DialogSpec::new("swatches", t!("uip-swatches-title"), tool_dialog_pos(ctx))
+                ..DialogSpec::new(
+                    "swatches",
+                    t!("uip-swatches-title"),
+                    panel_pos(ctx, "swatches"),
+                )
             },
             |ui| {
                 ui.spacing_mut().item_spacing = Vec2::splat(CELL_GAP);
@@ -659,7 +663,8 @@ fn values(ui: &mut egui::Ui, picker: &mut ColorPicker, channel: &mut Channel) ->
                     } else {
                         t!("uip-picker-b")
                     };
-                    if ui_kit::number_field(ui, &label, &mut v, 0..=100, "%", field).changed() {
+                    let suffix = crate::i18n::percent("");
+                    if ui_kit::number_field(ui, &label, &mut v, 0..=100, &suffix, field).changed() {
                         let v = v as f32 / 100.0;
                         p.set_hsb(if sat {
                             Hsb { s: v, ..p.hsb }
@@ -715,14 +720,15 @@ fn cmyk_field(
     typed: &mut Option<[f32; 4]>,
 ) {
     let label = ["C", "M", "Y", "K"][i];
+    let suffix = crate::i18n::percent("");
     let Some(cmyk) = ink else {
         ui.add_enabled_ui(false, |ui| {
-            ui_kit::number_field(ui, label, &mut 0, 0..=100, "%", width);
+            ui_kit::number_field(ui, label, &mut 0, 0..=100, &suffix, width);
         });
         return;
     };
     let mut v = cmyk[i].round() as i32;
-    if ui_kit::number_field(ui, label, &mut v, 0..=100, "%", width).changed() {
+    if ui_kit::number_field(ui, label, &mut v, 0..=100, &suffix, width).changed() {
         let mut new = cmyk.map(f32::round);
         new[i] = v as f32;
         *typed = Some(new);

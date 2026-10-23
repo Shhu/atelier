@@ -7,6 +7,8 @@ use crate::i18n::t;
 
 /// Seconds a message stays fully visible before fading out (in 1 s).
 const MESSAGE_TIME: f64 = 5.0;
+/// The same for an error, shown in the warning color.
+const ERROR_TIME: f64 = 20.0;
 
 impl AtelierApp {
     pub(super) fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -16,10 +18,16 @@ impl AtelierApp {
             self.status_since = now;
         }
         let age = now - self.status_since;
-        let alpha = (1.0 - (age - MESSAGE_TIME).max(0.0)).clamp(0.0, 1.0) as f32;
+        let error = self
+            .workspace
+            .error_status
+            .as_ref()
+            .is_some_and(|e| *e == self.status);
+        let time = if error { ERROR_TIME } else { MESSAGE_TIME };
+        let alpha = (1.0 - (age - time).max(0.0)).clamp(0.0, 1.0) as f32;
         // Repaints only when the message starts fading, then while it fades.
         if !self.status.is_empty() && alpha > 0.0 {
-            let wait = (MESSAGE_TIME - age).max(0.1);
+            let wait = (time - age).max(0.1);
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
@@ -29,19 +37,30 @@ impl AtelierApp {
         };
         let muted = ui_kit::color::MUTED;
         let message = (alpha > 0.0 && !self.status.is_empty()).then(|| {
-            (
-                self.status.clone(),
-                ui_kit::color::ACCENT_TEXT.gamma_multiply(alpha),
-            )
+            if error {
+                (
+                    format!("{}  {}", icon::WARNING, self.status),
+                    workspace::WARNING.gamma_multiply(alpha),
+                )
+            } else {
+                (
+                    self.status.clone(),
+                    ui_kit::color::ACCENT_TEXT.gamma_multiply(alpha),
+                )
+            }
         });
         let Some(doc) = &self.doc else {
-            ui.horizontal_centered(|ui| {
-                let welcome = t!(
-                    "status-welcome",
-                    key = keys::shortcut(ui.ctx(), &SHORTCUT_OPEN)
-                );
-                let (s, color) = message.unwrap_or((welcome, muted));
-                text(ui, s, egui::FontId::proportional(12.0), color);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                super::models_window::download_chips(ui, &mut self.downloads);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let welcome = t!(
+                        "ui3-status-welcome",
+                        new = keys::shortcut(ui.ctx(), &new_document::SHORTCUT_NEW),
+                        open = keys::shortcut(ui.ctx(), &SHORTCUT_OPEN)
+                    );
+                    let (s, color) = message.unwrap_or((welcome, muted));
+                    text(ui, s, egui::FontId::proportional(12.0), color);
+                });
             });
             return;
         };
@@ -50,6 +69,7 @@ impl AtelierApp {
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 14.0;
+            super::models_window::download_chips(ui, &mut self.downloads);
             let pointer = self.hover_pixel.map_or(String::new(), |(x, y)| {
                 format!("x {} · y {}", signed(x as f32), signed(y as f32))
             });
@@ -121,6 +141,24 @@ impl AtelierApp {
         let pair = |key: &str, what: String| (key.to_owned(), what);
         let handle = t!("xform-hint-handle");
         match self.tool {
+            // The Move tool: Alt copies, Ctrl picks (or not) the layer
+            // under the pointer; in Free Transform, from the center, no
+            // snapping.
+            Tool::Transform if !self.free_transform => vec![
+                (shift, t!("input3-hint-axis")),
+                (alt, t!("input3-hint-copy")),
+                (
+                    ctrl,
+                    if self.auto_select {
+                        t!("input3-hint-selected-layers")
+                    } else {
+                        t!("input3-hint-pick-layer")
+                    },
+                ),
+                pair("1…0", t!("hint-layer-opacity")),
+                enter,
+                esc,
+            ],
             Tool::Transform => vec![
                 (shift, t!("hint-move-shift")),
                 (alt, t!("hint-from-center")),
@@ -292,6 +330,12 @@ impl AtelierApp {
                     hints.push((alt_click, t!("hint-zoom-out")));
                 } else {
                     hints.push((keys::key(Key::Space), t!("hint-hand-any-tool")));
+                    // The Zoom tool for a moment, from any tool.
+                    let space_click = format!("{}+{click}", keys::key(Key::Space));
+                    let zoom_in = keys::combo(ctx, Modifiers::COMMAND, &space_click);
+                    let zoom_out = keys::combo(ctx, Modifiers::ALT, &space_click);
+                    hints.push((zoom_in, t!("hint-zoom-in")));
+                    hints.push((zoom_out, t!("hint-zoom-out")));
                 }
                 let alt_wheel = keys::combo(ctx, Modifiers::ALT, &t!("key-wheel"));
                 hints.push((alt_wheel, t!("hint-zoom")));

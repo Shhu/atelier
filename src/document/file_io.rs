@@ -268,7 +268,8 @@ impl ExportFormat {
     /// Largest side the format can store.
     fn max_side(self) -> u32 {
         match self {
-            ExportFormat::Png | ExportFormat::Tiff => u32::MAX,
+            // What Atelier itself opens.
+            ExportFormat::Png | ExportFormat::Tiff => MAX_DIMENSION,
             ExportFormat::Jpeg | ExportFormat::Gif => u16::MAX as u32,
             ExportFormat::WebP => 16_383,
             ExportFormat::Psd => 30_000,
@@ -291,21 +292,26 @@ pub fn export(
     })
 }
 
-/// Encodes `image` in `format` into `out` (see [`export`]), with EXIF
-/// metadata where the format has room for it.
+/// Encodes `image` in `format` into `out` (see [`export`]), with a
+/// copyright notice where the format has room for it (not GIF).
 pub fn encode_image(
     image: &RgbaImage,
     out: &mut (impl Write + Seek),
     format: ExportFormat,
     quality: u8,
     icc_profile: Option<&[u8]>,
-    exif: Option<&[u8]>,
+    copyright: Option<&str>,
 ) -> Result<(), FileError> {
     let (w, h) = image.dimensions();
     if w.max(h) > format.max_side() {
         return Err(FileError::FormatTooSmall(format, format.max_side()));
     }
-    let meta = (icc_profile, exif);
+    // TIFF: its own Copyright tag (its encoder takes no EXIF).
+    if let (ExportFormat::Tiff, Some(text)) = (format, copyright) {
+        return tiff_with_copyright(image, out, icc_profile, text);
+    }
+    let exif = copyright.map(crate::export::copyright_exif);
+    let meta = (icc_profile, exif.as_deref());
     match format {
         ExportFormat::Png => encode(PngEncoder::new(out), image, meta),
         ExportFormat::Jpeg => {
@@ -356,6 +362,37 @@ fn encode_with(
     }
     encoder.write_image(pixels, w, h, color)?;
     Ok(())
+}
+
+/// An RGBA TIFF with its profile and a Copyright tag.
+fn tiff_with_copyright(
+    image: &RgbaImage,
+    out: &mut (impl Write + Seek),
+    icc: Option<&[u8]>,
+    copyright: &str,
+) -> Result<(), FileError> {
+    use tiff::encoder::{Compression, TiffEncoder, colortype::RGBA8};
+    let tiff = |e: tiff::TiffError| FileError::Io(std::io::Error::other(e.to_string()));
+    let mut encoder = TiffEncoder::new(out)
+        .map_err(tiff)?
+        .with_compression(Compression::Lzw);
+    let (w, h) = image.dimensions();
+    let mut file = encoder.new_image::<RGBA8>(w, h).map_err(tiff)?;
+    // In UTF-8, as readers expect today (the crate only writes ASCII).
+    let mut text = crate::export::copyright_text(copyright).into_bytes();
+    text.push(0);
+    let entry = (file.encoder())
+        .write_entry_bytes(tiff::tags::Type::ASCII, &text)
+        .map_err(tiff)?;
+    let mut tags = tiff::Directory::empty();
+    tags.extend([(tiff::tags::Tag::Copyright, entry)]);
+    file.encoder().extend_from(&tags);
+    if let Some(icc) = icc {
+        file.encoder()
+            .write_tag(tiff::tags::Tag::IccProfile, icc)
+            .map_err(tiff)?;
+    }
+    file.write_data(image.as_raw()).map_err(tiff)
 }
 
 /// Encodes CMYK pixels (4 bytes each, 0 = no ink) of `size` into `out`
@@ -429,11 +466,19 @@ pub fn write_atomic(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<(), FileError>,
 ) -> Result<(), FileError> {
-    // Through a symbolic link, the file it points to is replaced, not the link.
+    // Through a symbolic link, the file it points to is replaced (or
+    // created), not the link.
     let target = match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path).or_else(|_| {
+            let to = std::fs::read_link(path)?;
+            Ok::<_, std::io::Error>(path.parent().map_or(to.clone(), |dir| dir.join(&to)))
+        })?,
         _ => path.to_path_buf(),
     };
+    // A read-only file stays as it is (the rename would replace it).
+    if std::fs::metadata(&target).is_ok_and(|m| m.permissions().readonly()) {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into());
+    }
     let tmp = temporary_path(&target);
     let result = (|| {
         let mut out = BufWriter::new(File::create(&tmp)?);
@@ -454,11 +499,14 @@ pub fn write_atomic(
     result
 }
 
-/// ".name.1234.tmp" next to `target` (1234: this process).
+/// ".name.1234-5.tmp" next to `target` (1234: this process, 5: this
+/// write, for writers on several threads).
 fn temporary_path(target: &Path) -> PathBuf {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut name = OsString::from(".");
     name.push(target.file_name().unwrap_or_default());
-    name.push(format!(".{}.tmp", std::process::id()));
+    name.push(format!(".{}-{n}.tmp", std::process::id()));
     target.with_file_name(name)
 }
 
@@ -501,6 +549,51 @@ mod tests {
             FileError::FormatTooSmall(ExportFormat::WebP, 16_383)
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_files_and_dangling_links() {
+        let dir = dir("read-only");
+        let locked = dir.join("locked.png");
+        std::fs::write(&locked, b"original").unwrap();
+        let mut p = std::fs::metadata(&locked).unwrap().permissions();
+        p.set_readonly(true);
+        std::fs::set_permissions(&locked, p).unwrap();
+        let err = write_atomic(&locked, |out| Ok(out.write_all(b"new")?)).unwrap_err();
+        assert!(
+            matches!(&err, FileError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(std::fs::read(&locked).unwrap(), b"original");
+        // Through a link to a file not there yet: that file is created.
+        let link = dir.join("link.png");
+        std::os::unix::fs::symlink("target.png", &link).unwrap();
+        write_atomic(&link, |out| Ok(out.write_all(b"made")?)).unwrap();
+        assert_eq!(std::fs::read(dir.join("target.png")).unwrap(), b"made");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn temporary_names_differ_between_writes() {
+        let target = Path::new("/somewhere/photo.png");
+        assert_ne!(temporary_path(target), temporary_path(target));
+    }
+
+    #[test]
+    fn tiff_holds_the_copyright() {
+        let image = RgbaImage::from_pixel(4, 4, image::Rgba([9, 9, 9, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        let text = "© 2026 Élodie";
+        encode_image(&image, &mut out, ExportFormat::Tiff, 90, None, Some(text)).unwrap();
+        let data = out.into_inner();
+        assert!(data.windows(text.len()).any(|w| w == text.as_bytes()));
+        let back = image::load_from_memory(&data).unwrap().into_rgba8();
+        assert_eq!(back, image);
     }
 
     #[test]

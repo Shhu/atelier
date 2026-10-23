@@ -168,7 +168,7 @@ impl Document {
     pub fn set_shape(&mut self, i: usize, shape: Shape) {
         let limit = self.shape_limit();
         self.layers[i].set_shape(shape, limit);
-        self.modified = true;
+        self.mark_modified();
     }
 
     /// Path `r`, in canvas coordinates.
@@ -208,7 +208,7 @@ impl Document {
                 self.set_shape(i, shape);
             }
         }
-        self.modified = true;
+        self.mark_modified();
     }
 
     /// Moves path `r` by `d` (a live shape stays one), without a history

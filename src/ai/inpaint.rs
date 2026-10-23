@@ -20,18 +20,17 @@ fn model_path() -> PathBuf {
 /// The model's session.
 pub(super) static SESSION: Slot = Slot::new(model_path);
 
-/// `image` (opaque) with the pixels where `hole` painted in by the model.
-/// It sees a square around the hole, twice its size where the image
-/// allows.
-pub fn inpaint(image: &RgbaImage, hole: &[bool]) -> Result<RgbaImage, String> {
-    let (w, h) = image.dimensions();
+/// The part of an image of `size` the model sees for `hole`: a square
+/// around it, twice its size where the image allows (x, y, w, h).
+fn seen(size: (u32, u32), hole: &[bool]) -> Option<[u32; 4]> {
+    let (w, h) = size;
     let mut b = [w, h, 0, 0];
     for (i, _) in hole.iter().enumerate().filter(|(_, h)| **h) {
         let (x, y) = (i as u32 % w, i as u32 / w);
         b = [b[0].min(x), b[1].min(y), b[2].max(x + 1), b[3].max(y + 1)];
     }
     if b[0] >= b[2] {
-        return Ok(image.clone());
+        return None;
     }
     let side = ((b[2] - b[0]).max(b[3] - b[1]) * 2).max(SIZE / 2);
     let span = |lo: u32, hi: u32, len: u32| {
@@ -41,8 +40,36 @@ pub fn inpaint(image: &RgbaImage, hole: &[bool]) -> Result<RgbaImage, String> {
     };
     let (x0, cw) = span(b[0], b[2], w);
     let (y0, ch) = span(b[1], b[3], h);
+    Some([x0, y0, cw, ch])
+}
+
+/// How much the model's view of `hole` in an image of `size` is reduced
+/// (1: not at all): its answer lacks the finer details.
+pub fn reduction(size: (u32, u32), hole: &[bool]) -> f32 {
+    seen(size, hole).map_or(1.0, |[_, _, cw, ch]| {
+        (cw.max(ch) as f32 / SIZE as f32).max(1.0)
+    })
+}
+
+/// `image` (opaque) with the pixels where `hole` painted in by the model.
+/// It sees a square around the hole, twice its size where the image
+/// allows, reduced to its size (its proportions kept, the rest of its
+/// square the edge repeated).
+pub fn inpaint(image: &RgbaImage, hole: &[bool]) -> Result<RgbaImage, String> {
+    let (w, h) = image.dimensions();
+    let Some([x0, y0, cw, ch]) = seen((w, h), hole) else {
+        return Ok(image.clone());
+    };
+    let scale = SIZE as f32 / cw.max(ch) as f32;
+    let (sw, sh) = (
+        ((cw as f32 * scale).round() as u32).clamp(1, SIZE),
+        ((ch as f32 * scale).round() as u32).clamp(1, SIZE),
+    );
     let crop = image::imageops::crop_imm(image, x0, y0, cw, ch).to_image();
-    let input = image::imageops::resize(&crop, SIZE, SIZE, FilterType::Triangle);
+    let small = image::imageops::resize(&crop, sw, sh, FilterType::Triangle);
+    let input = RgbaImage::from_fn(SIZE, SIZE, |x, y| {
+        *small.get_pixel(x.min(sw - 1), y.min(sh - 1))
+    });
     // Any part of the hole in a pixel makes it a hole, and a pixel more
     // around: the model must not see the edge of what is removed.
     let local = GrayImage::from_fn(cw, ch, |x, y| {
@@ -52,12 +79,14 @@ pub fn inpaint(image: &RgbaImage, hole: &[bool]) -> Result<RgbaImage, String> {
             0
         }])
     });
-    let mask = grow(&image::imageops::resize(
-        &local,
-        SIZE,
-        SIZE,
-        FilterType::Triangle,
-    ));
+    let local = image::imageops::resize(&local, sw, sh, FilterType::Triangle);
+    let mask = grow(&GrayImage::from_fn(SIZE, SIZE, |x, y| {
+        if x < sw && y < sh {
+            *local.get_pixel(x, y)
+        } else {
+            Luma([0])
+        }
+    }));
 
     let n = (SIZE * SIZE) as usize;
     let mut pixels = vec![0.0f32; 3 * n];
@@ -86,6 +115,7 @@ pub fn inpaint(image: &RgbaImage, hole: &[bool]) -> Result<RgbaImage, String> {
             painted[c * n + i].round().clamp(0.0, 255.0) as u8
         }))
     });
+    let out = image::imageops::crop_imm(&out, 0, 0, sw, sh).to_image();
     let out = image::imageops::resize(&out, cw, ch, FilterType::CatmullRom);
     let mut result = image.clone();
     for (x, y, p) in out.enumerate_pixels() {

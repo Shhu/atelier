@@ -2,6 +2,7 @@
 //! on the canvas), Last Filter, and the filters computed off the UI thread.
 
 use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use image::RgbaImage;
@@ -128,6 +129,22 @@ pub(super) struct Filters {
     camera_raw: Option<crate::camera_raw::Settings>,
     dialog: Option<FilterDialog>,
     applying: Option<Applying>,
+    /// The layer a dialog (a filter's, Liquify, Camera Raw) enlarged for
+    /// its preview, as it was.
+    enlarged: Option<Enlarged>,
+    /// Preview of an adjustment (or Make Transparent) being computed: what
+    /// for (the layer's id and revision), and the computation.
+    adjust: Option<(LayerPreview, u64, u64, Job<RgbaImage>)>,
+}
+
+/// A layer enlarged to the canvas for a dialog's preview: its document and
+/// id, its revision once enlarged, and its pixels, offset and revision
+/// before.
+struct Enlarged {
+    doc: u64,
+    layer: u64,
+    rev: u64,
+    before: (Arc<RgbaImage>, (i64, i64), u64),
 }
 
 impl Filters {
@@ -166,6 +183,8 @@ struct FilterDialog {
     center: Pos2,
     square: Square,
     canvas: Option<Job<RgbaImage>>,
+    /// Key of a canvas preview whose computation failed (not tried again).
+    failed: Option<u64>,
     /// Smart Sharpen: Shadows and Highlights settings shown.
     tones: bool,
 }
@@ -190,11 +209,20 @@ struct Applying {
     job: Job<RgbaImage>,
 }
 
-/// Computation on another thread, and what it was started for.
+/// A filter's result the dialog's preview already has, or is computing.
+enum Ready {
+    Image(Arc<RgbaImage>),
+    Job(Job<RgbaImage>),
+}
+
+/// Computation on another thread, and what it was started for. Dropping
+/// it stops the filters it applies (a preview no longer wanted, a filter
+/// cancelled).
 struct Job<T> {
     key: u64,
     region: [u32; 4],
     rx: mpsc::Receiver<T>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl<T: Send + 'static> Job<T> {
@@ -206,11 +234,43 @@ impl<T: Send + 'static> Job<T> {
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(work());
+            let _ = tx.send(crate::filters::cancellable(Some(flag), work));
             ctx.request_repaint();
         });
-        Self { key, region, rx }
+        Self {
+            key,
+            region,
+            rx,
+            cancel,
+        }
+    }
+
+    /// Stops the filters it applies: what it gives is then meaningless.
+    fn stop(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    fn stopped(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// What the computation gave: `Err(())` once it failed (its thread
+    /// panicked), `Ok(None)` while it runs.
+    fn poll(&self) -> Result<Option<T>, ()> {
+        match self.rx.try_recv() {
+            Ok(out) => Ok(Some(out)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err(()),
+        }
+    }
+}
+
+impl<T> Drop for Job<T> {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
     }
 }
 
@@ -243,6 +303,28 @@ pub(super) fn active_target(doc: &Document, selection: Option<&Selection>) -> Op
         image: layer.shared_image(),
         clip,
         offset: layer.offset,
+    })
+}
+
+/// A dialog's result is previewed over the whole layer: a layer smaller
+/// than the canvas is enlarged first, as it will be (its pixels don't
+/// change; a text, a shape or a targeted mask is left as it is). Returns
+/// what to put back if the dialog is cancelled.
+fn enlarge_for_preview(doc: &mut Document) -> Option<Enlarged> {
+    if doc.mask_targeted() || doc.active_layer().is_live() {
+        return None;
+    }
+    let layer = doc.active_layer();
+    let before = (layer.shared_image(), layer.offset, layer.rev());
+    if !doc.expand_active_to_canvas() {
+        return None;
+    }
+    let layer = doc.active_layer();
+    Some(Enlarged {
+        doc: doc.uid(),
+        layer: layer.id,
+        rev: layer.rev(),
+        before,
     })
 }
 
@@ -321,6 +403,9 @@ impl AtelierApp {
 
     /// The dialog of `filter`, opening with its settings.
     pub(super) fn open_filter_dialog(&mut self, filter: Filter) {
+        if self.refuse_hidden_target() {
+            return;
+        }
         let selection = self.selection.clone();
         // On a smart object: a smart filter.
         let smart = self.smart_filters_apply();
@@ -333,9 +418,9 @@ impl AtelierApp {
         // than the canvas is enlarged first, as it will be (its pixels
         // don't change; a text or a shape stays editable until the filter
         // applies).
-        if !doc.mask_targeted() && !doc.active_layer().is_live() {
-            doc.expand_active_to_canvas();
-        }
+        let enlarged = enlarge_for_preview(doc);
+        self.filters.enlarged = enlarged;
+        let Some(doc) = &mut self.doc else { return };
         // The square shows the middle of the selection, or of the canvas.
         let canvas = doc.full_rect();
         let around = selection.filter(|s| !s.inverted).map_or(canvas, |s| s.rect);
@@ -354,6 +439,7 @@ impl AtelierApp {
             center,
             square: Square::default(),
             canvas: None,
+            failed: None,
             tones: false,
         });
     }
@@ -398,6 +484,16 @@ impl AtelierApp {
     /// Applies `filter` to the active layer (or its targeted mask), inside
     /// the selection, on another thread: one undo step once done.
     pub(super) fn start_filter(&mut self, filter: Filter) {
+        self.start_filter_with(filter, None);
+    }
+
+    /// [`Self::start_filter`], the result being `ready` already: the
+    /// dialog's canvas preview of the same settings, computed or being
+    /// computed for the same pixels.
+    fn start_filter_with(&mut self, filter: Filter, ready: Option<Ready>) {
+        if self.refuse_hidden_target() {
+            return;
+        }
         if self.smart_filters_apply() {
             self.add_smart_filter(filter);
             self.filters.last = Some(filter);
@@ -407,6 +503,7 @@ impl AtelierApp {
         }
         let Some(doc) = &mut self.doc else { return };
         let rasterized = doc.active_layer().text.is_some() && !doc.mask_targeted();
+        let before = doc.target_layer().map(|l| l.image().dimensions());
         doc.checkpoint(title(filter.kind()));
         // The layer grows to the canvas, or its targeted mask stands in for
         // it, until the result is in (`poll_filter`).
@@ -430,10 +527,21 @@ impl AtelierApp {
         {
             self.preview_shown = None;
         }
-        let reach = filter.reach().unwrap_or(0);
-        let job = Job::spawn(&self.ctx, 0, [0; 4], move || {
-            target.process(reach, |image, origin| filter.apply(image, origin))
-        });
+        // The preview is the result only if the target kept its size.
+        let ready = ready.filter(|_| before == Some(target.image.dimensions()));
+        let job = match ready {
+            Some(Ready::Job(job)) => job,
+            Some(Ready::Image(image)) => {
+                // A job that gives at once what the preview holds.
+                Job::spawn(&self.ctx, 0, [0; 4], move || (*image).clone())
+            }
+            None => {
+                let reach = filter.reach().unwrap_or(0);
+                Job::spawn(&self.ctx, 0, [0; 4], move || {
+                    target.process(reach, |image, origin| filter.apply(image, origin))
+                })
+            }
+        };
         self.filters.applying = Some(Applying {
             filter,
             doc: doc.uid(),
@@ -450,10 +558,10 @@ impl AtelierApp {
         let Some(applying) = &self.filters.applying else {
             return;
         };
-        let result = match applying.job.rx.try_recv() {
-            Ok(image) => Some(image),
-            Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => None,
+        let result = match applying.job.poll() {
+            Ok(Some(image)) => Some(image),
+            Ok(None) => return,
+            Err(()) => None,
         };
         let Some(a) = self.filters.applying.take() else {
             return;
@@ -479,9 +587,108 @@ impl AtelierApp {
                 None => {
                     doc.end_paint();
                     doc.discard_step();
+                    self.status = t!("fx3-filter-failed", name = name.as_str());
                 }
             }
         }
+        self.end_layer_preview();
+        self.reset_pending();
+    }
+
+    /// The preview of an adjustment dialog (or Make Transparent) on the
+    /// canvas, computed on another thread: the last one stays shown until
+    /// the next is ready, one computation at a time.
+    pub(super) fn adjust_preview(&mut self, preview: LayerPreview) {
+        let Some(doc) = &self.doc else { return };
+        let layer = doc.active_layer();
+        let (id, rev) = (layer.id, layer.rev());
+        if let Some((done, layer, rev_then, job)) = &self.filters.adjust {
+            match job.poll() {
+                Ok(None) => return,
+                Ok(Some(image)) => {
+                    let done = done.clone();
+                    let current = (*layer, *rev_then) == (id, rev);
+                    self.filters.adjust = None;
+                    if current {
+                        self.show_preview(done, image);
+                    }
+                }
+                Err(()) => {
+                    self.filters.adjust = None;
+                    return self.end_layer_preview();
+                }
+            }
+        }
+        if let Some(p) = &self.preview_shown
+            && (&p.preview, p.layer, p.rev) == (&preview, id, rev)
+        {
+            return;
+        }
+        let Some(doc) = &self.doc else { return };
+        // Like the result: only inside the selection.
+        let Some(target) = active_target(doc, self.selection.as_ref()) else {
+            return self.end_layer_preview();
+        };
+        let wanted = preview.clone();
+        let job = Job::spawn(&self.ctx, 0, [0; 4], move || {
+            target.process(0, |image, _| wanted.apply(image))
+        });
+        self.filters.adjust = Some((preview, id, rev, job));
+    }
+
+    /// The adjustment dialog closed: its preview being computed is dropped.
+    pub(super) fn forget_adjust_preview(&mut self) {
+        self.filters.adjust = None;
+    }
+
+    /// A hidden layer is not filtered (its result could not be seen): says
+    /// so. Returns `true` then.
+    pub(super) fn refuse_hidden_target(&mut self) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        if doc.shown(doc.active) {
+            return false;
+        }
+        let name = doc.active_layer().name.as_str();
+        self.status = t!("fx3-filter-layer-hidden", name = name);
+        true
+    }
+
+    /// A dialog closed without changing the layer: the layer it enlarged
+    /// for its preview is put back as it was, if unchanged since.
+    pub(super) fn shrink_after_preview(&mut self) {
+        let Some(e) = self.filters.enlarged.take() else {
+            return;
+        };
+        if let Some(doc) = &mut self.doc
+            && (doc.uid(), doc.active_layer().id, doc.active_layer().rev())
+                == (e.doc, e.layer, e.rev)
+        {
+            let (image, offset, rev) = e.before;
+            doc.active_layer_mut().put_back_pixels(image, offset, rev);
+        }
+    }
+
+    /// See [`enlarge_for_preview`]: the layer enlarged for the dialog
+    /// opening, to put back if it is cancelled.
+    pub(super) fn enlarge_for_dialog(&mut self) {
+        let Some(doc) = &mut self.doc else { return };
+        self.filters.enlarged = enlarge_for_preview(doc);
+    }
+
+    /// Cancel of the filter being applied (its computation stops): the
+    /// layer stays as it was.
+    fn cancel_filter(&mut self) {
+        let Some(a) = self.filters.applying.take() else {
+            return;
+        };
+        if let Some(doc) = &mut self.doc
+            && (doc.uid(), doc.active_layer().id) == (a.doc, a.layer)
+        {
+            doc.end_paint();
+            doc.discard_step();
+        }
+        let name = title(a.filter.kind());
+        self.status = t!("retouch-status-cancelled", name = name.as_str());
         self.end_layer_preview();
         self.reset_pending();
     }
@@ -490,7 +697,10 @@ impl AtelierApp {
     pub(super) fn filter_window(&mut self, ctx: &egui::Context) {
         self.poll_filter();
         if let Some(a) = &self.filters.applying {
-            busy_indicator(ctx, &title(a.filter.kind()), a.started);
+            let name = title(a.filter.kind());
+            if cancellable_indicator(ctx, "filter_busy", &name, a.started, None) {
+                self.cancel_filter();
+            }
             return;
         }
         let Some(mut dialog) = self.filters.dialog.take() else {
@@ -536,10 +746,28 @@ impl AtelierApp {
             dialog.filter = dialog.opened;
         }
         if out.ok {
-            // The preview stays on the canvas until the result replaces it.
-            self.start_filter(dialog.filter);
+            // The preview stays on the canvas until the result replaces it;
+            // computed (or being computed) with these settings, it is the
+            // result.
+            let key = hash_of((layer_id, layer_rev, fingerprint));
+            let shown = self.preview_shown.as_ref().filter(|p| {
+                matches!(p.preview, LayerPreview::Filter(k) if k == key) && p.mask.is_none()
+            });
+            let ready = if self.smart_filters_apply() {
+                None
+            } else if let Some(p) = shown {
+                Some(Ready::Image(p.image.clone()))
+            } else {
+                dialog
+                    .canvas
+                    .take()
+                    .filter(|job| job.key == key && !job.stopped())
+                    .map(Ready::Job)
+            };
+            self.start_filter_with(dialog.filter, ready);
         } else if out.cancel {
             self.end_layer_preview();
+            self.shrink_after_preview();
         } else {
             self.filters.dialog = Some(dialog);
         }
@@ -572,13 +800,19 @@ impl AtelierApp {
             ((y0 as f32 + extent).ceil() as u32 + 1).min(h),
         ];
         let zoom = dialog.zoom;
-        let wanted = hash_of((key, region, zoom.to_bits()));
+        // Shown as the canvas shows the document (its profile, the monitor's).
+        let (lut_key, lut) = self.color.shown();
+        let wanted = hash_of((key, region, zoom.to_bits(), lut_key));
         let square = &mut dialog.square;
-        if let Some(job) = &square.job
-            && let Ok((filtered, original)) = job.rx.try_recv()
+        let polled = square.job.as_ref().map(Job::poll);
+        if let Some(Err(())) = polled {
+            // Failed: shown as it was, a new computation for new settings.
+            square.job = None;
+        }
+        if let Some(Ok(Some((filtered, original)))) = polled
+            && let Some(job) = square.job.take()
         {
             let (key, region) = (job.key, job.region);
-            square.job = None;
             let load =
                 |name: &str, image: ColorImage| ctx.load_texture(name, image, IMAGE_TEX_OPTIONS);
             square.shown = Some((
@@ -592,7 +826,7 @@ impl AtelierApp {
         if shown != Some(wanted) && square.job.is_none() {
             let (target, filter) = (target.clone(), dialog.filter);
             square.job = Some(Job::spawn(ctx, wanted, region, move || {
-                let original = image::imageops::crop_imm(
+                let mut original = image::imageops::crop_imm(
                     &*target.image,
                     region[0],
                     region[1],
@@ -600,9 +834,13 @@ impl AtelierApp {
                     region[3] - region[1],
                 )
                 .to_image();
-                let filtered = target.process_region(region, filter.reach(), |image, origin| {
-                    filter.apply(image, origin)
-                });
+                let mut filtered =
+                    target.process_region(region, filter.reach(), |image, origin| {
+                        filter.apply(image, origin)
+                    });
+                for image in [&mut filtered, &mut original] {
+                    color_ui::show_through(lut.as_deref(), image.as_mut(), false);
+                }
                 (square_image(&filtered, zoom), square_image(&original, zoom))
             }));
         }
@@ -619,21 +857,38 @@ impl AtelierApp {
         if self.smart_filters_apply() {
             return self.smart_filter_preview(ctx, dialog.filter, dialog.preview);
         }
-        if let Some(job) = &dialog.canvas
-            && let Ok(image) = job.rx.try_recv()
-        {
-            let done = job.key;
-            dialog.canvas = None;
-            if dialog.preview {
-                self.show_preview(LayerPreview::Filter(done), image);
+        match dialog.canvas.as_ref().map(Job::poll) {
+            Some(Ok(Some(image))) => {
+                if let Some(job) = dialog.canvas.take()
+                    && dialog.preview
+                    && !job.stopped()
+                {
+                    self.show_preview(LayerPreview::Filter(job.key), image);
+                }
             }
+            Some(Err(())) => {
+                if let Some(job) = dialog.canvas.take()
+                    && !job.stopped()
+                {
+                    dialog.failed = Some(job.key);
+                    let name = title(dialog.filter.kind());
+                    self.status = t!("fx3-filter-failed", name = name.as_str());
+                }
+            }
+            _ => {}
         }
         let shown = matches!(
             self.preview_shown.as_ref().map(|p| &p.preview),
             Some(LayerPreview::Filter(k)) if *k == key
         );
-        let computing = dialog.canvas.as_ref().map(|j| j.key);
-        if dialog.preview && !shown && computing.is_none() {
+        // A computation for other settings is stopped; the newest ones
+        // start once it is over (one computation at a time).
+        if let Some(job) = &dialog.canvas
+            && (job.key != key || !dialog.preview)
+        {
+            job.stop();
+        }
+        if dialog.preview && !shown && dialog.canvas.is_none() && dialog.failed != Some(key) {
             let (target, filter) = (target.clone(), dialog.filter);
             let reach = filter.reach().unwrap_or(0);
             dialog.canvas = Some(Job::spawn(ctx, key, [0; 4], move || {
@@ -653,8 +908,16 @@ fn square_image(image: &RgbaImage, zoom: f32) -> ColorImage {
         ((image.width() as f32 * zoom).round() as u32).max(1),
         ((image.height() as f32 * zoom).round() as u32).max(1),
     );
-    let small = image::imageops::resize(image, w, h, FilterType::Triangle);
-    ColorImage::from_rgba_unmultiplied([w as usize, h as usize], small.as_raw())
+    // Premultiplied: the hidden colors of transparent pixels stay hidden.
+    let mut premultiplied = image.clone();
+    for p in premultiplied.pixels_mut() {
+        let a = p[3] as u32;
+        for c in 0..3 {
+            p[c] = ((p[c] as u32 * a + 127) / 255) as u8;
+        }
+    }
+    let small = image::imageops::resize(&premultiplied, w, h, FilterType::Triangle);
+    ColorImage::from_rgba_premultiplied([w as usize, h as usize], small.as_raw())
 }
 
 /// The preview square: the result over a checkerboard, dragged to move
@@ -1118,6 +1381,56 @@ pub(super) fn busy_indicator(ctx: &egui::Context, name: &str, started: f64) {
         });
 }
 
+/// Indicator of a long computation that can be stopped, shown after a
+/// moment: its progress (a spinner without one) and Cancel. True when
+/// cancelled, with the button or Esc.
+pub(super) fn cancellable_indicator(
+    ctx: &egui::Context,
+    id: &str,
+    name: &str,
+    started: f64,
+    progress: Option<f32>,
+) -> bool {
+    let elapsed = ctx.input(|i| i.time) - started;
+    let visible = elapsed >= BUSY_DELAY;
+    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    let frame = if visible {
+        egui::Frame::new()
+            .fill(color::BG2)
+            .stroke(UiStroke::new(1.0, color::WINDOW_LINE))
+            .corner_radius(12)
+            .inner_margin(egui::Margin::symmetric(18, 14))
+    } else {
+        egui::Frame::new()
+    };
+    let mut cancel = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+    egui::Modal::new(egui::Id::new(id))
+        .backdrop_color(Color32::TRANSPARENT)
+        .frame(frame)
+        .show(ctx, |ui| {
+            if !visible {
+                return;
+            }
+            ui.set_width(280.0);
+            ui.label(egui::RichText::new(format!("{name}…")).color(color::TEXT));
+            ui.add_space(8.0);
+            match progress {
+                Some(fraction) => {
+                    ui.add(egui::ProgressBar::new(fraction).desired_height(6.0));
+                }
+                None => {
+                    ui.add(egui::Spinner::new().size(16.0).color(color::MUTED));
+                }
+            }
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                cancel |=
+                    ui_kit::button(ui, &t!("dialog-cancel"), Kind::Normal, None, true).clicked();
+            });
+        });
+    cancel
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1300,6 +1613,60 @@ mod tests {
         };
         settle(&mut h, |app| applied(app) && clouds(app));
         assert_eq!(pixels(&h), original);
+    }
+
+    #[test]
+    fn hidden_layers_are_not_filtered() {
+        let mut h = app();
+        let app = h.state_mut();
+        app.doc.as_mut().unwrap().active_layer_mut().visible = false;
+        app.run(Action::Filter(FilterKind::GaussianBlur));
+        assert!(app.filters.dialog.is_none());
+        app.run(Action::Filter(FilterKind::FindEdges));
+        assert!(app.filters.applying.is_none());
+        let name = app.doc.as_ref().unwrap().active_layer().name.clone();
+        assert_eq!(
+            app.status,
+            t!("fx3-filter-layer-hidden", name = name.as_str())
+        );
+    }
+
+    #[test]
+    fn a_filter_being_applied_stops_with_esc() {
+        let mut h = app();
+        let original = pixels(&h);
+        // Seconds of work on any image.
+        let slow = Filter::Minimum(Morphology {
+            radius: 500.0,
+            roundness: true,
+        });
+        h.state_mut().start_filter(slow);
+        assert!(h.state().filters.applying.is_some());
+        h.run_steps(1);
+        h.key_press(egui::Key::Escape);
+        h.run_steps(1);
+        assert!(h.state().filters.applying.is_none());
+        assert_eq!(pixels(&h), original);
+        assert!(!h.state().doc.as_ref().unwrap().can_undo(), "no step left");
+    }
+
+    #[test]
+    fn a_small_layer_enlarged_for_the_preview_shrinks_back_on_cancel() {
+        let mut h = app();
+        let doc = h.state_mut().doc.as_mut().unwrap();
+        let layer = doc.active_layer_mut();
+        layer.replace_pixels(RgbaImage::from_pixel(10, 8, image::Rgba([200, 0, 0, 255])));
+        layer.offset = (5, 6);
+        h.state_mut().run(Action::Filter(FilterKind::GaussianBlur));
+        let size = |h: &Harness<'static, AtelierApp>| {
+            let l = h.state().doc.as_ref().unwrap().active_layer();
+            (l.image().dimensions(), l.offset)
+        };
+        assert_eq!(size(&h).0, (64, 64), "previewed over the canvas");
+        settle(&mut h, |app| app.preview_shown.is_some());
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert_eq!(size(&h), ((10, 8), (5, 6)));
     }
 
     #[test]

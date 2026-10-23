@@ -244,7 +244,12 @@ fn patch_tool() {
     let p = pixel(&h, 45, 45);
     assert!(p[0] > 70 && p[1] > 140, "patched: {p:?}");
     assert_eq!(pixel(&h, 10, 10), image.get_pixel(10, 10).0);
-    undo_once(&mut h, &image);
+    // The patch, then the selection drawn: one step each.
+    let doc = h.state_mut().doc.as_mut().unwrap();
+    assert!(doc.undo());
+    assert_eq!(doc.active_layer().image(), &image);
+    assert_eq!(doc.history().1, 1);
+    assert!(doc.selection().is_some());
 
     h.state_mut().retouch.patch_mode = PatchMode::Destination;
     let rect = h.state().selection.as_ref().unwrap().rect;

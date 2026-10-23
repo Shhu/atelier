@@ -154,6 +154,14 @@ impl Model {
         files_in(&self.dir(), self.files())
     }
 
+    /// Removes its partial downloads that nothing writes any more (left by
+    /// a run of the program that stopped while downloading).
+    pub fn remove_orphans(self) {
+        for f in self.files() {
+            remove_orphans(&self.path(f.name));
+        }
+    }
+
     /// Bytes of its files present on disk.
     pub fn size_on_disk(self) -> u64 {
         self.files_on_disk().iter().map(|(_, len)| len).sum()
@@ -260,8 +268,19 @@ impl std::fmt::Display for DownloadError {
     }
 }
 
-fn failed(e: impl ToString) -> DownloadError {
-    DownloadError::Failed(e.to_string())
+/// A file of the model could not be written: why, in words.
+fn failed(e: std::io::Error) -> DownloadError {
+    use std::io::ErrorKind;
+    DownloadError::Failed(match e.kind() {
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => t!("fx3-ai-error-disk-full"),
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => {
+            t!(
+                "fx3-ai-error-no-write",
+                folder = root().display().to_string()
+            )
+        }
+        _ => t!("fx3-ai-error-write", error = e.to_string()),
+    })
 }
 
 /// Longest wait for a connection and for the server's answer.
@@ -293,12 +312,50 @@ impl Drop for Partial {
     }
 }
 
-/// Network error: a timeout says that the connection stopped responding.
-fn network(e: impl Into<ureq::Error>) -> DownloadError {
-    match e.into() {
-        ureq::Error::Timeout(_) => DownloadError::Failed(t!("ai-error-stalled")),
-        e => failed(e),
+/// A partial download untouched for this long, of another run of the
+/// program, is an orphan.
+const ORPHAN_AGE: Duration = Duration::from_secs(120);
+
+/// Removes the partial downloads of `path` that another run of the program
+/// left (each run names its own, see [`Partial`]) and stopped writing.
+fn remove_orphans(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let name = name.to_string_lossy();
+    let (prefix, own) = (
+        format!("{name}."),
+        format!("{name}.{}-", std::process::id()),
+    );
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let file = entry.file_name();
+        let Some(file) = file.to_str() else { continue };
+        if !file.starts_with(&prefix) || !file.ends_with(".part") || file.starts_with(&own) {
+            continue;
+        }
+        let age = entry.metadata().and_then(|m| m.modified()).ok();
+        if age
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= ORPHAN_AGE)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
+}
+
+/// Network error, in words: a timeout says that the connection stopped
+/// responding.
+fn network(e: impl Into<ureq::Error>) -> DownloadError {
+    use ureq::Error;
+    DownloadError::Failed(match e.into() {
+        Error::Timeout(_) | Error::BodyStalled => t!("ai-error-stalled"),
+        Error::HostNotFound | Error::ConnectionFailed | Error::Io(_) => {
+            t!("fx3-ai-error-offline")
+        }
+        Error::StatusCode(code) => t!("fx3-ai-error-status", code = code.to_string()),
+        Error::Tls(_) => t!("fx3-ai-error-secure"),
+        e => e.to_string(),
+    })
 }
 
 /// `file` to `path`, through a `.part` file renamed once checked.
@@ -319,6 +376,7 @@ fn download_file(
             .into()
     };
     let (windowed, whole) = (agent(Some(window)), agent(None));
+    remove_orphans(path);
     let partial = Partial::new(path);
     let mut out = std::fs::File::create(&partial.0).map_err(failed)?;
     let mut hasher = Sha256::new();
@@ -616,5 +674,25 @@ mod tests {
         let files = [file("", 2, "")];
         let found = files_in(&dir, &files);
         assert_eq!(found.iter().map(|(_, len)| len).sum::<u64>(), 42);
+    }
+
+    #[test]
+    fn orphan_partial_files_are_removed() {
+        let dir = temp_dir("orphans");
+        let part = |name: &str, age: u64| {
+            let path = dir.join(name);
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_modified(std::time::SystemTime::now() - Duration::from_secs(age))
+                .unwrap();
+            path
+        };
+        let own = format!("model.onnx.{}-0.part", std::process::id());
+        let old = part("model.onnx.1-0.part", 600);
+        let recent = part("model.onnx.2-0.part", 5);
+        let mine = part(&own, 600);
+        let other = part("other.onnx.1-0.part", 600);
+        remove_orphans(&dir.join("model.onnx"));
+        assert!(!old.exists());
+        assert!(recent.exists() && mine.exists() && other.exists());
     }
 }

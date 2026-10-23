@@ -493,7 +493,8 @@ fn read_samples(
             tiff.numbers(raw, STRIP_COUNTS).ok_or(Damaged)?,
         ),
     };
-    if tw == 0 || th == 0 {
+    // A tile is never much larger than the image (which is bounded).
+    if tw == 0 || th == 0 || tw > w.next_multiple_of(256) || th > h.next_multiple_of(256) {
         return Err(Damaged);
     }
     let across = w.div_ceil(tw);
@@ -512,12 +513,14 @@ fn read_samples(
             1 => unpack(data, tw * spp, th, bits, tiff.little),
             8 => {
                 let mut bytes = Vec::new();
+                // At most what the tile holds (4 bytes per sample).
                 flate2::read::ZlibDecoder::new(data)
+                    .take(n as u64 * 4)
                     .read_to_end(&mut bytes)
                     .map_err(|_| Damaged)?;
                 unpack(&bytes, tw * spp, th, bits, tiff.little)
             }
-            7 => ljpeg::decode(data).ok_or(Damaged)?,
+            7 => ljpeg::decode(data, n).ok_or(Damaged)?,
             34892 => {
                 let image = image::load_from_memory_with_format(data, image::ImageFormat::Jpeg)
                     .map_err(|_| Damaged)?;

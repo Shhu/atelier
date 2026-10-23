@@ -40,34 +40,7 @@ pub(super) fn document(
     let colors = if cmyk.is_some() { 4 } else { 3 };
     let extra = MAX_CHANNELS - colors - usize::from(transparent);
     let channels = &doc.channels[..doc.channels.len().min(extra)];
-    let mut notes = Vec::new();
-    if channels.len() < doc.channels.len() {
-        notes.push(t!(
-            "xchg-psd-note-channels",
-            count = doc.channels.len() - channels.len()
-        ));
-    }
-    let texts: Vec<&str> = layers
-        .iter()
-        .filter(|l| l.text.is_some())
-        .map(|l| l.name.as_str())
-        .collect();
-    if !texts.is_empty() {
-        notes.push(t!("xchg-psd-note-text-saved", count = texts.len()));
-    }
-    // Smart objects as their rendering: their contents, transform and
-    // smart filters stay in Atelier documents.
-    let smart: Vec<&str> = layers
-        .iter()
-        .filter(|l| l.is_smart())
-        .map(|l| l.name.as_str())
-        .collect();
-    if !smart.is_empty() {
-        notes.push(t!("xchg-psd-note-smart", names = smart.join(", ")));
-    }
-    if cmyk.is_some() && layers.len() > 1 {
-        notes.push(t!("color-psd-note-cmyk-layers"));
-    }
+    let notes = notes(doc, &layers, channels.len(), cmyk.is_some());
 
     // Records from the bottom up: a group's divider before its layers.
     let mut contents = Vec::with_capacity(layers.len());
@@ -150,6 +123,56 @@ pub(super) fn document(
     Ok((out.data, notes))
 }
 
+/// What a Photoshop document of `doc` can't keep, `kept` of its alpha
+/// channels written.
+fn notes(doc: &Document, layers: &[Layer], kept: usize, cmyk: bool) -> Vec<String> {
+    let mut notes = Vec::new();
+    if kept < doc.channels.len() {
+        notes.push(t!(
+            "xchg-psd-note-channels",
+            count = doc.channels.len() - kept
+        ));
+    }
+    let texts: Vec<&str> = layers
+        .iter()
+        .filter(|l| l.text.is_some())
+        .map(|l| l.name.as_str())
+        .collect();
+    if !texts.is_empty() {
+        notes.push(t!("xchg-psd-note-text-saved", count = texts.len()));
+    }
+    // Smart objects as their rendering: their contents, transform and
+    // smart filters stay in Atelier documents.
+    let smart: Vec<&str> = layers
+        .iter()
+        .filter(|l| l.is_smart())
+        .map(|l| l.name.as_str())
+        .collect();
+    if !smart.is_empty() {
+        notes.push(t!("xchg-psd-note-smart", names = smart.join(", ")));
+    }
+    // Shape layers as their rendering.
+    let shapes: Vec<&str> = layers
+        .iter()
+        .filter(|l| l.shape.is_some())
+        .map(|l| l.name.as_str())
+        .collect();
+    if !shapes.is_empty() {
+        notes.push(t!("files3-psd-note-shapes", names = shapes.join(", ")));
+    }
+    if cmyk && layers.len() > 1 {
+        notes.push(t!("color-psd-note-cmyk-layers"));
+    }
+    notes
+}
+
+/// What saving `doc` as a Photoshop document would lose (as [`document`]
+/// says it, without writing).
+pub(super) fn losses(doc: &Document) -> Vec<String> {
+    // At most the channels left with a transparent merged image.
+    notes(doc, &doc.render_layers(), MAX_CHANNELS - 4, false)
+}
+
 /// First index of the block of group `g` (itself and the layers below it
 /// that are deeper).
 fn block_start(layers: &[Layer], g: usize) -> usize {
@@ -218,7 +241,24 @@ fn resources(
     if let Some(icc) = icc {
         resource(r, 1039, &|r| r.bytes(icc));
     }
+    // The Paths panel: the saved paths, named, then the Work Path.
+    let size = (doc.width(), doc.height());
+    for (i, p) in doc.paths.iter().take(SAVED_PATHS).enumerate() {
+        let data = super::vector::records(&p.path, size);
+        r.bytes(b"8BIM");
+        r.u16(2000 + i as u16);
+        r.pascal(&mac_roman(&p.name), 2);
+        r.u32(data.len() as u32);
+        r.bytes(&data);
+        r.zeros(data.len() % 2);
+    }
+    if let Some(p) = &doc.work_path {
+        resource(r, 1025, &|r| r.bytes(&super::vector::records(p, size)));
+    }
 }
+
+/// Saved paths a file holds (resources 2000 to 2997).
+pub(super) const SAVED_PATHS: usize = 998;
 
 /// `text` in Mac OS Roman, what it can't hold as "?" (the record's name;
 /// the "luni" block has the real one).

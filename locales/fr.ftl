@@ -17,7 +17,7 @@ options-lasso-frequency = Fréquence
 options-lasso-frequency-hint = Plus elle est haute, plus les points d'ancrage sont serrés.
 options-position = Position
 options-size = Taille
-options-selection-inverted-hint = Intervertie : tout sauf cette zone.
+options-selection-inverted-hint = Intervertie : tout sauf cette zone.
 options-selection-bounds-hint = Taille de la boîte qui contient la sélection.
 options-no-selection = Aucune sélection.
 options-select-subject = Sélectionner le sujet
@@ -25,14 +25,14 @@ options-remove-background = Supprimer l'arrière-plan
 
 ## Paint Bucket tool options
 
-options-bucket-hint = Remplit avec la couleur de premier plan.
-options-bucket-contiguous-tip = Décoché : remplit aussi les zones de même couleur qui ne touchent pas le clic.
+options-bucket-hint = Remplit avec la couleur de premier plan
+options-bucket-contiguous-tip = Décoché : remplit aussi les zones de même couleur qui ne touchent pas le clic.
 
 ## Type tool options
 
-options-text-locked = Texte verrouillé
-options-text-locked-hint = Déverrouillez-le dans le panneau Calques pour le modifier, ou cliquez ailleurs pour créer un texte.
-options-font-default = Sans-serif (défaut)
+options-text-locked = Calque de texte verrouillé
+options-text-locked-hint = Déverrouillez-le dans le panneau Calques pour le modifier, ou cliquez ailleurs pour créer un calque de texte
+options-font-default = Sans-serif (par défaut)
 options-font = Police
 options-font-search = Rechercher…
 options-align-left = Aligner à gauche
@@ -41,7 +41,7 @@ options-align-right = Aligner à droite
 options-color = Couleur
 options-foreground = Premier plan
 options-use-foreground-tip = Prendre la couleur de premier plan
-options-text-color-hint = Les nouveaux textes prennent la couleur de premier plan.
+options-text-color-hint = Les nouveaux calques de texte prennent la couleur de premier plan
 
 ## Menu bar
 
@@ -103,10 +103,6 @@ menu-view-zoom-in = Zoom avant
 menu-view-zoom-out = Zoom arrière
 menu-view-fit-on-screen = Taille écran
 
-## Tools panel
-
-options-eyedropper-hint = Clic : premier plan · Alt+clic : arrière-plan
-
 ## Colors
 
 panel-foreground = Premier plan
@@ -118,11 +114,11 @@ panel-default-colors = Noir / blanc
 
 ## Brush tool options
 
-options-brush-hint = Peint avec la couleur de premier plan.
+options-brush-hint = Peint avec la couleur de premier plan
 options-hardness = Dureté
 options-opacity = Opacité
 
-## Canvas tool options
+## Crop tool options
 
 options-canvas-origin = Origine { $x }, { $y }
 options-fit-visible-pixels = Ajuster aux pixels visibles
@@ -131,14 +127,14 @@ options-fit-visible-pixels-tip = Cadre exactement le contenu de tous les calques
 ## Move tool options
 
 options-layer-locked = Calque verrouillé
-options-layer-locked-hint = Cliquez un autre élément, ou déverrouillez celui-ci dans le panneau Calques.
+options-layer-locked-hint = Cliquez sur un autre élément, ou déverrouillez celui-ci dans le panneau Calques
 options-center-on-canvas = Centrer dans la zone de travail
 options-rotation = Rotation
 options-constrain-proportions = Conserver les proportions
 options-fit-canvas = Adapter la zone de travail
 options-fit-canvas-tip =
-    Coché : la zone de travail prend exactement la taille et la place de l'élément (pratique pour redimensionner une image seule).
-    Décoché : la zone de travail ne change pas.
+    Coché : la zone de travail prend exactement la taille et la place de l'élément (pratique pour redimensionner une image seule).
+    Décoché : la zone de travail ne change pas.
 
 ## Layers panel
 
@@ -146,7 +142,6 @@ panel-layers = Calques
 panel-delete-layer-tip = Supprimer le calque
 panel-new-layer-tip = Nouveau calque
 panel-no-image = Aucune image.
-panel-visibility-tip = Afficher / masquer (Alt+clic : lui seul)
 panel-unlock-tip = Déverrouiller
 
 ## Layer properties
@@ -182,11 +177,11 @@ menu-edit-language = Langue
 
 ## Tools
 
-tool-transform = Déplacer / redimensionner
+tool-transform = Déplacement
 tool-brush = Pinceau
 tool-eraser = Gomme
-tool-text = Texte
-tool-canvas = Zone de travail
+tool-text = Texte horizontal
+tool-canvas = Recadrage
 tool-bucket = Pot de peinture
 tool-eyedropper = Pipette
 tool-select = Rectangle de sélection
@@ -208,65 +203,60 @@ app-fill-foreground = Couleur de premier plan
 app-fill-background = Couleur d'arrière-plan
 app-fill-color = Couleur…
 app-fill-black = Noir
-app-fill-gray = Gris 50{"\u00A0"}%
+app-fill-gray = Gris 50 %
 app-fill-white = Blanc
 
 ## Status messages, file dialogs and default contents
 
-status-welcome = Ouvrez une image ({ $key }) ou glissez-la dans la fenêtre.
-status-opened = Ouvert : { $path }
-status-open-failed = Impossible d'ouvrir { $path } : { $error }
-status-import-failed = Impossible d'importer { $path } : { $error }
+status-opened = Ouvert : { $path }
+status-open-failed = Impossible d'ouvrir { $path } : { $error }
+status-import-failed = Impossible d'importer { $path } : { $error }
 app-file-filter-all = Tous les fichiers
 app-dialog-save-as = Enregistrer sous
-status-saved = Enregistré : { $path }
-status-layer-moved = « { $name } » en ({ $x }, { $y })
-status-nothing-to-copy = Rien à copier : le calque est vide.
-status-copied = « { $name } » copié
-status-copy-failed = Copie impossible : { $error }
+status-saved = Enregistré : { $path }
+status-nothing-to-copy = Rien à copier : le calque est vide.
+status-copied = « { $name } » copié
+status-copy-failed = Copie impossible : { $error }
 status-clipboard-no-image = Le presse-papiers ne contient pas d'image.
 app-pasted-layer-name = Collé
 status-pasted = Image collée ({ $width } × { $height } px)
 status-no-color = Pas de couleur ici (transparent).
-status-background-color = Couleur d'arrière-plan : { $hex }
-status-foreground-color = Couleur de premier plan : { $hex }
-status-image-size = Taille de l'image : { $width } × { $height } px
-status-filled = « { $name } » rempli avec { $content }
+status-background-color = Couleur d'arrière-plan : { $hex }
+status-foreground-color = Couleur de premier plan : { $hex }
+status-image-size = Taille de l'image : { $width } × { $height } px
+status-filled = « { $name } » rempli avec { $content }
 status-no-visible-pixel = Ce calque n'a pas de pixel visible dans la zone.
-status-layer-is-locked = « { $name } » est verrouillé : déverrouillez-le dans le panneau Calques.
+status-layer-is-locked = « { $name } » est verrouillé : déverrouillez-le dans le panneau Calques.
 status-selection-empty = La sélection est vide sur ce calque.
-status-layer-locked = « { $name } » verrouillé
-status-layer-unlocked = « { $name } » déverrouillé
+status-layer-locked = « { $name } » verrouillé
+status-layer-unlocked = « { $name } » déverrouillé
 app-dialog-open-image = Ouvrir une image
-status-fill-foreground-color = la couleur de premier plan
-status-fill-background-color = la couleur d'arrière-plan
-status-element-fills-canvas = « { $name } » remplit déjà toute la zone de travail.
+status-element-fills-canvas = « { $name } » remplit déjà toute la zone de travail.
 status-content-fills-canvas = Le contenu remplit déjà toute la zone de travail.
 status-nothing-to-crop = Rien de visible à recadrer.
-status-layers-merged = Calques fusionnés dans « { $name } »
-status-merge-down-failed = Fusion impossible : il faut un calque visible et non verrouillé dessous.
+status-layers-merged = Calques fusionnés dans « { $name } »
+status-merge-down-failed = Fusion impossible : il faut un calque visible et non verrouillé dessous.
 status-merge-visible-failed = Il faut au moins deux calques visibles à fusionner.
-status-canvas-size = Zone de travail : { $width } × { $height } px
 status-rotated = , tourné de { $angle }°
-status-canvas-fit-element = Zone de travail ajustée à l'élément : { $width } × { $height } px{ $rotated }
-status-element-placed = Élément : { $width } × { $height } px en ({ $x }, { $y }){ $rotated }
-status-hardness = Dureté : { $value }{"\u00A0"}%
-status-brush-size = Taille : { $value } px
-status-tool-opacity = Opacité de l'outil : { $percent }{"\u00A0"}%
-status-layer-opacity = Opacité de « { $name } » : { $percent }{"\u00A0"}%
+status-canvas-fit-element = Zone de travail ajustée à l'élément : { $width } × { $height } px{ $rotated }
+status-element-placed = Élément : { $width } × { $height } px en ({ $x }, { $y }){ $rotated }
+status-hardness = Dureté : { $value } %
+status-brush-size = Taille : { $value } px
+status-tool-opacity = Opacité de l'outil : { $percent } %
+status-layer-opacity = Opacité de « { $name } » : { $percent } %
 
 ## Split into elements
 
-dialog-split-empty = « { $name } » est vide : rien à séparer.
-dialog-split-single = « { $name } » ne contient qu'un élément avec cet écart.
-dialog-split-done = « { $name } » séparé en { $count } calques.
+dialog-split-empty = « { $name } » est vide : rien à séparer.
+dialog-split-single = « { $name } » ne contient qu'un élément avec cet écart.
+dialog-split-done = « { $name } » séparé en { $count } calques.
 dialog-split-title = Séparer en éléments
 dialog-split-layer = Calque
 dialog-split-gap = Écart max. dans un élément
 dialog-split-gap-hint = Augmentez pour regrouper les lettres d'un mot, diminuez pour séparer des éléments proches.
 dialog-split-no-pixels = Aucun pixel visible.
 dialog-split-found = { $count ->
-    [one] 1 seul élément trouvé.
+    [one] { $count } seul élément trouvé.
    *[other] { $count } éléments trouvés.
 }
 dialog-split-apply = Séparer
@@ -277,7 +267,7 @@ dialog-cancel = Annuler
 dialog-transparency-title = Rendre une couleur transparente
 dialog-transparency-color = Couleur à retirer
 dialog-transparency-color-tip = Ou cliquez sur l'image
-dialog-transparency-hint = Astuce : cliquez sur l'image pour la choisir.
+dialog-transparency-hint = Astuce : cliquez sur l'image pour la choisir.
 dialog-transparency-tolerance = Tolérance
 dialog-transparency-softness = Adoucissement
 dialog-apply = Appliquer
@@ -300,8 +290,7 @@ dialog-adjust-brightness = Luminosité
 dialog-adjust-contrast = Contraste
 dialog-adjust-channel = Couche
 dialog-adjust-auto = Auto
-dialog-adjust-auto-tip = Étire chaque couche en ignorant 0,1{"\u00A0"}% de pixels à chaque bout
-dialog-curves-hint = Cliquez pour ajouter un point ; glissez-le hors du graphique (ou Ctrl+clic, Suppr) pour le retirer. Flèches : déplacer le point, Ctrl+Tab : point suivant.
+dialog-adjust-auto-tip = Étire chaque couche en ignorant 0,1 % de pixels à chaque bout
 dialog-adjust-vibrance = Vibrance
 dialog-adjust-saturation = Saturation
 dialog-vibrance-hint = La vibrance ravive surtout les couleurs ternes et épargne celles déjà vives (tons chair compris).
@@ -313,7 +302,7 @@ dialog-adjust-reset = Réinitialiser
 dialog-ok = OK
 dialog-preview = Aperçu
 dialog-close-tip = Fermer
-dialog-adjust-applied = Réglage « { $name } » appliqué
+dialog-adjust-applied = Réglage « { $name } » appliqué
 
 ## Fill
 
@@ -322,12 +311,12 @@ dialog-fill-contents = Contenu
 dialog-fill-color-tip = Couleur de remplissage
 dialog-fill-opacity = Opacité
 dialog-fill-preserve-transparency = Préserver la transparence
-dialog-fill-preserve-transparency-tip = Les pixels gardent leur opacité : le vide reste vide
+dialog-fill-preserve-transparency-tip = Les pixels gardent leur opacité : le vide reste vide
 dialog-fill-with-foreground = la couleur de premier plan
 dialog-fill-with-background = la couleur d'arrière-plan
 dialog-fill-with-color = la couleur { $color }
 dialog-fill-with-black = du noir
-dialog-fill-with-gray = du gris 50{"\u00A0"}%
+dialog-fill-with-gray = du gris 50 %
 dialog-fill-with-white = du blanc
 
 ## Image size
@@ -336,7 +325,7 @@ dialog-image-size-title = Taille de l'image
 dialog-image-size-current = Actuelle
 dialog-image-size-constrain = Conserver les proportions
 dialog-image-size-resample = Rééchantillonnage
-dialog-image-size-hint = Tous les calques suivent ; les textes restent modifiables.
+dialog-image-size-hint = Tous les calques suivent ; les textes restent modifiables.
 
 ## AI model download
 
@@ -347,7 +336,7 @@ dialog-model-no-ai = Sans IA
 ## Unsaved changes
 
 dialog-confirm-title = Modifications non enregistrées
-dialog-confirm-text = Enregistrer les modifications de « { $name } » ?
+dialog-confirm-text = Enregistrer les modifications de « { $name } » ?
 dialog-confirm-hint = Sinon, elles seront perdues.
 dialog-confirm-save = Enregistrer
 dialog-confirm-dont-save = Ne pas enregistrer
@@ -364,12 +353,12 @@ dialog-curves-output = Sortie
 ## Selection tools
 
 select-wand-outside-layer = Cliquez sur les pixels du calque actif.
-select-ai-unavailable = IA indisponible : { $error } ; méthode sans IA utilisée.
+select-ai-unavailable = IA indisponible : { $error } ; méthode sans IA utilisée.
 select-subject-searching = Recherche du sujet…
 select-subject-failed = La recherche du sujet a échoué.
-select-subject-not-found = Aucun sujet net trouvé : essayez le lasso magnétique ou la baguette magique.
+select-subject-not-found = Aucun sujet net trouvé : essayez le lasso magnétique ou la baguette magique.
 select-layer-changed = Le calque a changé pendant la recherche.
-select-background-removed = Arrière-plan de « { $name } » supprimé
+select-background-removed = Arrière-plan de « { $name } » supprimé
 select-subject-selected-note = Sujet sélectionné — { $note }
 select-subject-selected = Sujet sélectionné
 
@@ -392,16 +381,16 @@ canvas-menu-adjustments = Réglages
 
 ## Canvas status messages
 
-canvas-status-text-rasterized = « { $name } » converti en pixels (n'est plus modifiable comme texte)
-canvas-status-layer-moved = « { $name } » déplacé en ({ $x }, { $y })
+canvas-status-text-rasterized = « { $name } » converti en pixels (n'est plus modifiable comme texte)
+canvas-status-layer-moved = « { $name } » déplacé en ({ $x }, { $y })
 
 ## Document: default names
 
-doc-background-layer-name = Fond
+doc-background-layer-name = Arrière-plan
 doc-untitled = Sans titre
 doc-image-layer-default-name = Image
 doc-layer-default-name = Calque { $number }
-doc-layer-copy-name = { $name } (copie)
+doc-layer-copy-name = { $name } copie
 doc-layer-selection-name = { $name } (sélection)
 doc-text-layer-default-name = Texte
 
@@ -409,7 +398,7 @@ doc-text-layer-default-name = Texte
 
 blend-normal = Normal
 blend-multiply = Produit
-blend-screen = Écran
+blend-screen = Superposition
 
 ## Image adjustments (Image > Adjustments menu, adjustment window titles)
 
@@ -448,7 +437,7 @@ palette-suggested = Suggestions
 palette-tools = Outils
 palette-commands = Commandes
 palette-tool = Outil
-palette-no-match = Aucune commande ne correspond à « { $query } ».
+palette-no-match = Aucune commande ne correspond à « { $query } ».
 palette-navigate = Naviguer
 palette-run = Exécuter
 palette-close = Fermer
@@ -471,7 +460,7 @@ optbar-select-new = Nouvelle sélection
 
 ## Options bar: Eraser tool
 
-optbar-eraser-hint = Efface jusqu'à la transparence sur le calque actif.
+optbar-eraser-hint = Efface jusqu'à la transparence sur le calque actif
 
 ## Options bar: Eyedropper tool
 
@@ -485,7 +474,7 @@ optbar-use-foreground = Utiliser le premier plan
 
 side-kind-image = Image
 side-kind-text = Texte
-side-kind-locked = { $kind } · verrouillé
+side-kind-locked = { $kind } · non modifiable
 side-locked-notice = Calque verrouillé — déverrouillez-le dans le panneau Calques.
 side-transform = Transformation
 side-rotate-left-tip = Rotation de 90° antihoraire
@@ -511,7 +500,7 @@ doc-tab-close = Fermer
 
 ## Zoom bar
 
-zoombar-actual-pixels = 100{"\u00A0"}%
+zoombar-actual-pixels = 100 %
 
 ## Start screen (no image open)
 
@@ -558,7 +547,7 @@ hint-background = arrière-plan
 hint-keep-ratio = garder les proportions
 hint-zoom-in = zoom avant
 hint-zoom-out = zoom arrière
-hint-hand-any-tool = la main avec tout outil
+hint-hand-any-tool = la main, depuis n'importe quel outil
 hint-zoom = zoom
 hint-fit = taille écran
 
@@ -576,13 +565,13 @@ dialog-rotate-angle = Angle
 dialog-rotate-cw = ° horaire
 dialog-rotate-ccw = ° antihoraire
 status-image-rotated = Image pivotée de { $angle }°
-status-canvas-resized = Zone de travail : { $width } × { $height } px
+status-canvas-resized = Zone de travail : { $width } × { $height } px
 
 ## AI Models window
 
 models-menu = Modèles d'IA…
 models-title = Modèles d'IA
-models-hint = Les modèles d'IA fonctionnent sur cet ordinateur : aucune image n'est envoyée en ligne.
+models-hint = Les modèles d'IA fonctionnent sur cet ordinateur : aucune image n'est envoyée en ligne.
 models-state-downloaded = Téléchargé
 models-state-downloading = Téléchargement…
 models-state-incomplete = Incomplet
@@ -596,7 +585,7 @@ models-device-cpu = CPU
 models-device-gpu-if-available = GPU si disponible
 models-delete = Supprimer
 models-in-use = En cours d'utilisation
-models-total = Espace disque utilisé : { $size }
+models-total = Espace disque utilisé : { $size }
 models-open-folder = Ouvrir le dossier
 models-open-folder-failed = Impossible d'ouvrir le dossier des modèles ({ $error }).
 models-size-mb = { $size } Mo
@@ -605,15 +594,15 @@ models-size-gb = { $size } Go
 ## Deleting a model
 
 models-delete-title = Supprimer le modèle
-models-delete-text = Supprimer { $name } de cet ordinateur ? Cela libère { $size }.
-models-delete-hint = Utilisé par : { $feature }. Son téléchargement vous sera de nouveau proposé la prochaine fois que vous l'utiliserez.
+models-delete-text = Supprimer { $name } de cet ordinateur ? Cela libère { $size }.
+models-delete-hint = Utilisé par : { $feature }. Son téléchargement vous sera de nouveau proposé la prochaine fois que vous l'utiliserez.
 
 ## Model download
 
 models-prompt-title = Télécharger un modèle d'IA
-models-prompt-text = « { $feature } » utilise un modèle d'IA, { $name }, qui fonctionne sur cet ordinateur. Il faut le télécharger une fois : { $size }.
+models-prompt-text = « { $feature } » utilise un modèle d'IA, { $name }, qui fonctionne sur cet ordinateur. Il faut le télécharger une fois : { $size }.
 models-prompt-hint = Aucune image n'est envoyée en ligne. Vous pouvez supprimer le modèle à tout moment dans Édition › Modèles d'IA.
-models-status-downloading = Téléchargement de { $name }… { $percent }{"\u00A0"}%
+models-status-downloading = Téléchargement de { $name }… { $percent } %
 models-status-downloaded = { $name } téléchargé.
 models-status-failed = Impossible de télécharger { $name } ({ $error }).
 models-status-deleted = { $name } supprimé.
@@ -624,7 +613,7 @@ models-status-delete-failed = Impossible de supprimer { $name } ({ $error }).
 objsel-tool = Sélection d'objet
 objsel-hint = Cliquez sur un objet ou tracez un rectangle autour.
 objsel-analysing = Analyse de l'image…
-objsel-downloading = Téléchargement du modèle de sélection d'objet… { $percent }{"\u00A0"}%
+objsel-downloading = Téléchargement du modèle de sélection d'objet… { $percent } %
 objsel-failed = La sélection d'objet a échoué ({ $error })
 objsel-not-found = Aucun objet trouvé à cet endroit.
 
@@ -641,8 +630,8 @@ file-export-title = Exporter sous
 file-export-format = Format
 file-export-quality = Qualité
 file-export-ok = Exporter
-file-export-jpeg-hint = Le JPEG n'a pas de transparence : les zones transparentes deviennent blanches.
-file-export-lossless-hint = Sans perte : chaque pixel est conservé, transparence comprise.
+file-export-jpeg-hint = Le JPEG n'a pas de transparence : les zones transparentes deviennent blanches.
+file-export-lossless-hint = Sans perte : chaque pixel est conservé, transparence comprise.
 
 ## File dialogs
 
@@ -651,13 +640,13 @@ file-filter-atelier = Document Atelier
 
 ## File status messages
 
-file-status-opened-first-frame = Ouvert : { $path } (première image seulement : les animations ne sont pas prises en charge)
-file-status-imported-first-frame = Calque ajouté : { $path } (première image seulement : les animations ne sont pas prises en charge)
-file-status-open-in-another-tab = « { $name } » est ouvert dans un autre onglet : fermez-le d'abord, ou choisissez un autre nom.
-file-status-save-failed = Impossible d'enregistrer « { $name } » : { $error }. Rien n'a été écrasé.
-file-status-exported = Exporté : { $path }
-file-status-export-failed = Impossible d'exporter « { $name } » : { $error }. Rien n'a été écrasé.
-file-status-paste-failed = Impossible de coller l'image : { $error }
+file-status-opened-first-frame = Ouvert : { $path } (première image seulement : les animations ne sont pas prises en charge)
+file-status-imported-first-frame = Calque ajouté : { $path } (première image seulement : les animations ne sont pas prises en charge)
+file-status-open-in-another-tab = « { $name } » est ouvert dans un autre onglet : fermez-le d'abord, ou choisissez un autre nom.
+file-status-save-failed = Impossible d'enregistrer « { $name } » : { $error }. Rien n'a été écrasé.
+file-status-exported = Exporté : { $path }
+file-status-export-failed = Impossible d'exporter « { $name } » : { $error }. Rien n'a été écrasé.
+file-status-paste-failed = Impossible de coller l'image : { $error }
 
 ## File errors (after "Could not open …:")
 
@@ -666,25 +655,25 @@ file-error-permission = accès refusé
 file-error-disk-full = espace disque insuffisant
 file-error-damaged = le fichier est endommagé ou incomplet
 file-error-unsupported = format de fichier non pris en charge
-file-error-too-large = l'image est trop grande ({ $width } × { $height } px ; { $max } px au plus par côté)
+file-error-too-large = l'image est trop grande ({ $width } × { $height } px ; { $max } px au plus par côté)
 file-error-empty = l'image est vide (0 pixel)
 file-error-not-atelier = ce n'est pas un document Atelier
-file-error-newer-version = créé par une version plus récente d'Atelier (format { $version }) : mettez Atelier à jour pour l'ouvrir
+file-error-newer-version = créé par une version plus récente d'Atelier (format { $version }) : mettez Atelier à jour pour l'ouvrir
 file-error-format-limit = les images { $format } sont limitées à { $max } px par côté
 
 ## Layer merging
 
-doc-merge-locked = Fusion impossible : un calque est verrouillé.
-doc-merge-too-large = Fusion impossible : les calques sont trop éloignés.
+doc-merge-locked = Fusion impossible : un calque est verrouillé.
+doc-merge-too-large = Fusion impossible : les calques sont trop éloignés.
 
 ## Flatten Image
 
-doc-discard-hidden = Supprimer les calques masqués ?
+doc-discard-hidden = Supprimer les calques masqués ?
 
 ## Selection and Move tools: refusals
 
-select-layer-hidden = « { $name } » est masqué : affichez-le pour déplacer ses pixels.
-select-element-too-large = L'élément dépasserait { $max } px : transformation non appliquée.
+select-layer-hidden = « { $name } » est masqué : affichez-le pour déplacer ses pixels.
+select-element-too-large = L'élément dépasserait { $max } px : transformation non appliquée.
 
 ## AI errors and devices (fix-ai)
 ai-error-internal = erreur interne
@@ -694,7 +683,7 @@ ai-device-gpu-and-cpu = GPU (DirectML) et CPU
 ## Numbers
 
 number-decimal-separator = ,
-number-percent = { $value }{"\u00A0"}%
+number-percent = { $value } %
 
 ## Key names (menus, tooltips, palette, status bar)
 
@@ -728,7 +717,7 @@ core-blend-hue = Teinte
 core-blend-saturation = Saturation
 core-blend-color = Couleur
 core-blend-luminosity = Luminosité
-core-status-blend = { $name } : { $mode }
+core-status-blend = { $name } : { $mode }
 
 ## Adjustments (Image > Adjustments, adjustment layers)
 
@@ -764,7 +753,7 @@ core-kind-group = Groupe
 core-kind-fill = Remplissage
 core-group-name = Groupe { $number }
 core-layer-numbered-name = { $name } { $number }
-core-solid-fill-name = Couleur unie { $number }
+core-solid-fill-name = Remplissage de couleur { $number }
 core-gradient-fill-name = Dégradé { $number }
 core-solid-color = Couleur unie
 core-gradient = Dégradé
@@ -772,20 +761,20 @@ core-gradient = Dégradé
 ## Properties panel: layer, fill layer, mask, styles
 
 core-fill-opacity = Fond
-core-fill-opacity-tip = Opacité du fond : comme l'opacité, mais les styles de calque gardent la leur
+core-fill-opacity-tip = Opacité du fond : comme l'opacité, mais les styles de calque gardent la leur
 core-fill-content = Remplissage
 core-fill-color = Couleur
-core-mask = Masque de fond
+core-mask = Masque de fusion
 core-mask-density = Densité
 core-mask-feather = Contour progressif
 core-mask-load-selection = Récupérer la sélection du masque
 core-mask-invert = Inverser
 core-mask-apply = Appliquer le masque
 core-mask-delete = Supprimer le masque
-core-mask-enable = Activer le masque de fond
-core-mask-disable = Désactiver le masque de fond
+core-mask-enable = Activer le masque de fusion
+core-mask-disable = Désactiver le masque de fusion
 core-mask-link = Lier
-core-mask-unlink = Annuler le lien
+core-mask-unlink = Délier
 core-mask-reveal-all = Tout faire apparaître
 core-mask-hide-all = Tout masquer
 core-mask-reveal-selection = Faire apparaître la sélection
@@ -794,12 +783,10 @@ core-style-open-tip = Réglages dans la fenêtre Style de calque
 
 ## Layers panel
 
-core-layer-row-tip = Glisser pour réorganiser, ou dans un groupe · double-clic : renommer · Alt+clic : écrêter sur le calque du dessous · Ctrl+clic sur une vignette : ses pixels ou son masque en sélection · sur le masque : Maj+clic le désactive ou l'active, Alt+clic l'affiche seul
 core-group-fold-tip = Ouvrir / fermer le groupe
 core-link-layers-tip = Lier les calques
-core-unlink-layers-tip = Annuler le lien des calques
+core-unlink-layers-tip = Délier les calques
 core-styles-tip = Ajouter un style de calque
-core-add-mask-tip = Ajouter un masque de fond (Alt : tout masquer)
 core-new-adjustment-tip = Nouveau calque de remplissage ou de réglage
 core-new-group-tip = Nouveau groupe
 
@@ -809,10 +796,10 @@ core-menu-new-group = Nouveau groupe
 core-menu-layer-style = Style de calque
 core-menu-new-fill-layer = Nouveau calque de remplissage
 core-menu-new-adjustment-layer = Nouveau calque de réglage
-core-menu-layer-mask = Masque de fond
+core-menu-layer-mask = Masque de fusion
 core-menu-create-clipping = Créer un masque d'écrêtage
 core-menu-release-clipping = Annuler le masque d'écrêtage
-core-menu-group-layers = Grouper des calques
+core-menu-group-layers = Grouper les calques
 core-menu-ungroup-layers = Dissocier les calques
 core-menu-merge-group = Fusionner le groupe
 
@@ -845,7 +832,7 @@ core-glow-choke = Maigri
 
 filter-menu = Filtre
 filter-last = Dernier filtre
-filter-group-blur = Atténuation
+filter-group-blur = Flou
 filter-group-noise = Bruit
 filter-group-pixelate = Pixellisation
 filter-group-render = Rendu
@@ -873,12 +860,12 @@ filter-high-pass = Passe-haut
 filter-maximum = Maximum
 filter-minimum = Minimum
 filter-offset = Translation
-filter-applied = Filtre « { $name } » appliqué
-filter-no-pixels = Ce calque n'a pas de pixels à filtrer : choisissez un calque de pixels, ou son masque.
+filter-applied = Filtre « { $name } » appliqué
+filter-no-pixels = Ce calque n'a pas de pixels à filtrer : choisissez un calque de pixels, ou son masque.
 
 ## Filter dialogs
 
-filter-preview-tip = Faites glisser pour voir ailleurs ; maintenez le bouton enfoncé pour voir l'original.
+filter-preview-tip = Faites glisser pour voir ailleurs ; maintenez le bouton enfoncé pour voir l'original.
 filter-radius = Rayon
 filter-amount = Quantité
 filter-sharpen-amount = Gain
@@ -1001,7 +988,7 @@ sel-range-preview-black = Cache noir
 sel-range-preview-white = Cache blanc
 sel-range-preview-quick-mask = Masque
 sel-range-invert = Inverser
-sel-range-hint = Cliquez dans l'image pour échantillonner une couleur : { $add } en ajoute une, { $subtract } en soustrait une.
+sel-range-hint = Cliquez dans l'image pour échantillonner une couleur : { $add } en ajoute une, { $subtract } en soustrait une.
 
 ## Select and Mask
 
@@ -1028,15 +1015,15 @@ sel-mask-replaces-mask = Le masque du calque est remplacé.
 
 ## Transform Selection
 
-sel-transform-hint = Faites glisser les poignées pour mettre à l'échelle, hors du cadre pour faire pivoter.
+sel-transform-hint = Faites glisser les poignées pour mettre à l'échelle, hors du cadre pour faire pivoter
 
 ## Status messages
 
 sel-status-working = Calcul de la sélection…
 sel-status-nothing-selected = Plus aucun pixel n'est sélectionné.
-sel-status-faint = Aucun pixel n'est sélectionné à plus de 50{" "}% : les contours de la sélection ne seront pas visibles.
-sel-status-saved = Sélection mémorisée dans « { $name } ».
-sel-status-quick-mask-on = Mode Masque : peignez en noir pour masquer, en blanc pour sélectionner ; { $key } pour terminer.
+sel-status-faint = Aucun pixel n'est sélectionné à plus de 50 % : les contours de la sélection ne seront pas visibles.
+sel-status-saved = Sélection mémorisée dans « { $name } ».
+sel-status-quick-mask-on = Mode Masque : peignez en noir pour masquer, en blanc pour sélectionner ; { $key } pour terminer.
 sel-status-quick-mask-off = Sélection créée à partir du masque.
 
 ## Painting tools: names
@@ -1051,7 +1038,7 @@ paint-tool-smudge = Doigt
 
 ## Brush preset picker and brush options
 
-paint-brush-picker-tip = Forme : taille, dureté, angle, arrondi, pas et formes prédéfinies
+paint-brush-picker-tip = Forme : taille, dureté, angle, arrondi, pas et formes prédéfinies
 paint-angle = Angle
 paint-roundness = Arrondi
 paint-spacing = Pas
@@ -1068,7 +1055,7 @@ paint-airbrush-tip = Activer les effets d'aérographe (accumulation)
 paint-pressure-opacity-tip = Toujours utiliser la pression pour l'opacité (tablette graphique)
 paint-pressure-size-tip = Toujours utiliser la pression pour la taille (tablette graphique)
 paint-mode = Mode
-paint-range = Gamme
+paint-range = Plage
 paint-range-shadows = Tons foncés
 paint-range-midtones = Tons moyens
 paint-range-highlights = Tons clairs
@@ -1083,12 +1070,12 @@ paint-strength = Intensité
 paint-sample-all-tip = Agit sur ce que montrent tous les calques visibles, et peint le résultat sur le calque actif
 paint-finger-painting = Peinture au doigt
 paint-finger-painting-tip = Commence chaque tracé avec la couleur de premier plan
-paint-dodge-hint = Éclaircit les zones peintes.
-paint-burn-hint = Assombrit les zones peintes.
-paint-sponge-hint = Modifie la saturation des couleurs des zones peintes.
-paint-blur-hint = Adoucit les contours nets des zones peintes.
-paint-sharpen-hint = Accentue le contraste des contours des zones peintes.
-paint-smudge-hint = Étale la couleur le long du tracé, comme un doigt dans la peinture fraîche.
+paint-dodge-hint = Éclaircit les zones peintes
+paint-burn-hint = Assombrit les zones peintes
+paint-sponge-hint = Modifie la saturation des couleurs des zones peintes
+paint-blur-hint = Adoucit les contours nets des zones peintes
+paint-sharpen-hint = Accentue le contraste des contours des zones peintes
+paint-smudge-hint = Étale la couleur le long du tracé, comme un doigt dans la peinture fraîche
 
 ## Gradient tool options
 
@@ -1104,7 +1091,7 @@ paint-gradient-dither = Simuler
 paint-gradient-dither-tip = Ajoute un léger bruit pour éviter les effets de bandes
 paint-gradient-transparency = Transparence
 paint-gradient-transparency-tip = Utilise les arrêts d'opacité du dégradé
-paint-gradient-hint = Faites glisser sur l'image pour tracer le dégradé.
+paint-gradient-hint = Faites glisser sur l'image pour tracer le dégradé
 paint-gradient-fg-to-bg = Premier plan vers arrière-plan
 paint-gradient-fg-to-transparent = Premier plan vers transparent
 paint-gradient-black-white = Noir, blanc
@@ -1136,10 +1123,10 @@ paint-hint-sharpen = netteté
 paint-hint-finger-painting = peinture au doigt
 paint-hint-gradient = tracer le dégradé
 paint-hint-45 = par pas de 45°
-paint-status-flow = Flux : { $percent }{" "}%
-paint-status-exposure = Exposition : { $percent }{" "}%
-paint-status-strength = Intensité : { $percent }{" "}%
-paint-status-nothing-to-paint = Ce calque n'a pas de pixels à peindre : ajoutez un masque de fusion, ou choisissez un calque de pixels.
+paint-status-flow = Flux : { $percent } %
+paint-status-exposure = Exposition : { $percent } %
+paint-status-strength = Intensité : { $percent } %
+paint-status-nothing-to-paint = Ce calque n'a pas de pixels à peindre : ajoutez un masque de fusion, ou choisissez un calque de pixels.
 
 ## Color Picker
 
@@ -1148,7 +1135,7 @@ uip-picker-foreground-title = Sélecteur de couleurs (couleur de premier plan)
 uip-picker-background-title = Sélecteur de couleurs (couleur d'arrière-plan)
 uip-picker-new = nouvelle
 uip-picker-current = actuelle
-uip-picker-current-tip = Cliquer pour revenir à la couleur actuelle
+uip-picker-current-tip = Cliquez pour revenir à la couleur actuelle
 uip-picker-add-to-swatches = Ajouter au nuancier
 uip-picker-h = T
 uip-picker-s = S
@@ -1157,14 +1144,14 @@ uip-picker-red = R
 uip-picker-green = V
 uip-picker-blue = B
 uip-picker-sample-hint = Cliquez sur l'image pour y prélever une couleur.
-uip-status-swatch-added = Ajouté au nuancier : { $hex }
+uip-status-swatch-added = Ajouté au nuancier : { $hex }
 
 ## Swatches panel
 
 uip-swatches-title = Nuancier
 uip-swatches-recent = Couleurs utilisées récemment
 uip-swatches-new-tip = Créer une nuance à partir de la couleur de premier plan
-uip-swatches-hint = Clic : premier plan · { $background } : arrière-plan · { $delete } : supprimer
+uip-swatches-hint = Clic : premier plan · { $background } : arrière-plan · { $delete } : supprimer
 
 ## View, Window and Edit menus
 
@@ -1214,7 +1201,7 @@ retouch-tool-red-eye = Œil rouge
 ## Retouching tools: options bar
 
 retouch-aligned = Aligné
-retouch-aligned-tip = Garder le même décalage avec la source d'un tracé à l'autre ; décoché, chaque tracé repart du point source
+retouch-aligned-tip = Garder le même décalage avec la source d'un tracé à l'autre ; décoché, chaque tracé repart du point source
 retouch-sample = Échantillon
 retouch-sample-current = Calque actif
 retouch-sample-below = Calque actif et inférieurs
@@ -1227,16 +1214,14 @@ retouch-proximity-match-tip = Remplir la zone avec les pixels voisins dont le bo
 retouch-spot-sample-all-tip = Remplir à partir de ce que montrent tous les calques visibles
 retouch-patch = Pièce
 retouch-patch-source = Source
-retouch-patch-source-tip = Faire glisser la sélection vers la zone qui servira à la réparer
+retouch-patch-source-tip = Faites glisser la sélection vers la zone qui servira à la réparer
 retouch-patch-destination = Destination
-retouch-patch-destination-tip = Faire glisser la sélection vers la zone qu'elle doit réparer
+retouch-patch-destination-tip = Faites glisser la sélection vers la zone qu'elle doit réparer
 retouch-pupil-size = Taille de la pupille
 retouch-darken-amount = Valeur d'obscurcissement
-retouch-clone-hint = Alt + clic pour définir la source, puis peindre pour la copier
-retouch-healing-hint = Alt + clic pour définir la source, puis peindre : sa texture se fond dans les couleurs alentour
-retouch-spot-hint = Peindre sur un défaut pour le faire disparaître
-retouch-patch-hint = Sélectionner une zone, puis la faire glisser
-retouch-red-eye-hint = Cliquer sur une pupille rouge
+retouch-spot-hint = Peignez sur un défaut pour le faire disparaître
+retouch-patch-hint = Sélectionnez une zone, puis faites-la glisser
+retouch-red-eye-hint = Cliquez sur une pupille rouge
 
 ## Retouching tools: status bar hints and messages
 
@@ -1246,13 +1231,13 @@ retouch-key-drag-inside = Glisser dedans
 retouch-hint-patch = réparer
 retouch-hint-red-eye = corriger un œil rouge
 retouch-status-source-set = Source définie
-retouch-status-no-source = { $keys } pour définir d'abord la source
-retouch-status-nothing-to-sample = Rien autour à échantillonner
-retouch-status-no-red-eye = Aucun œil rouge trouvé ici
-retouch-status-select-first = Sélectionnez d'abord la zone à remplir
+retouch-status-no-source = { $keys } pour définir d'abord la source.
+retouch-status-nothing-to-sample = Rien autour à échantillonner.
+retouch-status-no-red-eye = Aucun œil rouge trouvé ici.
+retouch-status-select-first = Sélectionnez d'abord la zone à remplir.
 retouch-needs-selection = Sélection requise
 retouch-status-cancelled = { $name } annulé
-retouch-status-ai-failed = Le modèle d'IA a échoué ({ $error }) : remplissage fait sans lui
+retouch-status-ai-failed = Le modèle d'IA a échoué ({ $error }) : remplissage fait sans lui.
 
 ## Content-Aware Fill
 
@@ -1268,7 +1253,7 @@ retouch-output-current = Calque actif
 retouch-output-new = Nouveau calque
 retouch-use-ai = Utiliser le modèle d'IA (LaMa)
 retouch-use-ai-download = Utiliser le modèle d'IA (LaMa, { $size } à télécharger)
-retouch-use-ai-hint = Le modèle d'IA remplit les grandes zones et les scènes complexes ; sans lui, le remplissage est fait de morceaux pris dans l'image.
+retouch-use-ai-hint = Le modèle d'IA remplit les grandes zones et les scènes complexes ; sans lui, le remplissage est fait de morceaux pris dans l'image.
 retouch-model-purpose = Remplissage d'après le contenu, Correcteur localisé
 retouch-model-hint = Aucune image n'est envoyée en ligne. Sans IA, le remplissage est fait de morceaux pris dans l'image.
 
@@ -1310,8 +1295,8 @@ xform-hint-perspective = perspective
 
 ## Free Transform status messages
 
-xform-status-done = { $what } : « { $name } »
-xform-status-nothing = Rien à transformer sur « { $name } ».
+xform-status-done = { $what } : « { $name } »
+xform-status-nothing = Rien à transformer sur « { $name } ».
 xform-status-empty = La zone sélectionnée est vide.
 xform-status-no-again = Aucune transformation à répéter.
 
@@ -1342,7 +1327,7 @@ vector-layer-name = { $kind } { $number }
 
 vector-mode-shape = Forme
 vector-mode-path = Tracé
-vector-mode-tip = Choisir un mode d'outil : un calque de forme, ou un tracé
+vector-mode-tip = Choisir un mode d'outil : un calque de forme, ou un tracé
 vector-fill = Fond
 vector-fill-tip = Définir le type de fond de la forme
 vector-stroke = Contour
@@ -1375,7 +1360,7 @@ vector-op-exclude = Exclure les formes superposées
 vector-corner-radius = Rayon des angles
 vector-sides = Côtés
 vector-star-ratio = Rapport d'étoile
-vector-star-ratio-tip = Rayon intérieur de l'étoile, en pourcentage du rayon extérieur (100 % : un polygone)
+vector-star-ratio-tip = Rayon intérieur de l'étoile, en pourcentage du rayon extérieur (100 % : un polygone)
 vector-weight = Épaisseur
 vector-weight-tip = Épaisseur du trait
 vector-arrow-start = Flèche au début
@@ -1389,7 +1374,7 @@ vector-custom-bubble = Bulle
 vector-custom-bolt = Éclair
 vector-auto-add-delete = Ajout/suppression auto.
 vector-auto-add-delete-tip = Un clic sur un segment du tracé sélectionné ajoute un point d'ancrage, sur un point d'ancrage le supprime
-vector-pen-hint = Clic : point d'angle · glisser : point lisse · le premier point ferme le tracé
+vector-pen-hint = Clic : point d'angle · glisser : point lisse · le premier point ferme le tracé
 vector-freeform-hint = Faites glisser pour dessiner un tracé
 vector-anchor-tools-hint = Cliquez sur le tracé sélectionné
 vector-path-select-hint = Cliquez sur un tracé pour le sélectionner, faites-le glisser pour le déplacer
@@ -1445,21 +1430,17 @@ vector-radius-bottom-left = Rayon de l'angle inférieur gauche
 vector-radius-bottom-right = Rayon de l'angle inférieur droit
 vector-radii-linked = Même rayon pour tous les angles
 vector-menu-rasterize = Pixelliser le calque
-vector-status-rasterized = « { $name } » pixellisé (n'est plus modifiable comme texte ou forme)
+vector-status-rasterized = « { $name } » pixellisé (n'est plus modifiable comme texte ou forme)
 
 ## Paths panel and its dialogs
 
 vector-menu-paths = Tracés
 vector-paths-title = Tracés
-vector-paths-empty = Aucun tracé : dessinez-en un avec la plume.
+vector-paths-empty = Aucun tracé : dessinez-en un avec la plume.
 vector-work-path = Tracé de travail
 vector-path-name = Tracé { $number }
 vector-shape-path-name = Tracé de la forme { $name }
 vector-path-name-label = Nom
-vector-fill-path-tip = Remplir le tracé avec la couleur de premier plan (Alt : options)
-vector-stroke-path-tip = Contour du tracé avec la forme (Alt : options)
-vector-make-selection-tip = Récupérer le tracé comme sélection (Alt : options)
-vector-make-work-path-tip = Créer un tracé de travail à partir de la sélection (Alt : tolérance)
 vector-new-path-tip = Créer un tracé
 vector-delete-path-tip = Supprimer le tracé actif
 vector-make-selection-title = Définir une sélection
@@ -1476,8 +1457,8 @@ vector-stroke-tool = Outil
 vector-simulate-pressure = Simuler la pression
 vector-simulate-pressure-tip = Le contour s'affine à ses deux extrémités, comme avec une tablette
 vector-tolerance = Tolérance
-vector-tolerance-tip = Écart permis entre le tracé et le bord de la sélection : plus il est grand, moins il y a de points d'ancrage
-vector-status-no-path = Aucun tracé : dessinez-en un, ou sélectionnez-en un dans le panneau Tracés.
+vector-tolerance-tip = Écart permis entre le tracé et le bord de la sélection : plus il est grand, moins il y a de points d'ancrage
+vector-status-no-path = Aucun tracé : dessinez-en un, ou sélectionnez-en un dans le panneau Tracés.
 vector-status-no-selection = Faites d'abord une sélection.
 
 ## Type tool: editing on the canvas
@@ -1485,13 +1466,13 @@ vector-status-no-selection = Faites d'abord une sélection.
 type-status-typing = Saisissez votre texte
 type-status-committed = Texte validé
 type-status-cancelled = Modification du texte annulée
-type-click-hint = Cliquez pour saisir un texte de point, faites glisser pour tracer un cadre de texte de paragraphe.
+type-click-hint = Cliquez pour saisir un texte de point, faites glisser pour tracer un cadre de texte de paragraphe
 
 ## Type tool: status bar hints
 
 type-hint-point = texte de point
 type-hint-paragraph = texte de paragraphe
-type-hint-new = nouveau texte sur un texte
+type-hint-new = nouveau calque de texte par-dessus un autre
 type-hint-move = déplacer le texte
 type-hint-commit = valider
 type-hint-extend = étendre la sélection
@@ -1501,14 +1482,14 @@ type-hint-extend = étendre la sélection
 type-font-style-tip = Définir le style de police
 type-size-tip = Définir la taille de police
 type-leading = Interlignage
-type-leading-tip = Définir l’interlignage
+type-leading-tip = Définir l'interlignage
 type-leading-auto = Interlignage auto
-type-leading-auto-tip = Interlignage à 120 % de la taille de police
+type-leading-auto-tip = Interlignage à 120 % de la taille de police
 type-kerning = Crénage
 type-kerning-metrics = Métrique
 type-kerning-tip = Définir le crénage entre deux caractères
 type-tracking = Approche
-type-tracking-tip = Définir l’approche des caractères sélectionnés (millièmes de cadratin)
+type-tracking-tip = Définir l'approche des caractères sélectionnés (millièmes de cadratin)
 type-baseline = Décalage
 type-baseline-tip = Définir le décalage vertical
 type-vscale = Verticale
@@ -1602,7 +1583,6 @@ xchg-channel-green = Vert
 xchg-channel-blue = Bleu
 xchg-channel-alpha-name = Alpha { $number }
 xchg-channel-name = Nom
-xchg-channel-row-tip = Clic : afficher seule · Ctrl+clic : récupérer comme sélection · Double-clic : renommer
 xchg-channel-duplicate = Dupliquer la couche
 xchg-channel-delete = Supprimer la couche
 xchg-channel-load-tip = Récupérer la couche comme sélection
@@ -1612,16 +1592,16 @@ xchg-channel-delete-tip = Supprimer la couche active
 
 ## Gradients of layers (fill, Gradient Map, Gradient Overlay)
 
-xchg-gradient-edit-tip = Cliquer pour modifier le dégradé
+xchg-gradient-edit-tip = Cliquez pour modifier le dégradé
 
 ## PSD files
 
 xchg-file-filter-psd = Document PSD
 xchg-file-error-not-psd = Ce n'est pas un document PSD, ou cette version ne sait pas le lire.
 xchg-export-psd-hint = Les calques, masques, groupes, calques de réglage et de remplissage et styles de calque sont conservés, avec l'image aplatie.
-xchg-status-opened-simplified = Ouvert : { $path } — { $notes }
-xchg-status-saved-simplified = Enregistré : { $path } — { $notes }
-xchg-status-exported-simplified = Exporté : { $path } — { $notes }
+xchg-status-opened-simplified = Ouvert : { $path } — { $notes }
+xchg-status-saved-simplified = Enregistré : { $path } — { $notes }
+xchg-status-exported-simplified = Exporté : { $path } — { $notes }
 xchg-psd-alpha-name = Alpha { $number }
 xchg-psd-mode-bitmap = Bitmap
 xchg-psd-mode-grayscale = Niveaux de gris
@@ -1632,18 +1612,18 @@ xchg-psd-mode-duotone = Bichromie
 xchg-psd-mode-lab = Lab
 xchg-psd-note-depth = couches { $bits } bits converties en 8 bits
 xchg-psd-note-mode = { $mode } converti en RVB
-xchg-psd-note-text = calques de texte en pixels : { $names }
-xchg-psd-note-smart = objets dynamiques en pixels : { $names }
-xchg-psd-note-vector = masques vectoriels pixellisés : { $names }
-xchg-psd-note-shapes = contours de forme ignorés : { $names }
-xchg-psd-note-styles = styles de calque simplifiés : { $names }
-xchg-psd-note-dropped = non pris en charge, ignorés : { $names }
+xchg-psd-note-text = calques de texte en pixels : { $names }
+xchg-psd-note-smart = objets dynamiques en pixels : { $names }
+xchg-psd-note-vector = masques vectoriels pixellisés : { $names }
+xchg-psd-note-shapes = contours de forme ignorés : { $names }
+xchg-psd-note-styles = styles de calque simplifiés : { $names }
+xchg-psd-note-dropped = non pris en charge, ignorés : { $names }
 xchg-psd-note-channels = { $count ->
-        [one] une couche alpha ignorée (56 couches au plus)
+        [one] { $count } couche alpha ignorée (56 couches au plus)
        *[other] { $count } couches alpha ignorées (56 couches au plus)
     }
 xchg-psd-note-text-saved = { $count ->
-        [one] un calque de texte enregistré en pixels
+        [one] { $count } calque de texte enregistré en pixels
        *[other] { $count } calques de texte enregistrés en pixels
     }
 
@@ -1661,7 +1641,7 @@ color-menu-mode = Mode
 color-menu-mode-grayscale = Niveaux de gris
 color-menu-mode-rgb = Couleurs RVB
 color-menu-mode-cmyk = Couleurs CMJN
-color-mode-cmyk-tip = Les documents se retouchent en RVB. Pour un fichier CMJN, utilisez Exporter sous avec Utiliser le format d'épreuve : le fichier est converti dans le profil d'épreuve (CMJN de travail par défaut).
+color-mode-cmyk-tip = Les documents se retouchent en RVB. Pour un fichier CMJN, utilisez Exporter sous avec Utiliser le format d'épreuve : le fichier est converti dans le profil d'épreuve (CMJN de travail par défaut).
 
 ## Color management: shared labels
 
@@ -1683,15 +1663,15 @@ color-settings-working-spaces = Espaces de travail
 color-settings-rgb = RVB
 color-settings-cmyk = CMJN
 color-settings-load-cmyk = Charger CMJN…
-color-settings-hint = Les documents sans profil sont affichés et convertis comme le RVB de travail. Le CMJN de travail est la condition d'impression des épreuves écran, des fichiers CMJN et des valeurs CMJN du sélecteur de couleurs. Profil du moniteur : { $monitor }.
+color-settings-hint = Les documents sans profil sont affichés et convertis comme le RVB de travail. Le CMJN de travail est la condition d'impression des épreuves écran, des fichiers CMJN et des valeurs CMJN du sélecteur de couleurs. Profil du moniteur : { $monitor }.
 
 ## Color management: Assign Profile, Convert to Profile
 
 color-assign-title = Attribuer un profil
 color-assign-label = Attribuer le profil
 color-assign-none = Ne pas gérer les couleurs de ce document
-color-assign-working = RVB de travail : { $name }
-color-assign-hint = Les valeurs restent les mêmes : les couleurs changent d'aspect. Pour garder leur aspect, utilisez Convertir en profil.
+color-assign-working = RVB de travail : { $name }
+color-assign-hint = Les valeurs restent les mêmes : les couleurs changent d'aspect. Pour garder leur aspect, utilisez Convertir en profil.
 color-convert-title = Convertir en profil
 color-convert-source = Espace source
 color-convert-destination = Espace de destination
@@ -1708,21 +1688,21 @@ color-proof-ink = Simuler l'encre noire
 
 ## Color management: Grayscale, history, messages
 
-color-grayscale-discard = Supprimer les informations de couleur ?
+color-grayscale-discard = Supprimer les informations de couleur ?
 color-grayscale-discard-ok = Supprimer
 color-hist-assign-profile = Attribuer un profil
 color-hist-convert-to-profile = Convertir en profil
 color-hist-grayscale = Niveaux de gris
-color-status-assigned = Profil attribué : { $name }.
-color-status-unmanaged = Les couleurs du document ne sont plus gérées : il est affiché comme le RVB de travail.
+color-status-assigned = Profil attribué : { $name }.
+color-status-unmanaged = Les couleurs du document ne sont plus gérées : il est affiché comme le RVB de travail.
 color-status-converted = Converti en { $name }.
 color-status-not-a-profile = { $name } n'est pas un profil colorimétrique utilisable de ce type.
-color-picker-gamut = Attention : couleur non imprimable. Cliquez pour sélectionner la couleur imprimable la plus proche.
-color-psd-note-cmyk-layers = calques convertis en CMJN : modes de fusion et réglages peuvent changer d'aspect
+color-picker-gamut = Attention : couleur non imprimable. Cliquez pour sélectionner la couleur imprimable la plus proche.
+color-psd-note-cmyk-layers = calques convertis en CMJN : modes de fusion et réglages peuvent changer d'aspect
 
 ## Color management: Export As in CMYK
 
-color-export-use-proof = Utiliser le format d'épreuve : { $name }
+color-export-use-proof = Utiliser le format d'épreuve : { $name }
 
 ## Layer › Smart Objects, File › Place
 
@@ -1758,7 +1738,6 @@ smart-menu-disable-filter-mask = Désactiver le masque de filtre
 smart-menu-enable-filter-mask = Activer le masque de filtre
 smart-blending-title = Options de fusion ({ $name })
 smart-blending-tip = Options de fusion
-smart-filter-mask-tip = Masque de filtre : clic pour le modifier, Maj + clic pour le désactiver ou l'activer
 smart-filter-row-tip = Double-clic pour modifier le filtre, glisser pour le déplacer
 
 ## History steps
@@ -1776,16 +1755,16 @@ smart-hist-add-filter-mask = Ajouter un masque de filtre
 
 ## Status bar
 
-smart-status-converted = « { $name } » converti en objet dynamique
-smart-status-locked = Un calque verrouillé ne peut pas être converti
-smart-status-no-adjustments = Les réglages ne s'appliquent pas à un objet dynamique : utilisez un calque de réglage écrêté sur lui
-smart-status-not-editable = L'objet dynamique n'est pas directement modifiable : pixellisez-le d'abord
-smart-status-placed = Importé : { $path }
-smart-status-replaced = Contenu remplacé : { $path }
-smart-status-updated = Objet dynamique mis à jour : { $name }
-smart-status-parent-gone = Le document de l'objet dynamique est fermé : enregistrez ce contenu dans un fichier
-smart-status-link-missing = Fichier lié introuvable, sa dernière copie est affichée : { $names }
-smart-status-links-updated = Fichiers liés mis à jour : { $names }
+smart-status-converted = « { $name } » converti en objet dynamique
+smart-status-locked = Un calque verrouillé ne peut pas être converti.
+smart-status-no-adjustments = Les réglages ne s'appliquent pas à un objet dynamique : utilisez un calque de réglage écrêté sur lui.
+smart-status-not-editable = L'objet dynamique n'est pas directement modifiable : pixellisez-le d'abord.
+smart-status-placed = Importé : { $path }
+smart-status-replaced = Contenu remplacé : { $path }
+smart-status-updated = Objet dynamique mis à jour : { $name }
+smart-status-parent-gone = Le document de l'objet dynamique est fermé : enregistrez ce contenu dans un fichier.
+smart-status-link-missing = Fichier lié introuvable, sa dernière copie est affichée : { $names }
+smart-status-links-updated = Fichiers liés mis à jour : { $names }
 
 ## Filter › Liquify: the workspace and its tools
 
@@ -1836,8 +1815,8 @@ liquify-save-mesh-title = Enregistrer le maillage
 liquify-mesh-files = Maillages Fluidité
 # Proposed name of a saved mesh.
 liquify-mesh-file-name = Maillage
-liquify-status-mesh-saved = Maillage enregistré : { $file }
-liquify-status-mesh-error = Impossible de lire ou d'écrire le maillage : { $error }
+liquify-status-mesh-saved = Maillage enregistré : { $file }
+liquify-status-mesh-error = Impossible de lire ou d'écrire le maillage : { $error }
 liquify-status-not-a-mesh = Ce fichier n'est pas un maillage Fluidité.
 
 ## Liquify: View Options
@@ -1872,10 +1851,10 @@ liquify-color-gray = Gris
 
 actions-title = Scripts
 actions-empty = Aucun script. Créez-en un avec le bouton Créer un script.
-actions-toggle-tip = Activer/désactiver l’élément
+actions-toggle-tip = Activer/désactiver l'élément
 actions-dialog-tip = Activer/désactiver la boîte de dialogue
-actions-stop-tip = Arrêter l’exécution/l’enregistrement
-actions-record-tip = Commencer l’enregistrement
+actions-stop-tip = Arrêter l'exécution/l'enregistrement
+actions-record-tip = Commencer l'enregistrement
 actions-play-tip = Exécuter la sélection
 actions-new-set-tip = Créer un ensemble
 actions-new-action-tip = Créer un script
@@ -1890,7 +1869,7 @@ actions-menu-new-set = Nouvel ensemble…
 actions-menu-duplicate = Dupliquer
 actions-menu-delete = Supprimer
 actions-menu-play = Exécuter
-actions-menu-record = Commencer l’enregistrement
+actions-menu-record = Commencer l'enregistrement
 actions-menu-record-again = Enregistrer à nouveau…
 actions-menu-insert-stop = Insérer un arrêt…
 actions-menu-options = Options de script…
@@ -1906,7 +1885,7 @@ actions-file-filter = Scripts Atelier
 actions-new-action-title = Nouveau script
 actions-options-title = Options de script
 actions-new-set-title = Nouvel ensemble
-actions-set-options-title = Options d’ensemble
+actions-set-options-title = Options d'ensemble
 actions-insert-stop-title = Enregistrer un arrêt
 actions-record = Enregistrer
 actions-name = Nom
@@ -1920,10 +1899,10 @@ actions-allow-continue = Autoriser la poursuite
 actions-continue = Continuer
 actions-stop = Arrêter
 actions-append = Ajouter
-actions-reset-question = Remplacer les scripts actuels par les scripts par défaut ?
-actions-delete-set-question = Supprimer l’ensemble « { $name } » ?
-actions-delete-action-question = Supprimer le script « { $name } » ?
-actions-delete-step-question = Supprimer l’étape « { $name } » ?
+actions-reset-question = Remplacer les scripts actuels par les scripts par défaut ?
+actions-delete-set-question = Supprimer l'ensemble « { $name } » ?
+actions-delete-action-question = Supprimer le script « { $name } » ?
+actions-delete-step-question = Supprimer l'étape « { $name } » ?
 actions-set-default-name = Ensemble { $n }
 actions-action-default-name = Script { $n }
 actions-copy-name = { $name } copie
@@ -1954,29 +1933,29 @@ actions-document-folder = Le dossier du document
 
 ## Playing actions
 
-actions-status-played = Script « { $name } » exécuté.
-actions-status-stopped = Script « { $name } » arrêté.
+actions-status-played = Script « { $name } » exécuté.
+actions-status-stopped = Script « { $name } » arrêté.
 actions-status-loaded = Scripts chargés depuis { $path }.
-actions-status-load-failed = Impossible de charger les scripts : { $error }
+actions-status-load-failed = Impossible de charger les scripts : { $error }
 actions-status-saved = Scripts enregistrés dans { $path }.
-actions-status-save-failed = Impossible d’enregistrer les scripts : { $error }
-actions-error-step = Impossible d’exécuter « { $step } » (script « { $action } ») : { $error }
-actions-error-no-document = aucun document n’est ouvert.
-actions-error-no-selection = il n’y a pas de sélection.
-actions-error-unknown = cette version d’Atelier ne connaît pas cette commande.
-actions-error-no-folder = le document n’a jamais été enregistré : il n’a pas de dossier.
+actions-status-save-failed = Impossible d'enregistrer les scripts : { $error }
+actions-error-step = Impossible d'exécuter « { $step } » (script « { $action } ») : { $error }
+actions-error-no-document = aucun document n'est ouvert.
+actions-error-no-selection = il n'y a pas de sélection.
+actions-error-unknown = cette version d'Atelier ne connaît pas cette commande.
+actions-error-no-folder = le document n'a jamais été enregistré : il n'a pas de dossier.
 actions-error-exists = { $name } existe déjà.
-actions-error-format = impossible d’enregistrer { $name } dans son format.
-actions-error-not-actions = Ce n’est pas un fichier de scripts.
+actions-error-format = impossible d'enregistrer { $name } dans son format.
+actions-error-not-actions = Ce n'est pas un fichier de scripts.
 
 ## File › Automate, File › Scripts
 
 actions-menu-automate = Automatisation
 actions-menu-scripts = Scripts
 actions-batch-menu = Traitement par lots…
-actions-fit-image-menu = Adapter l’image…
-actions-processor-menu = Processeur d’images…
-actions-fit-image-title = Adapter l’image
+actions-fit-image-menu = Adapter l'image…
+actions-processor-menu = Processeur d'images…
+actions-fit-image-title = Adapter l'image
 actions-constrain-within = Limiter à
 actions-dont-enlarge = Ne pas agrandir
 
@@ -2003,7 +1982,7 @@ actions-example = Exemple
 actions-example-name = MonFichier
 actions-starting-serial = N° de série de départ
 actions-overwrite = Remplacer les fichiers existants
-actions-errors-stop = Arrêter en cas d’erreur
+actions-errors-stop = Arrêter en cas d'erreur
 actions-errors-log = Consigner les erreurs dans un fichier
 actions-name-none = (aucun)
 actions-name-text = Texte personnalisé
@@ -2011,7 +1990,7 @@ actions-name-document = Nom du document
 actions-name-document-lower = nom du document
 actions-name-document-upper = NOM DU DOCUMENT
 actions-name-serial = N° de série à { $digits ->
-    [one] 1 chiffre
+    [one] { $digits } chiffre
    *[other] { $digits } chiffres
 }
 actions-name-letter-lower = Lettre de série (a, b, c…)
@@ -2020,33 +1999,33 @@ actions-name-date = aaaammjj (date)
 actions-name-extension-lower = extension
 actions-name-extension-upper = EXTENSION
 actions-batch-progress = Document { $n } sur { $total }
-actions-batch-nothing = Il n’y a aucune image à traiter.
-actions-batch-stopped = Le traitement par lots s’est arrêté : { $error }
+actions-batch-nothing = Il n'y a aucune image à traiter.
+actions-batch-stopped = Le traitement par lots s'est arrêté : { $error }
 actions-batch-cancelled = Traitement par lots annulé après { $count ->
-    [one] 1 document
+    [one] { $count } document
    *[other] { $count } documents
 }.
-actions-batch-done = Traitement par lots terminé : { $count ->
-    [one] 1 document
+actions-batch-done = Traitement par lots terminé : { $count ->
+    [one] { $count } document
    *[other] { $count } documents
 }.
-actions-batch-done-errors = Traitement par lots terminé : { $count ->
-    [one] 1 document
+actions-batch-done-errors = Traitement par lots terminé : { $count ->
+    [one] { $count } document
    *[other] { $count } documents
 }, { $errors ->
-    [one] 1 erreur
+    [one] { $errors } erreur
    *[other] { $errors } erreurs
 } (voir { $path }).
 
 ## Image Processor
 
-actions-processor-title = Processeur d’images
+actions-processor-title = Processeur d'images
 actions-processor-source = Sélectionnez les images à traiter
-actions-processor-location = Sélectionnez l’emplacement d’enregistrement des images traitées
+actions-processor-location = Sélectionnez l'emplacement d'enregistrement des images traitées
 actions-same-location = Enregistrer au même emplacement
 actions-other-folder = Sélectionner un dossier
 actions-processor-subfolders-hint = Chaque format va dans un dossier à son nom (JPEG, PSD, TIFF).
-actions-processor-unsaved = Certains documents ouverts n’ont jamais été enregistrés : choisissez un dossier.
+actions-processor-unsaved = Certains documents ouverts n'ont jamais été enregistrés : choisissez un dossier.
 actions-processor-file-type = Type de fichier
 actions-save-as-format = Enregistrer au format { $format }
 actions-resize-to-fit = Redimensionner
@@ -2062,8 +2041,8 @@ actions-run = Exécuter
 actions-menu-export = Exportation
 actions-quick-export = Exportation rapide au format PNG
 actions-export-file-settings = Paramètres de fichier
-actions-export-image-size = Taille de l’image
-actions-export-gif-hint = 256 couleurs au plus ; chaque pixel est transparent ou opaque.
+actions-export-image-size = Taille de l'image
+actions-export-gif-hint = 256 couleurs au plus ; chaque pixel est transparent ou opaque.
 actions-export-metadata = Métadonnées
 actions-metadata-none = Aucune
 actions-metadata-copyright = Copyright et coordonnées
@@ -2078,8 +2057,8 @@ raw-window-title = Camera Raw
 raw-open = Ouvrir
 raw-developing = Développement
 raw-file-filter = Camera Raw
-raw-note-preview-only = ses données RAW ne peuvent pas être lues : l'aperçu intégré de l'appareil (8 bits) est utilisé
-raw-preview-tip = Faites glisser pour vous déplacer ; double-cliquez pour passer à 100 % ou à la taille de la fenêtre.
+raw-note-preview-only = ses données RAW ne peuvent pas être lues : l'aperçu intégré de l'appareil (8 bits) est utilisé
+raw-preview-tip = Faites glisser pour vous déplacer ; double-cliquez pour passer à 100 % ou à la taille de la fenêtre.
 raw-zoom-fit = Ajusté
 raw-zoom-fit-tip = Ajuster à la fenêtre
 raw-before = Avant
@@ -2144,7 +2123,7 @@ raw-curve-darks = Tons foncés
 raw-mixer-hue = Teinte
 raw-mixer-saturation = Saturation
 raw-mixer-luminance = Luminance
-raw-mixer-gray-hint = Monochrome : chaque gamme de couleurs s'éclaircit ou s'assombrit dans le gris.
+raw-mixer-gray-hint = Monochrome : chaque gamme de couleurs s'éclaircit ou s'assombrit dans le gris.
 raw-hue-red = Rouge
 raw-hue-orange = Orange
 raw-hue-yellow = Jaune
@@ -2158,14 +2137,14 @@ raw-hue-magenta = Magenta
 
 raw-grading-shadows = Ombres
 raw-grading-midtones = Tons moyens
-raw-grading-highlights = Tons clairs
+raw-grading-highlights = Hautes lumières
 raw-grading-global = Global
 raw-grading-hue = Teinte
 raw-grading-saturation = Saturation
 raw-grading-luminance = Luminance
 raw-grading-blending = Fusion
 raw-grading-balance = Équilibre
-raw-wheel-tip = Faites glisser pour choisir la teinte et la saturation ; double-cliquez pour réinitialiser.
+raw-wheel-tip = Faites glisser pour choisir la teinte et la saturation ; double-cliquez pour réinitialiser.
 
 ## Camera Raw: Detail
 
@@ -2174,7 +2153,6 @@ raw-sharpen-amount = Gain
 raw-sharpen-radius = Rayon
 raw-sharpen-detail = Détail
 raw-sharpen-masking = Masquage
-raw-sharpen-hint = Maintenez Alt en faisant glisser un curseur de netteté pour voir son effet. La netteté et la réduction du bruit se voient à partir de 100 %.
 raw-noise-reduction = Réduction du bruit
 raw-nr-luminance = Luminance
 raw-nr-luminance-detail = Détail de luminance
@@ -2188,7 +2166,7 @@ raw-vignette-style = Style
 raw-vignette-highlight-priority = Priorité hautes lumières
 raw-vignette-color-priority = Priorité couleur
 raw-vignette-paint-overlay = Incrustation de peinture
-raw-amount = Gain
+raw-amount = Quantité
 raw-midpoint = Milieu
 raw-roundness = Arrondi
 raw-feather = Contour progressif
@@ -2208,7 +2186,7 @@ raw-preset-warm-film = Film chaud
 raw-preset-save = Enregistrer le paramètre prédéfini
 raw-preset-name = Nom
 raw-preset-delete = Supprimer le paramètre prédéfini
-raw-preset-save-failed = Impossible d'enregistrer les paramètres prédéfinis : { $error }
+raw-preset-save-failed = Impossible d'enregistrer les paramètres prédéfinis : { $error }
 
 ## Artboards: the tool, the layers, the history
 
@@ -2261,7 +2239,7 @@ artboard-background = Arrière-plan
 artboard-background-other = Autre
 artboard-background-tip = Couleur d'arrière-plan du plan de travail
 artboard-hint-draw = tracer un plan de travail
-artboard-hint-duplicate = « + » : dupliquer avec son contenu
+artboard-hint-duplicate = « + » : dupliquer avec son contenu
 
 ## Artboards: dialogs
 
@@ -2286,7 +2264,7 @@ artboard-export-as-list = Plans de travail (un fichier chacun)
 
 ## Artboards: status messages
 
-artboard-status-new-document = Nouveau document : { $width } × { $height } px
+artboard-status-new-document = Nouveau document : { $width } × { $height } px
 artboard-status-not-group = Sélectionnez d'abord un groupe hors de tout plan de travail.
 artboard-status-none = Le document n'a pas de plan de travail.
 artboard-status-refused = Impossible de créer ce plan de travail (calques verrouillés, ou un plan de travail parmi eux).
@@ -2298,13 +2276,194 @@ artboard-status-exported = { $count ->
     [one] { $count } plan de travail exporté dans { $folder }
    *[other] { $count } plans de travail exportés dans { $folder }
 }
-artboard-status-export-failed = Échec de l'exportation : { $error }
+artboard-status-export-failed = Échec de l'exportation : { $error }
 
 ## Image Processor
 
-actions-use-proof = Utiliser le format d’épreuve
-actions-use-proof-tip = Fichiers JPEG et TIFF convertis dans le profil d’épreuve du document (CMJN)
+actions-use-proof = Utiliser le format d'épreuve
+actions-use-proof-tip = Fichiers JPEG et TIFF convertis dans le profil d'épreuve du document (CMJN)
 
 ## Color management: profile names
 
 color-adobe-rgb-compatible = Compatible Adobe RGB (1998)
+
+## History panel: selection steps (named like the commands)
+hist3-deselect = Désélectionner
+hist3-select-all = Tout sélectionner
+hist3-reselect = Resélectionner
+hist3-inverse = Intervertir
+hist3-move-selection = Déplacer la sélection
+hist3-select-subject = Sélectionner le sujet
+hist3-make-selection = Créer une sélection
+hist3-selection = Modification de la sélection
+hist3-quick-mask = Mode Masque
+
+## History panel: first row once older steps were forgotten
+hist3-oldest-state = Plus ancien état conservé
+
+## Selection computed in the background
+hist3-selection-changed = La sélection a changé pendant le calcul de la précédente : ce résultat est abandonné.
+
+## Move tool options
+input3-auto-select = Sélection automatique
+input3-auto-select-tip = Un clic sélectionne le calque sous le pointeur. Maintenez { $key } pour faire l'inverse un instant.
+
+## Hints and tips with modifier keys (written by the app for each system)
+input3-eyedropper-hint = Clic : premier plan · { $alt_click } : arrière-plan
+input3-visibility-tip = Afficher / masquer ({ $alt_click } : lui seul)
+input3-curves-hint = Cliquez pour ajouter un point ; glissez-le hors du graphique (ou { $ctrl_click }, { $delete }) pour le retirer. Flèches : déplacer le point, { $next } : point suivant.
+input3-layer-row-tip = Glissez pour réorganiser, ou dans un groupe · double-clic sur le nom : renommer, à côté : style de calque · { $alt_click } : écrêter sur le calque du dessous · { $ctrl_click } sur une vignette : ses pixels ou son masque en sélection · sur le masque : { $shift_click } le désactive ou l'active, { $alt_click } l'affiche seul
+input3-clone-hint = { $alt_click } pour définir la source, puis peignez pour la copier
+input3-healing-hint = { $alt_click } pour définir la source, puis peignez : sa texture se fond dans les couleurs alentour
+input3-channel-row-tip = Clic : afficher seule · { $ctrl_click } : récupérer comme sélection · Double-clic : renommer
+input3-filter-mask-tip = Masque de filtre : clic pour le modifier, { $shift_click } pour le désactiver ou l'activer
+input3-add-mask-tip = Ajouter un masque de fusion ({ $alt } : tout masquer)
+input3-fill-path-tip = Remplir le tracé avec la couleur de premier plan ({ $alt } : options)
+input3-stroke-path-tip = Contour du tracé avec la forme ({ $alt } : options)
+input3-make-selection-tip = Récupérer le tracé comme sélection ({ $alt } : options)
+input3-make-work-path-tip = Créer un tracé de travail à partir de la sélection ({ $alt } : tolérance)
+input3-raw-sharpen-hint = Maintenez { $alt } en faisant glisser un curseur de netteté pour voir son effet. La netteté et la réduction du bruit se voient à partir de 100 %.
+
+## Status bar hints of the Move tool
+input3-hint-axis = horizontalement ou verticalement
+input3-hint-copy = déplacer une copie
+input3-hint-pick-layer = le calque sous le pointeur
+input3-hint-selected-layers = les calques sélectionnés
+
+## Saving over a Photoshop document
+
+files3-quoted-name = « { $name } »
+files3-psd-note-shapes = calques de forme enregistrés en pixels : { $names }
+files3-status-psd-would-lose = Un fichier Photoshop perdrait : { $notes }. Enregistrez un document Atelier pour tout garder.
+files3-dialog-save-as-lossy = Enregistrer sous (un document Atelier garde tout)
+
+## Clipboard
+
+files3-menu-copy-merged = Copier avec fusion
+files3-menu-paste-special = Collage spécial
+files3-menu-paste-in-place = Coller en place
+files3-menu-paste-into = Coller dedans
+files3-status-copied-merged = Calques visibles copiés
+files3-status-paste-into-no-selection = Coller dedans demande une sélection.
+
+## Export
+
+files3-export-no-metadata = Les fichiers { $format } ne contiennent pas de métadonnées.
+files3-status-artboards-busy = Des plans de travail sont encore en cours d’exportation.
+
+## Painting and retouching (fix3 tools)
+
+tools3-status-source-empty = Rien de copié : la zone source est vide (Échantillon : { $sample }).
+tools3-status-layer-hidden = Impossible de peindre : « { $name } » est masqué.
+tools3-rasterize-text = Le calque de texte « { $name } » doit être pixellisé pour peindre dessus. Son texte ne sera plus modifiable.
+tools3-rasterize-shape = Le calque de forme « { $name } » doit être pixellisé pour peindre dessus. Sa forme ne sera plus modifiable.
+tools3-rasterize-ok = Pixelliser
+tools3-bucket-all-layers = Tous les calques
+tools3-bucket-all-layers-tip = Remplit selon les couleurs que montrent tous les calques visibles, sur le calque actif
+
+## Layer › Remove Background (fix3 tools)
+
+tools3-status-remove-background-pixels = Supprimer l'arrière-plan s'applique à un calque de pixels, de texte, de forme ou à un objet dynamique.
+
+## Actions panel: Clear All Actions, the actions file
+smart3-actions-clear-all-question = Supprimer tous les scripts ?
+smart3-actions-damaged = Les scripts enregistrés n'ont pas pu être lus ({ $error }) : les scripts par défaut sont affichés et le fichier a été conservé sous le nom { $backup }.
+smart3-actions-unreadable = Les scripts enregistrés n'ont pas pu être lus ({ $error }) : les scripts par défaut sont affichés, et les modifications des scripts ne seront pas enregistrées avant le redémarrage d'Atelier.
+smart3-actions-not-recorded = Non enregistré : cette commande ne peut pas faire partie d'un script.
+smart3-actions-not-saved = Les scripts n'ont pas pu être enregistrés : { $error }
+
+## Batch
+smart3-batch-written-twice = { $name } a déjà été écrit par ce traitement par lots : modifiez le nom de fichier (ajoutez un numéro de série).
+
+## Filters, Liquify, Camera Raw
+fx3-filter-failed = Impossible d'appliquer « { $name } » : le calque est inchangé.
+fx3-filter-layer-hidden = « { $name } » est masqué : affichez-le pour le filtrer.
+
+## Image › Mode › Grayscale
+fx3-grayscale-note = Les couleurs deviennent des gris de même luminosité, et les réglages qui ne font qu'ajouter de la couleur sont neutralisés. Le document reste en mode RVB : les couleurs peintes ensuite restent en couleur.
+
+## Proof Colors on: next to the zoom in the document tab
+fx3-tab-proof = { $zoom } (RVB/8/CMJN)
+
+## AI models: downloads
+fx3-download-cancel-tip = Annuler le téléchargement de { $name }
+fx3-ai-error-offline = pas de connexion au serveur : vérifiez la connexion Internet
+fx3-ai-error-status = le serveur a répondu par l'erreur { $code }
+fx3-ai-error-secure = la connexion sécurisée au serveur a échoué
+fx3-ai-error-disk-full = le disque est plein
+fx3-ai-error-no-write = impossible d'écrire dans le dossier des modèles ({ $folder })
+fx3-ai-error-write = le fichier n'a pas pu être écrit ({ $error })
+fx3-model-ready-run-again = { $name } est prêt : relancez la commande (la sélection ou le calque a changé entre-temps).
+
+## Content-Aware Fill, Spot Healing Brush
+fx3-ai-skipped-transparency = Modèle d'IA non utilisé : la zone a des pixels transparents, remplie avec des motifs à la place.
+
+## Start screen
+ui3-status-welcome = Créez une image ({ $new }), ouvrez-en une ({ $open }) ou glissez-la dans la fenêtre.
+
+## File menu: recent files
+ui3-menu-open-recent = Ouvrir les fichiers récents
+ui3-menu-clear-recent = Effacer la liste des fichiers récents
+
+## Window menu: workspace
+ui3-menu-hide-panels = Masquer les panneaux
+ui3-menu-reset-workspace = Réinitialiser l'espace de travail
+
+## Help menu
+ui3-menu-help = Aide
+ui3-menu-shortcuts = Raccourcis clavier…
+ui3-menu-website = Site web d'Atelier
+ui3-menu-report-problem = Signaler un problème…
+ui3-menu-about = À propos d'Atelier
+
+## About window
+ui3-about-version = Version { $version }
+ui3-about-description = Un éditeur d'images léger aux raccourcis familiers.
+ui3-about-license = Licence : { $license }
+ui3-about-source = Code source
+
+## Keyboard Shortcuts window
+ui3-shortcuts-title = Raccourcis clavier
+ui3-shortcuts-filter = Rechercher
+ui3-shortcuts-other = Autres touches
+ui3-shortcuts-palette = Rechercher une commande
+ui3-shortcuts-hide-side = Masquer le panneau latéral
+ui3-shortcuts-brush-size = Taille de la forme (plus petite / plus grande)
+ui3-shortcuts-pan = Déplacer la vue (maintenir)
+
+## Error alert
+ui3-alert-title = Un problème est survenu
+
+## Command palette
+ui3-palette-more = { $count ->
+    [one] { $count } autre résultat : précisez la recherche
+   *[other] { $count } autres résultats : précisez la recherche
+}
+# Why a greyed command can't run
+ui3-why-no-image = Ouvrez ou créez d'abord une image
+ui3-why-no-selection = Faites d'abord une sélection
+ui3-why-nothing-to-undo = Rien à annuler
+ui3-why-nothing-to-redo = Rien à rétablir
+ui3-why-not-now = Indisponible pour le calque actif ou dans l'état actuel
+# Other words a command is found by (space-separated, never shown)
+ui3-palette-keywords-image-size = redimensionner agrandir réduire rééchantillonner échelle dimensions
+ui3-palette-keywords-canvas-size = agrandir étendre bordure marge
+ui3-palette-keywords-rotate = pivoter tourner rotation retourner miroir symétrie
+ui3-palette-keywords-crop = recadrer recadrage rogner
+ui3-palette-keywords-move = déplacer déplacement
+ui3-palette-keywords-type = texte police écrire
+ui3-palette-keywords-black-white = noir blanc niveaux gris monochrome
+ui3-palette-keywords-export = jpg jpeg png webp gif enregistrer web
+ui3-palette-keywords-save = psd
+ui3-palette-keywords-cut-out = détourer détourage isoler effacer fond arrière-plan transparent
+ui3-palette-keywords-shortcuts = touches clavier raccourcis aide
+ui3-palette-keywords-about = version aide licence crédits
+ui3-palette-keywords-recent = récent récents fichier ouvrir
+
+## Export As: file sizes
+
+words3-size-kb = { $size } Ko
+
+## A label and its value (action steps, batch errors)
+
+words3-label-value = { $label } : { $value }

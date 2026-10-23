@@ -12,7 +12,6 @@ use image::{GrayImage, RgbaImage};
 use super::canvas::{draw_frame, pointer_angle, rotate_around, rotate_handle_pos};
 use super::color_range::ColorRange;
 use super::dialogs::{DialogSpec, block, floating_dialog, gap_between_blocks};
-use super::quick_mask::QuickMask;
 use super::render::GpuImage;
 use super::select_mask::{Output, SelectMask};
 use super::select_tools::{FreeLasso, ShapeOptions, combined};
@@ -189,11 +188,14 @@ pub(super) enum Then {
     Output(Output),
 }
 
-/// A selection being computed in the background, for a document.
+/// A selection being computed in the background, for a document, from
+/// the selection `base`, and its step's name.
 struct SelectJob {
     result: mpsc::Receiver<Option<Selection>>,
     doc: u64,
     then: Then,
+    base: Option<Selection>,
+    name: Option<String>,
 }
 
 /// Transform Selection in progress: the frame of the selection, moved,
@@ -250,7 +252,9 @@ pub(super) struct SelState {
     pub(super) color_range: Option<ColorRange>,
     pub(super) select_mask: Option<SelectMask>,
     pub(super) transform: Option<SelTransform>,
-    pub(super) quick_mask: Option<QuickMask>,
+    /// Name of the history step of the next selection change (what makes
+    /// it, when the tool doesn't say), see `commit_selection`.
+    pub(super) step_name: Option<String>,
     /// Mask shown over the canvas: what it was drawn for, image and place.
     overlay: Option<(u64, GpuImage, Rect)>,
 }
@@ -269,7 +273,7 @@ impl Default for SelState {
             color_range: None,
             select_mask: None,
             transform: None,
-            quick_mask: None,
+            step_name: None,
             overlay: None,
         }
     }
@@ -289,8 +293,6 @@ pub(super) enum OverlayStyle {
 /// Coverage shown over the canvas.
 pub(super) enum OverlayMask {
     Gray(Arc<GrayImage>),
-    /// Painted in gray (Quick Mask): what is erased counts as white.
-    Paint(Arc<RgbaImage>),
 }
 
 /// A mask shown over the canvas: its coverage, `scale` of its pixels per
@@ -300,6 +302,11 @@ pub(super) struct OverlaySource {
     pub(super) scale: f32,
     pub(super) style: OverlayStyle,
     pub(super) key: u64,
+}
+
+/// A menu item's label as the name of its history step (without "…").
+pub(super) fn step_label(label: String) -> String {
+    label.trim_end_matches(['…', '.']).trim_end().to_string()
 }
 
 /// Pixels the work on `sel` covers.
@@ -316,7 +323,7 @@ impl AtelierApp {
         let has_sel = self.selection.is_some();
         match command {
             Command::ColorRange => self.open_color_range(),
-            Command::SelectAndMask if has_sel => self.open_select_mask(),
+            Command::SelectAndMask => self.open_select_mask(),
             Command::Modify(kind) if has_sel => {
                 self.sel.modify = Some(ModifyDialog {
                     kind,
@@ -330,7 +337,11 @@ impl AtelierApp {
             Command::Transform if has_sel => self.start_selection_transform(),
             Command::QuickMask => self.toggle_quick_mask(),
             Command::Save if has_sel => {
-                let name = t!("sel-channel-default-name", n = doc.channels.len() + 1);
+                // The first number no channel has.
+                let name = (1..)
+                    .map(|n: usize| t!("sel-channel-default-name", n = n))
+                    .find(|n| doc.channels.iter().all(|c| c.name != *n))
+                    .expect("a free name");
                 self.sel.save = Some(SaveDialog {
                     channel: None,
                     name,
@@ -373,7 +384,7 @@ impl AtelierApp {
             Separator,
             Item(
                 t!("sel-menu-select-and-mask"),
-                has_sel,
+                self.can_select_mask(),
                 Some(&SHORTCUT_SELECT_AND_MASK),
                 Action::Select(Command::SelectAndMask),
             ),
@@ -387,7 +398,7 @@ impl AtelierApp {
             Check(
                 t!("sel-menu-quick-mask"),
                 has_doc,
-                self.sel.quick_mask.is_some(),
+                self.doc.as_ref().is_some_and(|d| d.quick_mask().is_some()),
                 Some(&SHORTCUT_QUICK_MASK),
                 Action::Select(Command::QuickMask),
             ),
@@ -419,9 +430,6 @@ impl AtelierApp {
     /// The document leaves (other tab, closed): Quick Mask turns back into
     /// the selection, the Select windows close, gestures stop.
     pub(super) fn leave_select_modes(&mut self) {
-        if self.sel.quick_mask.is_some() {
-            self.toggle_quick_mask();
-        }
         let s = &mut self.sel;
         s.free_lasso = None;
         s.modify = None;
@@ -475,6 +483,8 @@ impl AtelierApp {
         pixels: u64,
         work: impl FnOnce() -> Option<Selection> + Send + 'static,
     ) {
+        // One at a time, in order: the next one starts from its result.
+        self.wait_select_job();
         let Some(doc) = &self.doc else { return };
         if pixels <= SYNC_PIXELS {
             let result = work();
@@ -500,6 +510,8 @@ impl AtelierApp {
             result,
             doc: doc.uid(),
             then,
+            base: self.selection.clone(),
+            name: self.sel.step_name.take(),
         });
         self.status = t!("sel-status-working");
     }
@@ -508,20 +520,45 @@ impl AtelierApp {
     /// to another document).
     pub(super) fn poll_select_job(&mut self) {
         let Some(job) = &self.sel.job else { return };
-        let result = match job.result.try_recv() {
-            Ok(result) => result,
-            Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.sel.job = None;
-                return;
-            }
-        };
-        let (doc, then) = (job.doc, job.then);
-        self.sel.job = None;
-        self.status.clear();
-        if self.doc.as_ref().is_some_and(|d| d.uid() == doc) {
-            self.finish_select(result, then);
+        match job.result.try_recv() {
+            Ok(result) => self.select_job_done(result),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.sel.job = None,
         }
+    }
+
+    /// Waits for the selection being computed and applies it: what comes
+    /// next (a command, a click on the canvas) works with it, as if it
+    /// had been computed at once.
+    pub(super) fn wait_select_job(&mut self) {
+        let Some(job) = &self.sel.job else { return };
+        match job.result.recv() {
+            Ok(result) => self.select_job_done(result),
+            Err(_) => self.sel.job = None,
+        }
+    }
+
+    /// The selection computed in the background is ready: it applies to
+    /// its document if the selection it started from is still there.
+    fn select_job_done(&mut self, result: Option<Selection>) {
+        let Some(job) = self.sel.job.take() else {
+            return;
+        };
+        self.status.clear();
+        if self.doc.as_ref().is_none_or(|d| d.uid() != job.doc) {
+            return;
+        }
+        let unchanged = match (&job.base, &self.selection) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same(b),
+            _ => false,
+        };
+        if !unchanged {
+            self.status = t!("hist3-selection-changed");
+            return;
+        }
+        self.sel.step_name = job.name;
+        self.finish_select(result, job.then);
     }
 
     /// A selection computed in the background is still to come.
@@ -544,7 +581,11 @@ impl AtelierApp {
                 }
                 self.apply_selection(result, SelectMode::Replace);
             }
-            Then::Output(output) => return self.output_refined(result, output),
+            Then::Output(output) => {
+                self.output_refined(result, output);
+                self.sel.step_name = None;
+                return;
+            }
         }
         if faint {
             self.status = t!("sel-status-faint");
@@ -593,12 +634,14 @@ impl AtelierApp {
                 amount: d.amount,
                 at_bounds: d.at_bounds,
             });
+            self.sel.step_name = Some(step_label(d.kind.menu_label()));
             self.modify_selection(d.kind.op(d.amount), d.at_bounds);
         }
     }
 
     /// Select › Modify on the selection.
     fn modify_selection(&mut self, op: Modify, at_bounds: bool) {
+        self.wait_select_job();
         let (Some(sel), Some(doc)) = (self.selection.clone(), &self.doc) else {
             return;
         };
@@ -631,6 +674,7 @@ impl AtelierApp {
                 at_bounds,
             });
         } else {
+            self.sel.step_name = Some(step_label(kind.menu_label()));
             self.modify_selection(kind.op(amount), at_bounds);
         }
     }
@@ -656,6 +700,7 @@ impl AtelierApp {
 
     /// Grow (`contiguous`) and Similar, with the Magic Wand's tolerance.
     fn grow_selection(&mut self, contiguous: bool) {
+        self.wait_select_job();
         let (Some(sel), Some(doc), Some(pixels)) =
             (self.selection.clone(), &self.doc, self.wand_pixels_later())
         else {
@@ -664,6 +709,11 @@ impl AtelierApp {
         let canvas = doc.full_rect();
         let tolerance = (self.wand_tolerance * 255.0).round() as u8;
         let area = canvas.w as u64 * canvas.h as u64;
+        self.sel.step_name = Some(step_label(if contiguous {
+            t!("sel-menu-grow")
+        } else {
+            t!("sel-menu-similar")
+        }));
         self.select_later(Then::Modified, area, move || {
             let image = pixels();
             let grown = mask_ops::grow(&image, &sel.to_mask(canvas), tolerance, contiguous);
@@ -849,6 +899,7 @@ impl AtelierApp {
         } else {
             SelectMode::Replace
         };
+        self.sel.step_name = Some(step_label(t!("sel-menu-load")));
         self.select_later(Then::Select(mode), pixels, move || {
             let loaded = Selection::from_mask(&mask, (0, 0)).and_then(|s| s.within(canvas));
             if !d.invert {
@@ -894,6 +945,7 @@ impl AtelierApp {
     /// Applies Transform Selection (Enter, double-click in the frame, or
     /// anything else that commits what is pending).
     pub(super) fn apply_selection_transform(&mut self) {
+        self.wait_select_job();
         let (Some(t), Some(canvas)) = (
             self.sel.transform.take(),
             self.doc.as_ref().map(Document::full_rect),
@@ -906,6 +958,7 @@ impl AtelierApp {
         let map = t.map();
         let r = t.rect;
         let pixels = (r.width() * r.height()).max(0.0) as u64 + selection_pixels(&t.source, canvas);
+        self.sel.step_name = Some(step_label(t!("sel-menu-transform")));
         self.select_later(Then::Modified, pixels, move || {
             t.source.transformed(map, canvas)
         });
@@ -1126,22 +1179,13 @@ fn overlay_image(
     (w, h): (u32, u32),
 ) -> RgbaImage {
     let mut image = RgbaImage::new(w, h);
-    let (mw, mh, raw, channels) = match &source.mask {
-        OverlayMask::Gray(m) => (m.width() as i64, m.height() as i64, m.as_raw(), 1),
-        OverlayMask::Paint(m) => (m.width() as i64, m.height() as i64, m.as_raw(), 4),
+    let (mw, mh, raw) = match &source.mask {
+        OverlayMask::Gray(m) => (m.width() as i64, m.height() as i64, m.as_raw()),
     };
     if mw == 0 || mh == 0 {
         return image;
     }
-    let at = |x: i64, y: i64| {
-        let i = ((y.clamp(0, mh - 1) * mw + x.clamp(0, mw - 1)) * channels) as usize;
-        if channels == 1 {
-            raw[i] as f32
-        } else {
-            let (v, a) = (raw[i] as f32, raw[i + 3] as f32);
-            (v * a + 255.0 * (255.0 - a)) / 255.0
-        }
-    };
+    let at = |x: i64, y: i64| raw[(y.clamp(0, mh - 1) * mw + x.clamp(0, mw - 1)) as usize] as f32;
     let row = w as usize;
     let checker_a = ui_kit::color::CHECKER_A.to_array();
     let checker_b = ui_kit::color::CHECKER_B.to_array();

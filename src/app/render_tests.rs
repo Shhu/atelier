@@ -208,7 +208,7 @@ fn sample(texture: &ColorImage, filter: TextureFilter, uv: Vec2) -> [f32; 4] {
 fn app_with(doc: Document, tool: Tool, max_side: usize) -> Harness<'static, AtelierApp> {
     let gpu = Arc::new(Mutex::new(SoftGpu::default()));
     let mut h = Harness::builder()
-        .with_size([800.0, 600.0])
+        .with_size([1100.0, 750.0])
         .renderer(SoftRenderer(Arc::clone(&gpu)))
         .build_eframe(|cc| AtelierApp::new(cc, None));
     h.input_mut().max_texture_side = Some(max_side);
@@ -411,9 +411,17 @@ fn adjustment_preview_with_a_blend_layer() {
     {
         hs.lightness = -1.0;
     }
-    h.run_steps(2);
-    let shot = h.render().unwrap();
-    assert!(near(shown(&shot, &h, 200, 150), [0, 0, 0]));
+    // The preview is computed on another thread.
+    let start = std::time::Instant::now();
+    loop {
+        h.run_steps(1);
+        let shot = h.render().unwrap();
+        if near(shown(&shot, &h, 200, 150), [0, 0, 0]) {
+            break;
+        }
+        assert!(start.elapsed().as_secs() < 30, "no preview shown");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     h.state_mut().adjust = None;
     h.state_mut().end_layer_preview();
     h.run_steps(2);
@@ -663,4 +671,79 @@ fn mask_view_shows_the_mask() {
     let shot = h.render().unwrap();
     assert_eq!(shown(&shot, &h, 50, 50), [255, 255, 255]);
     assert_eq!(shown(&shot, &h, 200, 50), [0, 0, 0]);
+}
+
+/// A brush stroke below a Multiply layer, zoomed out to 50 % (composited
+/// at the level reduced twice): only the painted parts of the tiles are
+/// composited again, from the snapshots of the layers below, and they
+/// match the result.
+#[test]
+fn stroke_under_a_blend_layer_at_half_size() {
+    let mut h = app_with(multiply_doc(), Tool::Brush, 2048);
+    (h.state_mut().zoom, h.state_mut().brush_size) = (0.5, 30.0);
+    h.state_mut().primary = Color32::from_rgb(0, 0, 255);
+    h.run_steps(2);
+    let view = h.state().last_view.unwrap();
+    let (from, to) = (pos2(60.0, 150.0), pos2(340.0, 160.0));
+    h.hover_at(view.to_screen(from));
+    h.run_steps(1);
+    h.drag_at(view.to_screen(from));
+    h.run_steps(1);
+    for i in 1..=8 {
+        h.hover_at(view.to_screen(from.lerp(to, i as f32 / 8.0)));
+        // The frame after shows the dabs of this one.
+        h.run_steps(2);
+        let shot = h.render().unwrap();
+        let flat = h.state().doc.as_ref().unwrap().flatten();
+        // Behind the pointer (away from the brush outline), and outside.
+        let behind = (60 + 35 * i - 40).max(60);
+        for (x, y) in [(60, 150), (behind, 152), (100, 100), (300, 250)] {
+            // A pixel shown is the average of a block of 2 × 2.
+            let (x0, y0) = (x & !1, y & !1);
+            let block =
+                [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(dx, dy)| flat.get_pixel(x0 + dx, y0 + dy).0);
+            let [r, g, b] =
+                [0, 1, 2].map(|c| (block.iter().map(|p| p[c] as u32).sum::<u32>() / 4) as u8);
+            let at = shown(&shot, &h, x, y);
+            assert!(
+                near(at, [r, g, b]),
+                "frame {i}: {x}, {y}: {at:?} vs {:?}",
+                [r, g, b]
+            );
+        }
+    }
+}
+
+/// Zooming out across levels on a large image: the next frame still shows
+/// the image (the former tiles, scaled) while the new level is prepared,
+/// then the new level everywhere.
+#[test]
+fn zooming_across_levels_never_shows_an_empty_canvas() {
+    let color = [40, 120, 200, 255];
+    let mut h = app_with(
+        Document::new(solid(2600, 2000, color), None),
+        Tool::Hand,
+        2048,
+    );
+    let view = h.state().last_view.unwrap();
+    let rect = h.ctx.content_rect();
+    let middle = view.to_image(rect.center());
+    h.state_mut().zoom = 0.2;
+    h.run_steps(1);
+    let shot = h.render().unwrap();
+    let (x, y) = (middle.x as u32, middle.y as u32);
+    assert!(near(shown(&shot, &h, x, y), [40, 120, 200]), "at once");
+    let start = std::time::Instant::now();
+    loop {
+        h.run_steps(1);
+        let shot = h.render().unwrap();
+        if [(10, 10), (2590, 1990), (x, y)]
+            .iter()
+            .all(|&(x, y)| near(shown(&shot, &h, x, y), [40, 120, 200]))
+        {
+            break;
+        }
+        assert!(start.elapsed().as_secs() < 60, "the new level never came");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }

@@ -7,7 +7,7 @@ use egui::viewport::ResizeDirection;
 use egui::{Align, Align2, FontId, Layout, ViewportCommand};
 
 use super::keys;
-use super::menus::menu_entries;
+use super::menus::{explained_menu_entries, scrolling_menu};
 use super::palette::SHORTCUT_PALETTE;
 use super::*;
 use crate::i18n::t;
@@ -41,6 +41,14 @@ impl AtelierApp {
 
         let menus = self.menus();
         let mut action = None;
+        let (has_doc, has_selection) = (self.doc.is_some(), self.selection.is_some());
+        let why = move |a: Action| {
+            Some(super::palette::unavailable_reason(
+                has_doc,
+                has_selection,
+                a,
+            ))
+        };
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if SYSTEM_BUTTONS {
@@ -79,7 +87,13 @@ impl AtelierApp {
                         .config(config)
                         .ui(ui, |ui| {
                             ui.set_min_width(200.0);
-                            menu_entries(ui, entries, &mut action);
+                            // A menu taller than the window scrolls, rather
+                            // than covering the menu bar.
+                            // (It opens under the title bar, 40 px high.)
+                            let below = ui.ctx().content_rect().height() - 40.0;
+                            scrolling_menu(ui, title, below - 24.0, |ui| {
+                                explained_menu_entries(ui, entries, &mut action, &why);
+                            });
                         });
                 }
             });
