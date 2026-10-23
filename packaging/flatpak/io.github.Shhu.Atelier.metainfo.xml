@@ -70,6 +70,11 @@
     <display_length compare="ge">768</display_length>
   </requires>
   <releases>
+    <release version="0.4.0" date="2026-10-23">
+      <description>
+        <p>A stability and usability release after a full review: no more crashes on damaged files, nothing lost when saving PSD files, faster rendering and tools, the usual shortcuts and behaviors of professional editors, a two-column toolbar on small screens, Open Recent, a Help menu and a Diagnostics window.</p>
+      </description>
+    </release>
     <release version="0.3.2" date="2026-10-21">
       <description>
         <p>The Flatpak is built from source and installs from the shu-app.com repository, with automatic updates.</p>
