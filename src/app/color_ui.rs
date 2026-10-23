@@ -144,6 +144,8 @@ pub(super) struct ColorUi {
     cmyk: Profile,
     /// The monitor's profile (sRGB when the system gives none).
     monitor: Profile,
+    /// The system gave the monitor's profile.
+    monitor_known: bool,
     pub(super) dialog: Option<Dialog>,
     /// The canvas's table for what it shows (fingerprint): `None`, the
     /// colors as they are.
@@ -153,10 +155,12 @@ pub(super) struct ColorUi {
 impl ColorUi {
     pub(super) fn load() -> Self {
         let settings = ColorSettings::load();
+        let monitor = cms::monitor_profile();
         Self {
             cmyk: settings.cmyk_profile(),
             settings,
-            monitor: cms::monitor_profile().unwrap_or_else(|| cms::srgb().clone()),
+            monitor_known: monitor.is_some(),
+            monitor: monitor.unwrap_or_else(|| cms::srgb().clone()),
             dialog: None,
             canvas: None,
         }
@@ -168,6 +172,12 @@ impl ColorUi {
 
     pub(super) fn working_cmyk(&self) -> &Profile {
         &self.cmyk
+    }
+
+    /// The monitor's profile, and whether the system gave it (otherwise
+    /// sRGB is assumed).
+    pub(super) fn monitor(&self) -> (&Profile, bool) {
+        (&self.monitor, self.monitor_known)
     }
 
     /// The profile of `doc`'s pixels.

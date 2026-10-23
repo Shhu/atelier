@@ -503,6 +503,7 @@ impl AtelierApp {
         let (send, result) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
+            let _job = crate::diag::job("Selection");
             let _ = send.send(work());
             ctx.request_repaint();
         });

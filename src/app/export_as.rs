@@ -179,6 +179,7 @@ impl AtelierApp {
             let (tx, rx) = mpsc::channel();
             let ctx2 = ctx.clone();
             std::thread::spawn(move || {
+                let _job = crate::diag::job("Export As: flatten");
                 let _ = tx.send(flatten());
                 ctx2.request_repaint();
             });
@@ -208,6 +209,7 @@ impl AtelierApp {
             let icc = icc.clone();
             let (proof, srgb) = (proof.clone(), srgb.clone());
             std::thread::spawn(move || {
+                let _job = crate::diag::job("Export As: preview");
                 let icc = icc.as_deref().map(Vec::as_slice);
                 let _ = tx.send(preview_of(
                     &flat,
@@ -268,13 +270,17 @@ impl AtelierApp {
     /// Exports the document to `path` and says so; recorded with its folder.
     pub(super) fn export_to(&mut self, options: &ExportOptions, path: &Path) {
         self.commit_pending();
-        match self.write_export(options, path) {
+        let started = std::time::Instant::now();
+        let written = self.write_export(options, path);
+        crate::diag::record(format!("Export: {:?}", options.format), started.elapsed());
+        match written {
             Ok(notes) => {
                 let shown = path.display().to_string();
                 self.status = if notes.is_empty() {
                     t!("file-status-exported", path = shown)
                 } else {
                     let notes = notes.join(" · ");
+                    crate::diag::warn(format!("Exported {}: {notes}", files::file_name(path)));
                     t!(
                         "xchg-status-exported-simplified",
                         path = shown,
@@ -286,7 +292,7 @@ impl AtelierApp {
                     folder: path.parent().map(Path::to_path_buf),
                 });
             }
-            Err(e) => self.status = e,
+            Err(e) => self.status_failed(e),
         }
     }
 

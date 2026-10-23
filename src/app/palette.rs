@@ -406,6 +406,7 @@ fn keywords(action: Action) -> String {
         }
         Action::Workspace(workspace::Command::Shortcuts) => t!("ui3-palette-keywords-shortcuts"),
         Action::Workspace(workspace::Command::About) => t!("ui3-palette-keywords-about"),
+        Action::Workspace(workspace::Command::Diagnostics) => t!("diag-palette-keywords"),
         Action::Workspace(workspace::Command::OpenRecent(_)) => t!("ui3-palette-keywords-recent"),
         _ => String::new(),
     }

@@ -2467,3 +2467,152 @@ words3-size-kb = { $size } Ko
 ## A label and its value (action steps, batch errors)
 
 words3-label-value = { $label } : { $value }
+
+## Help › Diagnostics: measures and messages to send to a developer
+
+diag-menu = Diagnostics…
+diag-palette-keywords = performances journal logs rapport bogue bug plantage mémoire lent lenteur gel débogage
+diag-title = Diagnostics
+diag-uptime = lancé depuis { $duration }
+diag-copy = Copier les diagnostics
+diag-open-logs = Ouvrir le dossier des journaux
+diag-open-logs-failed = Impossible d'ouvrir le dossier des journaux ({ $error }).
+diag-clear = Effacer les mesures
+diag-note = La copie contient les versions, le système, les mesures et les messages récents : les dossiers deviennent des noms de fichiers, sans contenu d'image.
+diag-status-copied = Diagnostics copiés : collez-les dans un message ou un ticket.
+diag-tab-overview = Vue d'ensemble
+diag-tab-operations = Opérations lentes
+diag-tab-log = Journal
+diag-tab-documents = Documents
+diag-tab-system = Système
+diag-ms = { $value } ms
+diag-s = { $value } s
+diag-min = { $value } min
+diag-hours = { $hours } h { $minutes } min
+diag-ago = il y a { $duration }
+diag-unknown = Indisponible sur ce système
+diag-card-frame = Temps par image
+diag-card-frame-detail = max { $max } sur la dernière minute · { $frames ->
+    [one] { $frames } image
+   *[other] { $frames } images
+}
+diag-card-freezes = Blocages (1 min)
+diag-card-freezes-detail = { $total } au total · max { $max } · { $five } sur 5 min
+diag-card-memory = Mémoire du programme
+diag-card-memory-detail = privée { $private }
+diag-card-history = Mémoire de l'historique
+diag-card-history-detail = sur { $budget } pour tous les onglets · { $steps ->
+    [one] { $steps } étape
+   *[other] { $steps } étapes
+}
+diag-card-documents = Documents ouverts
+diag-card-documents-detail = le plus grand { $width } × { $height } · { $layers ->
+    [one] { $layers } calque
+   *[other] { $layers } calques
+} en tout
+diag-card-documents-none = Aucun document ouvert
+diag-card-rendering = Affichage du canevas
+diag-card-rendering-value = { $tiles ->
+    [one] { $tiles } tuile
+   *[other] { $tiles } tuiles
+}
+diag-card-rendering-detail = max { $max } par image · niveau { $level } · { $over } hors budget (1 min)
+diag-card-jobs = Calculs en arrière-plan
+diag-card-jobs-none = Aucun en cours
+diag-card-ai = Moteur d'IA
+diag-ai-unused = Pas encore utilisé
+diag-card-ai-detail = { $installed ->
+    [one] { $installed } modèle installé
+   *[other] { $installed } modèles installés
+} sur { $total }
+diag-card-color = Couleur
+diag-card-color-detail = écran : { $monitor } · épreuve { $proof }
+diag-on = activée
+diag-off = désactivée
+diag-card-log = Avertissements et erreurs
+diag-card-log-detail = { $warnings ->
+    [one] { $warnings } avertissement
+   *[other] { $warnings } avertissements
+} · { $errors ->
+    [one] { $errors } erreur
+   *[other] { $errors } erreurs
+}
+diag-sort-slowest = Les plus lentes
+diag-sort-recent = Les plus récentes
+diag-freezes = Blocages (5 min)
+diag-freezes-none = Aucun blocage ces 5 dernières minutes.
+diag-operations = Opérations
+diag-operations-none = Rien de mesuré pour l'instant.
+diag-col-operation = Opération
+diag-col-count = Nombre
+diag-col-last = Dernière
+diag-col-average = Moyenne
+diag-col-max = Max
+diag-col-when = Quand
+diag-background-tip = Calculée en arrière-plan : la fenêtre reste réactive pendant ce temps.
+diag-log-none = Aucun avertissement ni erreur pendant cette session.
+diag-level-warning = Avertissement
+diag-level-error = Erreur
+diag-level-panic = Plantage
+diag-log-file = Fichier journal : { $path }
+diag-doc-active = Actif
+diag-doc-size = Taille
+diag-doc-layers = Calques
+diag-doc-history = Historique
+diag-doc-history-value = { $done } sur { $steps ->
+    [one] { $steps } étape
+   *[other] { $steps } étapes
+} · { $memory }
+diag-doc-pixels = Pixels des calques
+diag-doc-profile = Profil
+diag-doc-format = Format de fichier
+diag-doc-unsaved = Pas encore enregistré
+diag-doc-embedded = Contenu d'un objet dynamique
+diag-kind-pixels = { $count ->
+    [one] { $count } calque de pixels
+   *[other] { $count } calques de pixels
+}
+diag-kind-text = { $count ->
+    [one] { $count } texte
+   *[other] { $count } textes
+}
+diag-kind-shape = { $count ->
+    [one] { $count } forme
+   *[other] { $count } formes
+}
+diag-kind-smart = { $count ->
+    [one] { $count } objet dynamique
+   *[other] { $count } objets dynamiques
+}
+diag-kind-adjustment = { $count ->
+    [one] { $count } réglage
+   *[other] { $count } réglages
+}
+diag-kind-fill = { $count ->
+    [one] { $count } remplissage
+   *[other] { $count } remplissages
+}
+diag-kind-group = { $count ->
+    [one] { $count } groupe
+   *[other] { $count } groupes
+}
+diag-sys-version = Version
+diag-sys-release = { $version } (version optimisée)
+diag-sys-debug = { $version } (version de débogage)
+diag-sys-os = Système
+diag-sys-gpu = Carte graphique
+diag-sys-gpu-unknown = Pas encore connue
+diag-sys-max-texture = Plus grande texture
+diag-sys-cores = Threads du processeur
+diag-sys-threads = Threads du programme
+diag-sys-scale = Échelle d'affichage
+diag-sys-window = Fenêtre
+diag-sys-language = Langue
+diag-sys-working-rgb = RVB de travail
+diag-sys-working-cmyk = CMJN de travail
+diag-sys-intent = Mode de rendu
+diag-sys-monitor = Profil de l'écran
+diag-sys-monitor-assumed = { $name } (supposé)
+diag-sys-history-budget = Budget de l'historique
+diag-sys-history-budget-value = { $active } par document, { $total } en tout
+diag-sys-since = Mesures depuis

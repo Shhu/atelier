@@ -558,6 +558,7 @@ impl AtelierApp {
         let (send, job) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
+            let _job = crate::diag::job("Magnetic Lasso edges");
             let mut image = image::RgbaImage::new(canvas.w, canvas.h);
             crate::document::composite_layers(&mut image, canvas, &layers, false);
             let _ = send.send(EdgeMap::new(&image));
@@ -1005,6 +1006,11 @@ impl AtelierApp {
         };
         let (send, result) = mpsc::channel();
         std::thread::spawn(move || {
+            let _job = crate::diag::job(if use_ai {
+                "Select Subject (AI)"
+            } else {
+                "Select Subject"
+            });
             let image = image();
             let found = if use_ai {
                 let found = ai::catch_panic(|| ai::subject::select_subject(&image));
@@ -1037,7 +1043,7 @@ impl AtelierApp {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.subject_job = None;
-                self.status = t!("select-subject-failed");
+                self.status_failed(t!("select-subject-failed"));
                 return;
             }
         };

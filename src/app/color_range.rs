@@ -171,6 +171,7 @@ impl AtelierApp {
             let (send, rx) = mpsc::channel();
             let ctx = self.ctx.clone();
             std::thread::spawn(move || {
+                let _job = crate::diag::job("Color Range: reduce");
                 let _ = send.send(reduce(&flatten()));
                 ctx.request_repaint();
             });

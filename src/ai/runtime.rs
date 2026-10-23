@@ -119,7 +119,12 @@ impl Slot {
         };
         let device = *device;
         match f(session, Loaded(())) {
-            Err(_) if device == Device::Gpu => {
+            Err(e) if device == Device::Gpu => {
+                let model = (self.path)();
+                let name = model.file_name().unwrap_or_default().to_string_lossy();
+                crate::diag::warn(format!(
+                    "{name}: the graphics card failed ({e}), running on the CPU"
+                ));
                 state.cpu_only = true;
                 state.session = None;
                 let (session, _) = state.session.insert(self.load(true)?);
@@ -177,8 +182,14 @@ impl Slot {
 /// accepts it and `cpu_only` is false, otherwise on the CPU.
 fn session(model: &Path, cpu_only: bool) -> Result<(Session, Device), String> {
     #[cfg(windows)]
-    if !cpu_only && let Ok(session) = gpu_session(model) {
-        return Ok((session, Device::Gpu));
+    if !cpu_only {
+        match gpu_session(model) {
+            Ok(session) => return Ok((session, Device::Gpu)),
+            Err(e) => crate::diag::warn(format!(
+                "{}: not loaded on the graphics card ({e}), on the CPU instead",
+                model.file_name().unwrap_or_default().to_string_lossy()
+            )),
+        }
     }
     #[cfg(not(windows))]
     let _ = cpu_only;

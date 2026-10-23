@@ -119,6 +119,7 @@ impl Worker {
                 // A panic still answers: the interface never waits forever.
                 let result = match job {
                     Ok((key, features, (x, y))) => {
+                        let _job = crate::diag::job("Object Selection: hover preview");
                         let prompt = Prompt {
                             points: vec![(x, y, true)],
                             rect: None,
@@ -130,6 +131,7 @@ impl Worker {
                         Done::Hover(key, mask.ok().flatten().and_then(|m| preview(&m)))
                     }
                     Err((features, pick)) => {
+                        let _job = crate::diag::job("Object Selection: pick");
                         let mask =
                             crate::ai::catch_panic(|| objects::segment(&features, &pick.prompt));
                         Done::Pick(pick, mask)
@@ -355,6 +357,7 @@ impl AtelierApp {
         let (send, result) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
+            let _job = crate::diag::job("Object Selection: image analysis");
             let _ = send.send(crate::ai::catch_panic(|| objects::encode(&flatten())));
             ctx.request_repaint();
         });
@@ -449,6 +452,7 @@ impl AtelierApp {
                         _ => t!("ai-error-internal"),
                     };
                     self.status = t!("objsel-failed", error = error);
+                    crate::diag::error(&self.status);
                 }
             }
         }
@@ -516,7 +520,7 @@ impl AtelierApp {
             os.worker = None;
             os.picking = 0;
             os.reset_hover();
-            self.status = t!("objsel-failed", error = t!("ai-error-internal"));
+            self.status_failed(t!("objsel-failed", error = t!("ai-error-internal")));
         }
     }
 
@@ -528,7 +532,7 @@ impl AtelierApp {
         let found = match mask {
             Ok(mask) => mask.and_then(|m| Selection::from_mask(&m.coverage, m.offset)),
             Err(error) => {
-                self.status = t!("objsel-failed", error = error);
+                self.status_failed(t!("objsel-failed", error = error));
                 return;
             }
         };

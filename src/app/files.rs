@@ -24,12 +24,16 @@ impl AtelierApp {
             return;
         }
         let shown = path.display().to_string();
-        match Document::open(path) {
+        let started = std::time::Instant::now();
+        let opened = Document::open(path);
+        crate::diag::record(format!("Open: {}", format_of(path)), started.elapsed());
+        match opened {
             Ok(opened) => {
                 self.status = if opened.animated {
                     t!("file-status-opened-first-frame", path = shown)
                 } else if !opened.notes.is_empty() {
                     let notes = opened.notes.join(" · ");
+                    crate::diag::warn(format!("Opened {} simplified: {notes}", file_name(path)));
                     t!("xchg-status-opened-simplified", path = shown, notes = notes)
                 } else {
                     t!("status-opened", path = shown)
@@ -143,7 +147,9 @@ impl AtelierApp {
             return;
         }
         let Some(doc) = &mut self.doc else { return };
+        let started = std::time::Instant::now();
         let saved = doc.save(path);
+        crate::diag::record(format!("Save: {}", format_of(path)), started.elapsed());
         let failed = saved.is_err();
         self.status = match saved {
             Ok(notes) => {
@@ -155,6 +161,8 @@ impl AtelierApp {
                 if notes.is_empty() {
                     t!("status-saved", path = shown)
                 } else {
+                    let what = notes.join(" · ");
+                    crate::diag::warn(format!("Saved {} simplified: {what}", file_name(path)));
                     t!(
                         "xchg-status-saved-simplified",
                         path = shown,
@@ -236,7 +244,7 @@ impl AtelierApp {
                 true
             }
             Err(e) => {
-                self.status = t!("status-copy-failed", error = e.to_string());
+                self.status_failed(t!("status-copy-failed", error = e.to_string()));
                 false
             }
         }
@@ -274,7 +282,7 @@ impl AtelierApp {
     fn paste_image(&mut self, image: image::RgbaImage, mode: PasteMode) {
         let (w, h) = image.dimensions();
         if let Err(e) = crate::document::check_size(w, h) {
-            self.status = t!("file-status-paste-failed", error = e.to_string());
+            self.status_failed(t!("file-status-paste-failed", error = e.to_string()));
             return;
         }
         if mode == PasteMode::Into && self.selection.is_none() {
@@ -447,6 +455,12 @@ pub(super) struct SaveDialog {
 #[cfg(test)]
 thread_local! {
     pub(super) static SAVE_DIALOG: std::cell::RefCell<SaveDialog> = Default::default();
+}
+
+/// A file's format, as measured: its extension ("png"), lowercase.
+pub(super) fn format_of(path: &Path) -> String {
+    path.extension()
+        .map_or_else(|| "?".to_owned(), |e| e.to_string_lossy().to_lowercase())
 }
 
 pub(super) fn file_name(path: &Path) -> String {

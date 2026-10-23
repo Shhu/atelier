@@ -2465,3 +2465,149 @@ words3-size-kb = { $size } KB
 ## A label and its value (action steps, batch errors)
 
 words3-label-value = { $label }: { $value }
+
+## Help › Diagnostics: measures and messages to send to a developer
+
+diag-menu = Diagnostics…
+diag-palette-keywords = performance log logs report bug crash memory slow freeze debug
+diag-title = Diagnostics
+diag-uptime = up for { $duration }
+diag-copy = Copy diagnostics
+diag-open-logs = Open the logs folder
+diag-open-logs-failed = Can't open the logs folder ({ $error }).
+diag-clear = Clear measures
+diag-note = The copy lists versions, system, measures and recent messages: folders become file names, no image content.
+diag-status-copied = Diagnostics copied: paste them into a message or an issue.
+diag-tab-overview = Overview
+diag-tab-operations = Slow operations
+diag-tab-log = Log
+diag-tab-documents = Documents
+diag-tab-system = System
+diag-ms = { $value } ms
+diag-s = { $value } s
+diag-min = { $value } min
+diag-hours = { $hours } h { $minutes } min
+diag-ago = { $duration } ago
+diag-unknown = Not available on this system
+diag-card-frame = Frame time
+diag-card-frame-detail = max { $max } over the last minute · { $frames ->
+    [one] { $frames } frame
+   *[other] { $frames } frames
+}
+diag-card-freezes = Freezes (1 min)
+diag-card-freezes-detail = { $total } in total · max { $max } · { $five } over 5 min
+diag-card-memory = Process memory
+diag-card-memory-detail = private { $private }
+diag-card-history = History memory
+diag-card-history-detail = of { $budget } for all tabs · { $steps ->
+    [one] { $steps } step
+   *[other] { $steps } steps
+}
+diag-card-documents = Open documents
+diag-card-documents-detail = largest { $width } × { $height } · { $layers ->
+    [one] { $layers } layer
+   *[other] { $layers } layers
+} in all
+diag-card-documents-none = No document open
+diag-card-rendering = Canvas rendering
+diag-card-rendering-value = { $tiles ->
+    [one] { $tiles } tile
+   *[other] { $tiles } tiles
+}
+diag-card-rendering-detail = max { $max } per frame · level { $level } · { $over } over budget (1 min)
+diag-card-jobs = Background jobs
+diag-card-jobs-none = None running
+diag-card-ai = AI runtime
+diag-ai-unused = Not used yet
+diag-card-ai-detail = { $installed } of { $total } models installed
+diag-card-color = Color
+diag-card-color-detail = monitor: { $monitor } · proof { $proof }
+diag-on = on
+diag-off = off
+diag-card-log = Warnings and errors
+diag-card-log-detail = { $warnings ->
+    [one] { $warnings } warning
+   *[other] { $warnings } warnings
+} · { $errors ->
+    [one] { $errors } error
+   *[other] { $errors } errors
+}
+diag-sort-slowest = Slowest
+diag-sort-recent = Most recent
+diag-freezes = Freezes (5 min)
+diag-freezes-none = No freeze in the last 5 minutes.
+diag-operations = Operations
+diag-operations-none = Nothing measured yet.
+diag-col-operation = Operation
+diag-col-count = Count
+diag-col-last = Last
+diag-col-average = Average
+diag-col-max = Max
+diag-col-when = When
+diag-background-tip = Computed in the background: the window stays responsive meanwhile.
+diag-log-none = No warning or error in this session.
+diag-level-warning = Warning
+diag-level-error = Error
+diag-level-panic = Crash
+diag-log-file = Log file: { $path }
+diag-doc-active = Active
+diag-doc-size = Size
+diag-doc-layers = Layers
+diag-doc-history = History
+diag-doc-history-value = { $done } of { $steps ->
+    [one] { $steps } step
+   *[other] { $steps } steps
+} · { $memory }
+diag-doc-pixels = Layer pixels
+diag-doc-profile = Profile
+diag-doc-format = File format
+diag-doc-unsaved = Not saved yet
+diag-doc-embedded = Smart object contents
+diag-kind-pixels = { $count ->
+    [one] { $count } pixel layer
+   *[other] { $count } pixel layers
+}
+diag-kind-text = { $count ->
+    [one] { $count } text
+   *[other] { $count } texts
+}
+diag-kind-shape = { $count ->
+    [one] { $count } shape
+   *[other] { $count } shapes
+}
+diag-kind-smart = { $count ->
+    [one] { $count } smart object
+   *[other] { $count } smart objects
+}
+diag-kind-adjustment = { $count ->
+    [one] { $count } adjustment
+   *[other] { $count } adjustments
+}
+diag-kind-fill = { $count ->
+    [one] { $count } fill
+   *[other] { $count } fills
+}
+diag-kind-group = { $count ->
+    [one] { $count } group
+   *[other] { $count } groups
+}
+diag-sys-version = Version
+diag-sys-release = { $version } (release build)
+diag-sys-debug = { $version } (debug build)
+diag-sys-os = System
+diag-sys-gpu = Graphics card
+diag-sys-gpu-unknown = Not known yet
+diag-sys-max-texture = Largest texture
+diag-sys-cores = Processor threads
+diag-sys-threads = Program threads
+diag-sys-scale = Display scale
+diag-sys-window = Window
+diag-sys-language = Language
+diag-sys-working-rgb = Working RGB
+diag-sys-working-cmyk = Working CMYK
+diag-sys-intent = Rendering intent
+diag-sys-monitor = Monitor profile
+diag-sys-monitor-assumed = { $name } (assumed)
+diag-sys-history-budget = History budget
+diag-sys-history-budget-value = { $active } per document, { $total } in all
+diag-sys-since = Measures since

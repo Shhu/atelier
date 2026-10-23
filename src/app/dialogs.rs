@@ -929,6 +929,7 @@ pub(super) fn forget_panel_places(ctx: &egui::Context) {
             "paths",
             "swatches",
             "shortcuts",
+            "diagnostics",
         ] {
             let id = egui::Id::new(id);
             d.remove::<Vec2>(id.with("offset"));

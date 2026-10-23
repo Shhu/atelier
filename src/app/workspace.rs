@@ -131,6 +131,7 @@ pub(super) enum Command {
     Shortcuts,
     Website,
     ReportProblem,
+    Diagnostics,
     About,
 }
 
@@ -171,6 +172,7 @@ impl AtelierApp {
             Command::ReportProblem => self
                 .ctx
                 .open_url(egui::OpenUrl::new_tab(format!("{REPOSITORY}/issues"))),
+            Command::Diagnostics => self.open_diagnostics(),
             Command::About => self.workspace.about = true,
         }
     }
@@ -217,11 +219,19 @@ impl AtelierApp {
     /// and in a window that stays until dismissed (`alert`), so that it
     /// can't go unnoticed. Batch runs keep only the status.
     pub(super) fn report_error(&mut self, message: String) {
+        crate::diag::error(&message);
         self.status = message.clone();
         self.workspace.error_status = Some(message.clone());
         if !self.automate.running() {
             self.workspace.alert = Some(message);
         }
+    }
+
+    /// Reports a failed operation in the status bar only (and the
+    /// diagnostics' log), for what can be tried again at once.
+    pub(super) fn status_failed(&mut self, message: String) {
+        crate::diag::error(&message);
+        self.status = message;
     }
 
     /// File › Open Recent: the recent files (by name, with their folder
@@ -348,14 +358,16 @@ impl AtelierApp {
             Separator,
             item(t!("ui3-menu-website"), Command::Website),
             item(t!("ui3-menu-report-problem"), Command::ReportProblem),
+            item(t!("diag-menu"), Command::Diagnostics),
             Separator,
             item(t!("ui3-menu-about"), Command::About),
         ]
     }
 
-    /// Keyboard Shortcuts, About and the alert.
+    /// Keyboard Shortcuts, Diagnostics, About and the alert.
     pub(super) fn workspace_windows(&mut self, ctx: &egui::Context) {
         self.shortcuts_window(ctx);
+        self.diagnostics_window(ctx);
         self.about_window(ctx);
         self.error_alert_window(ctx);
     }

@@ -778,7 +778,7 @@ fn local_date() -> Option<(i32, u32, u32)> {
 
 /// Year, month, day of the `days`-th day since 1970-01-01 (Howard
 /// Hinnant's algorithm).
-fn civil_date(days: i64) -> (i32, u32, u32) {
+pub(crate) fn civil_date(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);

@@ -226,10 +226,12 @@ struct Job<T> {
 }
 
 impl<T: Send + 'static> Job<T> {
+    /// `name`: what it is measured as (see `crate::diag`), if anything.
     fn spawn(
         ctx: &egui::Context,
         key: u64,
         region: [u32; 4],
+        name: Option<String>,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
@@ -237,6 +239,7 @@ impl<T: Send + 'static> Job<T> {
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
         std::thread::spawn(move || {
+            let _job = name.map(crate::diag::job);
             let _ = tx.send(crate::filters::cancellable(Some(flag), work));
             ctx.request_repaint();
         });
@@ -533,11 +536,12 @@ impl AtelierApp {
             Some(Ready::Job(job)) => job,
             Some(Ready::Image(image)) => {
                 // A job that gives at once what the preview holds.
-                Job::spawn(&self.ctx, 0, [0; 4], move || (*image).clone())
+                Job::spawn(&self.ctx, 0, [0; 4], None, move || (*image).clone())
             }
             None => {
                 let reach = filter.reach().unwrap_or(0);
-                Job::spawn(&self.ctx, 0, [0; 4], move || {
+                let name = format!("Filter: {:?}", filter.kind());
+                Job::spawn(&self.ctx, 0, [0; 4], Some(name), move || {
                     target.process(reach, |image, origin| filter.apply(image, origin))
                 })
             }
@@ -587,7 +591,7 @@ impl AtelierApp {
                 None => {
                     doc.end_paint();
                     doc.discard_step();
-                    self.status = t!("fx3-filter-failed", name = name.as_str());
+                    self.status_failed(t!("fx3-filter-failed", name = name.as_str()));
                 }
             }
         }
@@ -630,7 +634,12 @@ impl AtelierApp {
             return self.end_layer_preview();
         };
         let wanted = preview.clone();
-        let job = Job::spawn(&self.ctx, 0, [0; 4], move || {
+        let name = match &preview {
+            LayerPreview::Adjust(a) => format!("Adjustment preview: {:?}", a.kind()),
+            LayerPreview::Transparency(_) => "Make Transparent preview".to_owned(),
+            LayerPreview::Filter(_) => "Layer preview".to_owned(),
+        };
+        let job = Job::spawn(&self.ctx, 0, [0; 4], Some(name), move || {
             target.process(0, |image, _| wanted.apply(image))
         });
         self.filters.adjust = Some((preview, id, rev, job));
@@ -825,7 +834,8 @@ impl AtelierApp {
         let shown = square.shown.as_ref().map(|s| s.0);
         if shown != Some(wanted) && square.job.is_none() {
             let (target, filter) = (target.clone(), dialog.filter);
-            square.job = Some(Job::spawn(ctx, wanted, region, move || {
+            let name = format!("Filter dialog preview: {:?}", filter.kind());
+            square.job = Some(Job::spawn(ctx, wanted, region, Some(name), move || {
                 let mut original = image::imageops::crop_imm(
                     &*target.image,
                     region[0],
@@ -872,7 +882,7 @@ impl AtelierApp {
                 {
                     dialog.failed = Some(job.key);
                     let name = title(dialog.filter.kind());
-                    self.status = t!("fx3-filter-failed", name = name.as_str());
+                    self.status_failed(t!("fx3-filter-failed", name = name.as_str()));
                 }
             }
             _ => {}
@@ -891,7 +901,8 @@ impl AtelierApp {
         if dialog.preview && !shown && dialog.canvas.is_none() && dialog.failed != Some(key) {
             let (target, filter) = (target.clone(), dialog.filter);
             let reach = filter.reach().unwrap_or(0);
-            dialog.canvas = Some(Job::spawn(ctx, key, [0; 4], move || {
+            let name = format!("Filter canvas preview: {:?}", filter.kind());
+            dialog.canvas = Some(Job::spawn(ctx, key, [0; 4], Some(name), move || {
                 target.process(reach, |image, origin| filter.apply(image, origin))
             }));
         }

@@ -9,6 +9,7 @@ mod cms;
 mod color;
 mod compose;
 mod config;
+mod diag;
 mod document;
 mod elements;
 mod export;
@@ -38,6 +39,8 @@ use std::path::PathBuf;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    diag::start();
+    diag::install_panic_hook();
     i18n::init();
     let path = std::env::args_os().nth(1).map(PathBuf::from);
 

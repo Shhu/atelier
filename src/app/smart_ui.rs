@@ -367,6 +367,7 @@ impl AtelierApp {
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
+            let _job = crate::diag::job("Smart object rendering");
             let _ = tx.send(job.run());
             ctx.request_repaint();
         });
@@ -415,7 +416,11 @@ impl AtelierApp {
                 }
             }
             Err(e) => {
-                self.status = t!("status-import-failed", path = shown, error = e.to_string());
+                self.status_failed(t!(
+                    "status-import-failed",
+                    path = shown,
+                    error = e.to_string()
+                ));
             }
         }
     }
@@ -559,14 +564,14 @@ impl AtelierApp {
             return;
         };
         let shown = path.display().to_string();
-        self.status = match contents.save(&path) {
-            Ok(_) => t!("status-saved", path = shown),
-            Err(e) => t!(
+        match contents.save(&path) {
+            Ok(_) => self.status = t!("status-saved", path = shown),
+            Err(e) => self.status_failed(t!(
                 "file-status-save-failed",
-                name = shown,
+                name = files::file_name(&path),
                 error = e.to_string()
-            ),
-        };
+            )),
+        }
     }
 
     /// Reset Transform: the contents at 100 %, unturned, centered where
@@ -615,6 +620,7 @@ impl AtelierApp {
             let (tx, rx) = mpsc::channel();
             let ctx = self.ctx.clone();
             std::thread::spawn(move || {
+                let _job = crate::diag::job("Linked files: read");
                 let _ = tx.send(reads.into_iter().map(LinkRead::run).collect());
                 ctx.request_repaint();
             });
@@ -832,6 +838,7 @@ impl AtelierApp {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            let _job = crate::diag::job("Smart filter preview");
             let _ = tx.send(job.run());
             ctx.request_repaint();
         });

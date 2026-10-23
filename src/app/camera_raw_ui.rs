@@ -480,6 +480,7 @@ impl AtelierApp {
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
+            let _job = crate::diag::job("Camera Raw: read");
             let loaded = read().map(|(source, preview_only)| Loaded {
                 analysis: Analysis::of(&source),
                 source,
@@ -648,7 +649,7 @@ impl AtelierApp {
             }
             (Err(e), Purpose::Open { path, .. }) => {
                 let path = path.display().to_string();
-                self.status = t!("status-open-failed", path = path, error = e.to_string());
+                self.status_failed(t!("status-open-failed", path = path, error = e.to_string()));
             }
             (Err(_), _) => {}
         }
@@ -768,6 +769,7 @@ impl AtelierApp {
         let ctx = self.ctx.clone();
         let (done, flag) = (progress.clone(), cancel.clone());
         std::thread::spawn(move || {
+            let _job = crate::diag::job("Camera Raw: develop");
             let image = crate::filters::cancellable(Some(flag), || work(&done));
             let _ = tx.send(image);
             ctx.request_repaint();
@@ -843,7 +845,7 @@ impl AtelierApp {
                         None => {
                             doc.end_paint();
                             doc.discard_step();
-                            self.status = t!("fx3-filter-failed", name = name.as_str());
+                            self.status_failed(t!("fx3-filter-failed", name = name.as_str()));
                         }
                     }
                 }
@@ -1015,6 +1017,7 @@ impl RawWindow {
         let (settings, region, scale) = (settings.clone(), wanted.region, wanted.scale);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            let _job = crate::diag::job("Camera Raw: preview");
             let developed =
                 develop_region(&source, cached, &analysis, &settings, region, scale, visual);
             let _ = tx.send(developed);

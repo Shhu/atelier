@@ -149,7 +149,11 @@ impl AtelierApp {
                 Err(e @ DownloadError::Cancelled) => self.status = e.to_string(),
                 Err(e) => {
                     let error = e.to_string();
-                    self.status = t!("models-status-failed", name = model.name(), error = error);
+                    self.status_failed(t!(
+                        "models-status-failed",
+                        name = model.name(),
+                        error = error
+                    ));
                 }
             }
         }
@@ -277,7 +281,7 @@ impl AtelierApp {
         if out.other {
             let root = models::root();
             if let Err(e) = open_folder(&root) {
-                self.status = t!("models-open-folder-failed", error = e.to_string());
+                self.status_failed(t!("models-open-folder-failed", error = e.to_string()));
             }
         }
         if out.ok || out.cancel {
@@ -451,14 +455,14 @@ impl AtelierApp {
             if model == Model::Objects {
                 self.object_select.forget();
             }
-            self.status = match model.delete() {
-                Ok(()) => t!("models-status-deleted", name = model.name()),
-                Err(e) => t!(
+            match model.delete() {
+                Ok(()) => self.status = t!("models-status-deleted", name = model.name()),
+                Err(e) => self.status_failed(t!(
                     "models-status-delete-failed",
                     name = model.name(),
                     error = e
-                ),
-            };
+                )),
+            }
         }
         if (out.ok || out.cancel)
             && let Some(w) = &mut self.models_window
@@ -544,7 +548,7 @@ fn progress_bar(ui: &mut egui::Ui, fraction: f32) {
 }
 
 /// Shows `path` in the system's file manager (created if needed).
-fn open_folder(path: &Path) -> std::io::Result<()> {
+pub(super) fn open_folder(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
     let program = if cfg!(windows) {
         "explorer"

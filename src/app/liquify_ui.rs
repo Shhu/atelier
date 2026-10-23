@@ -679,6 +679,7 @@ impl AtelierApp {
         let (tx, rx) = mpsc::channel();
         let (ctx, shared) = (self.ctx.clone(), Arc::clone(&progress));
         std::thread::spawn(move || {
+            let _job = crate::diag::job("Liquify");
             let mut done = true;
             let image = target.process(u32::MAX, |image, _| {
                 match liquify::render(image, &fitted, &shared) {

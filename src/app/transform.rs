@@ -1282,6 +1282,7 @@ impl AtelierApp {
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
+            let _job = crate::diag::job("Transform");
             let _ = tx.send(job.run());
             ctx.request_repaint();
         });

@@ -11,6 +11,7 @@ mod color_range;
 #[cfg(test)]
 mod color_tests;
 mod color_ui;
+mod diagnostics;
 mod dialogs;
 mod downloads;
 #[cfg(test)]
@@ -273,7 +274,7 @@ const WHEEL_ZOOM_RATE: f32 = 1.0 / 200.0;
 /// Delay (s) to type two opacity digits in a row (4 then 5: 45%).
 const DIGIT_DELAY: f64 = 0.6;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
     /// Artboard tool (with the Move tool: V).
     Artboard,
@@ -583,7 +584,7 @@ impl View {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Action {
     Open,
     Import,
@@ -959,6 +960,8 @@ pub struct AtelierApp {
     new_doc: new_document::NewDocument,
     /// Panels shown and their sizes, Help windows, alerts.
     workspace: workspace::Workspace,
+    /// Help › Diagnostics.
+    diagnostics: diagnostics::Diagnostics,
 }
 
 /// Processing previewed on a layer while a window is open.
@@ -1442,6 +1445,7 @@ impl AtelierApp {
             artboards: Default::default(),
             new_doc: Default::default(),
             workspace: Default::default(),
+            diagnostics: Default::default(),
             history: Default::default(),
             channels: Default::default(),
         };
@@ -1925,6 +1929,7 @@ impl AtelierApp {
         let Some(stroke) = self.stroke.take() else {
             return;
         };
+        let _measured = crate::diag::timer(format!("Stroke end: {:?}", self.tool));
         // The healing tools finish their work (the Spot Healing Brush its own way).
         let Some(stroke) = self.finish_retouch(stroke) else {
             return;
@@ -1953,6 +1958,7 @@ impl AtelierApp {
     }
 
     fn run(&mut self, action: Action) {
+        let _measured = crate::diag::timer(format!("{action:?}"));
         // A selection still being computed applies first: the command
         // works with it, as if it had been computed at once.
         self.wait_select_job();
@@ -2347,6 +2353,7 @@ impl AtelierApp {
     }
 
     fn apply_transform(&mut self) {
+        let _measured = crate::diag::timer("Transform commit");
         self.record_transform();
         self.commit_placing();
         if self.apply_transform_extras() {
@@ -3237,7 +3244,17 @@ fn fits_max_dimension(size: Vec2, angle: f32) -> bool {
 }
 
 impl eframe::App for AtelierApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let start = std::time::Instant::now();
+        self.read_gpu(frame);
+        self.frame_ui(ui);
+        self.end_frame(start);
+    }
+}
+
+impl AtelierApp {
+    /// Everything a frame does and draws.
+    fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.handle_dropped_files(&ctx);
         self.poll_subject(&ctx);
@@ -3588,6 +3605,11 @@ mod tests {
                         what @ ("color-settings" | "assign-profile" | "convert-profile"
                         | "proof-setup" | "proof-colors"),
                     ) => app.capture_color(what),
+                    // Help › Diagnostics, on a tab: `diagnostics`,
+                    // `diagnostics-operations`, `-log`, `-documents`, `-system`.
+                    Ok(what) if what.starts_with("diagnostics") => {
+                        app.capture_diagnostics(what);
+                    }
                     _ => {}
                 }
                 // Groups, masks, clipping, adjustment and fill layers

@@ -1595,7 +1595,7 @@ impl AtelierApp {
                 a.changed();
                 self.status = t!("actions-status-loaded", path = path.display().to_string());
             }
-            Err(e) => self.status = t!("actions-status-load-failed", error = e.to_string()),
+            Err(e) => self.status_failed(t!("actions-status-load-failed", error = e.to_string())),
         }
     }
 
@@ -1618,10 +1618,10 @@ impl AtelierApp {
         else {
             return;
         };
-        self.status = match act::write(&path, &[set]) {
-            Ok(()) => t!("actions-status-saved", path = path.display().to_string()),
-            Err(e) => t!("actions-status-save-failed", error = e.to_string()),
-        };
+        match act::write(&path, &[set]) {
+            Ok(()) => self.status = t!("actions-status-saved", path = path.display().to_string()),
+            Err(e) => self.status_failed(t!("actions-status-save-failed", error = e.to_string())),
+        }
     }
 
     /// A Stop step's message, or the step that could not be played.

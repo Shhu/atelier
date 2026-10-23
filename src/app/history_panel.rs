@@ -77,6 +77,7 @@ impl AtelierApp {
     /// The state after `done` steps (a click in the History panel), like
     /// as many undos or redos.
     pub(super) fn go_to_history(&mut self, done: usize) {
+        let _measured = crate::diag::timer("History: go to step");
         self.finish_stroke();
         // A text being typed is committed first, as by Undo: its own steps
         // are then ordinary ones.

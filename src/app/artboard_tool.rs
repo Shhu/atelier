@@ -148,7 +148,7 @@ pub(super) fn orientation_field(ui: &mut egui::Ui, (w, h): &mut (u32, u32)) -> b
 }
 
 /// Artboard commands of the Layer and File menus.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum Command {
     /// Layer › New › Artboard…
     New,
@@ -701,7 +701,9 @@ impl AtelierApp {
                     folder = folder
                 );
             }
-            Ok(Err(error)) => self.status = t!("artboard-status-export-failed", error = error),
+            Ok(Err(error)) => {
+                self.status_failed(t!("artboard-status-export-failed", error = error))
+            }
             Err(TryRecvError::Disconnected) => {}
         }
         self.artboards.job = None;
@@ -897,6 +899,7 @@ impl AtelierApp {
         }
         let (send, receive) = channel();
         std::thread::spawn(move || {
+            let _job = crate::diag::job("Artboards to Files");
             let _ = send.send(job());
         });
         self.artboards.job = Some(receive);

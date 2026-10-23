@@ -680,6 +680,11 @@ impl AtelierApp {
         let shared = Arc::clone(&progress);
         let (output, ai) = (task.output, task.method == Method::Ai);
         std::thread::spawn(move || {
+            let _job = crate::diag::job(if ai {
+                "Content-Aware Fill (AI)"
+            } else {
+                "Content-Aware Fill"
+            });
             let filled = task.compute(&shared);
             let _ = tx.send(filled);
             ctx.request_repaint();
@@ -742,7 +747,7 @@ impl AtelierApp {
             doc.discard_step();
         }
         if let Some(error) = failure {
-            self.status = t!("retouch-status-ai-failed", error = error);
+            self.status_failed(t!("retouch-status-ai-failed", error = error));
         } else if cancelled {
             self.status = t!("retouch-status-cancelled", name = job.name.as_str());
         }

@@ -776,9 +776,11 @@ impl AtelierApp {
             let work = compose_work(cv, &plan, &todo, threads);
             let start = std::time::Instant::now();
             let mut done = Vec::new();
+            let mut over_budget = false;
             for batch in work.chunks(threads.max(1)) {
                 if start.elapsed() > TILE_BUDGET && !done.is_empty() {
                     ctx.request_repaint();
+                    over_budget = true;
                     break;
                 }
                 let results: Vec<std::sync::Mutex<Option<TileResult>>> =
@@ -789,6 +791,8 @@ impl AtelierApp {
                 });
                 done.extend(batch.iter().zip(results));
             }
+            let tiles = done.iter().filter(|(item, _)| item.last).count();
+            crate::diag::tiles(tiles as u32, over_budget, level);
             let mut snaps: SnapParts = HashMap::new();
             let mut whole: HashMap<(i64, i64), Vec<(PixelRect, ColorImage)>> = HashMap::new();
             for (item, result) in done {

@@ -1034,6 +1034,7 @@ impl Document {
 
     /// Records an already captured state (to add it only if something changed).
     fn push_state(&mut self, state: State, name: String) {
+        let _measured = crate::diag::timer("History: record step");
         self.seq += 1;
         self.undo.push_back(Step {
             state,

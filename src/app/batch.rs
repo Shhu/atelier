@@ -912,6 +912,7 @@ impl AtelierApp {
                     Err(e) => {
                         let shown = path.display().to_string();
                         let error = t!("status-open-failed", path = shown, error = e.to_string());
+                        crate::diag::error(&error);
                         (None, Some(error))
                     }
                 }
