@@ -1026,3 +1026,127 @@ fn a_new_documents_view_is_reduced_off_the_ui_thread() {
     let at = shown(&shot, &h, middle.x as u32, middle.y as u32);
     assert!(at[1] > 100 && at[0] < 60, "the image shows: {at:?}");
 }
+
+/// Panning while a change of the whole view is composited over several
+/// frames: the tiles coming into view show at once, never holes.
+#[test]
+fn tiles_panned_into_view_during_a_generation_show_at_once() {
+    let mut doc = Document::new(solid(3000, 2000, [255, 255, 255, 255]), None);
+    doc.add_layer("red".into(), solid(3000, 2000, [255, 0, 0, 255]), (0, 0));
+    for k in 0..12 {
+        doc.add_layer(format!("l{k}"), solid(3000, 2000, [0, 0, 255, 8]), (0, 0));
+    }
+    let mut h = app_with(doc, Tool::Hand, 2048);
+    h.state_mut().zoom = 0.5;
+    h.run_steps(1);
+    until_reduced(&mut h);
+    for _ in 0..20 {
+        h.run_steps(1);
+    }
+    h.state_mut().doc.as_mut().unwrap().layers[1].opacity = 0.0;
+    // A tile per frame (a slow computer).
+    super::render::TEST_TILE_BUDGET.set(Some(std::time::Duration::ZERO));
+    super::render::TEST_THREADS.set(Some(1));
+    h.run_steps(1);
+    let started = h.state().generation_pending();
+    let mut panned = 0;
+    while h.state().generation_pending() && panned < 6 {
+        h.state_mut().pan -= vec2(150.0, 100.0);
+        h.run_steps(1);
+        panned += 1;
+        let holes = super::render::TEST_HOLES.with(std::cell::Cell::get);
+        assert_eq!(holes, 0, "empty tiles after pan {panned}");
+    }
+    super::render::TEST_TILE_BUDGET.set(None);
+    super::render::TEST_THREADS.set(None);
+    assert!(started && panned >= 3, "a generation ran ({panned} frames)");
+    // Once done, the view shows the document as it is.
+    h.state_mut().pan = Vec2::ZERO;
+    let start = std::time::Instant::now();
+    while h.state().generation_pending() {
+        assert!(start.elapsed().as_secs() < 60, "never done");
+        h.run_steps(1);
+    }
+    for _ in 0..3 {
+        h.run_steps(1);
+    }
+    let shot = h.render().unwrap();
+    let view = h.state().last_view.unwrap();
+    let p = view.to_image(h.ctx.content_rect().center());
+    let flat = h.state().doc.as_ref().unwrap().flatten();
+    let [r, g, b, _] = flat.get_pixel(p.x as u32, p.y as u32).0;
+    assert!(near(shown(&shot, &h, p.x as u32, p.y as u32), [r, g, b]));
+}
+
+/// A large document shown for the first time: a coarse view of it while
+/// its reductions are made, not an empty canvas.
+#[test]
+fn a_new_document_shows_coarsely_while_reduced() {
+    let mut h = app_with(
+        Document::new(solid(200, 100, [0, 0, 0, 255]), None),
+        Tool::Hand,
+        2048,
+    );
+    h.state_mut().zoom = 0.3;
+    h.run_steps(2);
+    let mut doc = Document::new(solid(3000, 2000, [255, 255, 255, 255]), None);
+    for k in 0..3 {
+        doc.add_layer(format!("l{k}"), solid(3000, 2000, [0, 160, 0, 255]), (0, 0));
+    }
+    h.state_mut().doc = Some(doc);
+    h.state_mut().pan = Vec2::ZERO;
+    h.run_steps(1);
+    assert!(h.state().level_pending(), "reduced on a worker thread");
+    assert_eq!(
+        super::render::TEST_HOLES.with(std::cell::Cell::get),
+        0,
+        "no empty tiles"
+    );
+    let shot = h.render().unwrap();
+    let view = h.state().last_view.unwrap();
+    let p = view.to_image(h.ctx.content_rect().center());
+    if (0.0..3000.0).contains(&p.x) && (0.0..2000.0).contains(&p.y) {
+        assert!(near(shown(&shot, &h, p.x as u32, p.y as u32), [0, 160, 0]));
+    }
+    until_reduced(&mut h);
+}
+
+/// The view of a tab left during a generation keeps none (its reductions
+/// would stay pinned), and shows the change once back.
+#[test]
+fn a_tab_left_during_a_generation_drops_it() {
+    let mut doc = Document::new(solid(3000, 2000, [255, 255, 255, 255]), None);
+    doc.add_layer("red".into(), solid(3000, 2000, [255, 0, 0, 255]), (0, 0));
+    for k in 0..12 {
+        doc.add_layer(format!("l{k}"), solid(3000, 2000, [0, 0, 255, 8]), (0, 0));
+    }
+    let mut h = app_with(doc, Tool::Hand, 2048);
+    h.state_mut().zoom = 0.5;
+    h.run_steps(1);
+    until_reduced(&mut h);
+    for _ in 0..20 {
+        h.run_steps(1);
+    }
+    h.state_mut().doc.as_mut().unwrap().layers[1].opacity = 0.0;
+    super::render::TEST_TILE_BUDGET.set(Some(std::time::Duration::ZERO));
+    h.run_steps(1);
+    super::render::TEST_TILE_BUDGET.set(None);
+    assert!(h.state().generation_pending(), "a generation ran");
+    let other = Document::new(solid(300, 200, [0, 0, 0, 255]), None);
+    let first = h.state_mut().doc.replace(other);
+    h.run_steps(1);
+    assert_eq!(h.state().kept_generations(), 0);
+    h.state_mut().doc = first;
+    for _ in 0..10 {
+        h.run_steps(1);
+    }
+    let shot = h.render().unwrap();
+    let view = h.state().last_view.unwrap();
+    let p = view.to_image(h.ctx.content_rect().center());
+    let flat = h.state().doc.as_ref().unwrap().flatten();
+    let [r, g, b, _] = flat.get_pixel(p.x as u32, p.y as u32).0;
+    assert!(
+        near(shown(&shot, &h, p.x as u32, p.y as u32), [r, g, b]),
+        "the change shows"
+    );
+}

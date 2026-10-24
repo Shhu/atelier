@@ -148,7 +148,7 @@ impl DirtyRect {
 /// premultiplied colors in 0..1.
 struct Carried {
     size: usize,
-    pixels: Vec<[f32; 4]>,
+    pixels: Vec<[u16; 4]>,
 }
 
 /// A stroke in progress.
@@ -569,97 +569,86 @@ impl Stroke {
         sharpen: bool,
     ) {
         let (w, h) = image.dimensions();
-        // The area and a one-pixel border, read before writing.
+        // The area and a one-pixel border, read before writing (as they
+        // are: 4 bytes a pixel, a large dab covers megapixels).
         let (x0, y0) = (r.x.saturating_sub(1), r.y.saturating_sub(1));
         let (x1, y1) = ((r.x + r.w + 1).min(w), (r.y + r.h + 1).min(h));
         let rw = (x1 - x0) as usize;
         let read: &RgbaImage = self.source.as_ref().unwrap_or(&*image);
-        let mut region = vec![[0.0f32; 4]; rw * (y1 - y0) as usize];
+        let mut region = vec![[0u8; 4]; rw * (y1 - y0) as usize];
         dab_rows(&mut region, rw, |first, band| {
             for (j, row) in band.chunks_exact_mut(rw).enumerate() {
                 let y = y0 + (first + j) as u32;
-                for (x, out) in (x0..x1).zip(row) {
-                    *out = premultiply(read.get_pixel(x, y).0);
+                let from = ((y * w + x0) * 4) as usize;
+                let line = &read.as_raw()[from..from + rw * 4];
+                for (out, px) in row.iter_mut().zip(line.chunks_exact(4)) {
+                    out.copy_from_slice(px);
                 }
             }
         });
-        let at = |x: u32, y: u32| region[(y - y0) as usize * rw + (x - x0) as usize];
-        let strength = self.settings.flow.clamp(0.0, 1.0) * self.settings.pressure_scale(p);
-        // Computed on all the cores, then written.
-        let (scratch, clip) = (&self.scratch, &self.clip);
-        let mut results = vec![([0.0f32; 4], 0.0f32); (r.w * r.h) as usize];
-        dab_rows(&mut results, r.w as usize, |first, band| {
-            for (j, row) in band.chunks_exact_mut(r.w as usize).enumerate() {
-                let py = r.y + (first + j) as u32;
-                for (i, px) in (r.x..r.x + r.w).enumerate() {
-                    let amount = scratch[(first + j) * r.w as usize + i]
-                        * strength
-                        * limit(clip, px, py, shaped);
-                    if amount <= 0.0 {
-                        continue;
-                    }
-                    let mut mean = [0.0f32; 4];
-                    let mut n = 0.0;
-                    for ny in py.saturating_sub(1).max(y0)..(py + 2).min(y1) {
-                        for nx in px.saturating_sub(1).max(x0)..(px + 2).min(x1) {
-                            let q = at(nx, ny);
-                            for c in 0..4 {
-                                mean[c] += q[c];
-                            }
-                            n += 1.0;
-                        }
-                    }
-                    let cur = at(px, py);
-                    let mut out = [0.0f32; 4];
+        let at = |x: u32, y: u32| premultiply(region[(y - y0) as usize * rw + (x - x0) as usize]);
+        let filtered = |px: u32, py: u32, amount: f32| {
+            let mut mean = [0.0f32; 4];
+            let mut n = 0.0;
+            for ny in py.saturating_sub(1).max(y0)..(py + 2).min(y1) {
+                for nx in px.saturating_sub(1).max(x0)..(px + 2).min(x1) {
+                    let q = at(nx, ny);
                     for c in 0..4 {
-                        let m = mean[c] / n;
-                        out[c] = if sharpen {
-                            cur[c] + (cur[c] - m) * amount
-                        } else {
-                            cur[c] + (m - cur[c]) * amount
-                        };
+                        mean[c] += q[c];
                     }
-                    out[3] = out[3].clamp(0.0, 1.0);
-                    for c in 0..3 {
-                        out[c] = out[c].clamp(0.0, out[3]);
-                    }
-                    row[i] = (out, amount);
+                    n += 1.0;
                 }
             }
-        });
-        self.put_all(image, r, &results);
-    }
-
-    /// [`Self::put`] of `results` (row by row over `r`; an amount of 0:
-    /// nothing), on all the cores when only the layer is written.
-    fn put_all(&mut self, image: &mut RgbaImage, r: DirtyRect, results: &[([f32; 4], f32)]) {
+            let cur = at(px, py);
+            let mut out = [0.0f32; 4];
+            for c in 0..4 {
+                let m = mean[c] / n;
+                out[c] = if sharpen {
+                    cur[c] + (cur[c] - m) * amount
+                } else {
+                    cur[c] + (m - cur[c]) * amount
+                };
+            }
+            out[3] = out[3].clamp(0.0, 1.0);
+            for c in 0..3 {
+                out[c] = out[c].clamp(0.0, out[3]);
+            }
+            out
+        };
+        let strength = self.settings.flow.clamp(0.0, 1.0) * self.settings.pressure_scale(p);
+        let rwd = r.w as usize;
         if self.source.is_some() {
-            let mut k = 0;
-            for py in r.y..r.y + r.h {
-                for px in r.x..r.x + r.w {
-                    let (out, amount) = results[k];
-                    k += 1;
+            // Sampling all layers: written over the layer, one by one.
+            for (j, py) in (r.y..r.y + r.h).enumerate() {
+                for (i, px) in (r.x..r.x + r.w).enumerate() {
+                    let amount =
+                        self.scratch[j * rwd + i] * strength * limit(&self.clip, px, py, shaped);
                     if amount > 0.0 {
+                        let out = filtered(px, py, amount);
                         self.put(image, px, py, out, amount);
                     }
                 }
             }
             return;
         }
-        let (w, rw) = (image.width() as usize, r.w as usize);
+        // Into the layer, on all the cores (the reads are in `region`).
+        let (scratch, clip) = (&self.scratch, &self.clip);
+        let width = w as usize;
         let painted = std::sync::atomic::AtomicBool::new(false);
         let raw: &mut [u8] = image.as_mut();
-        let rows = &mut raw[r.y as usize * w * 4..(r.y + r.h) as usize * w * 4];
-        dab_rows_work(rows, w * 4, rw * r.h as usize, |first, band| {
+        let rows = &mut raw[r.y as usize * width * 4..(r.y + r.h) as usize * width * 4];
+        dab_rows_work(rows, width * 4, rwd * r.h as usize, |first, band| {
             let mut any = false;
-            for (j, line) in band.chunks_exact_mut(w * 4).enumerate() {
-                let done = &results[(first + j) * rw..][..rw];
-                let pixels = line[r.x as usize * 4..(r.x as usize + rw) * 4].chunks_exact_mut(4);
-                for (&(out, amount), p) in done.iter().zip(pixels) {
+            for (j, line) in band.chunks_exact_mut(width * 4).enumerate() {
+                let py = r.y + (first + j) as u32;
+                let pixels = line[r.x as usize * 4..(r.x as usize + rwd) * 4].chunks_exact_mut(4);
+                for ((i, px), p) in (r.x..r.x + r.w).enumerate().zip(pixels) {
+                    let amount =
+                        scratch[(first + j) * rwd + i] * strength * limit(clip, px, py, shaped);
                     if amount > 0.0 {
-                        let px = unpremultiply(out);
-                        any |= p != px;
-                        p.copy_from_slice(&px);
+                        let out = unpremultiply(filtered(px, py, amount));
+                        any |= p != out;
+                        p.copy_from_slice(&out);
                     }
                 }
             }
@@ -711,71 +700,126 @@ impl Stroke {
         };
         let first = self.carried.is_none();
         // Slots the first dab cannot pick up (outside the image or the
-        // selection) are empty (NaN): they lay nothing down until filled.
+        // selection) are empty: they lay nothing down until filled.
         let carried = self.carried.get_or_insert_with(|| Carried {
             size,
-            pixels: vec![finger.map_or([f32::NAN; 4], premultiply); size * size],
+            pixels: vec![finger.map_or(EMPTY_SLOT, |c| slot(premultiply(c))); size * size],
         });
+        let cs = carried.size;
+        let rw = r.w as usize;
+        // The dab's rows of slots, and where it starts in them.
+        let (i0, j0) = ((r.x as i64 - ix + half) as usize, (r.y as i64 - iy + half) as usize);
+        let slots = &mut carried.pixels[j0 * cs..(j0 + r.h as usize) * cs];
         if first && finger.is_none() {
             // Picks up what is under the first dab, lays nothing down.
             let read: &RgbaImage = self.source.as_ref().unwrap_or(&*image);
-            for y in r.y..r.y + r.h {
-                for x in r.x..r.x + r.w {
-                    let (i, j) = (
-                        (x as i64 - ix + half) as usize,
-                        (y as i64 - iy + half) as usize,
-                    );
-                    carried.pixels[j * carried.size + i] = premultiply(read.get_pixel(x, y).0);
+            dab_rows_work(slots, cs, rw * r.h as usize, |first, band| {
+                for (jj, line) in band.chunks_exact_mut(cs).enumerate() {
+                    let y = r.y + (first + jj) as u32;
+                    for (k, s) in line[i0..i0 + rw].iter_mut().enumerate() {
+                        *s = slot(premultiply(read.get_pixel(r.x + k as u32, y).0));
+                    }
                 }
-            }
+            });
             return None;
         }
         self.tip_coverage(r, cx, cy, diameter);
         let strength = self.settings.flow.clamp(0.0, 1.0) * self.settings.pressure_scale(p);
-        // What each pixel becomes, on all the cores: the new slot, and the
-        // amount laid down (0: none).
-        let rw = r.w as usize;
-        let mut results = vec![([0.0f32; 4], 0.0f32); rw * r.h as usize];
-        {
-            let read: &RgbaImage = self.source.as_ref().unwrap_or(&*image);
-            let carried = self.carried.as_ref().expect("carried paint");
-            let (scratch, clip) = (&self.scratch, &self.clip);
-            dab_rows(&mut results, rw, |first, band| {
-                for (jj, row) in band.chunks_exact_mut(rw).enumerate() {
-                    let y = r.y + (first + jj) as u32;
-                    let j = (y as i64 - iy + half) as usize;
-                    for (k, x) in (r.x..r.x + r.w).enumerate() {
-                        let amount =
-                            scratch[(first + jj) * rw + k] * strength * limit(clip, x, y, shaped);
-                        let cur = premultiply(read.get_pixel(x, y).0);
-                        let i = (x as i64 - ix + half) as usize;
-                        let slot = carried.pixels[j * carried.size + i];
-                        row[k] = if amount <= 0.0 || slot[3].is_nan() {
-                            (cur, 0.0)
-                        } else {
-                            (
-                                std::array::from_fn(|c| cur[c] + (slot[c] - cur[c]) * amount),
-                                amount,
-                            )
-                        };
+        // What a pixel becomes (`cur` under the slot `s`): the new slot,
+        // and the amount laid down (0: none). Each pixel meets only its own
+        // slot: computed in place, row by row.
+        let (scratch, clip) = (&self.scratch, &self.clip);
+        let smudged = |k: usize, x: u32, y: u32, cur: [f32; 4], s: &mut [u16; 4]| {
+            let amount = scratch[k] * strength * limit(clip, x, y, shaped);
+            let held = unslot(*s);
+            if amount <= 0.0 || held.is_none() {
+                *s = slot(cur);
+                return None;
+            }
+            let held = held.expect("checked");
+            let out: [f32; 4] = std::array::from_fn(|c| cur[c] + (held[c] - cur[c]) * amount);
+            *s = slot(out);
+            Some((out, amount))
+        };
+        let carried = self.carried.as_mut().expect("carried paint");
+        let slots = &mut carried.pixels[j0 * cs..(j0 + r.h as usize) * cs];
+        if let Some(source) = &mut self.source {
+            // Sampling all layers: written over the layer, one by one.
+            let mut painted = false;
+            for (jj, line) in slots.chunks_exact_mut(cs).enumerate() {
+                let y = r.y + jj as u32;
+                for (k, s) in line[i0..i0 + rw].iter_mut().enumerate() {
+                    let x = r.x + k as u32;
+                    let cur = premultiply(source.get_pixel(x, y).0);
+                    if let Some((out, amount)) = smudged(jj * rw + k, x, y, cur, s) {
+                        let px = unpremultiply(out);
+                        source.put_pixel(x, y, image::Rgba(px));
+                        let target = image.get_pixel_mut(x, y);
+                        let before = target.0;
+                        target.0 = over(before, [px[0], px[1], px[2], to_u8(amount)]);
+                        painted |= target.0 != before;
                     }
                 }
-            });
-        }
-        let carried = self.carried.as_mut().expect("carried paint");
-        let mut k = 0;
-        for y in r.y..r.y + r.h {
-            let j = (y as i64 - iy + half) as usize;
-            for x in r.x..r.x + r.w {
-                let i = (x as i64 - ix + half) as usize;
-                carried.pixels[j * carried.size + i] = results[k].0;
-                k += 1;
             }
+            self.painted |= painted;
+            return Some(r);
         }
-        self.put_all(image, r, &results);
+        // Into the layer, on all the cores.
+        let width = image.width() as usize;
+        let painted = std::sync::atomic::AtomicBool::new(false);
+        let raw: &mut [u8] = image.as_mut();
+        let rows = &mut raw[r.y as usize * width * 4..(r.y + r.h) as usize * width * 4];
+        let row = |jj: usize, line: &mut [u8], slots: &mut [[u16; 4]]| {
+            let y = r.y + jj as u32;
+            let pixels = line[r.x as usize * 4..(r.x as usize + rw) * 4].chunks_exact_mut(4);
+            let mut any = false;
+            for ((k, s), p) in slots[i0..i0 + rw].iter_mut().enumerate().zip(pixels) {
+                let x = r.x + k as u32;
+                let cur = premultiply([p[0], p[1], p[2], p[3]]);
+                if let Some((out, _)) = smudged(jj * rw + k, x, y, cur, s) {
+                    let px = unpremultiply(out);
+                    any |= p != px;
+                    p.copy_from_slice(&px);
+                }
+            }
+            if any {
+                painted.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        if rw * (r.h as usize) < DAB_PARALLEL {
+            for (jj, (line, s)) in rows
+                .chunks_exact_mut(width * 4)
+                .zip(slots.chunks_exact_mut(cs))
+                .enumerate()
+            {
+                row(jj, line, s);
+            }
+        } else {
+            use rayon::prelude::*;
+            rows.par_chunks_exact_mut(width * 4)
+                .zip(slots.par_chunks_exact_mut(cs))
+                .enumerate()
+                .for_each(|(jj, (line, s))| row(jj, line, s));
+        }
+        self.painted |= painted.into_inner();
         Some(r)
     }
 }
+
+/// A slot of the paint the Smudge tool's finger carries: premultiplied,
+/// 0..1 in 16 bits a channel (a large finger holds megapixels).
+fn slot(p: [f32; 4]) -> [u16; 4] {
+    p.map(|v| (v.clamp(0.0, 1.0) * SLOT_ONE).round() as u16)
+}
+
+/// The paint a slot holds (`None`: empty).
+fn unslot(s: [u16; 4]) -> Option<[f32; 4]> {
+    (s != EMPTY_SLOT).then(|| s.map(|v| f32::from(v) / SLOT_ONE))
+}
+
+/// Value of 1.0 in a slot, below the empty slot's.
+const SLOT_ONE: f32 = 65534.0;
+const EMPTY_SLOT: [u16; 4] = [u16::MAX; 4];
 
 /// Selection coverage of pixel (x, y), 0..1.
 fn limit(clip: &Option<Clip>, x: u32, y: u32, shaped: bool) -> f32 {
@@ -796,18 +840,31 @@ fn dab_rows<T: Send>(data: &mut [T], row: usize, f: impl Fn(usize, &mut [T]) + S
     dab_rows_work(data, row, work, f);
 }
 
-/// [`dab_rows`] for rows wider than the dab: `work` pixels in all.
+/// Pixels of a dab worked on by one thread, at least.
+const DAB_BAND: usize = 1 << 14;
+
+/// [`dab_rows`] for rows wider than the dab: `work` pixels in all. Large
+/// dabs go to a pool of threads kept from one dab to the next (starting
+/// threads for each would cost more than a medium dab).
 fn dab_rows_work<T: Send>(
     data: &mut [T],
     row: usize,
     work: usize,
     f: impl Fn(usize, &mut [T]) + Sync,
 ) {
-    if work < DAB_PARALLEL {
-        f(0, data);
-    } else {
-        crate::mask_ops::par_rows(data, row, f);
+    use rayon::prelude::*;
+    let rows = data.len() / row.max(1);
+    let bands = (work / DAB_BAND)
+        .min(rayon::current_num_threads())
+        .min(rows);
+    if work < DAB_PARALLEL || bands <= 1 {
+        return f(0, data);
     }
+    let per = rows.div_ceil(bands);
+    let f = &f;
+    data.par_chunks_mut(per * row)
+        .enumerate()
+        .for_each(|(i, band)| f(i * per, band));
 }
 
 fn premultiply(p: [u8; 4]) -> [f32; 4] {
@@ -1157,6 +1214,29 @@ mod tests {
             edge_contrast(StrokeMode::Blur, 6) < once,
             "more passes, more blur"
         );
+    }
+
+    /// Large dabs (worked on in bands, on all the cores) over an edge that
+    /// varies only across: every row of the dab's core comes out the same.
+    #[test]
+    fn large_blur_and_smudge_dabs_are_seamless() {
+        for mode in [StrokeMode::Blur, StrokeMode::Smudge { finger: None }] {
+            let mut img = RgbaImage::from_fn(600, 600, |x, _| {
+                image::Rgba(if x < 300 { [0, 0, 0, 255] } else { WHITE })
+            });
+            let mut set = settings([0, 0, 0, 255]);
+            (set.size, set.flow) = (400.0, 0.8);
+            let mut s = paint(&mut img, mode, set);
+            for x in [150.0, 250.0, 350.0, 450.0] {
+                s.add_point(&mut img, x, 300.0, 1.0);
+            }
+            let row = |y: u32| (280..420).map(|x| img.get_pixel(x, y).0).collect::<Vec<_>>();
+            let middle = row(300);
+            assert!(middle.iter().any(|p| p[0] != 0 && p[0] != 255), "{mode:?} changed the edge");
+            for y in (200..400).step_by(7) {
+                assert_eq!(row(y), middle, "{mode:?}: row {y}");
+            }
+        }
     }
 
     #[test]

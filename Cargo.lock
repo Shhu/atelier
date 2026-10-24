@@ -437,6 +437,7 @@ dependencies = [
  "lcms2",
  "libc",
  "ort",
+ "rayon",
  "rfd",
  "serde",
  "serde_json",

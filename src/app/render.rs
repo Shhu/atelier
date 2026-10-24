@@ -483,6 +483,23 @@ impl CanvasView {
         }
     }
 
+    /// Forgets the generation being composited, if any: its tiles are
+    /// composited again when next shown.
+    fn drop_generation(&mut self) {
+        let Some(generation) = self.generation.take() else {
+            return;
+        };
+        let frame = self.frame;
+        for w in &generation.work {
+            if let Some(tile) = self.tiles.get_mut(&w.tile) {
+                if tile.dirty.is_none() {
+                    tile.since = frame;
+                }
+                tile.dirty = Some(tile.dirty.map_or(w.rect, |d| d.union(w.rect)));
+            }
+        }
+    }
+
     /// Marks `area` (pixels of the level) to composite again.
     fn mark(&mut self, area: Option<PixelRect>) {
         let frame = self.frame;
@@ -562,6 +579,8 @@ fn view_for(
         // Kept lighter: its tiles and the reductions of its level only
         // (those within a budget).
         (old.pending, old.spare, old.stale) = (None, None, None);
+        // An unfinished generation holds the reductions it composites from.
+        old.drop_generation();
         if old.sources.bytes() > KEPT_SOURCES_BYTES {
             old.sources = compose::LevelCache::new(old.level);
         }
@@ -839,6 +858,12 @@ impl AtelierApp {
         }
         crate::document::note_painted(uid, &strokes);
         if cv.pending.is_some() {
+            // Nothing to show meanwhile (a document shown for the first
+            // time): a coarse view of it.
+            if cv.tiles.is_empty() && cv.stale.is_none() {
+                cv.stale =
+                    coarse_tiles(ctx, &layers, canvas, &opts, level, channel, lut.as_deref());
+            }
             ctx.request_repaint();
             paint_tiles(painter, view, cv, &visible);
             return;
@@ -878,8 +903,53 @@ impl AtelierApp {
             .collect();
         todo.sort_by_key(|(_, _, k)| *k);
         let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+        #[cfg(test)]
+        let threads = TEST_THREADS.with(std::cell::Cell::get).unwrap_or(threads);
+        let near = |&(tx, ty): &(i64, i64)| {
+            tx >= cols.start() - 2
+                && tx <= cols.end() + 2
+                && ty >= rows.start() - 2
+                && ty <= rows.end() + 2
+        };
         if let Some(mut generation) = cv.generation.take() {
             // A change of much of the view being composited: on with it.
+            generation.note(dirty, level);
+            // Tiles come into view meanwhile (a pan): at once, from its
+            // state (no holes in the view); marked again where something
+            // changed since it began.
+            let missing: Vec<Todo> = todo
+                .iter()
+                .filter(|(t, _, _)| !cv.tiles.contains_key(t))
+                .copied()
+                .collect();
+            if !missing.is_empty() {
+                let work = compose_work(cv, &generation.plan, &missing, threads);
+                let done = work
+                    .chunks(threads.max(1))
+                    .flat_map(|batch| run_batch(&generation.plan, batch, channel, lut.as_deref()))
+                    .collect();
+                upload(ctx, cv, done, true);
+                let frame = cv.frame;
+                for (t, _, _) in &missing {
+                    let own = CanvasView::tile_rect(*t);
+                    let part = match generation.marked {
+                        None => None,
+                        Some(None) => Some(own),
+                        Some(Some(m)) => intersect(own, m),
+                    };
+                    if let Some(tile) = cv.tiles.get_mut(t)
+                        && part.is_some()
+                    {
+                        tile.dirty = part;
+                        tile.since = frame;
+                    }
+                }
+            }
+            // What left the view is not worth finishing.
+            let rest = generation.work.split_off(generation.next);
+            generation
+                .work
+                .extend(rest.into_iter().filter(|w| near(&w.tile)));
             let over_budget = generation.run(threads, channel, lut.as_deref());
             crate::diag::tiles(generation.last_count, over_budget, level);
             if generation.next < generation.work.len() {
@@ -899,6 +969,7 @@ impl AtelierApp {
                 next: 0,
                 done: Vec::new(),
                 last_count: 0,
+                marked: None,
             };
             let over_budget = generation.run(threads, channel, lut.as_deref());
             crate::diag::tiles(generation.last_count, over_budget, level);
@@ -928,12 +999,6 @@ impl AtelierApp {
         }
         cv.sigs = sigs;
         // Tiles far from the view go.
-        let near = |&(tx, ty): &(i64, i64)| {
-            tx >= cols.start() - 2
-                && tx <= cols.end() + 2
-                && ty >= rows.start() - 2
-                && ty <= rows.end() + 2
-        };
         if !visible.is_empty() {
             cv.tiles.retain(|t, _| near(t));
         }
@@ -952,6 +1017,61 @@ impl AtelierApp {
     }
 }
 
+/// Pixels of a coarse view at most (see [`coarse_tiles`]).
+const COARSE_PIXELS: u64 = 1 << 18;
+
+/// The whole canvas in tiles of a level coarser than `level` (4 times at
+/// least, [`COARSE_PIXELS`] at most), from a pixel of each block: what a
+/// view shows while its reductions are made (a few milliseconds).
+fn coarse_tiles(
+    ctx: &egui::Context,
+    layers: &[Layer],
+    canvas: PixelRect,
+    opts: &compose::Options,
+    level: u32,
+    channel: Option<usize>,
+    lut: Option<&crate::cms::Lut>,
+) -> Option<(u32, Tiles)> {
+    let mut coarse = level + 2;
+    while (u64::from(canvas.w) >> coarse) * (u64::from(canvas.h) >> coarse) > COARSE_PIXELS {
+        coarse += 1;
+    }
+    let b = (compose::TILE as i64) << coarse;
+    let range =
+        |from: i64, len: u32| from.div_euclid(b)..=(from + i64::from(len.max(1)) - 1).div_euclid(b);
+    let work: Vec<Work> = range(canvas.y, canvas.h)
+        .flat_map(|ty| range(canvas.x, canvas.w).map(move |tx| (tx, ty)))
+        .map(|tile| Work {
+            tile,
+            rect: CanvasView::tile_rect(tile),
+            last: true,
+            hot: None,
+        })
+        .collect();
+    if work.len() > 64 {
+        return None;
+    }
+    let plan = compose::plan(layers, canvas, &mut compose::Sampled(coarse), opts);
+    let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+    let tiles = work
+        .chunks(threads)
+        .flat_map(|batch| run_batch(&plan, batch, channel, lut))
+        .map(|(w, result)| {
+            let name = format!("coarse-{}-{}", w.tile.0, w.tile.1);
+            let tex = ctx.load_texture(name, result.image, IMAGE_TEX_OPTIONS);
+            (
+                w.tile,
+                Tile {
+                    tex,
+                    dirty: None,
+                    since: 0,
+                },
+            )
+        })
+        .collect();
+    Some((coarse, tiles))
+}
+
 /// Draws the tiles of `visible`, and where one is missing, what the former
 /// level's tiles show there.
 fn paint_tiles(painter: &Painter, view: View, cv: &CanvasView, visible: &[(i64, i64)]) {
@@ -964,15 +1084,24 @@ fn paint_tiles(painter: &Painter, view: View, cv: &CanvasView, visible: &[(i64, 
             Vec2::splat(s as f32),
         )
     };
+    // Tests: visible tiles with nothing drawn.
+    #[cfg(test)]
+    let mut holes = 0;
     for &t in visible {
         let r = canvas_rect(t, cv.level);
         if let Some(tile) = cv.tiles.get(&t) {
             painter.image(tile.tex.id(), view.rect_to_screen(r), full, Color32::WHITE);
             continue;
         }
+        #[cfg(test)]
+        {
+            holes += 1;
+        }
         let Some((level, stale)) = &cv.stale else {
             continue;
         };
+        #[cfg(test)]
+        let mut drawn = false;
         let s = side(*level);
         let (x0, y0) = (
             (r.min.x as i64).div_euclid(s),
@@ -997,9 +1126,19 @@ fn paint_tiles(painter: &Painter, view: View, cv: &CanvasView, visible: &[(i64, 
                     ((part.max - o.min) / o.size()).to_pos2(),
                 );
                 painter.image(old.tex.id(), view.rect_to_screen(part), uv, Color32::WHITE);
+                #[cfg(test)]
+                {
+                    drawn = true;
+                }
             }
         }
+        #[cfg(test)]
+        {
+            holes -= usize::from(drawn);
+        }
     }
+    #[cfg(test)]
+    TEST_HOLES.set(holes);
 }
 
 /// `r` (canvas pixels) in pixels of `level`: the blocks it touches.
@@ -1385,6 +1524,15 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: parts of tiles composited at a time by the view.
+    pub(super) static TEST_THREADS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// Tests: visible tiles left empty by the last frame.
+    pub(super) static TEST_HOLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn tile_budget() -> std::time::Duration {
     #[cfg(test)]
     if let Some(budget) = TEST_TILE_BUDGET.with(std::cell::Cell::get) {
@@ -1407,6 +1555,9 @@ struct Generation {
     done: Vec<(Work, TileResult)>,
     /// Tiles finished by the last [`Self::run`].
     last_count: u32,
+    /// What changed since it began (pixels of the level; `Some(None)`:
+    /// everything), where what it composites is already old.
+    marked: Option<Option<PixelRect>>,
 }
 
 impl Generation {
@@ -1427,23 +1578,43 @@ impl Generation {
                 break;
             }
             let end = (self.next + threads.max(1)).min(self.work.len());
-            let batch = &self.work[self.next..end];
-            let results: Vec<std::sync::Mutex<Option<TileResult>>> =
-                batch.iter().map(|_| std::sync::Mutex::new(None)).collect();
-            compose::parallel(batch.len(), |k| {
-                let result = composite_part(&self.plan, &batch[k], channel, lut);
-                *results[k].lock().expect("tile") = Some(result);
-            });
-            for (item, result) in batch.iter().zip(results) {
-                if let Some(result) = result.into_inner().expect("tile") {
-                    self.done.push((item.clone(), result));
-                }
-            }
+            let done = run_batch(&self.plan, &self.work[self.next..end], channel, lut);
+            self.done.extend(done);
             self.next = end;
         }
         self.last_count = self.done[first..].iter().filter(|(w, _)| w.last).count() as u32;
         over_budget
     }
+
+    /// Notes what changed in this frame (see [`Self::marked`]).
+    fn note(&mut self, dirty: compose::Dirty, level: u32) {
+        self.marked = match (dirty, self.marked) {
+            (compose::Dirty::Nothing, m) => m,
+            (compose::Dirty::All, _) | (_, Some(None)) => Some(None),
+            (compose::Dirty::Area(a), None) => Some(Some(reduced(a, level))),
+            (compose::Dirty::Area(a), Some(Some(m))) => Some(Some(m.union(reduced(a, level)))),
+        };
+    }
+}
+
+/// Composites `batch`, a part per core.
+fn run_batch(
+    plan: &compose::Plan,
+    batch: &[Work],
+    channel: Option<usize>,
+    lut: Option<&crate::cms::Lut>,
+) -> Vec<(Work, TileResult)> {
+    let results: Vec<std::sync::Mutex<Option<TileResult>>> =
+        batch.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    compose::parallel(batch.len(), |k| {
+        let result = composite_part(plan, &batch[k], channel, lut);
+        *results[k].lock().expect("tile") = Some(result);
+    });
+    batch
+        .iter()
+        .zip(results)
+        .filter_map(|(item, result)| Some((item.clone(), result.into_inner().expect("tile")?)))
+        .collect()
 }
 
 /// Composited parts on the GPU: into their tiles, or as new tiles once
@@ -1966,5 +2137,12 @@ impl AtelierApp {
         self.canvas_view
             .as_ref()
             .is_some_and(|v| v.generation.is_some())
+    }
+
+    /// Generations kept by the views of other documents.
+    pub(super) fn kept_generations(&self) -> usize {
+        self.canvas_view.as_ref().map_or(0, |v| {
+            v.others.iter().filter(|o| o.generation.is_some()).count()
+        })
     }
 }

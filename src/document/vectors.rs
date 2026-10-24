@@ -237,6 +237,7 @@ impl Document {
             }
             shape.translate(d);
             self.set_shape(i, shape);
+            self.layers[i].carry_styles(d);
         } else if let Some(mut path) = self.path(r) {
             path.translate(d);
             self.set_path(r, path);
@@ -312,7 +313,8 @@ mod tests {
         let b = path.bounds().unwrap();
         assert_eq!((b.min.x, b.min.y), (17.0, 2.0));
 
-        // Moved by a fraction: rendered again; the former styles stay put.
+        // Moved by a fraction: rendered again; the former styles move with
+        // it (to the nearest pixel) until drawn again.
         let before = doc.active_layer().offset;
         let canvas = |l: &Layer, s: &crate::compose::styles::Styles| {
             (
@@ -326,7 +328,39 @@ mod tests {
         assert_ne!(layer.rev(), rev);
         assert_ne!(layer.offset, before);
         let former = layer.styles_cached().expect("styles");
-        assert_eq!(canvas(layer, &former), at);
+        assert_eq!(canvas(layer, &former), (at.0 - 21, at.1));
+    }
+
+    /// A styled shape dragged by fractions of a pixel (zoomed in), its
+    /// styles held: they follow it, not left where it started.
+    #[test]
+    fn held_styles_follow_a_shape_dragged_by_fractions() {
+        let mut doc = Document::new(RgbaImage::from_pixel(300, 60, Rgba([255; 4])), None);
+        doc.add_shape_layer(
+            "Rectangle".into(),
+            "Rectangle",
+            rect_shape(10.0, 5.0, 30.0, 25.0),
+        );
+        let fx = &mut doc.active_layer_mut().effects;
+        fx.stroke.enabled = true;
+        fx.stroke.width = 3.0;
+        let id = doc.active_layer().id;
+        let canvas = |doc: &Document| {
+            let l = doc.active_layer();
+            let s = l.styles_shown(true, true).expect("styles");
+            (
+                l.offset.0 + s.exterior[0].offset.0,
+                l.offset.1 + s.exterior[0].offset.1,
+            )
+        };
+        doc.active_layer().styles(false).expect("styles");
+        let start = canvas(&doc);
+        doc.hold_effects(true);
+        for _ in 0..20 {
+            doc.move_path(PathRef::Layer(id), pt(7.5, 0.25));
+        }
+        assert_eq!(canvas(&doc), (start.0 + 150, start.1 + 5));
+        doc.hold_effects(false);
     }
 
     #[test]

@@ -20,10 +20,12 @@ use ui_kit::color;
 /// larger ones on another thread.
 const SYNC_HOLE: usize = 600;
 /// Healing Brush: a window of more pixels than this is not healed while
-/// painting (the cloned pixels show), only once the stroke ends…
-const HEAL_LIVE: u64 = 1 << 20;
-/// …and a stroke whose box has more is healed on another thread.
-const HEAL_ASYNC: u64 = 2 << 20;
+/// painting (the cloned pixels show, like Photoshop), only once the stroke
+/// ends…
+const HEAL_LIVE: u64 = 1 << 18;
+/// …and a stroke whose box has more is healed on another thread (tens of
+/// milliseconds a quarter megapixel).
+const HEAL_ASYNC: u64 = 1 << 18;
 /// Holes at least this wide are painted in by the AI model, when it is
 /// there (Spot Healing Brush).
 const AI_HOLE: u32 = 64;
@@ -145,6 +147,36 @@ pub(super) struct RetouchTools {
     /// on (see [`AtelierApp::fill_context`]).
     waiting: Option<(FillRequest, FillContext)>,
     job: Option<FillJob>,
+    /// What is visible from the active layer down (Current & Below), kept
+    /// while the document is unchanged: for the strokes, for the brush's
+    /// preview.
+    below: BelowCache,
+    below_shown: BelowCache,
+}
+
+/// A composite of the layers below (see [`composite_below`]), by a
+/// fingerprint of the document's state and the region.
+type BelowCache = Option<(u64, Arc<RgbaImage>)>;
+
+/// [`composite_below`], from `cache` when `doc` is unchanged.
+fn below_cached(cache: &mut BelowCache, doc: &Document, region: PixelRect) -> Arc<RgbaImage> {
+    let layer = doc.active_layer();
+    let key = hash_of((
+        doc.uid(),
+        doc.state_id(),
+        doc.active,
+        layer.id,
+        layer.rev(),
+        (region.x, region.y, region.w, region.h),
+    ));
+    match cache {
+        Some((k, image)) if *k == key => Arc::clone(image),
+        _ => {
+            let image = Arc::new(composite_below(doc, region));
+            *cache = Some((key, Arc::clone(&image)));
+            image
+        }
+    }
 }
 
 impl Default for RetouchTools {
@@ -177,6 +209,8 @@ impl Default for RetouchTools {
             },
             waiting: None,
             job: None,
+            below: None,
+            below_shown: None,
         }
     }
 }
@@ -247,6 +281,10 @@ struct FillJob {
     started: f64,
     progress: Arc<Progress>,
     rx: mpsc::Receiver<Filled>,
+    /// Patch tool (Destination): the selection once the patch is in place.
+    selection: Option<Option<Selection>>,
+    /// Its progress is not known (a spinner instead of a bar).
+    indeterminate: bool,
 }
 
 /// A fill's pixels (`None`: cancelled, nothing to copy, or nothing
@@ -349,6 +387,48 @@ impl Tool {
     }
 }
 
+/// Bounds of the pixels `clip` covers at all (rows in parallel: a large
+/// selection takes a while).
+fn hole_of(clip: &crate::pixel_ops::Clip) -> Option<DirtyRect> {
+    let [x0, y0, x1, y1] = clip.rect;
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    // First and last pixel covered of each row.
+    let mut rows = vec![(u32::MAX, 0u32); (y1 - y0) as usize];
+    let band = rows
+        .len()
+        .div_ceil(crate::pixel_ops::threads().max(1))
+        .max(1);
+    std::thread::scope(|s| {
+        for (k, chunk) in rows.chunks_mut(band).enumerate() {
+            s.spawn(move || {
+                for (j, r) in chunk.iter_mut().enumerate() {
+                    let y = y0 + (k * band + j) as u32;
+                    let covered = |&x: &u32| clip.coverage(x, y) > 0;
+                    if let Some(a) = (x0..x1).find(covered) {
+                        let b = (a..x1).rev().find(covered).unwrap_or(a);
+                        *r = (a, b);
+                    }
+                }
+            });
+        }
+    });
+    let mut b: Option<DirtyRect> = None;
+    for (j, &(a, e)) in rows.iter().enumerate() {
+        if a <= e {
+            let r = DirtyRect {
+                x: a,
+                y: y0 + j as u32,
+                w: e - a + 1,
+                h: 1,
+            };
+            b = Some(b.map_or(r, |b| b.union(r)));
+        }
+    }
+    b
+}
+
 /// `r` grown by `margin`, within `w` × `h`.
 fn grow(r: DirtyRect, margin: u32, (w, h): (u32, u32)) -> DirtyRect {
     let (x0, y0) = (r.x.saturating_sub(margin), r.y.saturating_sub(margin));
@@ -413,7 +493,12 @@ fn composite_below(doc: &Document, region: PixelRect) -> RgbaImage {
 
 /// The image a source is sampled in, and its corner on the canvas: in
 /// `from`, the document of the source, for a stroke on `doc`.
-fn sample_image(doc: &Document, from: &Document, sample: Sample) -> (Arc<RgbaImage>, (i64, i64)) {
+fn sample_image(
+    doc: &Document,
+    from: &Document,
+    sample: Sample,
+    below: &mut BelowCache,
+) -> (Arc<RgbaImage>, (i64, i64)) {
     let layer = from.active_layer();
     // Over the stroke's layer, or the whole canvas of another document.
     let rect = if from.uid() == doc.uid() {
@@ -424,7 +509,7 @@ fn sample_image(doc: &Document, from: &Document, sample: Sample) -> (Arc<RgbaIma
     match sample {
         _ if doc.mask_targeted() && from.uid() == doc.uid() => (layer.shared_image(), layer.offset),
         Sample::Current => (layer.shared_image(), layer.offset),
-        Sample::CurrentAndBelow => (Arc::new(composite_below(from, rect)), (rect.x, rect.y)),
+        Sample::CurrentAndBelow => (below_cached(below, from, rect), (rect.x, rect.y)),
         Sample::All => (from.composite_shared(rect), (rect.x, rect.y)),
     }
 }
@@ -457,7 +542,7 @@ impl RetouchTools {
         };
         let offset = source.clone.stroke_offset((at.x, at.y), aligned);
         self.stroke_offset = Some(offset);
-        let (image, origin) = sample_image(doc, from, sample);
+        let (image, origin) = sample_image(doc, from, sample, &mut self.below);
         if tool == Tool::HealingBrush
             && sample != Sample::Current
             && !doc.mask_targeted()
@@ -468,7 +553,7 @@ impl RetouchTools {
             self.seen = Some(match sample {
                 _ if same => Arc::clone(&image),
                 Sample::All => doc.composite_shared(rect),
-                _ => Arc::new(composite_below(doc, rect)),
+                _ => below_cached(&mut self.below, doc, rect),
             });
         }
         let layer = doc.active_layer().offset;
@@ -511,21 +596,39 @@ fn heal_stroke(stroke: &Stroke, image: &mut RgbaImage, r: DirtyRect, seen: Optio
 
 /// The Healing Brush's final pass over `window` of `image`, tile by tile,
 /// only where the stroke went: each tile meets the pixels healed around it
-/// (the box of a long diagonal stroke is most of the image).
-fn heal_tiles(stroke: &Stroke, image: &mut RgbaImage, window: DirtyRect, seen: Option<&RgbaImage>) {
+/// (the box of a long diagonal stroke is most of the image). With
+/// `progress` (on another thread), it tells how far it is and stops when
+/// cancelled: `false` then.
+fn heal_tiles(
+    stroke: &Stroke,
+    image: &mut RgbaImage,
+    window: DirtyRect,
+    seen: Option<&RgbaImage>,
+    progress: Option<&Progress>,
+) -> bool {
     let width = image.width();
     let cover = stroke.coverage();
-    for tile in tiles(window, HEAL_TILE) {
-        let covered = (tile.y..tile.y + tile.h).any(|y| {
-            let row = (y * width) as usize;
-            cover[row + tile.x as usize..row + (tile.x + tile.w) as usize]
-                .iter()
-                .any(|&c| c > 0)
-        });
-        if covered {
-            heal_stroke(stroke, image, tile, seen);
+    let covered: Vec<DirtyRect> = tiles(window, HEAL_TILE)
+        .into_iter()
+        .filter(|tile| {
+            (tile.y..tile.y + tile.h).any(|y| {
+                let row = (y * width) as usize;
+                cover[row + tile.x as usize..row + (tile.x + tile.w) as usize]
+                    .iter()
+                    .any(|&c| c > 0)
+            })
+        })
+        .collect();
+    for (i, &tile) in covered.iter().enumerate() {
+        if progress.is_some_and(Progress::cancelled) {
+            return false;
+        }
+        heal_stroke(stroke, image, tile, seen);
+        if let Some(p) = progress {
+            p.set((i + 1) as f32 / covered.len() as f32);
         }
     }
+    !progress.is_some_and(Progress::cancelled)
 }
 
 /// Color of the Spot Healing Brush's stroke while it is painted, at half
@@ -629,7 +732,7 @@ impl AtelierApp {
                     self.heal_later(stroke, window, seen);
                     return None;
                 }
-                heal_tiles(&stroke, layer.pixels_mut(), window, seen.as_deref());
+                heal_tiles(&stroke, layer.pixels_mut(), window, seen.as_deref(), None);
                 self.stroke_dirty = Some(self.stroke_dirty.map_or(window, |d| d.union(window)));
                 Some(stroke)
             }
@@ -721,7 +824,7 @@ impl AtelierApp {
                 doc.end_paint();
                 doc.discard_step();
                 self.status = if unchanged {
-                    t!("tools4-status-heal-unchanged")
+                    t!("tools5-status-unchanged")
                 } else {
                     t!("retouch-status-nothing-to-sample")
                 };
@@ -734,13 +837,20 @@ impl AtelierApp {
     /// then put in place like a fill (see `poll_fill`).
     fn heal_later(&mut self, stroke: Stroke, window: DirtyRect, seen: Option<Arc<RgbaImage>>) {
         let Some(doc) = &self.doc else { return };
-        let mut image = doc.active_layer().image().clone();
+        let painted = doc.active_layer().shared_image();
         let progress = Arc::new(Progress::default());
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
+        let shared = Arc::clone(&progress);
         std::thread::spawn(move || {
             let _job = crate::diag::job("Healing Brush");
-            heal_tiles(&stroke, &mut image, window, seen.as_deref());
+            let mut image = (*painted).clone();
+            // Cancelled: nothing (the stroke is given up).
+            if !heal_tiles(&stroke, &mut image, window, seen.as_deref(), Some(&shared)) {
+                let _ = tx.send((None, None, false));
+                ctx.request_repaint();
+                return;
+            }
             let unchanged = same_pixels(&image, stroke.base(), window);
             let healed = (!unchanged).then(|| crop(&image, window));
             let _ = tx.send((healed, None, unchanged));
@@ -800,6 +910,8 @@ impl AtelierApp {
             started: self.ctx.input(|i| i.time),
             progress,
             rx,
+            selection: None,
+            indeterminate: ai,
         });
     }
 
@@ -807,13 +919,16 @@ impl AtelierApp {
     /// layer.
     fn poll_fill(&mut self) {
         let Some(job) = &self.retouch.job else { return };
-        let (filled, failure, unchanged) = match job.rx.try_recv() {
-            Ok(result) => result,
+        // Disconnected: the computation failed (panicked).
+        let ((filled, failure, unchanged), panicked) = match job.rx.try_recv() {
+            Ok(result) => (result, false),
             Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => (None, None, false),
+            Err(mpsc::TryRecvError::Disconnected) => ((None, None, false), true),
         };
         let job = self.retouch.job.take().expect("checked above");
         let cancelled = job.progress.cancelled();
+        // Cancelled: never applied, even if it was done meanwhile.
+        let filled = filled.filter(|_| !cancelled);
         let Some(doc) = self.doc.as_mut().filter(|d| d.uid() == job.doc) else {
             return;
         };
@@ -842,6 +957,11 @@ impl AtelierApp {
             self.stroke_dirty = Some(self.stroke_dirty.map_or(r, |d| d.union(r)));
             doc.hold_effects(false);
             doc.end_paint();
+            if let Some(selection) = job.selection.clone() {
+                // Moved with the patch, in its step.
+                self.selection = selection;
+                self.sync_selection();
+            }
         } else {
             doc.hold_effects(false);
             doc.end_paint();
@@ -849,10 +969,12 @@ impl AtelierApp {
         }
         if let Some(error) = failure {
             self.status_failed(tm!("retouch-status-ai-failed", error = error));
-        } else if unchanged {
-            self.status = t!("tools4-status-heal-unchanged");
+        } else if panicked && !cancelled {
+            self.status_failed(tm!("fx3-filter-failed", name = job.name.as_str()));
         } else if cancelled {
             self.status = t!("retouch-status-cancelled", name = job.name.as_str());
+        } else if unchanged {
+            self.status = t!("tools5-status-unchanged");
         }
         self.reset_pending();
     }
@@ -865,7 +987,7 @@ impl AtelierApp {
             self.status = t!("retouch-status-select-first");
             return;
         }
-        if self.refuse_if_locked() || self.refuse_hidden_layer() {
+        if self.refuse_if_target_locked() || self.refuse_hidden_layer() {
             return;
         }
         let mut settings = self.retouch.settings;
@@ -886,7 +1008,7 @@ impl AtelierApp {
                 return;
             }
         }
-        if self.refuse_if_locked() || self.refuse_hidden_layer() {
+        if self.refuse_if_target_locked() || self.refuse_hidden_layer() {
             return;
         }
         // Filled on the layer itself: a text or shape is rasterized first
@@ -926,19 +1048,7 @@ impl AtelierApp {
         let image = layer.shared_image();
         let size = image.dimensions();
         let clip = selection.clip(&layer, doc.full_rect());
-        let hole = clip.as_ref().and_then(|clip| {
-            let [x0, y0, x1, y1] = clip.rect;
-            let mut b: Option<DirtyRect> = None;
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    if clip.coverage(x, y) > 0 {
-                        let r = DirtyRect { x, y, w: 1, h: 1 };
-                        b = Some(b.map_or(r, |b| b.union(r)));
-                    }
-                }
-            }
-            b
-        });
+        let hole = clip.as_ref().and_then(hole_of);
         let (Some(clip), Some(hole)) = (clip, hole) else {
             if output == Output::CurrentLayer {
                 doc.end_paint();
@@ -957,10 +1067,16 @@ impl AtelierApp {
             },
         };
         let base = crop(&image, region);
-        let coverage: Vec<f32> = (region.y..region.y + region.h)
-            .flat_map(|y| (region.x..region.x + region.w).map(move |x| (x, y)))
-            .map(|(x, y)| clip.coverage(x, y) as f32 / 255.0)
-            .collect();
+        let mut coverage = vec![0.0f32; region.w as usize * region.h as usize];
+        crate::filters::par_rows(&mut coverage, region.w.max(1) as usize, |first, band| {
+            let w = region.w as usize;
+            for (j, row) in band.chunks_exact_mut(w).enumerate() {
+                let y = region.y + (first + j) as u32;
+                for (i, v) in row.iter_mut().enumerate() {
+                    *v = clip.coverage(region.x + i as u32, y) as f32 / 255.0;
+                }
+            }
+        });
         let method = if request.settings.ai && ai_usable(&base) {
             Method::Ai
         } else {
@@ -1211,6 +1327,11 @@ impl AtelierApp {
             layer.image().dimensions(),
         );
         let base = layer.shared_image();
+        // A large patch: healed on another thread (seconds otherwise).
+        if u64::from(window.w) * u64::from(window.h) > HEAL_ASYNC {
+            self.patch_later(base, clip, offset, window, area, mode);
+            return;
+        }
         let cover = |x: u32, y: u32| clip.coverage(x, y) as f32 / 255.0;
         retouch::heal_area(
             layer.pixels_mut(),
@@ -1233,6 +1354,51 @@ impl AtelierApp {
             self.sync_selection();
         }
         self.reset_pending();
+    }
+
+    /// A large patch, healed on another thread, then put in place like a
+    /// fill (see `poll_fill`); Destination moves the selection then.
+    fn patch_later(
+        &mut self,
+        base: Arc<RgbaImage>,
+        clip: crate::pixel_ops::Clip,
+        offset: (i64, i64),
+        window: DirtyRect,
+        area: Option<Selection>,
+        mode: PatchMode,
+    ) {
+        let progress = Arc::new(Progress::default());
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        let shared = Arc::clone(&progress);
+        std::thread::spawn(move || {
+            let _job = crate::diag::job("Patch");
+            let mut image = (*base).clone();
+            let cover = |x: u32, y: u32| clip.coverage(x, y) as f32 / 255.0;
+            retouch::heal_area(&mut image, &base, cover, (&base, offset), window, None);
+            let result = if shared.cancelled() {
+                (None, None, false)
+            } else {
+                let unchanged = same_pixels(&image, &base, window);
+                ((!unchanged).then(|| crop(&image, window)), None, unchanged)
+            };
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.watch_fill(
+            Tool::Patch.name(),
+            (window.x, window.y),
+            Output::CurrentLayer,
+            false,
+            progress,
+            rx,
+        );
+        if let Some(job) = &mut self.retouch.job {
+            job.indeterminate = true;
+            if mode == PatchMode::Destination {
+                job.selection = Some(area);
+            }
+        }
     }
 
     // ---------------------------------------------------------- red eye
@@ -1384,6 +1550,28 @@ impl AtelierApp {
     fn overlay_texture(&mut self, corner: (i64, i64), covered: u32) -> Option<egui::TextureId> {
         let side = covered.min(1024);
         let step = covered as f32 / side as f32;
+        let mut below_shown = self.retouch.below_shown.take();
+        let made = self.overlay_pixels(corner, covered, side, step, &mut below_shown);
+        self.retouch.below_shown = below_shown;
+        if let Some((key, image)) = made? {
+            let texture = self
+                .ctx
+                .load_texture("clone_overlay", image, IMAGE_TEX_OPTIONS);
+            self.retouch.overlay = Some((key, texture));
+        }
+        self.retouch.overlay.as_ref().map(|(_, t)| t.id())
+    }
+
+    /// The source shown in the brush, if not shown already (`Some(None)`):
+    /// its fingerprint and pixels.
+    fn overlay_pixels(
+        &self,
+        corner: (i64, i64),
+        covered: u32,
+        side: u32,
+        step: f32,
+        below_shown: &mut BelowCache,
+    ) -> Option<Option<(u64, ColorImage)>> {
         let (_, doc) = self.clone_source()?;
         let sample = match self.tool {
             Tool::CloneStamp => self.retouch.clone_sample,
@@ -1414,6 +1602,24 @@ impl AtelierApp {
                 Sample::Current => points
                     .map(|(x, y)| color(layer.pixel_at(x, y).unwrap_or([0; 4])))
                     .collect(),
+                // What the stroke samples: from the layer down (kept).
+                Sample::CurrentAndBelow => {
+                    let full = doc.full_rect();
+                    let seen = below_cached(below_shown, doc, full);
+                    points
+                        .map(|(x, y)| {
+                            let (sx, sy) = (x - full.x, y - full.y);
+                            let inside = sx >= 0
+                                && sy >= 0
+                                && sx < seen.width() as i64
+                                && sy < seen.height() as i64;
+                            match inside {
+                                true => color(seen.get_pixel(sx as u32, sy as u32).0),
+                                false => Color32::TRANSPARENT,
+                            }
+                        })
+                        .collect()
+                }
                 _ if covered == side => doc
                     .composite(region, None)
                     .pixels()
@@ -1439,12 +1645,9 @@ impl AtelierApp {
                 }
             };
             let image = ColorImage::new([side as usize, side as usize], pixels);
-            let texture = self
-                .ctx
-                .load_texture("clone_overlay", image, IMAGE_TEX_OPTIONS);
-            self.retouch.overlay = Some((key, texture));
+            return Some(Some((key, image)));
         }
-        self.retouch.overlay.as_ref().map(|(_, t)| t.id())
+        Some(None)
     }
 
     /// Keys of the retouching tools, for the status bar.
@@ -1521,7 +1724,7 @@ fn fill_progress(ctx: &egui::Context, job: &FillJob) -> bool {
             ui.label(egui::RichText::new(format!("{}…", job.name)).color(color::TEXT));
             ui.add_space(8.0);
             let fraction = job.progress.fraction();
-            if job.ai {
+            if job.indeterminate {
                 ui.add(egui::Spinner::new().size(16.0).color(color::MUTED));
             } else {
                 ui.add(egui::ProgressBar::new(fraction).desired_height(6.0));
@@ -1536,8 +1739,52 @@ fn fill_progress(ctx: &egui::Context, job: &FillJob) -> bool {
 }
 
 #[cfg(test)]
+impl RetouchTools {
+    /// The fill under way's Cancel button.
+    pub(super) fn cancel_fill(&self) {
+        if let Some(job) = &self.job {
+            job.progress.cancel();
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hole of a Content-Aware Fill: the bounds of what the selection
+    /// covers, found row by row in parallel.
+    #[test]
+    fn the_hole_is_the_bounds_of_the_selection() {
+        let canvas = crate::document::PixelRect {
+            x: 0,
+            y: 0,
+            w: 400,
+            h: 300,
+        };
+        let rect = crate::document::PixelRect {
+            x: 50,
+            y: 40,
+            w: 210,
+            h: 130,
+        };
+        let sel = crate::selection::Selection::ellipse(rect, canvas, true).unwrap();
+        let doc = Document::new(RgbaImage::new(400, 300), None);
+        let clip = sel.clip(doc.active_layer(), canvas).unwrap();
+        let [x0, y0, x1, y1] = clip.rect;
+        let mut serial: Option<DirtyRect> = None;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if clip.coverage(x, y) > 0 {
+                    let r = DirtyRect { x, y, w: 1, h: 1 };
+                    serial = Some(serial.map_or(r, |b| b.union(r)));
+                }
+            }
+        }
+        let hole = hole_of(&clip).unwrap();
+        assert_eq!(Some(hole), serial);
+        assert!(hole.x >= 49 && hole.x + hole.w <= 261, "{hole:?}");
+    }
 
     #[test]
     fn heal_tiles_cover_the_area_and_overlap() {

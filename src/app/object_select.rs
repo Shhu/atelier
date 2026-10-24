@@ -12,7 +12,7 @@ use super::models_window::AfterDownload;
 use super::*;
 use crate::ai::models::Model;
 use crate::ai::objects::{self, Features, Mask, Prompt};
-use crate::i18n::t;
+use crate::i18n::{Message, t};
 
 /// Distance (screen px) from which a press becomes a rectangle.
 const DRAG_DISTANCE: f32 = 4.0;
@@ -67,10 +67,12 @@ struct Shown {
 
 /// A click or a rectangle: on the image `fingerprint`, with Shift and Alt.
 struct Pick {
-    /// The document clicked, its image then and its history step.
+    /// The document clicked, its image then and its history generation
+    /// (see `Document::history_generation`: the steps earlier picks record
+    /// leave it as it is, an undo doesn't).
     doc: u64,
     fingerprint: u64,
-    step: u64,
+    generation: u64,
     prompt: Prompt,
     shift: bool,
     alt: bool,
@@ -411,13 +413,17 @@ impl AtelierApp {
         if !self.request_model(AfterDownload::ObjectSelection) {
             return;
         }
-        let Some((doc, step)) = self.doc.as_ref().map(|d| (d.uid(), d.history_step())) else {
+        let Some((doc, generation)) = self
+            .doc
+            .as_ref()
+            .map(|d| (d.uid(), d.history_generation()))
+        else {
             return;
         };
         let pick = Pick {
             doc,
             fingerprint: current,
-            step,
+            generation,
             prompt,
             shift,
             alt,
@@ -449,12 +455,12 @@ impl AtelierApp {
         if !tool && !self.object_select.busy() {
             return;
         }
-        // Clicks waiting for an analysis that only the tool starts: the
-        // tool was left, they are dropped rather than applied later.
+        // Clicks waiting for the analysis: the tool was left, they are
+        // dropped rather than applied later, under another tool.
         let os = &mut self.object_select;
-        if !tool && os.analysing.is_none() && !os.queued.is_empty() {
+        if !tool && !os.queued.is_empty() {
             os.queued.clear();
-            self.status = t!("sel4-objsel-dropped");
+            self.status = t!("sel5-objsel-tool-left");
         }
         let current = self.doc.as_ref().map(fingerprint);
         let uid = self.doc.as_ref().map(Document::uid);
@@ -475,8 +481,8 @@ impl AtelierApp {
                     os.failed = Some(key);
                     os.queued.clear();
                     let error = match outcome {
-                        Ok(Err(e)) => e,
-                        _ => t!("ai-error-internal"),
+                        Ok(Err(e)) => Message::from(e),
+                        _ => Message::of(|| t!("ai-error-internal")),
                     };
                     let failed = tm!("objsel-failed", error = error);
                     self.status = failed.shown.clone();
@@ -538,19 +544,22 @@ impl AtelierApp {
                 }
                 Done::Pick(pick, mask) => {
                     self.object_select.picking -= 1;
-                    let step = self.doc.as_ref().map(Document::history_step);
-                    if uid == Some(pick.doc) && step != Some(pick.step) {
-                        // Undone, redone or edited meanwhile: the click was
-                        // about another state (never recorded over it).
-                        self.status = t!("hist4-selection-history-changed");
+                    let generation = self.doc.as_ref().map(Document::history_generation);
+                    if uid == Some(pick.doc) && generation != Some(pick.generation) {
+                        // Undone or redone meanwhile: the click was about
+                        // another state (never recorded over it, nor over
+                        // the redo list). The steps of earlier picks (a
+                        // quick Shift+click) don't count.
+                        self.status = t!("hist5-selection-undone");
                     } else if Some(pick.fingerprint) == current {
                         self.apply_object(mask, pick.shift, pick.alt);
                     } else if let Some(now) = current
                         && uid == Some(pick.doc)
                         && self.tool == Tool::ObjectSelect
                     {
-                        // The image changed meanwhile (an undo): the click
-                        // is made again on what shows now, rather than lost
+                        // The image changed meanwhile (a step recorded
+                        // forward): the click is made again on what shows
+                        // now, after it, rather than lost
                         // (never on another tab, nor once the tool is left:
                         // it would land later, unexpected).
                         crate::diag::warn(tm!("ui4-log-objsel-picked-again"));
@@ -568,7 +577,10 @@ impl AtelierApp {
             os.worker = None;
             os.picking = 0;
             os.reset_hover();
-            self.status_failed(tm!("objsel-failed", error = t!("ai-error-internal")));
+            self.status_failed(tm!(
+                "objsel-failed",
+                error = Message::of(|| t!("ai-error-internal"))
+            ));
         }
     }
 
@@ -588,6 +600,8 @@ impl AtelierApp {
             self.status = t!("objsel-not-found");
             return;
         };
+        // A selection made before it lands first, in order.
+        self.wait_select_job();
         let mode = self.selection_mode(shift, alt);
         self.apply_selection(Some(found), mode);
     }
@@ -889,7 +903,7 @@ mod tests {
         let pick = Pick {
             doc: doc.uid(),
             fingerprint: fingerprint(doc),
-            step: doc.history_step(),
+            generation: doc.history_generation(),
             prompt: Prompt {
                 points: vec![(10.0, 10.0, true)],
                 rect: None,
@@ -903,7 +917,150 @@ mod tests {
         let app = harness.state();
         assert!(app.object_select.queued.is_empty());
         assert!(!app.object_select.busy());
-        assert_eq!(app.status, t!("sel4-objsel-dropped"));
+        assert_eq!(app.status, t!("sel5-objsel-tool-left"));
         assert!(app.selection.is_none());
+    }
+
+    /// Also while the analysis still runs: the click isn't applied once
+    /// it ends, under another tool.
+    #[test]
+    fn a_click_waiting_for_the_analysis_is_dropped_when_the_tool_is_left() {
+        let mut harness = app_with(image::RgbaImage::new(64, 64));
+        let app = harness.state_mut();
+        let doc = app.doc.as_ref().unwrap();
+        let current = fingerprint(doc);
+        let pick = Pick {
+            doc: doc.uid(),
+            fingerprint: current,
+            generation: doc.history_generation(),
+            prompt: Prompt {
+                points: vec![(10.0, 10.0, true)],
+                rect: None,
+            },
+            shift: false,
+            alt: false,
+        };
+        // An analysis that never ends.
+        let (send, result) = mpsc::channel();
+        app.object_select.analysing = Some((current, result));
+        app.object_select.queued.push(pick);
+        app.tool = Tool::Brush;
+        harness.run_steps(2);
+        let app = harness.state();
+        assert!(app.object_select.queued.is_empty());
+        assert_eq!(app.status, t!("sel5-objsel-tool-left"));
+        drop(send);
+    }
+
+    /// Masks as the worker would give them, for picks made at `generation`.
+    fn picks_done(
+        app: &mut AtelierApp,
+        generation: u64,
+        masks: &[(PixelRect, bool)],
+    ) -> mpsc::Sender<Done> {
+        let doc = app.doc.as_ref().unwrap();
+        let (uid, current) = (doc.uid(), fingerprint(doc));
+        let (send, done) = mpsc::channel();
+        for &(r, shift) in masks {
+            let pick = Pick {
+                doc: uid,
+                fingerprint: current,
+                generation,
+                prompt: Prompt {
+                    points: vec![(r.x as f32, r.y as f32, true)],
+                    rect: None,
+                },
+                shift,
+                alt: false,
+            };
+            let mask = Mask {
+                coverage: GrayImage::from_pixel(r.w, r.h, image::Luma([255])),
+                offset: (r.x, r.y),
+            };
+            send.send(Done::Pick(pick, Ok(Some(mask)))).unwrap();
+        }
+        app.object_select.picking = masks.len();
+        app.object_select.worker = Some(Worker {
+            queue: Arc::new((Mutex::new(Queue::default()), Condvar::new())),
+            done,
+        });
+        send
+    }
+
+    /// A click, then a Shift+click before the first object is back: both
+    /// are applied, in order (the first one's step doesn't drop the
+    /// second).
+    #[test]
+    fn a_quick_shift_click_adds_the_second_object() {
+        let mut harness = app_with(image::RgbaImage::new(64, 64));
+        let app = harness.state_mut();
+        app.tool = Tool::ObjectSelect;
+        let generation = app.doc.as_ref().unwrap().history_generation();
+        let a = PixelRect { x: 2, y: 2, w: 10, h: 10 };
+        let b = PixelRect { x: 40, y: 30, w: 10, h: 10 };
+        let _send = picks_done(app, generation, &[(a, false), (b, true)]);
+        app.poll_object_select();
+        let rect = app.selection.as_ref().expect("both objects").rect;
+        assert_eq!(rect, a.union(b));
+        assert_eq!(app.doc.as_ref().unwrap().history().0.len(), 2);
+        assert!(app.status.is_empty(), "{}", app.status);
+    }
+
+    /// A click made before an undo is dropped: it was about another state,
+    /// and recording it would wipe the redo list.
+    #[test]
+    fn a_click_made_before_an_undo_is_dropped() {
+        let mut harness = app_with(image::RgbaImage::new(64, 64));
+        let app = harness.state_mut();
+        app.tool = Tool::ObjectSelect;
+        let d = app.doc.as_mut().unwrap();
+        d.checkpoint("a".into());
+        let generation = d.history_generation();
+        d.undo();
+        d.redo();
+        let a = PixelRect { x: 2, y: 2, w: 10, h: 10 };
+        let _send = picks_done(app, generation, &[(a, false)]);
+        app.poll_object_select();
+        assert!(app.selection.is_none());
+        assert_eq!(app.status, t!("hist5-selection-undone"));
+    }
+
+    /// The same through the real model: a click, then a Shift+click right
+    /// after, during the first analysis and once it is done.
+    #[test]
+    #[ignore = "needs the SAM model"]
+    fn two_quick_clicks_select_both_objects() {
+        fn click(harness: &mut Harness<'_, AtelierApp>, at: Pos2, modifiers: Modifiers) {
+            harness.event(egui::Event::ModifiersChanged(modifiers));
+            harness.hover_at(at);
+            harness.run_steps(1);
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers,
+                });
+                harness.run_steps(1);
+            }
+            harness.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+        }
+        for analysed in [true, false] {
+            let mut harness = app_with(demo_photo());
+            harness.state_mut().tool = Tool::ObjectSelect;
+            if analysed {
+                settle(&mut harness);
+            } else {
+                harness.run_steps(2);
+            }
+            let ball = screen(&harness, 290.0, 360.0);
+            let box_ = screen(&harness, 660.0, 320.0);
+            click(&mut harness, ball, Modifiers::NONE);
+            click(&mut harness, box_, Modifiers::SHIFT);
+            settle(&mut harness);
+            let rect = harness.state().selection.as_ref().expect("both").rect;
+            assert_near(rect, [170, 166, 590, 314]);
+            assert_eq!(harness.state().doc.as_ref().unwrap().history().0.len(), 2);
+        }
     }
 }

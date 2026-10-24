@@ -46,7 +46,7 @@ pub use file_io::{
     file_size, file_thumbnail,
 };
 pub use file_io::{encode_cmyk, has_cmyk};
-pub use file_io::{encode_image, write_atomic};
+pub use file_io::{ImageMetadata, encode_image, write_atomic};
 pub use masks::{Mask, NewMask};
 pub use native::is_native;
 pub use native::{adjustment_from_json, adjustment_to_json};
@@ -156,6 +156,9 @@ struct StylesCache {
     /// The layer's place when they were last shown for its pixels (they
     /// stay there for other pixels, see `Layer::placed_styles`).
     offset: std::cell::Cell<(i64, i64)>,
+    /// Part of a move of its shape since then not yet in `offset`, under
+    /// a pixel (see `Layer::carry_styles`).
+    moved: std::cell::Cell<(f32, f32)>,
 }
 
 /// An element of the composition. Its pixels may extend beyond the canvas:
@@ -269,6 +272,7 @@ impl Layer {
             effects: self.effects.clone(),
             styles: Arc::clone(&styles),
             offset: self.offset.into(),
+            moved: Default::default(),
         });
         Some(styles)
     }
@@ -650,6 +654,13 @@ pub struct Document {
     step: u64,
     /// Number of the last step recorded.
     seq: u64,
+    /// Changes when the history goes back or sideways (see
+    /// [`Self::history_generation`]).
+    generation: u64,
+    /// The oldest step a full history let go to record the step numbered
+    /// here, and whether steps were forgotten before: given back if that
+    /// step is discarded (it changed nothing).
+    evicted: Option<(u64, Step, bool)>,
     /// Steps were forgotten (a full history): the oldest state kept is no
     /// longer the one opened.
     forgotten: bool,
@@ -676,6 +687,9 @@ pub struct Document {
     /// The active layer, set aside while an RGBA stand-in of its mask takes
     /// its place (see `masks.rs`).
     swapped: Option<Box<Layer>>,
+    /// The last RGBA stand-in of a targeted mask made (see
+    /// `Document::target_layer`), for what it was made from.
+    stand_in: std::cell::RefCell<Option<masks::StandIn>>,
     /// The targeted mask is the active smart object's smart filter mask.
     filter_mask_target: bool,
     /// The contents of a smart object opened by Edit Contents: saving
@@ -710,6 +724,8 @@ impl Document {
             redo: Vec::new(),
             step: 0,
             seq: 0,
+            generation: 0,
+            evicted: None,
             forgotten: false,
             dropped_redo: None,
             state_id: 0,
@@ -721,6 +737,7 @@ impl Document {
             uid: next_rev(),
             mask_target: None,
             swapped: None,
+            stand_in: Default::default(),
             filter_mask_target: false,
             embedded_in: None,
             file_notes: Vec::new(),
@@ -765,6 +782,7 @@ impl Document {
         let mut doc = Self::new(decoded.image, Some(path.to_path_buf()));
         doc.icc_profile = decoded.icc_profile.map(Arc::new);
         doc.file_metadata.exif = decoded.exif.map(Arc::new);
+        doc.file_metadata.image = Some(Arc::new(decoded.metadata));
         // Not said on opening (the first frame is): kept for saving over
         // the file in its format.
         doc.file_notes = decoded.losses;
@@ -873,6 +891,8 @@ impl Document {
             redo: Vec::new(),
             step: 0,
             seq: 0,
+            generation: 0,
+            evicted: None,
             forgotten: false,
             dropped_redo: None,
             state_id: 0,
@@ -884,6 +904,7 @@ impl Document {
             uid: next_rev(),
             mask_target: self.mask_target,
             swapped: self.swapped.clone(),
+            stand_in: Default::default(),
             filter_mask_target: self.filter_mask_target,
             // Never gives contents back to a smart object.
             embedded_in: None,
@@ -1071,8 +1092,13 @@ impl Document {
             name,
             seq: self.seq,
         });
-        if self.undo.len() > MAX_UNDO {
-            self.undo.pop_front();
+        // The oldest step goes, but stays at hand until another step comes:
+        // this one may change nothing (a cancelled dialog).
+        self.evicted = None;
+        if self.undo.len() > MAX_UNDO
+            && let Some(oldest) = self.undo.pop_front()
+        {
+            self.evicted = Some((self.seq, oldest, self.forgotten));
             self.forgotten = true;
         }
         // Kept until another step comes: this one may change nothing.
@@ -1104,7 +1130,8 @@ impl Document {
         self.state_buffers(&mut seen, None);
         let mut total = 0;
         let dropped = self.dropped_redo.iter().flat_map(|(_, steps)| steps);
-        for state in self.redo.iter().chain(&self.undo).chain(dropped) {
+        let evicted = self.evicted.iter().map(|(_, step, _)| step);
+        for state in self.redo.iter().chain(&self.undo).chain(dropped).chain(evicted) {
             total += self.state_buffers(&mut seen, Some(&state.state));
         }
         total
@@ -1149,8 +1176,11 @@ impl Document {
     /// [`Self::history_bytes`]). The last step is always kept. A dropped
     /// redo list goes first: it only comes back if a step changes nothing.
     pub fn trim_history(&mut self, budget: usize) {
-        if self.dropped_redo.is_some() && self.history_bytes() > budget {
+        if (self.dropped_redo.is_some() || self.evicted.is_some())
+            && self.history_bytes() > budget
+        {
             self.dropped_redo = None;
+            self.evicted = None;
         }
         let mut seen = std::collections::HashSet::new();
         self.state_buffers(&mut seen, None);
@@ -1184,6 +1214,21 @@ impl Document {
         self.step
     }
 
+    /// Identifies the current state: a new one with each change, the same
+    /// one back when a step is undone or discarded.
+    pub fn state_id(&self) -> u64 {
+        self.state_id
+    }
+
+    /// Changes when the history goes back or sideways: an undo, a redo (a
+    /// click in the History panel), a step discarded or rolled back. Steps
+    /// recorded forward leave it as it is: a result computed in the
+    /// background still applies after them, but never over a state it was
+    /// not computed from (nor wiping the redo list it did not know).
+    pub fn history_generation(&self) -> u64 {
+        self.generation
+    }
+
     /// The document was just saved: its current state is the saved one.
     pub fn mark_saved(&mut self) {
         self.saved_id = Some(self.state_id);
@@ -1205,6 +1250,13 @@ impl Document {
         if let Some(prev) = self.undo.pop_back() {
             self.restore(prev.state);
             self.step += 1;
+            self.generation += 1;
+            // The oldest step it made the history let go comes back.
+            if self.evicted.as_ref().is_some_and(|(seq, ..)| *seq == prev.seq) {
+                let (_, oldest, forgotten) = self.evicted.take().expect("checked");
+                self.undo.push_front(oldest);
+                self.forgotten = forgotten;
+            }
             if let Some((seq, _)) = &self.dropped_redo
                 && *seq >= prev.seq
             {
@@ -1259,7 +1311,9 @@ impl Document {
         let state = self.restore(prev.state);
         self.redo.push(Step { state, ..prev });
         self.dropped_redo = None;
+        self.evicted = None;
         self.step += 1;
+        self.generation += 1;
         true
     }
 
@@ -1270,7 +1324,9 @@ impl Document {
         let state = self.restore(next.state);
         self.undo.push_back(Step { state, ..next });
         self.dropped_redo = None;
+        self.evicted = None;
         self.step += 1;
+        self.generation += 1;
         true
     }
 
@@ -2389,9 +2445,13 @@ impl Document {
             }
         }
         if fit_canvas {
+            // What shows (a turned box has transparent corners).
             let r = block
                 .filter(|&i| self.layers[i].has_pixels())
-                .map(|i| self.layers[i].rect())
+                .map(|i| {
+                    let l = &self.layers[i];
+                    l.content_bounds().unwrap_or(l.rect())
+                })
                 .reduce(PixelRect::union);
             if let Some(r) = r {
                 self.fit_canvas_to(r);
@@ -3313,6 +3373,47 @@ mod tests {
     }
 
     #[test]
+    fn a_discarded_step_gives_back_the_oldest_one_of_a_full_history() {
+        let mut doc = Document::new(RgbaImage::new(4, 4), None);
+        for i in 0..MAX_UNDO {
+            doc.checkpoint(format!("s{i}"));
+        }
+        assert!(!doc.history_forgotten());
+        let numbers = doc.history_numbers();
+        // A cancelled dialog: recorded, then discarded.
+        doc.checkpoint("cancelled".into());
+        assert!(doc.history_forgotten());
+        doc.discard_step();
+        assert_eq!(doc.history_numbers(), numbers);
+        assert!(!doc.history_forgotten(), "the opened state is still the oldest");
+        // Kept, a new step makes the oldest go for good.
+        doc.checkpoint("kept".into());
+        doc.checkpoint("next".into());
+        doc.discard_step();
+        assert_eq!(doc.undo.len(), MAX_UNDO);
+        assert_eq!(doc.history_numbers()[0], numbers[1]);
+        assert!(doc.history_forgotten());
+    }
+
+    #[test]
+    fn only_going_back_or_sideways_changes_the_generation() {
+        let mut doc = Document::new(RgbaImage::new(4, 4), None);
+        let start = doc.history_generation();
+        doc.checkpoint("a".into());
+        doc.checkpoint("b".into());
+        assert_eq!(doc.history_generation(), start, "steps forward");
+        doc.undo();
+        let undone = doc.history_generation();
+        assert_ne!(undone, start);
+        doc.redo();
+        assert_ne!(doc.history_generation(), undone);
+        let redone = doc.history_generation();
+        doc.checkpoint("c".into());
+        doc.discard_step();
+        assert_ne!(doc.history_generation(), redone, "a step discarded");
+    }
+
+    #[test]
     fn a_new_adjustment_layer_is_one_step_with_a_full_history() {
         let mut doc = Document::new(RgbaImage::new(16, 16), None);
         for i in 0..MAX_UNDO + 10 {
@@ -3464,8 +3565,9 @@ mod tests {
         doc.checkpoint("typing".into());
         assert!(doc.rollback_to(mark));
         assert_eq!(doc.layers.len(), 1);
-        // Further back than the history reaches: not at the mark.
-        for _ in 0..MAX_UNDO + 1 {
+        // Further back than the history reaches (the oldest step the last
+        // one let go comes back, not those before): not at the mark.
+        for _ in 0..MAX_UNDO + 2 {
             doc.checkpoint("step".into());
         }
         assert!(!doc.rollback_to(mark));

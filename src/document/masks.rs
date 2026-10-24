@@ -45,7 +45,13 @@ pub struct Mask {
 struct FeatherJob {
     key: (u64, u32),
     done: Mutex<Option<Feathered>>,
+    /// When it starts.
+    asked: std::time::Instant,
 }
+
+/// A new feathered image is made at most this often while the radius
+/// keeps changing (its slider): each one shown recomposites the layer.
+const FEATHER_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Feathered images being made.
 static FEATHERING: AtomicUsize = AtomicUsize::new(0);
@@ -276,9 +282,15 @@ impl Mask {
             drop(slot);
             return at_once();
         };
+        // Soon after the former one: it waits a little (the radius shown
+        // changes about ten times a second at most).
+        let wait = slot.as_ref().map_or(std::time::Duration::ZERO, |j| {
+            FEATHER_EVERY.saturating_sub(j.asked.elapsed())
+        });
         let job = Arc::new(FeatherJob {
             key,
             done: Mutex::new(None),
+            asked: std::time::Instant::now() + wait,
         });
         let (image, default, feather, rev) = (
             Arc::clone(&self.image),
@@ -299,6 +311,7 @@ impl Mask {
                     }
                 }
                 let _running = Running;
+                std::thread::sleep(wait);
                 let f = feathered(&image, default, feather, rev);
                 *work.done.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
             });
@@ -899,16 +912,46 @@ impl Document {
             return Some(std::borrow::Cow::Owned(proxy));
         }
         if self.mask_targeted() {
-            return Some(std::borrow::Cow::Owned(stand_in(
-                &self.layers[self.active],
-                self.full_rect(),
-                self.filter_mask_target,
-            )));
+            return Some(std::borrow::Cow::Owned(self.cached_stand_in()));
         }
         let layer = &self.layers[self.active];
         layer
             .has_pixels()
             .then_some(std::borrow::Cow::Borrowed(layer))
+    }
+
+    /// [`stand_in`] of the targeted mask, made again only when the mask
+    /// (or the canvas) changed: a dialog asks for it at every frame.
+    fn cached_stand_in(&self) -> Layer {
+        let layer = &self.layers[self.active];
+        let (area, filter) = (self.full_rect(), self.filter_mask_target);
+        let mask = target_mask(layer, filter).expect("a mask");
+        let key = (
+            layer.id,
+            mask.rev(),
+            mask.origin(layer.offset),
+            mask.image.dimensions(),
+            mask.default,
+            filter,
+            (area.x, area.y, area.w, area.h),
+        );
+        let mut cache = self.stand_in.borrow_mut();
+        if let Some(c) = cache.as_ref().filter(|c| c.key == key) {
+            return Layer {
+                image: Arc::clone(&c.image),
+                rev: c.rev,
+                offset: c.offset,
+                ..stand_in_shell(layer)
+            };
+        }
+        let made = stand_in(layer, area, filter);
+        *cache = Some(StandIn {
+            key,
+            image: Arc::clone(&made.image),
+            rev: made.rev,
+            offset: made.offset,
+        });
+        made
     }
 
     fn swap_in_mask(&mut self) {
@@ -957,6 +1000,27 @@ fn mask_was_white(mask: Option<&Mask>) -> bool {
     mask.is_some_and(|m| m.default == 255 && m.image.pixels().all(|p| p.0[0] == 255))
 }
 
+/// The last stand-in made (see `Document::cached_stand_in`): what it was
+/// made from, its pixels and their revision.
+pub(super) struct StandIn {
+    key: StandInKey,
+    image: Arc<RgbaImage>,
+    rev: u64,
+    offset: (i64, i64),
+}
+
+/// Layer id, mask revision, origin, size and default, smart filter mask,
+/// canvas.
+type StandInKey = (
+    u64,
+    u64,
+    (i64, i64),
+    (u32, u32),
+    u8,
+    bool,
+    (i64, i64, u32, u32),
+);
+
 /// RGBA stand-in of `layer`'s mask (its smart filter mask with `filter`)
 /// over `area` (canvas): the gray value in the colors, opaque. Same id and
 /// settings as the layer, without mask or styles.
@@ -990,13 +1054,21 @@ fn stand_in(layer: &Layer, area: PixelRect, filter: bool) -> Layer {
     });
     let image = RgbaImage::from_raw(r.w, r.h, raw).expect("size");
     Layer {
-        kind: LayerKind::Pixels,
         image: Arc::new(image),
         rev: next_rev(),
+        offset: (r.x, r.y),
+        ..stand_in_shell(layer)
+    }
+}
+
+/// A stand-in's settings: `layer`'s, as plain pixels without mask or
+/// styles (its pixels to set).
+fn stand_in_shell(layer: &Layer) -> Layer {
+    Layer {
+        kind: LayerKind::Pixels,
         bounds: std::cell::Cell::new(None),
         styles_cache: RefCell::new(None),
         styles_job: Default::default(),
-        offset: (r.x, r.y),
         effects: Default::default(),
         mask: None,
         text: None,
@@ -1240,6 +1312,35 @@ mod tests {
         assert_eq!((at, *image == *direct), (direct_at, true));
     }
 
+    /// While the radius keeps changing (its slider), a new feathered image
+    /// shows at most every `FEATHER_EVERY`: each one recomposites the layer.
+    #[test]
+    fn feather_radius_changes_show_at_most_ten_times_a_second() {
+        let mut m = Mask::new(
+            GrayImage::from_pixel(1100, 1000, Luma([255])),
+            (0, 0),
+            0,
+            (0, 0),
+        );
+        m.feather = 2.0;
+        m.shaped_later((0, 0));
+        let start = std::time::Instant::now();
+        let mut shown = Vec::new();
+        for k in 0..400 {
+            m.feather = 3.0 + (k % 7) as f32;
+            let (_, _, key) = m.shaped_later((0, 0));
+            if shown.last() != Some(&key.1) {
+                shown.push(key.1);
+            }
+            if start.elapsed() > std::time::Duration::from_millis(350) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The first one, then one new radius per 100 ms at most.
+        assert!(shown.len() <= 5, "{} images in 350 ms", shown.len());
+    }
+
     fn doc() -> Document {
         let mut doc = Document::new(RgbaImage::from_pixel(10, 10, Rgba([255, 0, 0, 255])), None);
         doc.add_layer(
@@ -1248,6 +1349,28 @@ mod tests {
             (0, 0),
         );
         doc
+    }
+
+    /// The stand-in of a targeted mask is made once while the mask doesn't
+    /// change (dialogs ask for it at every frame), again when it does.
+    #[test]
+    fn mask_stand_in_is_made_again_only_when_the_mask_changes() {
+        let mut doc = doc();
+        assert!(doc.add_mask(NewMask::HideAll, None));
+        let a = doc.target_layer().unwrap().into_owned();
+        let b = doc.target_layer().unwrap().into_owned();
+        assert!(Arc::ptr_eq(&a.image, &b.image));
+        assert_eq!(a.rev, b.rev);
+        assert_eq!(a.image.get_pixel(5, 5).0, [0, 0, 0, 255]);
+        assert!(doc.begin_paint());
+        doc.active_layer_mut()
+            .pixels_mut()
+            .put_pixel(5, 5, Rgba([255, 255, 255, 255]));
+        doc.end_paint();
+        let c = doc.target_layer().unwrap().into_owned();
+        assert!(!Arc::ptr_eq(&a.image, &c.image));
+        assert_ne!(a.rev, c.rev);
+        assert_eq!(c.image.get_pixel(5, 5).0, [255, 255, 255, 255]);
     }
 
     #[test]

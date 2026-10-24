@@ -450,6 +450,16 @@ impl AtelierApp {
                         ],
                     ),
                     Item(
+                        if self.selection_hidden() {
+                            t!("ui5-menu-show-layers")
+                        } else {
+                            t!("ui5-menu-hide-layers")
+                        },
+                        has_doc,
+                        Some(&SHORTCUT_HIDE_LAYERS),
+                        Action::ToggleVisibility,
+                    ),
+                    Item(
                         t!("menu-layer-toggle-lock"),
                         has_doc,
                         None,
@@ -729,13 +739,53 @@ pub(super) fn explained_menu_entries(
                 ui.separator();
             }
             MenuEntry::Submenu(label, sub) => {
-                ui.menu_button(label.as_str(), |ui| {
+                // Aligned with the items next to options, like them.
+                let text: egui::WidgetText = if indent {
+                    let mut text = egui::text::LayoutJob::default();
+                    let font = egui::TextStyle::Button.resolve(ui.style());
+                    let format = |color| egui::TextFormat::simple(font.clone(), color);
+                    text.append(icon::CHECK, 0.0, format(Color32::TRANSPARENT));
+                    text.append(label, 6.0, format(Color32::PLACEHOLDER));
+                    text.into()
+                } else {
+                    label.as_str().into()
+                };
+                // Nothing in it can run: greyed, saying why.
+                let enabled = sub.iter().any(|e| match e {
+                    MenuEntry::Item(_, enabled, ..) | MenuEntry::Check(_, enabled, ..) => *enabled,
+                    MenuEntry::Choice(..) | MenuEntry::Submenu(..) => true,
+                    MenuEntry::Separator | MenuEntry::Unavailable(..) => false,
+                });
+                if !enabled {
+                    let reason = sub.iter().find_map(|e| match e {
+                        MenuEntry::Item(_, _, _, act) => why(*act),
+                        MenuEntry::Unavailable(_, why) => Some(why.clone()),
+                        _ => None,
+                    });
+                    let response = ui.add_enabled(false, egui::Button::new(text).right_text("⏵"));
+                    let name = format!("{label} ⏵");
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, false, &name)
+                    });
+                    if let Some(reason) = reason {
+                        response.on_disabled_hover_text(reason);
+                    }
+                    continue;
+                }
+                let response = ui.menu_button(text, |ui| {
                     // Never taller than the window: it scrolls.
                     let most = ui.ctx().content_rect().height() - 16.0;
                     scrolling_menu(ui, label, most, |ui| {
                         explained_menu_entries(ui, sub, action, why);
                     });
                 });
+                if indent {
+                    // As egui names a submenu.
+                    let name = format!("{label} ⏵");
+                    response.response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name)
+                    });
+                }
             }
             MenuEntry::Item(label, enabled, shortcut, act) => {
                 let mut button = if indent {

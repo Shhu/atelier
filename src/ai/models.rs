@@ -232,10 +232,12 @@ impl Model {
 
 /// `files` present in `dir`, and their partial downloads, with their size.
 fn files_in(dir: &Path, files: &[ModelFile]) -> Vec<(PathBuf, u64)> {
+    // Partial downloads, and the marks of the files checked.
     let partial = |name: &str| {
-        files
-            .iter()
-            .any(|f| name.starts_with(&format!("{}.", f.name)) && name.ends_with(".part"))
+        files.iter().any(|f| {
+            (name.starts_with(&format!("{}.", f.name)) && name.ends_with(".part"))
+                || name == format!("{}{CHECKED_MARK}", f.name)
+        })
     };
     let mut found: Vec<(PathBuf, u64)> = std::fs::read_dir(dir)
         .into_iter()
@@ -367,21 +369,110 @@ fn create_partial(path: &Path) -> std::io::Result<std::fs::File> {
 /// download again. Returns `true` then.
 /// Its other files (external data) are checked too.
 pub fn remove_if_damaged(path: &Path) -> bool {
-    let Some(model) = Model::ALL
-        .into_iter()
-        .find(|m| m.files().iter().any(|f| m.path(f.name) == path))
-    else {
+    let Some(model) = model_of(path) else {
         return false;
     };
     let mut removed = false;
     for f in model.files() {
         let path = model.path(f.name);
         if digest_of(&path).is_some_and(|d| d != f.sha256) {
-            crate::diag::warn(crate::i18n::tm!("ui4-log-model-damaged", name = f.name));
-            removed |= std::fs::remove_file(&path).is_ok();
+            removed |= remove_damaged(&path, f.name);
         }
     }
     removed
+}
+
+/// Before the first use of a model in this run of the program (`path`:
+/// one of its files): its files that aren't what was downloaded are
+/// removed, so that it is offered for download again. Loading a model
+/// only notices a damaged graph; damaged weights would give wrong results
+/// for ever. Each file is hashed once, then remembered beside it (its size
+/// and date). Returns `true` if one was removed. It takes seconds the
+/// first time: never on the UI thread.
+pub fn remove_damaged_once(path: &Path) -> bool {
+    let Some(model) = model_of(path) else {
+        return false;
+    };
+    // One check at a time (two sessions of a model load together).
+    let mut checked = checked();
+    let mut removed = false;
+    for f in model.files() {
+        removed |= remove_if_not(&model.path(f.name), f, &mut checked);
+    }
+    removed
+}
+
+/// File `f` at `path` removed if it isn't what was downloaded, unless found
+/// right before (in `checked`, or by its mark). Returns `true` if removed.
+fn remove_if_not(path: &Path, f: &ModelFile, checked: &mut Vec<PathBuf>) -> bool {
+    if checked.iter().any(|p| p == path) {
+        return false;
+    }
+    // Missing: loading says so.
+    let Some(now) = stamp(path) else {
+        return false;
+    };
+    if std::fs::read_to_string(mark_of(path)).is_ok_and(|s| s == now) {
+        checked.push(path.to_path_buf());
+        return false;
+    }
+    match digest_of(path) {
+        Some(d) if d != f.sha256 => remove_damaged(path, f.name),
+        Some(_) => {
+            mark_checked(path, checked);
+            false
+        }
+        None => false,
+    }
+}
+
+/// The model `path` is a file of.
+fn model_of(path: &Path) -> Option<Model> {
+    Model::ALL
+        .into_iter()
+        .find(|m| m.files().iter().any(|f| m.path(f.name) == path))
+}
+
+fn remove_damaged(path: &Path, name: &str) -> bool {
+    crate::diag::warn(crate::i18n::tm!("ui4-log-model-damaged", name = name));
+    let _ = std::fs::remove_file(mark_of(path));
+    std::fs::remove_file(path).is_ok()
+}
+
+/// Model files found right in this run of the program.
+fn checked() -> std::sync::MutexGuard<'static, Vec<PathBuf>> {
+    static CHECKED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    CHECKED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What tells, beside a model file, that it was found right: its
+/// [`stamp`] then.
+fn mark_of(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(CHECKED_MARK);
+    PathBuf::from(name)
+}
+
+const CHECKED_MARK: &str = ".checked";
+
+/// Size and modification time of a file.
+fn stamp(path: &Path) -> Option<String> {
+    let m = std::fs::metadata(path).ok()?;
+    let t = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(format!("{} {}", m.len(), t.as_nanos()))
+}
+
+fn mark_checked(path: &Path, checked: &mut Vec<PathBuf>) {
+    if let Some(now) = stamp(path) {
+        let _ = std::fs::write(mark_of(path), now);
+    }
+    if !checked.iter().any(|p| p == path) {
+        checked.push(path.to_path_buf());
+    }
 }
 
 /// The SHA-256 of a file, in hexadecimal.
@@ -511,7 +602,10 @@ fn download_file(
     if digest != file.sha256 {
         return Err(DownloadError::Failed(t!("ai-error-model-corrupt")));
     }
-    super::rename(&partial.0, path).map_err(failed)
+    super::rename(&partial.0, path).map_err(failed)?;
+    // Just checked: not hashed again before its first use.
+    mark_checked(path, &mut checked());
+    Ok(())
 }
 
 /// Models folder: `%LOCALAPPDATA%\Atelier\modeles` on Windows,
@@ -723,6 +817,30 @@ mod tests {
         let result = done.recv_timeout(Duration::from_secs(5));
         assert_eq!(result, Ok(Err(DownloadError::Cancelled)));
         assert_eq!(parts(&dir), 0);
+    }
+
+    /// A model file of the right size whose bytes changed (damaged weights,
+    /// which load without error) is found by its hash and removed; one
+    /// found right is not hashed again while it doesn't change.
+    #[test]
+    fn damaged_model_files_are_found_by_their_hash_once() {
+        const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let dir = temp_dir("checked");
+        let path = dir.join("model.onnx");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut checked = Vec::new();
+        assert!(!remove_if_not(&path, &file("", 3, ABC), &mut checked));
+        assert!(mark_of(&path).exists());
+        // Found right in an earlier run (its mark): not hashed again, even
+        // if the expected digest were another.
+        let mut later = Vec::new();
+        assert!(!remove_if_not(&path, &file("", 3, "0"), &mut later));
+        assert!(path.exists());
+        // Changed since: hashed again, removed with its mark.
+        std::fs::write(&path, b"abcd").unwrap();
+        let mut again = Vec::new();
+        assert!(remove_if_not(&path, &file("", 4, ABC), &mut again));
+        assert!(!path.exists() && !mark_of(&path).exists());
     }
 
     /// Partial files (from a download cut short by a crash) count on disk,

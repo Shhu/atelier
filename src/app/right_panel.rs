@@ -14,6 +14,8 @@ mod type_sections;
 
 /// Height of the panel headings ("Properties", "Layers").
 const HEADING_HEIGHT: f32 = 42.0;
+/// Blend mode and opacity of the active layer, under the Layers heading.
+const BLEND_ROW: f32 = 36.0;
 /// Row of the layers list.
 const ROW_HEIGHT: f32 = 44.0;
 const ROW_GAP: f32 = 2.0;
@@ -22,6 +24,8 @@ const VISIBLE_ROWS: usize = 5;
 /// Below this panel height, the list shows this many rows before scrolling.
 const SHORT_PANEL: f32 = 650.0;
 const SHORT_VISIBLE_ROWS: usize = 3;
+/// Temp data: the Properties' height, unscrolled.
+const PROPERTIES_NATURAL: &str = "side-properties-natural";
 /// Room the Properties keep above the Layers, when the panel has it.
 const PROPERTIES_MIN: f32 = 160.0;
 /// Buttons under the list, with their top border.
@@ -49,11 +53,17 @@ impl AtelierApp {
             );
             return;
         };
-        // A low panel lists fewer rows before scrolling, for the Properties.
+        // A low panel lists fewer rows before scrolling, for the Properties;
+        // a tall one more, as many as the Properties leave room for.
+        let fixed = HEADING_HEIGHT + BLEND_ROW + 6.0 + FOOTER_HEIGHT;
         let visible = if full.height() < SHORT_PANEL {
             SHORT_VISIBLE_ROWS
         } else {
-            VISIBLE_ROWS
+            let natural = ui
+                .data(|d| d.get_temp::<f32>(Id::new(PROPERTIES_NATURAL)))
+                .unwrap_or(f32::INFINITY);
+            let room = full.height() - natural - fixed + ROW_GAP;
+            VISIBLE_ROWS.max((room / (ROW_HEIGHT + ROW_GAP)).floor().max(0.0) as usize)
         };
         let rows = n.clamp(1, visible) as f32;
         let most = visible as f32 * (ROW_HEIGHT + ROW_GAP) - ROW_GAP;
@@ -61,14 +71,11 @@ impl AtelierApp {
         // The Layers part: as dragged (a share of the panel), or fitted to
         // the list.
         let dragged = self.workspace.layout.layers_share;
-        let layers_height = dragged.map_or(
-            HEADING_HEIGHT + list_height + 6.0 + FOOTER_HEIGHT,
-            |share| share * full.height(),
-        );
+        let layers_height = dragged.map_or(list_height + fixed, |share| share * full.height());
         // Properties scroll: when the panel is short, they give up room
         // first, down to the layers' heading, one row and their buttons;
         // otherwise they keep a few lines whatever the split.
-        let layers_min = HEADING_HEIGHT + ROW_HEIGHT + 6.0 + FOOTER_HEIGHT;
+        let layers_min = ROW_HEIGHT + fixed;
         let props_min = PROPERTIES_MIN;
         let split = (full.bottom() - layers_height)
             .max(full.top() + props_min)
@@ -136,18 +143,18 @@ impl AtelierApp {
         // We edit a copy; if it changes, the previous state is recorded
         // (once per series of edits to the same property).
         let mut name = layer.name.clone();
-        let mut opacity = layer.opacity;
+        let opacity = layer.opacity;
         let mut fill_opacity = layer.fill;
-        let mut blend = layer.blend;
+        let blend = layer.blend;
         let mut effects = layer.effects.clone();
         let mut content = layer.kind.clone();
         let mut mask = layer.mask.as_ref().map(|m| (m.density, m.feather));
         let (group, pixels) = (layer.is_group(), layer.has_pixels());
         let artboard = layer.artboard.is_some();
         let mut fill = None;
-        let mut hovered = None;
         let mut action = None;
-        egui::ScrollArea::vertical()
+        let top = ui.min_rect().height();
+        let scrolled = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .min_scrolled_height(0.0)
             .show(ui, |ui| {
@@ -162,14 +169,12 @@ impl AtelierApp {
                 if pixels || (group && !artboard) {
                     self.transform_section(ui);
                 }
-                section(ui, Some(&t!("side-layer")), |ui| {
-                    ui.add_enabled_ui(!locked, |ui| {
-                        hovered = layer_fields(ui, &mut opacity, &mut blend, group);
-                        if !group {
-                            fill_field(ui, &mut fill_opacity);
-                        }
+                // (Opacity and blend mode: under the Layers heading.)
+                if !group {
+                    section(ui, Some(&t!("side-layer")), |ui| {
+                        ui.add_enabled_ui(!locked, |ui| fill_field(ui, &mut fill_opacity));
                     });
-                });
+                }
                 if is_text {
                     self.character_section(ui, locked);
                     self.paragraph_section(ui, locked);
@@ -230,10 +235,9 @@ impl AtelierApp {
                     });
                 }
             });
-        // (The Layer Style window has its own list.)
-        if self.layer_style.is_none() {
-            self.blend_preview = hovered.map(|m| (layer_id, m));
-        }
+        // Their height unscrolled: what a tall panel leaves to the Layers.
+        let natural = top + scrolled.content_size.y;
+        ui.data_mut(|d| d.insert_temp(Id::new(PROPERTIES_NATURAL), natural));
 
         let Some(doc) = &self.doc else { return };
         let layer = doc.active_layer();
@@ -544,8 +548,9 @@ impl AtelierApp {
         if lock != locked {
             self.run(Action::ToggleLock);
         }
+        self.blend_row(ui);
         let footer = Rect::from_min_max(pos2(rect.left(), rect.bottom() - FOOTER_HEIGHT), rect.max);
-        let top = rect.top() + HEADING_HEIGHT;
+        let top = rect.top() + HEADING_HEIGHT + BLEND_ROW;
         let list = Rect::from_min_max(
             pos2(rect.left() + 6.0, top),
             pos2(rect.right() - 6.0, (footer.top() - 6.0).max(top)),
@@ -559,6 +564,98 @@ impl AtelierApp {
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         self.layer_buttons(&mut buttons);
+    }
+
+    /// The selected layers are all hidden (Layer › Show Layers).
+    pub(super) fn selection_hidden(&self) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        self.selected_indices()
+            .iter()
+            .all(|&i| !doc.layers[i].visible)
+    }
+
+    /// Layer › Hide Layers / Show Layers (Ctrl+,): the selected layers all
+    /// hidden, or all shown again when they all were; one step.
+    pub(super) fn toggle_visibility(&mut self) {
+        // A text being typed ends first (an empty new one goes away).
+        self.commit_text();
+        let show = self.selection_hidden();
+        let picked = self.selected_indices();
+        if picked.is_empty() {
+            return;
+        }
+        let step = if show {
+            t!("xchg-hist-show-layer")
+        } else {
+            t!("xchg-hist-hide-layer")
+        };
+        self.record_change(step, None);
+        if let Some(doc) = &mut self.doc {
+            for i in picked {
+                doc.layers[i].visible = show;
+            }
+        }
+    }
+
+    /// Blend mode and opacity of the active layer, above the list (as in
+    /// the reference editor); a change is one step.
+    fn blend_row(&mut self, ui: &mut Ui) {
+        let Some(doc) = &self.doc else { return };
+        let layer = doc.active_layer();
+        let (layer_id, locked, group) = (layer.id, layer.locked, layer.is_group());
+        let (mut opacity, mut blend) = (layer.opacity, layer.blend);
+        let row = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), BLEND_ROW));
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .max_rect(row.shrink2(vec2(14.0, 4.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let hovered = child
+            .add_enabled_ui(!locked, |ui| {
+                ui.spacing_mut().item_spacing.x = GAP;
+                let half = (ui.available_width() - GAP) / 2.0;
+                let hovered = blend_combo(ui, "side_blend", &mut blend, group, half);
+                let text = i18n::percent(format!("{:.0}", opacity * 100.0));
+                ui_kit::scrub(ui, &t!("panel-opacity"), &mut opacity, 0.0..=1.0, &text, half);
+                hovered
+            })
+            .inner;
+        ui.advance_cursor_after_rect(row);
+        // (The Layer Style window has its own list.)
+        if self.layer_style.is_none() {
+            self.blend_preview = hovered.map(|m| (layer_id, m));
+        }
+        let Some(layer) = self.doc.as_ref().map(Document::active_layer) else {
+            return;
+        };
+        let changes = [
+            (opacity != layer.opacity, "opacity"),
+            (blend != layer.blend, "blend"),
+        ];
+        let steps: Vec<(String, &str)> = changes
+            .into_iter()
+            .filter(|c| c.0)
+            .map(|(_, prop)| (property_step(prop, layer), prop))
+            .collect();
+        if steps.is_empty() {
+            return;
+        }
+        // A text being typed ends first (an empty new one goes away).
+        self.commit_text();
+        if self
+            .doc
+            .as_ref()
+            .is_none_or(|d| d.active_layer().id != layer_id)
+        {
+            return;
+        }
+        for (step, prop) in steps {
+            self.record_change(step, Some((layer_id, prop)));
+        }
+        if let Some(doc) = &mut self.doc {
+            let layer = doc.active_layer_mut();
+            (layer.opacity, layer.blend) = (opacity, blend);
+        }
     }
 
     fn layer_rows(&mut self, ui: &mut Ui) {
@@ -1031,17 +1128,39 @@ impl AtelierApp {
                 );
             }
         }
+        // What is pending is applied first (an empty new text goes away):
+        // the layers are found again by id, and the drop is given up if
+        // one of them is gone.
+        let id_of = |app: &Self, i: usize| app.doc.as_ref()?.layers.get(i).map(|l| l.id);
+        let index_of = |app: &Self, id: u64| {
+            let d = app.doc.as_ref()?;
+            d.layers.iter().position(|l| l.id == id)
+        };
         if let Some((from, above)) = reorder {
+            let ids = id_of(self, from).zip(above.map_or(Some(None), |a| id_of(self, a).map(Some)));
             self.commit_pending();
-            if let Some(doc) = &mut self.doc
+            let found = ids.and_then(|(from, above)| {
+                let above = match above {
+                    Some(a) => Some(index_of(self, a)?),
+                    None => None,
+                };
+                Some((index_of(self, from)?, above))
+            });
+            if let Some((from, above)) = found
+                && let Some(doc) = &mut self.doc
                 && doc.drop_layer(from, above)
             {
                 self.reset_pending();
             }
         }
         if let Some((from, group)) = into_group {
+            let ids = id_of(self, from).zip(id_of(self, group));
             self.commit_pending();
-            if let Some(doc) = &mut self.doc
+            let found = ids.and_then(|(from, group)| {
+                Some((index_of(self, from)?, index_of(self, group)?))
+            });
+            if let Some((from, group)) = found
+                && let Some(doc) = &mut self.doc
                 && doc.drop_into(from, group)
             {
                 self.reset_pending();
@@ -1538,26 +1657,6 @@ fn locked_notice(ui: &mut Ui) {
         });
 }
 
-/// Opacity and blend mode, side by side (Pass Through too for a group).
-/// Returns the mode under the pointer in the open list, previewed on the
-/// canvas.
-fn layer_fields(
-    ui: &mut Ui,
-    opacity: &mut f32,
-    blend: &mut BlendMode,
-    group: bool,
-) -> Option<BlendMode> {
-    let half = (ui.available_width() - GAP) / 2.0;
-    let mut hovered = None;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = GAP;
-        let text = i18n::percent(format!("{:.0}", *opacity * 100.0));
-        ui_kit::scrub(ui, &t!("panel-opacity"), opacity, 0.0..=1.0, &text, half);
-        hovered = blend_combo(ui, "side_blend", blend, group, half);
-    });
-    hovered
-}
-
 /// The list of blend modes, in Photoshop's blocks; returns the mode under
 /// the pointer while it is open.
 pub(super) fn blend_combo(
@@ -1568,7 +1667,8 @@ pub(super) fn blend_combo(
     width: f32,
 ) -> Option<BlendMode> {
     let mut hovered = None;
-    ui_kit::combo(ui, id, None, &blend.label(), width, |ui| {
+    let label = blend.label();
+    let shown = ui_kit::combo(ui, id, None, &label, width, |ui| {
         if group {
             let r = ui.selectable_value(
                 blend,
@@ -1587,8 +1687,10 @@ pub(super) fn blend_combo(
             }
         }
     })
-    .response
-    .on_hover_text(t!("panel-blend-mode"));
+    .response;
+    let name = t!("panel-blend-mode");
+    ui_kit::name_control(ui, shown.id, &name, &label);
+    shown.on_hover_text(name);
     hovered
 }
 

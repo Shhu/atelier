@@ -1,5 +1,6 @@
 //! Command palette (Ctrl+K): searches the tools and every menu command.
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -27,6 +28,8 @@ pub(super) struct Palette {
     active: usize,
     /// The highlight moved with the keyboard: scroll it into view.
     scroll: bool,
+    /// The query changed: the highlight goes to the first available result.
+    fresh: bool,
 }
 
 impl Palette {
@@ -80,6 +83,14 @@ impl AtelierApp {
             )
         });
         let p = &mut self.palette;
+        // Enter runs something: a greyed best match stays in sight, above.
+        if std::mem::take(&mut p.fresh) {
+            p.active = groups
+                .iter()
+                .flat_map(|(_, entries, _)| entries)
+                .position(|e| e.enabled)
+                .unwrap_or(0);
+        }
         if down {
             p.active += 1;
         }
@@ -153,15 +164,24 @@ impl AtelierApp {
         if query.is_empty() {
             // With no image: what starts one (tools included: Crop).
             let no_doc = self.doc.is_none();
-            let suggested = commands
+            let mut suggested: Vec<Entry> = commands
                 .into_iter()
                 .chain(tools.filter(|_| !no_doc))
                 .filter(|e| e.enabled && suggested(e.action, no_doc))
                 .collect();
+            // New, Open and Paste above the recent files.
+            suggested.sort_by_key(|e| {
+                matches!(
+                    e.action,
+                    Action::Workspace(workspace::Command::OpenRecent(_))
+                )
+            });
             return vec![(t!("palette-suggested"), suggested, 0)];
         }
-        let tools = ranked(tools.collect(), query, MAX_TOOLS);
-        let commands = ranked(commands, query, MAX_COMMANDS);
+        let tools: Vec<Entry> = tools.collect();
+        let vocabulary = vocabulary(tools.iter().chain(&commands));
+        let tools = ranked(tools, query, MAX_TOOLS, &vocabulary);
+        let commands = ranked(commands, query, MAX_COMMANDS, &vocabulary);
         // The group with the better match first (Enter runs it).
         let commands_first = commands.2 > tools.2;
         let mut groups = vec![
@@ -218,6 +238,7 @@ impl AtelierApp {
             if edit.changed() {
                 // The results were built before the field: show the new ones.
                 self.palette.active = 0;
+                self.palette.fresh = true;
                 ui.ctx().request_repaint();
             }
             // The field keeps the keyboard while the palette is open.
@@ -451,6 +472,8 @@ pub(super) fn unavailable_reason(f: &Facts, action: Action) -> String {
                 | Smart::EditContents
                 | Smart::ExportContents
                 | Smart::ReplaceContents
+                | Smart::UpdateModified
+                | Smart::EmbedLinked
         )
     );
     if matches!(action, Action::AddMask(_)) && f.mask {
@@ -545,13 +568,29 @@ fn keywords(action: Action) -> String {
         Action::Tool(Tool::Canvas) | Action::CropToSelection | Action::CropToContent => {
             t!("ui3-palette-keywords-crop")
         }
+        Action::NewDocument => t!("ui5-palette-keywords-new"),
+        Action::ToggleVisibility => t!("ui5-palette-keywords-visibility"),
+        Action::Tool(Tool::ObjectSelect) => t!("ui5-palette-keywords-object-select"),
+        Action::Automate(actions_panel::Command::Panel) => t!("ui5-palette-keywords-actions"),
+        Action::Undo => t!("ui5-palette-keywords-undo"),
+        Action::SetLanguage(_) => t!("ui5-palette-keywords-language"),
+        Action::Adjust(AdjustKind::HueSaturation) => t!("ui5-palette-keywords-desaturate"),
+        Action::Transform(transform::Command::Mode(transform::Mode::Scale)) => {
+            t!("ui5-palette-keywords-scale")
+        }
         Action::Tool(Tool::Transform) => t!("ui3-palette-keywords-move"),
         Action::Tool(Tool::Text) => t!("ui3-palette-keywords-type"),
         Action::Adjust(AdjustKind::BlackWhite)
-        | Action::NewAdjustmentLayer(AdjustKind::BlackWhite) => {
-            t!("ui3-palette-keywords-black-white")
-        }
-        Action::ExportAs => t!("ui3-palette-keywords-export"),
+        | Action::NewAdjustmentLayer(AdjustKind::BlackWhite) => format!(
+            "{} {}",
+            t!("ui3-palette-keywords-black-white"),
+            t!("ui5-palette-keywords-desaturate")
+        ),
+        Action::ExportAs => format!(
+            "{} {}",
+            t!("ui3-palette-keywords-export"),
+            t!("ui5-palette-keywords-save-for-web")
+        ),
         Action::Automate(actions_panel::Command::QuickExport) => {
             t!("ui4-palette-keywords-quick-export")
         }
@@ -573,28 +612,46 @@ fn keywords(action: Action) -> String {
     }
 }
 
-/// The entries matching `query`, the best matches first (among equal ones,
-/// the available, then the shallower in the menus), at most `max`; how many
-/// more match; the best score.
-/// How an entry ranks: its score, whether it is available, its depth in the
-/// menus (shallower first).
-type Rank = (u32, bool, std::cmp::Reverse<usize>);
+/// The entries matching `query`, the best matches first, at most `max`;
+/// how many more match; the best score. Within a level of match (a label
+/// that starts with the query, one holding its words, its menu path, its
+/// keywords…), the available ones come first, then the finer score, then
+/// the shallower in the menus.
+/// How an entry ranks: its level, whether it is available, its score, its
+/// depth in the menus (shallower first).
+type Rank = (u32, bool, u32, std::cmp::Reverse<usize>);
 
-fn ranked(entries: Vec<Entry>, query: &str, max: usize) -> (Vec<Entry>, usize, u32) {
+fn ranked(
+    entries: Vec<Entry>,
+    query: &str,
+    max: usize,
+    vocabulary: &HashSet<String>,
+) -> (Vec<Entry>, usize, u32) {
     let mut scored: Vec<(Rank, Entry)> = entries
         .into_iter()
         .filter_map(|e| {
-            let score = score(&e.label, &e.path, &keywords(e.action), query)?;
+            let score = score_in(&e.label, &e.path, &keywords(e.action), query, vocabulary)?;
             let depth = e.path.matches('›').count();
-            Some(((score, e.enabled, std::cmp::Reverse(depth)), e))
+            Some(((score / 20, e.enabled, score, std::cmp::Reverse(depth)), e))
         })
         .collect();
     // Stable: equal matches keep the menus' order.
     scored.sort_by_key(|(key, _)| std::cmp::Reverse(*key));
-    let best = scored.first().map_or(0, |((score, ..), _)| *score);
+    let best = scored.first().map_or(0, |((_, _, score, _), _)| *score);
     let more = scored.len().saturating_sub(max);
     let entries = scored.into_iter().take(max).map(|(_, e)| e).collect();
     (entries, more, best)
+}
+
+/// The whole words of the entries' labels and menu paths, folded.
+fn vocabulary<'a>(entries: impl Iterator<Item = &'a Entry>) -> HashSet<String> {
+    let mut all = HashSet::new();
+    for e in entries {
+        for text in [&e.label, &e.path] {
+            all.extend(words(&fold(text)).map(str::to_owned));
+        }
+    }
+    all
 }
 
 /// Small words a query may hold that commands don't ("black and white").
@@ -602,43 +659,97 @@ const FILLERS: [&str; 12] = [
     "a", "and", "of", "the", "to", "et", "de", "des", "du", "la", "le", "les",
 ];
 
-/// How well a command matches `query` (higher is better), or `None`: its
-/// label starts with it; each word of it starts a word of the label; the
-/// label holds it from the start of a word; each word starts a word of the
-/// menu path and label, or of the keywords. Case and accents don't count.
-/// Within a level, a few points more: the label's words it covers, the
-/// query as a phrase in the menu path and label, an earlier keyword.
+/// [`score_in`] without the words of the menus.
+#[cfg(test)]
 fn score(label: &str, path: &str, keywords: &str, query: &str) -> Option<u32> {
+    score_in(label, path, keywords, query, &HashSet::new())
+}
+
+/// How well a command matches `query` (higher is better), or `None`. A
+/// typed word that is a whole word of the menus (`vocabulary`: "masque",
+/// "select") stands for that word (or its plural): a command holding it
+/// only inside a longer word ("Masquer", "Selection") or a near spelling
+/// matches at the lowest level.
+fn score_in(
+    label: &str,
+    path: &str,
+    keywords: &str,
+    query: &str,
+    vocabulary: &HashSet<String>,
+) -> Option<u32> {
+    rate(label, path, keywords, query, Some(vocabulary))
+        .or_else(|| rate(label, path, keywords, query, None).map(|s| 20 + s / 20))
+}
+
+/// The score: its label starts with `query`; each word of it starts a word
+/// of the label; the label holds it from the start of a word; each word
+/// starts a word of the menu path and label, or of the keywords. Case and
+/// accents don't count. Within a level, a few points more: the label's
+/// words it covers, the query as a phrase in the menu path and label, an
+/// earlier keyword. With `whole`, the words of the menus typed stand for
+/// themselves (see [`score_in`]).
+fn rate(
+    label: &str,
+    path: &str,
+    keywords: &str,
+    query: &str,
+    whole: Option<&HashSet<String>>,
+) -> Option<u32> {
     // The British spelling finds the commands too.
     let query = fold(query).replace("colour", "color");
     let label = fold(label);
     let wanted: Vec<&str> = words(&query).filter(|w| !FILLERS.contains(w)).collect();
+    let exact = |typed: &str| whole.is_some_and(|v| v.contains(typed));
+    let matches = |word: &str, typed: &str| {
+        if exact(typed) {
+            word.strip_prefix(typed)
+                .is_some_and(|rest| matches!(rest, "" | "s" | "es"))
+        } else {
+            starts_like(word, typed)
+        }
+    };
+    // `text` holds the query at the start of a word, ending a word too when
+    // its last word is one of the menus'.
+    let holds = |text: &str, from_start: bool| {
+        let last = words(&query).last().unwrap_or("");
+        text.match_indices(query.as_str()).any(|(i, _)| {
+            let starts = if from_start {
+                i == 0
+            } else {
+                text[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric())
+            };
+            let rest = &text[i + query.len()..];
+            let tail: String = rest.chars().take_while(|c| c.is_alphanumeric()).collect();
+            starts && (!exact(last) || matches!(tail.as_str(), "" | "s" | "es"))
+        })
+    };
     // The share of the label's words the query starts (0 to 4).
     let covered = || {
         let own: Vec<&str> = words(&label).filter(|w| !FILLERS.contains(w)).collect();
         let hit = own
             .iter()
-            .filter(|w| wanted.iter().any(|q| starts_like(w, q)))
+            .filter(|w| wanted.iter().any(|q| matches(w, q)))
             .count();
         (4 * hit / own.len().max(1)) as u32
     };
-    if label.starts_with(&query) {
+    if holds(&label, true) {
         return Some(100 + covered());
     }
     if wanted.is_empty() {
-        return at_word_start(&label, &query).then_some(60);
+        return holds(&label, false).then_some(60);
     }
     let all_found = |text: &str| {
         let have: Vec<&str> = words(text).collect();
-        wanted
-            .iter()
-            .all(|q| have.iter().any(|w| starts_like(w, q)))
+        wanted.iter().all(|q| have.iter().any(|w| matches(w, q)))
     };
     let full = format!("{} {label}", fold(path));
-    let phrase = if at_word_start(&full, &query) { 5 } else { 0 };
+    let phrase = if holds(&full, false) { 5 } else { 0 };
     if all_found(&label) {
         Some(80 + covered())
-    } else if at_word_start(&label, &query) {
+    } else if holds(&label, false) {
         Some(60)
     } else if all_found(&full) {
         Some(40 + phrase)
@@ -649,20 +760,10 @@ fn score(label: &str, path: &str, keywords: &str, query: &str) -> Option<u32> {
         }
         // The earlier the keyword, the closer the command.
         let first = words(&keywords)
-            .position(|k| wanted.iter().any(|q| starts_like(k, q)))
+            .position(|k| wanted.iter().any(|q| matches(k, q)))
             .unwrap_or(usize::MAX);
         Some(30 + phrase + 4u32.saturating_sub(first.min(4) as u32))
     }
-}
-
-/// `text` holds `part` at the start of one of its words.
-fn at_word_start(text: &str, part: &str) -> bool {
-    text.match_indices(part).any(|(i, _)| {
-        text[..i]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !c.is_alphanumeric())
-    })
 }
 
 /// The words of folded text.
@@ -1117,6 +1218,11 @@ mod tests {
             t!("ui4-why-not-smart")
         );
         assert_eq!(why(Action::LastFilter), t!("ui4-why-no-filter-yet"));
+        // On a plain pixel layer: not a smart object at all.
+        assert_eq!(
+            why(Action::Smart(smart_ui::Command::UpdateModified)),
+            t!("ui4-why-not-smart")
+        );
         assert_eq!(
             why(Action::View(rulers::Command::ClearGuides)),
             t!("ui4-why-no-guides")
@@ -1143,6 +1249,92 @@ mod tests {
                 .any(|e| matches!(e.action, Action::NewDocument))
         );
         assert!(suggested.iter().all(|e| e.enabled));
+    }
+
+    /// The row Enter runs after typing: an available one, even when a
+    /// greyed command matches better (it stays listed above, saying why).
+    #[test]
+    fn the_highlight_starts_on_an_available_command() {
+        let mut h = app(true, Lang::En);
+        for query in ["layer mask", "layer style", "transform", "select", "expand", "cut"] {
+            let p = &mut h.state_mut().palette;
+            p.open();
+            p.query = query.to_owned();
+            p.fresh = true;
+            h.run_steps(2);
+            let app = h.state();
+            let groups = app.palette_groups(&h.ctx, query);
+            let active = groups
+                .iter()
+                .flat_map(|(_, entries, _)| entries)
+                .nth(app.palette.active)
+                .map(|e| (e.label.clone(), e.enabled));
+            assert!(active.as_ref().is_some_and(|a| a.1), "{query}: {active:?}");
+            h.state_mut().palette.open = false;
+            h.run_steps(1);
+        }
+    }
+
+    /// Whole words typed don't run a command that only holds a longer
+    /// word ("masque" is not "Masquer les panneaux"); common phrasings.
+    #[test]
+    fn whole_words_and_common_phrasings() {
+        let first = |lang: Lang, q: &str| {
+            let h = app(true, lang);
+            let first = found(&h, q).first().map(|(_, a)| *a);
+            i18n::set_lang(Lang::En);
+            first
+        };
+        assert!(matches!(first(Lang::En, "hide layer"), Some(Action::ToggleVisibility)));
+        assert!(matches!(
+            first(Lang::Fr, "masquer le calque"),
+            Some(Action::ToggleVisibility)
+        ));
+        assert!(!matches!(
+            first(Lang::Fr, "masque"),
+            Some(Action::Workspace(workspace::Command::TogglePanels))
+        ));
+        assert!(!matches!(
+            first(Lang::Fr, "selection rapide"),
+            Some(Action::Select(select_menu::Command::QuickMask))
+        ));
+        for (lang, q) in [
+            (Lang::En, "new document"),
+            (Lang::En, "new image"),
+            (Lang::Fr, "nouveau document"),
+            (Lang::Fr, "nouvelle image"),
+        ] {
+            assert!(matches!(first(lang, q), Some(Action::NewDocument)), "{q}");
+        }
+        let h = app(true, Lang::En);
+        assert!(
+            found(&h, "crop to selection")
+                .iter()
+                .any(|(_, a)| matches!(a, Action::CropToSelection))
+        );
+        // A near spelling ranks below the word itself.
+        let h = app(true, Lang::Fr);
+        let forme = found(&h, "forme");
+        i18n::set_lang(Lang::En);
+        let export = forme
+            .iter()
+            .position(|(_, a)| matches!(a, Action::Automate(actions_panel::Command::QuickExport)));
+        assert!(export.is_none_or(|i| i > 0), "{forme:?}");
+    }
+
+    /// Without an image: New, Open and Paste before the recent files.
+    #[test]
+    fn paste_comes_before_the_recent_files() {
+        let h = app(false, Lang::En);
+        let groups = h.state().palette_groups(&h.ctx, "");
+        let actions: Vec<Action> = groups[0].1.iter().map(|e| e.action).collect();
+        let paste = actions.iter().position(|a| matches!(a, Action::Paste));
+        let recent = actions
+            .iter()
+            .position(|a| matches!(a, Action::Workspace(workspace::Command::OpenRecent(_))));
+        if let (Some(paste), Some(recent)) = (paste, recent) {
+            assert!(paste < recent);
+        }
     }
 
     /// Options show their state; cut lists say how many more match.

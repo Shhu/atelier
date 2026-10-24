@@ -120,14 +120,24 @@ struct Current {
     committed: bool,
     edits: bool,
     before: Option<Before>,
+    /// Its work was cancelled or failed (see [`ActionsState::step_stopped`]).
+    stopped: Option<Stopped>,
+}
+
+/// How the work of the step being played ended early.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Stopped {
+    Cancelled,
+    /// Why (in the user's words).
+    Failed(String),
 }
 
 /// A document's state before a step.
 struct Before {
     doc: u64,
     status: String,
-    depth: usize,
-    step: u64,
+    /// See `Document::state_id`.
+    state: u64,
 }
 
 /// Actions being played.
@@ -194,6 +204,15 @@ impl Default for ActionsState {
 }
 
 impl ActionsState {
+    /// The work of the step being played (a filter, Camera Raw, Liquify, a
+    /// smart object's rendering) was cancelled or failed: the action stops
+    /// there instead of going on. Nothing while not playing.
+    pub(super) fn step_stopped(&mut self, how: Stopped) {
+        if let Some(c) = self.player.as_mut().and_then(|p| p.current.as_mut()) {
+            c.stopped.get_or_insert(how);
+        }
+    }
+
     fn action(&self, (s, a): (usize, usize)) -> Option<&Sequence> {
         self.library.sets.get(s)?.actions.get(a)
     }
@@ -878,6 +897,22 @@ impl AtelierApp {
                 return;
             };
             if let Some(c) = p.current.take() {
+                match c.stopped {
+                    // Like Photoshop, a step cancelled stops the action
+                    // (Batch stops at that file).
+                    Some(Stopped::Cancelled) if !p.batch => {
+                        self.status = t!("actions-status-stopped", name = c.action.as_str());
+                        return self.stop_playing();
+                    }
+                    Some(Stopped::Cancelled) => {
+                        let why = self.status.clone();
+                        return self.step_error(&c.title, &c.action, c.row, why);
+                    }
+                    Some(Stopped::Failed(why)) => {
+                        return self.step_error(&c.title, &c.action, c.row, why);
+                    }
+                    None => {}
+                }
                 if let Some(error) = self.step_failed(&c) {
                     return self.step_error(&c.title, &c.action, c.row, error);
                 }
@@ -912,8 +947,7 @@ impl AtelierApp {
             let before = self.doc.as_ref().map(|d| Before {
                 doc: d.uid(),
                 status: self.status.clone(),
-                depth: d.history().1,
-                step: d.history_step(),
+                state: d.state_id(),
             });
             self.actions.selected = Some(q.row);
             match self.play_step(&q.step.command, dialog) {
@@ -927,6 +961,7 @@ impl AtelierApp {
                             committed: false,
                             edits: edits(&q.step.command) && !dialog,
                             before,
+                            stopped: None,
                         });
                     }
                 }
@@ -942,8 +977,9 @@ impl AtelierApp {
         let (true, Some(b), Some(doc)) = (c.edits, &c.before, &self.doc) else {
             return None;
         };
-        let depth = doc.history().1;
-        let done = depth > b.depth || (depth == b.depth && doc.history_step() != b.step);
+        // A step recorded then discarded (it changed nothing) gives the
+        // state back.
+        let done = doc.state_id() != b.state;
         (doc.uid() == b.doc && !done && self.status != b.status).then(|| self.status.clone())
     }
 
@@ -1292,7 +1328,9 @@ impl AtelierApp {
     /// Window › Actions and the commands of File › Automate and Scripts.
     pub(super) fn automate_command(&mut self, command: Command) {
         match command {
-            Command::Panel => self.actions.open = !self.actions.open,
+            Command::Panel => {
+                super::workspace::toggle_panel(&mut self.workspace, &mut self.actions.open);
+            }
             Command::Batch => self.open_batch(),
             Command::ImageProcessor => self.open_image_processor(),
             Command::FitImage => {
@@ -1632,7 +1670,7 @@ impl AtelierApp {
                 a.changed();
                 self.status = t!("actions-status-loaded", path = path.display().to_string());
             }
-            Err(e) => self.report_error(tm!("actions-status-load-failed", error = e.to_string())),
+            Err(e) => self.report_error(tm!("actions-status-load-failed", error = crate::i18n::Message::of(|| e.to_string()))),
         }
     }
 
@@ -1667,7 +1705,7 @@ impl AtelierApp {
         };
         match act::write(&path, &sets) {
             Ok(()) => self.status = t!("actions-status-saved", path = path.display().to_string()),
-            Err(e) => self.report_error(tm!("actions-status-save-failed", error = e.to_string())),
+            Err(e) => self.report_error(tm!("actions-status-save-failed", error = crate::i18n::Message::of(|| e.to_string()))),
         }
     }
 
@@ -2958,6 +2996,104 @@ mod tests {
         !app.actions.playing() && !app.actions_wait()
     }
 
+    /// A filter step cancelled while it computes stops the action (the
+    /// next steps don't run on the unfiltered image).
+    #[test]
+    fn a_cancelled_filter_step_stops_the_action() {
+        let mut h = app();
+        let original = flat(&h);
+        let blur = Recorded::Filter {
+            filter: Filter::GaussianBlur { radius: 30.0 },
+        };
+        with_action(&mut h, vec![Step::new(blur), invert()]);
+        let app = h.state_mut();
+        app.panel_click(PanelClick::Play);
+        app.play_actions();
+        assert!(app.filters.busy(), "the filter computes");
+        app.cancel_filter();
+        settle(&mut h, idle);
+        let app = h.state();
+        assert_eq!(flat(&h), original, "nothing applied");
+        assert_eq!(app.doc.as_ref().unwrap().history().1, 0);
+        assert_eq!(app.status, t!("actions-status-stopped", name = "A"));
+    }
+
+    /// A filter cancelled while it computes is not recorded; one applied is.
+    #[test]
+    fn a_cancelled_filter_is_not_recorded() {
+        let mut h = app();
+        with_action(&mut h, Vec::new());
+        let app = h.state_mut();
+        app.panel_click(PanelClick::Record);
+        app.start_filter(Filter::GaussianBlur { radius: 50.0 });
+        assert!(app.filters.busy());
+        app.cancel_filter();
+        assert!(app.actions.library.sets[0].actions[0].steps.is_empty());
+        app.start_filter(Filter::GaussianBlur { radius: 2.0 });
+        settle(&mut h, |app| !app.filters.busy());
+        let app = h.state_mut();
+        app.panel_click(PanelClick::Stop);
+        let steps = &app.actions.library.sets[0].actions[0].steps;
+        let titles: Vec<String> = steps.iter().map(|s| step_title(&s.command)).collect();
+        assert_eq!(
+            titles,
+            [step_title(&Recorded::Filter {
+                filter: Filter::GaussianBlur { radius: 2.0 },
+            })]
+        );
+    }
+
+    /// The same for a smart filter: its rendering cancelled, nothing is
+    /// recorded, and Last Filter doesn't repeat it.
+    #[test]
+    fn a_cancelled_smart_filter_is_not_recorded() {
+        let mut h = app();
+        with_action(&mut h, Vec::new());
+        let app = h.state_mut();
+        app.run(Action::Smart(super::super::smart_ui::Command::Convert));
+        assert!(app.smart_filters_apply());
+        app.panel_click(PanelClick::Record);
+        app.start_filter(Filter::Median { radius: 40.0 });
+        // Rendered on another thread (a filter's cost can't be told).
+        assert!(app.smart.busy(), "rendered in the background");
+        app.cancel_smart_rendering();
+        app.panel_click(PanelClick::Stop);
+        assert!(app.actions.library.sets[0].actions[0].steps.is_empty());
+        assert_eq!(app.filters.last, None);
+        let smart = app.doc.as_ref().unwrap().active_layer().smart.as_deref();
+        assert!(smart.is_some_and(|s| s.filters.is_empty()));
+    }
+
+    /// Edit › Clear on a hidden layer is refused, also as a played step.
+    #[test]
+    fn clear_on_a_hidden_layer_is_refused() {
+        let mut h = app();
+        let app = h.state_mut();
+        let doc = app.doc.as_mut().unwrap();
+        doc.active_layer_mut().visible = false;
+        let before = doc.active_layer().image().clone();
+        let rect = crate::document::PixelRect {
+            x: 10,
+            y: 10,
+            w: 30,
+            h: 20,
+        };
+        app.selection = Some(rect.into());
+        app.run(Action::ClearSelection);
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(*doc.active_layer().image(), before);
+        assert_eq!(doc.history().1, 0);
+        let name = doc.active_layer().name.clone();
+        assert_eq!(app.status, t!("fx4-layer-hidden", name = name.as_str()));
+        app.status.clear();
+        let clear = Recorded::Menu {
+            item: MenuItem::of(Action::ClearSelection).unwrap(),
+        };
+        app.play_step(&clear, false).unwrap();
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(*doc.active_layer().image(), before);
+    }
+
     #[test]
     fn steps_on_a_hidden_layer_stop_the_action() {
         let mut h = app();
@@ -3586,6 +3722,28 @@ mod tests {
                 item: MenuItem::FlattenImage
             }
         );
+    }
+
+    /// Played, Flatten Image with a hidden layer flattens without asking
+    /// (the step says so), and the action goes on.
+    #[test]
+    fn played_flatten_with_hidden_layers_does_not_ask() {
+        let mut h = app();
+        let flatten = Step::new(Recorded::Menu {
+            item: MenuItem::FlattenImage,
+        });
+        with_action(&mut h, vec![flatten, invert()]);
+        let app = h.state_mut();
+        app.run(Action::NewLayer);
+        app.doc.as_mut().unwrap().active_layer_mut().visible = false;
+        app.doc.as_mut().unwrap().active = 0;
+        let before = flat(&h);
+        h.state_mut().panel_click(PanelClick::Play);
+        settle(&mut h, idle);
+        assert!(!h.state().flatten_confirm, "not asked");
+        assert_eq!(h.state().doc.as_ref().unwrap().layers.len(), 1, "flattened");
+        assert_ne!(flat(&h), before, "the next step ran");
+        assert!(h.state().actions.message.is_none());
     }
 
     /// The actions file can't be read: the panel says changes aren't

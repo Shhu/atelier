@@ -68,13 +68,16 @@ impl ExportDialog {
 }
 
 /// The export as it will be written, reduced for the preview, and its
-/// size in bytes. `proof`: Use Proof Setup's conversion.
+/// size in bytes. `proof`: Use Proof Setup's conversion. Shown on the
+/// monitor (`profiles`: the document's and the monitor's) as the canvas
+/// shows the document.
 fn preview_of(
     flat: &RgbaImage,
     options: &ExportOptions,
     icc: Option<&[u8]>,
     proof: Option<&crate::cms::Converter>,
     srgb: Option<&crate::cms::Profile>,
+    profiles: (&crate::cms::Profile, &crate::cms::Profile),
 ) -> Preview {
     // A large export is previewed smaller, its file size estimated from
     // that one's.
@@ -91,11 +94,14 @@ fn preview_of(
             ..options.clone()
         };
         let k = area(options) / area(&reduced);
-        let (shown, bytes) = preview_of(flat, &reduced, icc, proof, srgb);
+        let (shown, bytes) = preview_of(flat, &reduced, icc, proof, srgb, profiles);
         return (shown, bytes.map(|b| (b as f64 * k) as usize));
     }
     let image = options.render(flat.clone());
     let cmyk = proof.filter(|_| options.use_proof && crate::document::has_cmyk(options.format));
+    // The file's colors are in sRGB once converted, else the document's
+    // (inks seen through the document's profile too).
+    let mut converted = false;
     let (shown, bytes) = match (options.format, cmyk) {
         (_, Some(proof)) => {
             // Shown as printed: through the inks and back.
@@ -119,7 +125,9 @@ fn preview_of(
         (ExportFormat::Psd, None) => (image, None),
         _ => {
             let mut image = image;
-            let icc = in_srgb(&mut image, srgb).or(icc);
+            let to_srgb = in_srgb(&mut image, srgb);
+            converted = to_srgb.is_some();
+            let icc = to_srgb.or(icc);
             match options.encode(&image, icc) {
                 Ok(bytes) => {
                     let decoded = image::load_from_memory(&bytes).map(|d| d.into_rgba8());
@@ -131,13 +139,17 @@ fn preview_of(
     };
     // At most twice the preview's side (sharp on high-density screens).
     let side = PREVIEW as u32 * 2;
-    let small = if shown.width().max(shown.height()) > side {
+    let mut small = if shown.width().max(shown.height()) > side {
         image::DynamicImage::ImageRgba8(shown)
             .thumbnail(side, side)
             .into_rgba8()
     } else {
         shown
     };
+    let (doc, monitor) = profiles;
+    let from = if converted { crate::cms::srgb() } else { doc };
+    let lut = crate::cms::Lut::display(from, monitor);
+    color_ui::show_through(lut.as_ref(), small.as_mut(), false);
     let size = [small.width() as usize, small.height() as usize];
     (
         ColorImage::from_rgba_unmultiplied(size, small.as_raw()),
@@ -172,6 +184,7 @@ impl AtelierApp {
         let icc = doc.icc_profile.clone();
         let proof = self.proof_converter();
         let srgb = self.srgb_source(&d.options);
+        let profiles = (self.color.profile_of(doc), self.color.monitor().0.clone());
         // The flattened image once, then the file for each change of the
         // settings (the last one wins).
         if d.flat.is_none() && d.flat_job.is_none() {
@@ -208,6 +221,7 @@ impl AtelierApp {
             let ctx2 = ctx.clone();
             let icc = icc.clone();
             let (proof, srgb) = (proof.clone(), srgb.clone());
+            let profiles = profiles.clone();
             std::thread::spawn(move || {
                 let _job = crate::diag::job("Export As: preview");
                 let icc = icc.as_deref().map(Vec::as_slice);
@@ -217,6 +231,7 @@ impl AtelierApp {
                     icc,
                     proof.as_ref(),
                     srgb.as_ref(),
+                    (&profiles.0, &profiles.1),
                 ));
                 ctx2.request_repaint();
             });
@@ -272,10 +287,10 @@ impl AtelierApp {
         self.commit_pending();
         // As Save As: the other tab's file would no longer be its own.
         if self.tab_of(path).is_some_and(|i| i != self.active_tab) {
-            self.status = t!(
+            self.report_error(tm!(
                 "file-status-open-in-another-tab",
                 name = files::file_name(path)
-            );
+            ));
             return;
         }
         let started = std::time::Instant::now();
@@ -314,15 +329,15 @@ impl AtelierApp {
         &self,
         options: &ExportOptions,
         path: &Path,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<String>, crate::i18n::Message> {
         let Some(doc) = &self.doc else {
             return Ok(Vec::new());
         };
         let failed = |e: crate::document::FileError| {
-            t!(
+            tm!(
                 "file-status-export-failed",
                 name = files::file_name(path),
-                error = e.to_string()
+                error = crate::i18n::Message::of(|| e.to_string())
             )
         };
         if options.use_proof
@@ -629,6 +644,53 @@ mod tests {
     use crate::actions::{Library, Step};
     use egui_kittest::Harness;
     use image::Rgba;
+
+    /// The preview shows the file's colors on the monitor, as the canvas
+    /// shows the document: through the monitor's profile.
+    #[test]
+    fn the_preview_is_shown_through_the_monitor_profile() {
+        use crate::cms::{WorkingRgb, srgb};
+        let flat = RgbaImage::from_pixel(20, 20, Rgba([200, 30, 30, 255]));
+        let adobe = WorkingRgb::AdobeRgb.profile();
+        let options = ExportOptions {
+            srgb: false,
+            ..ExportOptions::default()
+        };
+        let pixel = |(image, _): Preview| image.pixels[0].to_array();
+        // Adobe RGB numbers on an sRGB monitor: converted for the screen.
+        let shown = pixel(preview_of(
+            &flat,
+            &options,
+            None,
+            None,
+            None,
+            (adobe, srgb()),
+        ));
+        assert_ne!(shown[..3], [200, 30, 30]);
+        // On a monitor of the same profile: as they are.
+        let same = pixel(preview_of(
+            &flat,
+            &options,
+            None,
+            None,
+            None,
+            (adobe, adobe),
+        ));
+        assert_eq!(same, [200, 30, 30, 255]);
+        // Converted to sRGB for the file, on an sRGB monitor: the file's.
+        let mut converted = flat.clone();
+        in_srgb(&mut converted, Some(adobe));
+        let to_srgb = ExportOptions::default();
+        let shown = pixel(preview_of(
+            &flat,
+            &to_srgb,
+            None,
+            None,
+            Some(adobe),
+            (adobe, srgb()),
+        ));
+        assert_eq!(shown[..3], converted.get_pixel(0, 0).0[..3]);
+    }
 
     /// A 300 × 200 PNG opened from a folder of its own.
     fn app(name: &str) -> (Harness<'static, AtelierApp>, PathBuf) {

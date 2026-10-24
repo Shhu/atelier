@@ -20,7 +20,7 @@ pub use build::{
     Dirty, Options, Placed, PlacedMask, Preview, Sig, dirty_area, plan, signatures, source_versions,
 };
 use gradient::Ramp;
-pub use levels::{FullSize, Hint, LevelCache, SourceKey, Sources, Src};
+pub use levels::{FullSize, Hint, LevelCache, Sampled, SourceKey, Sources, Src};
 
 use crate::document::PixelRect;
 use crate::pixel_ops::Adjustment;
@@ -781,6 +781,45 @@ mod tests {
             dirty_area(&adjusted, &signatures(&doc.layers, &opts), &[]),
             Dirty::All
         );
+    }
+
+    /// A stroke on a mask (feathered or not) redoes what it painted only,
+    /// for the display too; a new feather radius redoes the layer.
+    #[test]
+    fn mask_strokes_are_dirty_where_painted() {
+        let mut doc = Document::new(RgbaImage::from_pixel(100, 100, RED), None);
+        doc.add_layer("s".into(), RgbaImage::from_pixel(80, 80, BLUE), (10, 10));
+        let white = image::GrayImage::from_pixel(80, 80, image::Luma([255]));
+        doc.layers[1].mask = Some(crate::document::Mask::new(white, (10, 10), 255, (10, 10)));
+        let opts = Options {
+            later_styles: true,
+            ..Default::default()
+        };
+        let id = doc.layers[1].id;
+        let r = |x, y, w, h| PixelRect { x, y, w, h };
+        for feather in [0.0, 3.0] {
+            doc.layers[1].mask.as_mut().unwrap().feather = feather;
+            let before = signatures(&doc.layers, &opts);
+            doc.layers[1]
+                .mask
+                .as_mut()
+                .unwrap()
+                .pixels_mut()
+                .put_pixel(20, 20, image::Luma([0]));
+            let after = signatures(&doc.layers, &opts);
+            let stroke = [(id, r(30, 30, 1, 1))];
+            assert_eq!(
+                dirty_area(&before, &after, &stroke),
+                Dirty::Area(r(30, 30, 1, 1)),
+                "feather {feather}"
+            );
+        }
+        let before = signatures(&doc.layers, &opts);
+        doc.layers[1].mask.as_mut().unwrap().feather = 5.0;
+        assert!(matches!(
+            dirty_area(&before, &signatures(&doc.layers, &opts), &[]),
+            Dirty::Area(a) if a.w >= 80
+        ));
     }
 
     /// 6000 × 4000, 20 layers in various modes, an adjustment, a mask and

@@ -1763,7 +1763,7 @@ smart-status-placed = Importé : { $path }
 smart-status-replaced = Contenu remplacé : { $path }
 smart-status-updated = Objet dynamique mis à jour : { $name }
 smart-status-parent-gone = Le document de l'objet dynamique est fermé : enregistrez ce contenu dans un fichier.
-smart-status-link-missing = Fichier lié introuvable, sa dernière copie est affichée : { $names }
+smart-status-link-missing = Fichiers liés introuvables, leur dernière copie est affichée : { $names }
 smart-status-links-updated = Fichiers liés mis à jour : { $names }
 
 ## Filter › Liquify: the workspace and its tools
@@ -2333,7 +2333,7 @@ input3-hint-selected-layers = les calques sélectionnés
 
 files3-quoted-name = « { $name } »
 files3-psd-note-shapes = calques de forme enregistrés en pixels : { $names }
-files3-status-psd-would-lose = Un fichier Photoshop perdrait : { $notes }. Enregistrez un document Atelier pour tout garder.
+files3-status-psd-would-lose = Ce fichier PSD ne peut pas être réenregistré sans modifications ({ $notes }). Enregistrez un document Atelier pour tout garder.
 files3-dialog-save-as-lossy = Enregistrer sous (un document Atelier garde tout)
 
 ## Clipboard
@@ -2447,7 +2447,7 @@ ui3-why-not-now = Indisponible pour le calque actif ou dans l'état actuel
 ui3-palette-keywords-image-size = redimensionner agrandir réduire rééchantillonner échelle dimensions résolution dpi ppp
 ui3-palette-keywords-canvas-size = agrandir étendre bordure marge
 ui3-palette-keywords-rotate = pivoter tourner rotation retourner miroir symétrie
-ui3-palette-keywords-crop = recadrer recadrage rogner
+ui3-palette-keywords-crop = recadrer recadrage rogner sélection
 ui3-palette-keywords-move = déplacer déplacement
 ui3-palette-keywords-type = texte police écrire
 ui3-palette-keywords-black-white = noir blanc niveaux gris monochrome
@@ -2471,7 +2471,7 @@ words3-label-value = { $label } : { $value }
 diag-menu = Diagnostics…
 diag-palette-keywords = performances journal logs rapport bogue bug plantage mémoire lent lenteur gel débogage
 diag-title = Diagnostics
-diag-uptime = lancé depuis { $duration }
+diag-uptime = ouvert depuis { $duration }
 diag-copy = Copier les diagnostics
 diag-open-logs = Ouvrir le dossier des journaux
 diag-open-logs-failed = Impossible d'ouvrir le dossier des journaux ({ $error }).
@@ -2495,7 +2495,7 @@ diag-card-frame-detail = max { $max } sur la dernière minute · { $frames ->
    *[other] { $frames } rafraîchissements
 }
 diag-card-freezes = Blocages (1 min)
-diag-card-freezes-detail = { $total } au total · max { $max } · { $five } ces 5 dernières minutes
+diag-card-freezes-detail = { $total } au total · max { $max } · { $five } dans les 5 dernières minutes
 diag-card-memory = Mémoire du programme
 diag-card-history = Mémoire de l'historique
 diag-card-history-detail = sur { $budget } pour tous les onglets · { $steps ->
@@ -2513,7 +2513,7 @@ diag-card-rendering-value = { $tiles ->
     [one] { $tiles } tuile
    *[other] { $tiles } tuiles
 }
-diag-card-rendering-detail = max { $max } par rafraîchissement · niveau de taille { $level } · { $over } à court de temps (1 min)
+diag-card-rendering-detail = max { $max } par rafraîchissement · { $over } rafraîchissements lents (1 min)
 diag-card-jobs = Calculs en arrière-plan
 diag-card-jobs-none = Aucun en cours
 diag-card-ai = Calcul de l'IA
@@ -2599,7 +2599,7 @@ diag-sys-debug = { $version } (version de débogage)
 diag-sys-os = Système
 diag-sys-gpu = Carte graphique
 diag-sys-gpu-unknown = Pas encore connue
-diag-sys-max-texture = Plus grande image sur la carte graphique
+diag-sys-max-texture = Taille d'image maximale de la carte graphique
 diag-sys-cores = Cœurs logiques du processeur
 diag-sys-threads = Fils d'exécution du programme
 diag-sys-scale = Échelle d'affichage
@@ -2614,17 +2614,11 @@ diag-sys-history-budget = Budget de l'historique
 diag-sys-history-budget-value = { $active } par document, { $total } en tout
 diag-sys-since = Mesures depuis
 
-## History: background results dropped after a history change
-hist4-selection-history-changed = Le document a changé pendant le calcul de la sélection : ce résultat est abandonné.
-hist4-subject-history-changed = Le document a changé pendant la recherche : relancez la commande.
-
-## Enregistrer un fichier dans son propre format
+## Saving over a file in its own format
 
 files4-note-frames = les autres images de l'animation
 files4-note-pages = les autres pages
-files4-note-metadata = des métadonnées (copyright, EXIF, XMP ou IPTC)
 files4-psd-note-comps = compositions de calques ignorées
-files4-status-would-lose = « { $name } » perdrait : { $notes }. Enregistrez-le comme document Atelier pour tout garder.
 
 ## Layers: delete
 tools4-status-last-layer = Suppression impossible : un document garde au moins un calque.
@@ -2632,12 +2626,6 @@ tools4-status-last-layer = Suppression impossible : un document garde au moins 
 ## Move tool
 tools4-show-transform-controls = Afficher les options de transformation
 tools4-show-transform-controls-tip = Affiche le cadre et les poignées du calque sélectionné : faire glisser une poignée le met à l'échelle ou le fait pivoter. Sinon, un glissement ne fait que déplacer.
-
-## Retouching
-tools4-status-heal-unchanged = Aucun changement : le remplissage redonne les pixels qui étaient là.
-
-## Free Transform
-tools4-status-path-transform = La transformation manuelle s'applique aux calques : faites glisser le tracé avec l'outil Sélection de tracé, ou transformez tout son calque de forme.
 
 ## Keys in Quick Mask mode
 input4-quick-mask-delete = En mode Masque, { $delete } efface la zone sélectionnée du masque : faites d'abord une sélection.
@@ -2673,7 +2661,7 @@ fx4-raw-open-failed = Impossible de développer { $name } : rien n'a été ouve
 fx4-ai-model-damaged = fichier du modèle endommagé : il a été supprimé et sera téléchargé à nouveau à la prochaine utilisation
 
 ## Linked smart objects: Edit Contents, files read again
-smart4-status-link-unreadable = Le fichier lié n'a pas pu être lu, sa dernière copie est affichée : { $names }
+smart4-status-link-unreadable = Les fichiers liés illisibles montrent leur dernière copie : { $names }
 smart4-status-link-saved = Enregistré dans { $name } : les objets dynamiques liés à ce fichier suivent.
 smart4-status-link-saved-flat = Enregistré dans { $name }, calques fusionnés : les objets dynamiques liés à ce fichier suivent. Cet onglet garde les calques jusqu'à sa fermeture.
 smart4-status-updated-embedded = Objet dynamique mis à jour et incorporé (son fichier lié est introuvable) : { $name }
@@ -2695,7 +2683,7 @@ smart4-artboards-exist = { $count ->
 smart4-artboards-replace = Remplacer
 smart4-artboards-keep-both = Conserver les deux
 
-## Aide > Diagnostic : carte mémoire
+## Help > Diagnostics: memory card
 
 perf4-diag-memory-detail = privée { $private }, copies d'affichage { $display }
 perf4-diag-memory-display = copies d'affichage { $display }
@@ -2717,12 +2705,12 @@ ui4-why-no-mask = Le calque actif n'a pas de masque de fusion
 ui4-why-no-pixels = Le calque actif n'a pas de pixels à lui
 ui4-why-not-smart = Le calque actif n'est pas un objet dynamique
 ui4-why-not-linked = L'objet dynamique n'est pas lié à un fichier
-ui4-why-not-live = Seuls les calques de texte, de forme et les objets dynamiques se pixellisent
+ui4-why-not-live = Seuls les calques de texte, de forme et les objets dynamiques peuvent être pixellisés
 ui4-why-smart-adjust = Les réglages ne modifient pas un objet dynamique : ajoutez un calque de réglage au-dessus
 ui4-why-no-layer-below = Il n'y a pas de calque en dessous avec lequel fusionner
 ui4-why-not-group = Le calque actif n'est pas un groupe
 ui4-why-not-artboard = Le calque actif n'est pas un plan de travail
-ui4-why-not-top-group = Sélectionnez un groupe en haut de la liste, hors de tout plan de travail
+ui4-why-not-top-group = Sélectionnez un groupe qui n'est pas dans un autre groupe ni dans un plan de travail
 ui4-why-in-artboard = Les calques sont déjà dans un plan de travail
 ui4-why-no-artboards = L'image n'a pas de plan de travail
 ui4-why-no-style = Le calque actif n'a pas de style de calque
@@ -2731,7 +2719,7 @@ ui4-why-no-saved-selection = Aucune sélection n'a été mémorisée dans cette 
 ui4-why-no-last-selection = Il n'y a pas de sélection précédente à rétablir
 ui4-why-no-filter-yet = Aucun filtre appliqué pour l'instant
 ui4-why-no-transform-yet = Aucune transformation appliquée pour l'instant
-ui4-why-busy = Déjà en cours : attendez qu'il se termine
+ui4-why-busy = Déjà en cours : attendez la fin du calcul
 
 ## Options bar: a hidden layer the tools would refuse
 ui4-options-layer-hidden = Calque masqué
@@ -2789,7 +2777,7 @@ ui4-diag-verdict-errors = { $count ->
    *[other] { $count } erreurs se sont produites pendant cette session : voyez l'onglet Journal.
 }
 ui4-diag-verdict-slow = L'affichage est lent en ce moment.
-ui4-diag-what-to-send = Pour signaler un problème, utilisez Signaler un problème : le rapport est copié, à coller dans votre message.
+ui4-diag-what-to-send = Signaler un problème… copie ce rapport et ouvre la page : collez-le dans votre message.
 ui4-diag-report = Signaler un problème…
 ui4-diag-report-tip = Copie le rapport, puis ouvre la page où signaler les problèmes
 ui4-diag-status-report = Rapport copié : collez-le dans votre message, sur la page qui s'est ouverte.
@@ -2797,7 +2785,7 @@ ui4-diag-just-now = à l'instant
 ui4-diag-tip-frame = Temps pour dessiner la fenêtre une fois. Sous { $smooth }, c'est fluide ; au-delà de { $sluggish }, ça rame.
 ui4-diag-tip-freezes = Moments où la fenêtre a cessé de répondre pendant plus de { $freeze }.
 ui4-diag-tip-memory = Mémoire qu'utilise le programme, y compris celle qu'il partage avec d'autres programmes.
-ui4-diag-tip-history = Mémoire gardée pour annuler, pour tous les documents ouverts ; les étapes les plus anciennes partent au-delà du budget.
+ui4-diag-tip-history = Mémoire gardée pour annuler, pour tous les documents ouverts ; au-delà du budget, les étapes les plus anciennes sont supprimées.
 ui4-diag-tip-documents = Documents ouverts, le plus grand et les calques qu'ils contiennent.
 ui4-diag-tip-rendering = Morceaux de l'image dessinés par rafraîchissement. Un niveau de taille au-dessus de 0 montre une copie réduite quand vous dézoomez.
 ui4-diag-tip-jobs = Travail fait sans bloquer la fenêtre (filtres, IA, enregistrement…).
@@ -2811,4 +2799,95 @@ ui4-diag-gpu-cpu = logicielle (sur le processeur)
 ui4-diag-gpu-other = autre
 
 ## Keyboard Shortcuts: tools that share a key
-ui4-shortcuts-tools-cycle = { $key }, puis { $next } pour le suivant
+ui4-shortcuts-tools-cycle = { $key } · { $next }
+
+## History: background results after an undo or a redo
+hist5-selection-undone = Annulé ou rétabli pendant le calcul de la sélection : refaites-la.
+hist5-subject-undone = Annulé ou rétabli pendant la recherche : relancez la commande.
+hist5-subject-selection-changed = La sélection a changé pendant la recherche : relancez Sélectionner le sujet pour l'utiliser.
+## History: step names
+hist5-delete-layers = Supprimer les calques
+
+## Fichiers trop grands pour être enregistrés ou ouverts
+
+files5-error-layer-too-large = le calque « { $name } » est trop grand pour être enregistré ({ $width } × { $height } px) : recadrez-le ou réduisez-le
+files5-error-out-of-memory = l'ouvrir demanderait plus de mémoire que cet ordinateur n'en a ({ $memory } Go)
+
+## Ce qu'enregistrer un fichier dans son format perdrait
+
+files5-psd-note-animation = l'animation d'images
+files5-psd-note-spot = les couleurs d'accompagnement (gardées comme couches alpha)
+files5-psd-note-variables = les variables et jeux de données
+files5-psd-note-other = d'autres données que cette application ne lit pas
+files5-note-images = les autres images qu'il contient (carte de gain HDR, aperçus)
+files5-note-xmp = ses métadonnées XMP ou IPTC
+files5-note-exif = ses métadonnées EXIF
+files5-note-other-apps = des données d'autres applications (calques, ressources d'image)
+files5-status-batch-would-lose = « { $name } » perdrait : { $notes }. Laissé tel quel.
+
+## Quick Mask: notice in the options bar
+
+sel5-options-quick-mask = Mode Masque
+sel5-options-quick-mask-tip = Tous les outils modifient la sélection, pas le calque : peignez en noir pour masquer, en blanc pour sélectionner. Cliquez ou appuyez sur { $key } pour terminer.
+
+## Object Selection
+
+sel5-objsel-tool-left = Sélection d'objet : un autre outil a été choisi avant que l'objet soit trouvé ; ce clic a été ignoré.
+
+## Linked file opened by Edit Contents: saved in a format that can't hold everything
+smart5-link-save-title = Enregistrer { $name }
+smart5-link-save-merge = { $name } ne peut pas contenir de calques : l'enregistrement les fusionne dans le fichier. Les objets dynamiques liés à ce fichier affichent alors l'image fusionnée, et cet onglet garde ses calques.
+smart5-link-save-lose = Enregistrer { $name } dans son format fera perdre : { $notes }.
+smart5-link-save-ok = Enregistrer
+smart5-link-save-as = Enregistrer sous…
+
+## Batch: Save and Close over files open with unsaved changes
+smart5-batch-open-modified = { $count ->
+    [one] { $names } est ouvert avec des modifications non enregistrées : rien n'a été traité. Enregistrez-le ou fermez-le, puis relancez le traitement.
+   *[other] { $count } fichiers sont ouverts avec des modifications non enregistrées ({ $names }) : rien n'a été traité. Enregistrez-les ou fermez-les, puis relancez le traitement.
+}
+
+## Retouching
+tools5-status-unchanged = Aucun changement : le résultat est identique aux pixels qui étaient là.
+
+## Transform
+tools5-status-path-transform = Les transformations s'appliquent aux calques : faites glisser le tracé avec l'outil Sélection de tracé, ou transformez tout son calque de forme.
+
+## Crop tool
+tools5-crop-confirm-title = Recadrage
+tools5-crop-confirm-text = Recadrer l'image ?
+tools5-crop-confirm-crop = Recadrer
+tools5-crop-confirm-dont = Ne pas recadrer
+
+## Move tool
+tools5-hist-duplicate-layers = Dupliquer les calques
+tools5-layer-copy-numbered = { $name } copie { $number }
+
+## Layer menu: visibility of the selected layers
+ui5-menu-hide-layers = Masquer les calques
+ui5-menu-show-layers = Afficher les calques
+
+## Command palette: other words commands are found by
+ui5-palette-keywords-new = document image vierge nouvelle nouveau créer
+ui5-palette-keywords-visibility = visibilité œil afficher masquer
+ui5-palette-keywords-object-select = sélection rapide
+ui5-palette-keywords-actions = actions macro enregistrer
+ui5-palette-keywords-undo = aller en arrière revenir étape précédente
+ui5-palette-keywords-language = anglais français english french
+ui5-palette-keywords-desaturate = désaturer
+ui5-palette-keywords-scale = échelle redimensionner
+ui5-palette-keywords-save-for-web = enregistrer pour le web
+
+## Help > Diagnostics: background jobs
+ui5-op-smart-render = Rendu d'objet dynamique
+ui5-op-smart-preview = Aperçu de filtre dynamique
+
+## A layer inside a hidden group
+ui5-options-group-hidden-tip = Son groupe « { $group } » est masqué : affichez le groupe avec son œil dans le panneau Calques
+ui5-status-group-hidden = Impossible de peindre : le groupe « { $group } » qui contient « { $name } » est masqué. Affichez le groupe avec son œil dans le panneau Calques.
+
+## Keyboard Shortcuts window
+ui5-shortcuts-cycle-note = Maj avec la touche d'un outil choisit l'outil suivant de son groupe.
+
+## Files dragged over an open document
+ui5-drop-place-hint = Déposez pour placer dans cette image. Pour ouvrir dans un onglet à part : Fichier › Ouvrir ({ $key }).

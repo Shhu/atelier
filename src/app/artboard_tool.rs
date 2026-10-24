@@ -895,6 +895,7 @@ impl AtelierApp {
                 overlapping: s.overlapping,
             },
             replace: false,
+            open: self.open_paths(),
         };
         let names: Vec<String> = which.iter().map(|&i| doc.layers[i].name.clone()).collect();
         let ext = files.format.extensions()[0];
@@ -1055,13 +1056,14 @@ impl AtelierApp {
         let icc = doc.icc_profile.clone();
         // Converted as a single export is (sRGB, Use Proof Setup).
         let (proof, srgb) = (self.proof_converter(), self.srgb_source(&options));
+        let open = self.open_paths();
         self.run_artboards_job(which.len(), move || {
             let mut used = Vec::new();
             let mut written = Vec::new();
             for (name, image) in render() {
                 let stem = artboard_file_stem(&name, &mut used);
                 let ext = options.format.extensions()[0];
-                let path = artboard_path(&folder, &stem, ext, &mut used, replace);
+                let path = artboard_path(&folder, &stem, ext, &mut used, replace, &open);
                 let icc = icc.as_deref().map(Vec::as_slice);
                 let bytes = super::export_as::export_bytes(
                     image,

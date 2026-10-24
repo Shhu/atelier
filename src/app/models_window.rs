@@ -289,7 +289,7 @@ impl AtelierApp {
         if out.other {
             let root = models::root();
             if let Err(e) = open_folder(&root) {
-                self.status_failed(tm!("models-open-folder-failed", error = e.to_string()));
+                self.status_failed(tm!("models-open-folder-failed", error = crate::i18n::Message::of(|| e.to_string())));
             }
         }
         if out.ok || out.cancel {

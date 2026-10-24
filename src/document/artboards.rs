@@ -72,6 +72,9 @@ pub struct ArtboardFiles {
     pub options: ArtboardExport,
     /// Files of the same names replaced (else numbered: both kept).
     pub replace: bool,
+    /// Files open in a tab (the document's own among them): never
+    /// replaced, numbered instead.
+    pub open: Vec<PathBuf>,
 }
 
 /// Side of an artboard, where the "+" buttons add the next one.
@@ -252,8 +255,8 @@ impl Document {
         let n = copies.len();
         self.layers.splice(r.end..r.end, copies);
         self.active = r.end + n - 1;
-        let top = &mut self.layers[self.active];
-        top.name = t!("doc-layer-copy-name", name = top.name.as_str());
+        let name = self.copy_name(&self.layers[self.active].name);
+        self.layers[self.active].name = name;
         self.fit_artboards();
         true
     }
@@ -463,7 +466,8 @@ impl Document {
             for (name, image) in render() {
                 let stem = artboard_file_stem(&format!("{}{name}", files.prefix), &mut used);
                 let ext = files.format.extensions()[0];
-                let path = artboard_path(&files.folder, &stem, ext, &mut used, files.replace);
+                let (folder, replace) = (&files.folder, files.replace);
+                let path = artboard_path(folder, &stem, ext, &mut used, replace, &files.open);
                 let profile = profile.as_deref().map(Vec::as_slice);
                 super::file_io::export(&image, &path, files.format, files.quality, profile)?;
                 written.push(path);
@@ -570,22 +574,27 @@ pub fn existing_artboard_files(folder: &Path, prefix: &str, names: &[String], ex
         .count()
 }
 
-/// The file `stem`.`ext` in `folder`: replaced if `replace`, else
-/// numbered while one of that name exists ("Artboard 1-2.png"). The name
-/// is then `used`.
+/// The file `stem`.`ext` in `folder`: replaced if `replace` and not one
+/// of the files `open` in a tab, else numbered while one of that name
+/// exists ("Artboard 1-2.png"). The name is then `used`.
 pub fn artboard_path(
     folder: &Path,
     stem: &str,
     ext: &str,
     used: &mut Vec<String>,
     replace: bool,
+    open: &[PathBuf],
 ) -> PathBuf {
-    if replace {
-        let path = folder.join(format!("{stem}.{ext}"));
+    let mut path = folder.join(format!("{stem}.{ext}"));
+    let same = |p: &PathBuf| {
+        *p == path
+            || std::fs::canonicalize(p)
+                .is_ok_and(|p| std::fs::canonicalize(&path).is_ok_and(|q| p == q))
+    };
+    if replace && !open.iter().any(same) {
         used.push(path_stem(&path));
         return path;
     }
-    let mut path = folder.join(format!("{stem}.{ext}"));
     let mut n = 2;
     while path.exists() || (n > 2 && used.contains(&path_stem(&path))) {
         path = folder.join(format!("{stem}-{n}.{ext}"));
@@ -779,6 +788,7 @@ mod tests {
                 overlapping: false,
             },
             replace: false,
+            open: Vec::new(),
         };
         let which = doc.artboards();
         let names: Vec<String> = which.iter().map(|&i| doc.layers[i].name.clone()).collect();
@@ -795,8 +805,16 @@ mod tests {
             replace: true,
             ..files
         };
-        let replaced = doc.export_artboards_later(&which, replace)().unwrap();
+        let replaced = doc.export_artboards_later(&which, replace.clone())().unwrap();
         assert_eq!(replaced, written);
+        // A file open in a tab is never replaced: numbered instead.
+        let open = ArtboardFiles {
+            open: vec![written[0].clone()],
+            ..replace
+        };
+        let beside = doc.export_artboards_later(&which, open)().unwrap();
+        assert_ne!(beside[0], written[0]);
+        assert_eq!(beside[1], written[1]);
         for (path, &i) in written.iter().zip(&which) {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             assert!(name.starts_with("doc_") && name.ends_with(".png"), "{name}");

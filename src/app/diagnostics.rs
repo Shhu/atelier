@@ -198,6 +198,9 @@ fn static_operation(name: &str) -> Option<String> {
         "Object Selection: hover preview" => t!("ui4-op-objsel-hover"),
         "Object Selection: pick" => t!("ui4-op-objsel-pick"),
         "Object Selection: image analysis" => t!("ui4-op-objsel-analysis"),
+        "Smart object rendering" => t!("ui5-op-smart-render"),
+        "Smart filter preview" => t!("ui5-op-smart-preview"),
+        "Select Subject" => format!("{} › {}", t!("menu-select"), t!("menu-select-subject")),
         _ => return None,
     })
 }
@@ -575,7 +578,9 @@ impl AtelierApp {
                         .truncate(),
                     );
                 });
-                ui.horizontal(|ui| {
+                // French labels are wider: the buttons wrap rather than
+                // widen the window past its title bar.
+                ui.horizontal_wrapped(|ui| {
                     let copy_label = t!("diag-copy");
                     copy = ui_kit::button_with_icon(
                         ui,
@@ -615,29 +620,6 @@ impl AtelierApp {
                     )
                     .clicked();
                 });
-                // In plain words first: is anything wrong?
-                let (verdict, worrying) = verdict(&snap);
-                ui.horizontal_wrapped(|ui| {
-                    let (glyph, tint) = if worrying {
-                        (icon::WARNING, workspace::WARNING)
-                    } else {
-                        (icon::CHECK_CIRCLE, color::ACCENT_TEXT)
-                    };
-                    ui.label(egui::RichText::new(glyph).size(15.0).color(tint));
-                    ui.label(egui::RichText::new(verdict).color(color::TEXT));
-                });
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!(
-                            "{} {}",
-                            t!("ui4-diag-what-to-send"),
-                            t!("diag-note")
-                        ))
-                        .size(12.0)
-                        .color(color::LABEL),
-                    )
-                    .wrap(),
-                );
                 let count = |label: String, n: usize| match n {
                     0 => label,
                     n => format!("{label} ({n})"),
@@ -664,7 +646,12 @@ impl AtelierApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| match tab {
-                        Tab::Overview => overview(ui, &snap),
+                        Tab::Overview => {
+                            // In the scrolled body: on a small screen the
+                            // tabs keep their room.
+                            verdict_lines(ui, &snap);
+                            overview(ui, &snap);
+                        }
                         Tab::Operations => operations(ui, &snap, &mut sort),
                         Tab::Log => log_tab(ui, &snap),
                         Tab::Documents => documents(ui, &snap),
@@ -689,7 +676,7 @@ impl AtelierApp {
             ctx.open_url(egui::OpenUrl::new_tab(workspace::ISSUES_URL));
         }
         if open_logs && let Err(e) = models_window::open_folder(&diag::log_dir()) {
-            self.status_failed(tm!("diag-open-logs-failed", error = e.to_string()));
+            self.status_failed(tm!("diag-open-logs-failed", error = crate::i18n::Message::of(|| e.to_string())));
         }
         if clear {
             diag::clear();
@@ -1036,6 +1023,33 @@ impl AtelierApp {
         // folder in it…).
         diag::scrub(&r)
     }
+}
+
+/// In plain words first: is anything wrong? Then what the report holds.
+fn verdict_lines(ui: &mut egui::Ui, snap: &Snapshot) {
+    let (verdict, worrying) = verdict(snap);
+    ui.horizontal_wrapped(|ui| {
+        let (glyph, tint) = if worrying {
+            (icon::WARNING, workspace::WARNING)
+        } else {
+            (icon::CHECK_CIRCLE, color::ACCENT_TEXT)
+        };
+        ui.label(egui::RichText::new(glyph).size(15.0).color(tint));
+        ui.label(egui::RichText::new(verdict).color(color::TEXT));
+    });
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(format!(
+                "{} {}",
+                t!("ui4-diag-what-to-send"),
+                t!("diag-note")
+            ))
+            .size(12.0)
+            .color(color::LABEL),
+        )
+        .wrap(),
+    );
+    ui.add_space(8.0);
 }
 
 /// The overview's cards, in a grid as wide as the window.
@@ -1845,6 +1859,60 @@ mod tests {
         let shown = names.doing(&freeze.context);
         assert!(shown.contains(&Tool::Brush.name()), "{shown}");
         assert!(shown.contains("Image Size"), "{shown}");
+    }
+
+    /// Failures in French are logged in English: the cause too (a file
+    /// error), and the background jobs are named in French in the window.
+    #[test]
+    fn a_french_failure_is_english_in_the_report() {
+        let mut h = app(Some(PathBuf::from("logo.png")));
+        i18n::set_lang(Lang::Fr);
+        let dir = std::env::temp_dir().join("atelier-words5-report");
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = h.state_mut();
+        app.open_path(&dir.join("absent-words5.psd"));
+        app.save_to(&dir.join("missing-folder").join("x-words5.atelier"));
+        let names = app.names();
+        let render = names.operation("Smart object rendering");
+        let preview = names.operation("Smart filter preview");
+        let subject = names.operation("Select Subject");
+        let report = app.diagnostics_report();
+        i18n::set_lang(Lang::En);
+        let lines: Vec<&str> = report.lines().filter(|l| l.contains("words5")).collect();
+        assert!(lines.len() >= 2, "{report}");
+        for line in lines {
+            assert!(!line.contains("introuvable") && !line.contains("Impossible"), "{line}");
+        }
+        assert!(report.contains("absent-words5.psd: file not found"), "{report}");
+        assert_ne!(render, "Smart object rendering");
+        assert_ne!(preview, "Smart filter preview");
+        assert_ne!(subject, "Select Subject");
+    }
+
+    /// Whatever the window's height, its tabs keep their room: the verdict
+    /// and the note scroll with the Overview, and without a footer the body
+    /// takes its place.
+    #[test]
+    fn a_small_screen_leaves_the_tabs_room() {
+        i18n::set_lang(Lang::Fr);
+        let mut h = Harness::builder()
+            .with_size([1024.0, 600.0])
+            .build_eframe(|cc| AtelierApp::new(cc, None));
+        h.run_steps(2);
+        h.state_mut()
+            .run(Action::Workspace(workspace::Command::Diagnostics));
+        h.run_steps(4);
+        let screen = h.ctx.content_rect();
+        let rect = h
+            .ctx
+            .memory(|m| m.area_rect(egui::Id::new("diagnostics")))
+            .expect("shown");
+        i18n::set_lang(Lang::En);
+        assert!(screen.contains_rect(rect), "{rect:?}");
+        // From under the options bar to above the status bar.
+        assert!(rect.height() >= 600.0 - 40.0 - 46.0 - 28.0 - 40.0, "{rect:?}");
+        // The title bar as wide as the window (its ✕ at the right edge).
+        assert!(rect.width() <= WIDTH + 40.0, "{rect:?}");
     }
 
     /// In French, the window names operations and freezes in French; the

@@ -436,3 +436,51 @@ fn path_selection_moves_a_styled_shape_without_rendering_it_again() {
     assert_eq!(layer.offset, (offset.0 + 11, offset.1 + 7));
     assert_eq!(doc(&h).flatten().get_pixel(60, 50).0, [255, 0, 0, 255]);
 }
+
+/// A locked shape layer's path stays put in Quick Mask Mode too (the mode
+/// lifts the lock for edits of the mask only).
+#[test]
+fn quick_mask_keeps_a_locked_shape_in_place() {
+    use crate::vector::{Bounds, Live, Shape, ShapeKind, ShapeStroke, pt};
+    let mut h = app(Tool::PathSelect);
+    let live = Live::new(
+        ShapeKind::Rectangle,
+        Bounds::of(pt(20.0, 20.0), pt(80.0, 70.0)),
+    );
+    let shape = Shape::live(live, Paint::Color([255, 0, 0]), ShapeStroke::default());
+    let d = h.state_mut().doc.as_mut().unwrap();
+    d.add_shape_layer("R".into(), "R", shape);
+    d.active_layer_mut().locked = true;
+    h.run_steps(2);
+    h.state_mut()
+        .run(Action::Select(super::select_menu::Command::QuickMask));
+    h.run_steps(2);
+    assert!(doc(&h).quick_mask().is_some());
+    let offset = doc(&h).active_layer().offset;
+    let start = screen(&h, 50.0, 45.0);
+    h.hover_at(start);
+    h.run_steps(1);
+    h.drag_at(start);
+    h.run_steps(1);
+    let to = screen(&h, 61.0, 52.0);
+    for i in 1..=4 {
+        h.hover_at(start.lerp(to, i as f32 / 4.0));
+        h.run_steps(1);
+    }
+    h.event(egui::Event::PointerButton {
+        pos: to,
+        button: PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    h.run_steps(2);
+    assert_eq!(doc(&h).active_layer().offset, offset);
+    let name = doc(&h).active_layer().name.clone();
+    assert!(
+        h.state()
+            .status
+            .contains(&t!("status-layer-is-locked", name = name.as_str())),
+        "{:?}",
+        h.state().status
+    );
+}

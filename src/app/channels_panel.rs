@@ -386,7 +386,9 @@ impl AtelierApp {
             .iter()
             .map(|c| Arc::as_ptr(&c.mask) as usize)
             .collect();
-        let key = hash_of((doc.uid(), format!("{sigs:?}"), alphas));
+        // The composite as the canvas shows it (display profile, proof).
+        let (lut_key, lut) = self.color.shown();
+        let key = hash_of((doc.uid(), format!("{sigs:?}"), alphas, lut_key));
         let now = ctx.input(|i| i.time);
         if let Some((k, at, _)) = &self.channels.thumbs {
             if *k == key {
@@ -448,7 +450,9 @@ impl AtelierApp {
         let cache = &mut panel.reduced.as_mut().expect("set above").1;
         let small = small_composite(doc, cache);
         let (w, h) = small.dimensions();
-        let mut images: Vec<ColorImage> = vec![to_color_image(&small)];
+        let mut composite = small.clone();
+        color_ui::show_through(lut.as_deref(), composite.as_mut(), false);
+        let mut images: Vec<ColorImage> = vec![to_color_image(&composite)];
         for c in 0..3 {
             let gray = RgbaImage::from_fn(w, h, |x, y| {
                 let p = small.get_pixel(x, y).0;

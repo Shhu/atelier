@@ -411,3 +411,181 @@ fn clicking_the_current_row_with_an_empty_text_redoes_nothing() {
         (vec!["s0", "s1", "s2", "s3"], 2)
     );
 }
+
+/// A big marquee (computed in the background), then the Layers panel's eye
+/// before it is there: the marquee lands first, then the eye's step.
+#[test]
+fn a_layers_panel_change_keeps_the_selection_being_computed() {
+    let mut h = app(3000, 2000);
+    h.state_mut().doc.as_mut().unwrap().add_empty_layer();
+    let r = PixelRect { x: 100, y: 100, w: 2000, h: 1500 };
+    h.state_mut()
+        .select_shape(r, false, SelectMode::Replace, 0.0, true);
+    assert!(h.state().select_busy());
+    // What `layers_list` does for a click on the eye.
+    h.state_mut().record_change("Hide Layer".into(), None);
+    h.state_mut().doc.as_mut().unwrap().layers[0].visible = false;
+    settle(&mut h);
+    assert_eq!(h.state().selection.as_ref().map(|s| s.rect), Some(r));
+    let (names, _) = doc(&h).history();
+    assert_eq!(names.len(), 3);
+    assert_eq!(names[2], "Hide Layer");
+}
+
+/// The same with a step recorded without waiting (a series of opacity
+/// edits): a step forward doesn't drop the selection.
+#[test]
+fn a_step_forward_keeps_the_selection_being_computed() {
+    let mut h = app(3000, 2000);
+    let r = PixelRect { x: 0, y: 0, w: 2500, h: 1800 };
+    h.state_mut()
+        .select_shape(r, true, SelectMode::Replace, 0.0, true);
+    assert!(h.state().select_busy());
+    h.state_mut().doc.as_mut().unwrap().checkpoint("Opacity".into());
+    settle(&mut h);
+    assert!(h.state().selection.is_some(), "{}", h.state().status);
+    assert_eq!(doc(&h).history().0.len(), 2);
+}
+
+/// A click on a greyed History row while a selection is computed: the new
+/// selection drops the redo list, so the row is gone and the new
+/// selection stays.
+#[test]
+fn a_click_on_a_redo_row_dropped_by_the_selection_keeps_it() {
+    let mut h = app(3000, 2000);
+    for i in 0..4 {
+        h.state_mut().doc.as_mut().unwrap().checkpoint(format!("s{i}"));
+    }
+    h.state_mut().undo();
+    h.state_mut().undo();
+    let r = PixelRect { x: 0, y: 0, w: 2500, h: 1800 };
+    h.state_mut()
+        .select_shape(r, false, SelectMode::Replace, 0.0, true);
+    assert!(h.state().select_busy());
+    // The last row, "s3" (greyed).
+    h.state_mut().go_to_history(4);
+    settle(&mut h);
+    let (names, done) = doc(&h).history();
+    assert_eq!(names.len(), 3);
+    assert_eq!(done, 3, "the new selection is the current step");
+    assert_eq!(h.state().selection.as_ref().map(|s| s.rect), Some(r));
+}
+
+/// Select Subject, then the user selects something else before it is
+/// found: their selection stays (the subject is dropped, with a message).
+/// A step forward meanwhile doesn't drop it.
+#[test]
+fn select_subject_after_a_newer_selection_or_a_step() {
+    let photo = || {
+        let mut img = image::RgbaImage::from_pixel(400, 300, image::Rgba([20, 40, 200, 255]));
+        for y in 100..200 {
+            for x in 150..250 {
+                img.put_pixel(x, y, image::Rgba([240, 30, 20, 255]));
+            }
+        }
+        img
+    };
+    let found = |h: &mut Harness<'_, AtelierApp>| {
+        let start = std::time::Instant::now();
+        while h.state().subject_job.is_some() {
+            assert!(start.elapsed().as_secs() < 60, "subject never found");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            h.run_steps(1);
+        }
+    };
+    let mut h = app(400, 300);
+    let r = PixelRect { x: 0, y: 0, w: 50, h: 50 };
+    {
+        let app = h.state_mut();
+        app.doc = Some(Document::new(photo(), None));
+        app.start_subject(false, false);
+        app.select_shape(r, false, SelectMode::Replace, 0.0, true);
+    }
+    found(&mut h);
+    assert_eq!(h.state().selection.as_ref().map(|s| s.rect), Some(r));
+    assert_eq!(h.state().status, t!("hist5-subject-selection-changed"));
+    assert_eq!(doc(&h).history().0.len(), 1);
+
+    let mut h = app(400, 300);
+    {
+        let app = h.state_mut();
+        app.doc = Some(Document::new(photo(), None));
+        app.start_subject(false, false);
+        app.record_change("Hide Layer".into(), None);
+    }
+    found(&mut h);
+    assert!(h.state().selection.is_some(), "{}", h.state().status);
+    assert_eq!(doc(&h).history().0.len(), 2);
+}
+
+/// Dragging a layer row while an empty new text is open: the text goes
+/// away first, the drop works on what remains (no crash, no layer off by
+/// one).
+#[test]
+fn reordering_layers_with_an_empty_new_text_open() {
+    let mut h = app(200, 200);
+    h.state_mut().doc.as_mut().unwrap().add_empty_layer();
+    h.state_mut().create_text(pos2(10.0, 30.0), None);
+    h.run_steps(2);
+    assert!(h.state().type_tool.edit.is_some());
+    assert_eq!(doc(&h).layers.len(), 3);
+    // The text's row dragged and released low in the panel.
+    h.state_mut().list_drag = Some(2);
+    let low = pos2(1100.0, 790.0);
+    h.hover_at(low);
+    h.event(egui::Event::PointerButton {
+        pos: low,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    h.run_steps(2);
+    assert_eq!(doc(&h).layers.len(), 2);
+    assert!(h.state().list_drag.is_none());
+}
+
+/// Place Embedded, then a Layers panel change during its Free Transform:
+/// the place is applied first (one step with its transform), then the
+/// change.
+#[test]
+fn a_layers_panel_change_while_placing_applies_the_place() {
+    let dir = std::env::temp_dir().join(format!("atelier-place-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("p.png");
+    image::RgbaImage::from_pixel(40, 40, image::Rgba([255, 0, 0, 255]))
+        .save(&file)
+        .unwrap();
+    let mut h = app(200, 200);
+    h.state_mut().doc.as_mut().unwrap().add_empty_layer();
+    let before = doc(&h).history().0.len();
+    h.state_mut().place_path(&file, false);
+    h.run_steps(1);
+    assert!(h.state().transform_pending());
+    let layers = doc(&h).layers.len();
+    h.state_mut().record_change("Hide Layer".into(), None);
+    h.state_mut().doc.as_mut().unwrap().layers[0].visible = false;
+    assert!(!h.state().transform_pending());
+    h.run_steps(1);
+    assert_eq!(doc(&h).layers.len(), layers);
+    let (names, _) = doc(&h).history();
+    assert_eq!(names.len(), before + 2);
+    assert_eq!(names[before], t!("smart-hist-place-embedded"));
+    assert_eq!(names[before + 1], "Hide Layer");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Deleting several layers is named for several.
+#[test]
+fn deleting_several_layers_is_named_for_several() {
+    let mut h = app(64, 64);
+    let d = h.state_mut().doc.as_mut().unwrap();
+    for _ in 0..3 {
+        d.add_empty_layer();
+    }
+    assert!(d.delete_layers(&[3]));
+    let one = t!("menu-layer-delete");
+    assert_eq!(d.history().0.last().copied(), Some(one.as_str()));
+    assert!(d.delete_layers(&[1, 2, 2]));
+    let several = t!("hist5-delete-layers");
+    assert_eq!(d.history().0.last().copied(), Some(several.as_str()));
+}

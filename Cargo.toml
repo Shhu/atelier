@@ -43,6 +43,9 @@ tiff = "0.11"
 # (`image` gives them as approximate RGB; already built for it).
 zune-jpeg = "0.5"
 zune-core = "0.5"
+# A pool of worker threads for the brush engine's large dabs (already
+# built for `image`).
+rayon = "1.12"
 
 # The monitor's profile, published by the desktop on the X root window.
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -45,7 +45,7 @@ use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use super::file_io::{MAX_DIMENSION, check_size};
+use super::file_io::{Budget, MAX_DIMENSION, check_size, layer_fits};
 use super::{
     Artboard, ArtboardBackground, BlendMode, Channel, Document, FileError, Fill, LayerKind, Mask,
 };
@@ -847,6 +847,15 @@ fn text_data(t: TextEntry, image: &RgbaImage) -> TextData {
     data
 }
 
+/// Refuses to write `layer` with pixels of `w` × `h`, which no reader
+/// would take back.
+pub(super) fn check_layer(layer: &super::Layer, w: u32, h: u32) -> Result<(), FileError> {
+    match layer_fits(w, h) {
+        true => Ok(()),
+        false => Err(FileError::LayerTooLarge(layer.name.clone(), w, h)),
+    }
+}
+
 /// Writes `doc` as an Atelier document, to be kept in `folder` (linked
 /// files are also recorded relative to it).
 pub(super) fn write(
@@ -855,6 +864,13 @@ pub(super) fn write(
     folder: Option<&Path>,
 ) -> Result<(), FileError> {
     let layers = doc.render_layers();
+    for layer in layers.iter() {
+        let (w, h) = layer.image().dimensions();
+        check_layer(layer, w, h)?;
+        if let Some(m) = &layer.mask {
+            check_layer(layer, m.image().width(), m.image().height())?;
+        }
+    }
     // The layers' pixels then their masks (as RGBA or gray PNGs), encoded on
     // the other cores while this one flattens.
     enum Pixels<'a> {
@@ -1380,20 +1396,75 @@ fn layer_entry(layer: &super::Layer, image: Option<String>) -> LayerEntry {
 
 /// Reads an Atelier document.
 pub(super) fn read(path: &Path) -> Result<Document, FileError> {
-    read_archive(&mut open(path)?, Some(path))
+    read_archive(&mut open(path)?, Some(path), &mut Budget::new())
 }
 
-/// An Atelier document held in memory (a smart object's contents).
-fn read_bytes(data: &[u8]) -> Result<Document, FileError> {
+/// An Atelier document held in memory (a smart object's contents), its
+/// pixels taken from `budget`.
+fn read_bytes(data: &[u8], budget: &mut Budget) -> Result<Document, FileError> {
     let mut zip = ZipArchive::new(Cursor::new(data)).map_err(|_| FileError::Damaged)?;
-    read_archive(&mut zip, None)
+    read_archive(&mut zip, None, budget)
+}
+
+/// The entries of an archive being read that hold pixels or documents:
+/// each read once (a manifest naming one entry for many layers would
+/// multiply its pixels in memory), from the budget of the whole document.
+pub(super) struct Claims<'a> {
+    names: std::collections::HashSet<String>,
+    pub(super) budget: &'a mut Budget,
+}
+
+impl<'a> Claims<'a> {
+    fn new(budget: &'a mut Budget) -> Self {
+        Self {
+            names: std::collections::HashSet::new(),
+            budget,
+        }
+    }
+
+    /// Entry `name`, refused when already read.
+    pub(super) fn claim(&mut self, name: &str) -> Result<(), FileError> {
+        match self.names.insert(name.to_owned()) {
+            true => Ok(()),
+            false => Err(FileError::Damaged),
+        }
+    }
+
+    /// [`read_pixels`], once per entry, the pixels taken from the budget.
+    pub(super) fn pixels(
+        &mut self,
+        zip: &mut ZipArchive<impl Read + Seek>,
+        name: &str,
+        size: (u32, u32),
+        bpp: u64,
+    ) -> Result<Vec<u8>, FileError> {
+        self.claim(name)?;
+        self.budget.take(size.0, size.1, bpp)?;
+        read_pixels(zip, name, size, bpp)
+    }
+
+    /// An embedded document (`limit` bytes at most), its bytes taken from
+    /// the budget, then read.
+    pub(super) fn document(
+        &mut self,
+        zip: &mut ZipArchive<impl Read + Seek>,
+        name: &str,
+        limit: u64,
+    ) -> Result<Document, FileError> {
+        self.claim(name)?;
+        let data = read_entry(zip, name, limit.min(self.budget.left()))?;
+        self.budget.take_bytes(data.len() as u64)?;
+        read_bytes(&data, self.budget)
+    }
 }
 
 /// [`read`] from an open archive, the document's file at `path`.
 fn read_archive(
     zip: &mut ZipArchive<impl Read + Seek>,
     path: Option<&Path>,
+    budget: &mut Budget,
 ) -> Result<Document, FileError> {
+    let mut claims = Claims::new(budget);
     let manifest = read_manifest(zip)?;
     check_size(manifest.width, manifest.height)?;
     if manifest.layers.is_empty() {
@@ -1413,11 +1484,11 @@ fn read_archive(
                 .map(|m| (&m.image, m.width, m.height, true)),
         );
     for (image, w, h, gray) in sizes {
-        if w > 4 * MAX_DIMENSION || h > 4 * MAX_DIMENSION {
+        if !layer_fits(w, h) {
             return Err(FileError::Damaged);
         }
         let blob = match image {
-            Some(name) => Some(read_pixels(zip, name, (w, h), if gray { 1 } else { 4 })?),
+            Some(name) => Some(claims.pixels(zip, name, (w, h), if gray { 1 } else { 4 })?),
             None if w == 0 || h == 0 => None,
             None => return Err(FileError::Damaged),
         };
@@ -1513,7 +1584,7 @@ fn read_archive(
         layer.text = entry.text.map(|t| text_data(t, layer.image()));
         layer.shape = entry.shape.map(|s| Box::new(vectors::shape_of(&s)));
         if let Some(e) = entry.smart.filter(|_| layer.has_pixels()) {
-            let s = smart::smart_of(e, zip, &mut contents, layer.offset, folder)?;
+            let s = smart::smart_of(e, zip, &mut contents, layer.offset, folder, &mut claims)?;
             layer.smart = Some(Box::new(s));
         }
         layer.artboard = entry
@@ -1545,7 +1616,7 @@ fn read_archive(
         .collect();
     let canvas = (manifest.width, manifest.height);
     for c in &manifest.channels {
-        let png = read_pixels(zip, &c.image, canvas, 1)?;
+        let png = claims.pixels(zip, &c.image, canvas, 1)?;
         doc.channels.push(Channel {
             name: c.name.clone(),
             mask: Arc::new(decode_gray(&png, canvas)?),
@@ -2393,6 +2464,42 @@ mod tests {
         // Untouched, it opens.
         let same = crafted(&path, |_| {}, png, None);
         assert_eq!(Document::open(&same).unwrap().doc.flatten(), doc.flatten());
+    }
+
+    /// A manifest naming one entry for many layers would multiply its
+    /// pixels in memory: refused. The pixels of the whole document must
+    /// fit in memory.
+    #[test]
+    fn entries_are_read_once_and_within_memory() {
+        let path = temp("shared-entry");
+        let mut doc = Document::new(RgbaImage::from_pixel(8, 8, Rgba([9, 9, 9, 255])), None);
+        doc.add_layer(
+            "A".into(),
+            RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 255])),
+            (0, 0),
+        );
+        doc.save(&path).unwrap();
+        let shared = with_manifest(&path, "shared.atelier", |j| {
+            j["layers"][1]["image"] = j["layers"][0]["image"].clone();
+        });
+        assert!(matches!(Document::open(&shared), Err(FileError::Damaged)));
+        assert!(Document::open(&path).is_ok());
+        let read = |memory| read_archive(&mut open(&path).unwrap(), None, &mut Budget::of(memory));
+        assert!(matches!(read(100), Err(FileError::OutOfMemory(100))));
+        assert!(read(1 << 20).is_ok());
+    }
+
+    /// No layer is written that the readers would refuse.
+    #[test]
+    fn layers_no_reader_takes_are_not_written() {
+        let doc = Document::new(RgbaImage::new(2, 2), None);
+        let layer = &doc.layers[0];
+        assert!(check_layer(layer, 4 * MAX_DIMENSION, 2).is_ok());
+        assert!(matches!(
+            check_layer(layer, 4 * MAX_DIMENSION + 1, 2),
+            Err(FileError::LayerTooLarge(_, _, 2))
+        ));
+        assert!(check_layer(layer, MAX_DIMENSION + 1, MAX_DIMENSION).is_err());
     }
 
     /// The pixels a PNG entry may declare: what deflate can make of its

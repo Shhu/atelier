@@ -40,6 +40,9 @@ impl AtelierApp {
         if i == self.active_tab || i >= self.tab_count() {
             return;
         }
+        if self.crop_asks(super::canvas::CropThen::Tab(i)) {
+            return;
+        }
         let Some(current) = self.park() else { return };
         let mut all = std::mem::take(&mut self.parked);
         all.insert(self.active_tab, current);
@@ -57,6 +60,13 @@ impl AtelierApp {
         }
         self.doc = Some(doc);
         self.fit_pending = Some(1.0);
+    }
+
+    /// The files of the open tabs.
+    pub(super) fn open_paths(&self) -> Vec<std::path::PathBuf> {
+        (0..self.tab_count())
+            .filter_map(|i| self.tab(i).and_then(|(d, _)| d.path.clone()))
+            .collect()
     }
 
     /// Tab already showing the file at `path`, if any.

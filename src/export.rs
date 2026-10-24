@@ -36,6 +36,10 @@ pub struct ExportOptions {
     /// gives a file its own back).
     #[serde(skip)]
     pub exif: Option<std::sync::Arc<Vec<u8>>>,
+    /// The resolution, XMP, IPTC… of the file replaced, written back in
+    /// its format (Save and Close).
+    #[serde(skip)]
+    pub kept: Option<std::sync::Arc<crate::document::ImageMetadata>>,
 }
 
 impl Default for ExportOptions {
@@ -50,6 +54,7 @@ impl Default for ExportOptions {
             embed_profile: true,
             use_proof: false,
             exif: None,
+            kept: None,
         }
     }
 }
@@ -96,6 +101,7 @@ impl ExportOptions {
             icc,
             self.copyright.as_deref(),
             self.exif.as_deref().map(Vec::as_slice),
+            self.kept.as_deref(),
         )?;
         Ok(out.into_inner())
     }

@@ -24,6 +24,17 @@ pub struct Entry {
     rank: usize,
 }
 
+/// A recent file that is gone for good: missing from a folder that is
+/// there. A file on an unplugged drive or a sleeping network share (its
+/// folder unreachable too) stays in the list.
+pub fn gone(path: &Path) -> bool {
+    let missing = matches!(
+        std::fs::metadata(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    missing && path.parent().is_some_and(|dir| dir.is_dir())
+}
+
 #[derive(Default)]
 pub struct Recent {
     paths: Vec<PathBuf>,
@@ -307,6 +318,15 @@ impl Recent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Forgotten only when its folder is there and the file isn't.
+    #[test]
+    fn a_file_on_a_missing_drive_is_not_gone() {
+        let dir = std::env::temp_dir();
+        assert!(gone(&dir.join("atelier-surely-not-here.png")));
+        assert!(!gone(&dir.join("no-such-folder-atelier/photo.png")));
+        assert!(!gone(&dir));
+    }
 
     #[test]
     fn paths_survive_the_list_file() {

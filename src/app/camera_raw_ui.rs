@@ -10,6 +10,7 @@ use std::sync::mpsc;
 
 use image::RgbaImage;
 
+use super::actions_panel::Stopped;
 use super::dialogs::{
     DialogSpec, Steps, Track, block, channel_selector, curves_editor, dialog_body_height,
     floating_dialog, full_segmented, gap_between_blocks, help, level_track, slider_row_steps,
@@ -101,6 +102,8 @@ enum Destination {
         doc: u64,
         layer: u64,
         rasterized: bool,
+        /// Remembered (Last Filter, an action) once developed.
+        settings: Box<Settings>,
     },
     /// A new document, from a RAW file.
     Document { path: PathBuf, preview_only: bool },
@@ -255,12 +258,18 @@ struct Preview {
     histogram_job: Option<(u64, mpsc::Receiver<Developed>)>,
     /// The source reduced for the histogram.
     small: Option<(u32, Arc<Source>)>,
+    /// Key of a histogram whose computation failed (not tried again).
+    histogram_failed: Option<u64>,
+    /// A computation failed since the last frame (to say so).
+    failure: bool,
 }
 
 #[derive(Default)]
 struct Pane {
     shown: Option<Shown>,
     job: Option<(u64, mpsc::Receiver<Developed>)>,
+    /// Key of a development that failed (not tried again).
+    failed: Option<u64>,
 }
 
 /// Developed pixels on screen.
@@ -608,6 +617,9 @@ impl AtelierApp {
         if let Some(status) = status {
             self.status = status;
         }
+        if std::mem::take(&mut window.preview.failure) {
+            self.status_failed(tm!("fx4-preview-failed-any"));
+        }
         if out.reset {
             window.settings = window.opened.clone();
             window.curve_point = None;
@@ -652,10 +664,18 @@ impl AtelierApp {
                 self.report_error(tm!(
                     "status-open-failed",
                     path = path,
-                    error = e.to_string()
+                    error = crate::i18n::Message::of(|| e.to_string())
                 ));
             }
-            (Err(_), _) => {}
+            // The Camera Raw Filter's pixels could not be read (it
+            // panicked): nothing opens, the layer it enlarged goes back.
+            (Err(_), _) => {
+                self.shrink_after_preview();
+                let text = tm!("fx3-filter-failed", name = t!("raw-filter-title"));
+                self.actions
+                    .step_stopped(Stopped::Failed(text.shown.clone()));
+                self.status_failed(text);
+            }
         }
     }
 
@@ -706,12 +726,12 @@ impl AtelierApp {
     }
 
     fn add_camera_raw_smart_filter(&mut self, settings: Settings) {
-        self.add_smart_filter(SmartFilterKind::CameraRaw(Arc::new(settings.clone())));
-        self.camera_raw_applied(settings);
+        let filter = SmartFilterKind::CameraRaw(Arc::new(settings.clone()));
+        self.add_smart_filter(filter, move |app| app.camera_raw_applied(settings));
     }
 
-    /// Camera Raw applied with `settings`: Last Filter repeats it, an
-    /// action being recorded gets it.
+    /// Camera Raw applied with `settings` (its result in, not cancelled):
+    /// Last Filter repeats it, an action being recorded gets it.
     fn camera_raw_applied(&mut self, settings: Settings) {
         self.filters.remember_camera_raw(settings.clone());
         self.record(Recorded::CameraRaw { settings });
@@ -737,11 +757,11 @@ impl AtelierApp {
             self.status = t!("status-selection-empty");
             return;
         };
-        self.camera_raw_applied(settings.clone());
         let destination = Destination::Layer {
             doc: uid,
             layer,
             rasterized,
+            settings: Box::new(settings.clone()),
         };
         self.spawn_development(destination, move |progress| {
             target.process(0, |image, _| {
@@ -806,6 +826,7 @@ impl AtelierApp {
                 self.shrink_after_preview();
                 self.end_layer_preview();
                 self.reset_pending();
+                self.actions.step_stopped(Stopped::Cancelled);
                 t!("raw-filter-title")
             }
             Destination::Document { path, .. } => file_label(&path),
@@ -831,6 +852,7 @@ impl AtelierApp {
                 doc: uid,
                 layer,
                 rasterized,
+                settings,
             } => {
                 let name = t!("raw-filter-title");
                 if let Some(doc) = &mut self.doc
@@ -846,11 +868,15 @@ impl AtelierApp {
                                 let note = t!("canvas-status-text-rasterized", name = layer);
                                 self.status = format!("{} — {note}", self.status);
                             }
+                            self.camera_raw_applied(*settings);
                         }
                         None => {
                             doc.end_paint();
                             doc.discard_step();
-                            self.status_failed(tm!("fx3-filter-failed", name = name.as_str()));
+                            let text = tm!("fx3-filter-failed", name = name.as_str());
+                            self.actions
+                                .step_stopped(Stopped::Failed(text.shown.clone()));
+                            self.status_failed(text);
                             self.shrink_after_preview();
                         }
                     }
@@ -861,7 +887,7 @@ impl AtelierApp {
             Destination::Document { path, preview_only } => {
                 let Some(image) = result else {
                     let name = file_label(&path);
-                    self.status_failed(tm!("fx4-raw-open-failed", name = name.as_str()));
+                    self.report_error(tm!("fx4-raw-open-failed", name = name.as_str()));
                     return;
                 };
                 let shown = path.display().to_string();
@@ -942,10 +968,18 @@ impl RawWindow {
     fn update_preview(&mut self, ctx: &egui::Context) {
         for (i, pane) in self.preview.panes.iter_mut().enumerate() {
             let Some((key, rx)) = &pane.job else { continue };
-            let Ok(developed) = rx.try_recv() else {
-                continue;
-            };
             let key = *key;
+            let developed = match rx.try_recv() {
+                Ok(developed) => developed,
+                Err(mpsc::TryRecvError::Empty) => continue,
+                // It panicked: not asked again for the same settings.
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    pane.job = None;
+                    pane.failed = Some(key);
+                    self.preview.failure = true;
+                    continue;
+                }
+            };
             pane.job = None;
             let size = [
                 developed.image.width() as usize,
@@ -971,16 +1005,27 @@ impl RawWindow {
     /// sharpening slider, before).
     fn update_histogram(&mut self, ctx: &egui::Context) {
         let p = &mut self.preview;
-        if let Some((key, rx)) = &p.histogram_job
-            && let Ok(developed) = rx.try_recv()
-        {
-            p.histogram_key = *key;
-            p.histogram = Some(developed.histogram);
-            p.small = Some(developed.scaled);
-            p.histogram_job = None;
+        if let Some((key, rx)) = &p.histogram_job {
+            match rx.try_recv() {
+                Ok(developed) => {
+                    p.histogram_key = *key;
+                    p.histogram = Some(developed.histogram);
+                    p.small = Some(developed.scaled);
+                    p.histogram_job = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    p.histogram_failed = Some(*key);
+                    p.histogram_job = None;
+                    p.failure = true;
+                }
+            }
         }
         let key = hash_of(format!("{:?}", self.settings));
-        if (p.histogram.is_some() && p.histogram_key == key) || p.histogram_job.is_some() {
+        if (p.histogram.is_some() && p.histogram_key == key)
+            || p.histogram_job.is_some()
+            || p.histogram_failed == Some(key)
+        {
             return;
         }
         let (source, analysis) = (self.source.clone(), self.analysis.clone());
@@ -1020,7 +1065,10 @@ impl RawWindow {
             visual,
         ));
         let pane = &mut self.preview.panes[i];
-        if pane.shown.as_ref().is_some_and(|s| s.key == key) || pane.job.is_some() {
+        if pane.shown.as_ref().is_some_and(|s| s.key == key)
+            || pane.job.is_some()
+            || pane.failed == Some(key)
+        {
             return;
         }
         let (tx, rx) = mpsc::channel();
@@ -1148,7 +1196,11 @@ impl RawWindow {
         if self.preview.panes.iter().any(|p| p.job.is_some()) {
             let spinner =
                 Rect::from_min_size(rect.right_bottom() - vec2(24.0, 24.0), Vec2::splat(16.0));
-            ui.put(spinner, egui::Spinner::new().size(16.0).color(color::MUTED));
+            // Painted, not added, so the fields below keep their ids.
+            egui::Spinner::new()
+                .size(16.0)
+                .color(color::MUTED)
+                .paint_at(ui, spinner);
         }
         painter.rect_stroke(
             rect,

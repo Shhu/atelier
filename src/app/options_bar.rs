@@ -55,11 +55,29 @@ impl AtelierApp {
                 workspace::PaintBlock::Hidden => (
                     icon::EYE_SLASH,
                     t!("ui4-options-layer-hidden"),
-                    t!("ui4-options-layer-hidden-tip"),
+                    match self.hidden_group() {
+                        Some(group) => t!("ui5-options-group-hidden-tip", group = group),
+                        None => t!("ui4-options-layer-hidden-tip"),
+                    },
                 ),
             };
             ui.label(egui::RichText::new(format!("{glyph} {label}")).color(color::MUTED))
                 .on_hover_text(tip);
+            sep(ui);
+        }
+        // Quick Mask Mode: every tool edits the selection, not the layer;
+        // said as long as it lasts (a click leaves it).
+        if self.doc.as_ref().is_some_and(|d| d.quick_mask().is_some()) {
+            let label = format!("{} {}", icon::CIRCLE_HALF, t!("sel5-options-quick-mask"));
+            let text = egui::RichText::new(label).color(color::ACCENT_TEXT);
+            let tip = t!("sel5-options-quick-mask-tip", key = keys::key(Key::Q));
+            if ui
+                .add(egui::Button::new(text).frame(false))
+                .on_hover_text(tip)
+                .clicked()
+            {
+                self.run(Action::Select(super::select_menu::Command::QuickMask));
+            }
             sep(ui);
         }
         match self.tool {
@@ -103,16 +121,78 @@ impl AtelierApp {
         }
     }
 
+    /// The bar's rows: 46 px with the margins, wrapping when the window is
+    /// too narrow. Its height doesn't change with the tool (the tallest
+    /// bar seen at this width stays, so the toolbar and the canvas don't
+    /// jump on a tool switch), nor while the pointer is down (a drag on
+    /// the canvas); only a pending transform's longer bar adds rows, for
+    /// its time.
+    pub(super) fn options_bar_rows(&mut self, ui: &mut egui::Ui) {
+        let id = egui::Id::new("options-bar-height");
+        let width = ui.available_width();
+        let key = (width.to_bits(), i18n::lang().code());
+        // (width and language, tallest bar there, last height)
+        let (kept, last) = match ui.data(|d| d.get_temp::<((u32, &'static str), f32, f32)>(id)) {
+            Some((k, kept, last)) if k == key => (kept, last),
+            Some((_, _, last)) => (0.0, last),
+            None => (0.0, 0.0),
+        };
+        let held = ui.input(|i| i.pointer.any_down()) && last > 0.0;
+        let top = ui.cursor().min;
+        let mut rows = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("options_bar_rows")
+                .max_rect(Rect::from_min_size(top, vec2(width, 28.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true)),
+        );
+        if held {
+            // Rows that would grow the bar now wait for the release.
+            let clip = rows.clip_rect().intersect(Rect::from_min_size(top, vec2(width, last)));
+            rows.set_clip_rect(clip);
+        }
+        let transient = self.sel.transform.is_some()
+            || (self.tool == Tool::Transform && self.transform_in_bar());
+        self.options_bar(&mut rows);
+        let content = rows.min_rect().height().max(28.0);
+        let kept = if transient { kept } else { kept.max(content) };
+        let height = if held { last } else { content.max(kept) };
+        ui.allocate_exact_size(vec2(width, height), Sense::hover());
+        ui.data_mut(|d| d.insert_temp(id, (key, kept, height)));
+        // A taller or shorter bar moves the canvas area: the image stays
+        // where it was on screen.
+        if last > 0.0 && height != last && self.doc.is_some() {
+            self.pan.y -= (height - last) / 2.0;
+        }
+    }
+
+    /// Move tool: Auto-Select and Show Transform Controls; while a
+    /// transform is pending, its reference point, numbers, Resample, Warp
+    /// and the ✕ ✓ pair instead (the bar stays short the rest of the time).
     fn transform_options(&mut self, ui: &mut egui::Ui) {
-        // Always shown (the bar keeps its layout while a move is pending,
-        // and the setting that decides what the next click picks stays in
-        // sight); off limits during Free Transform only.
-        let ctrl = keys::modifiers(ui.ctx(), Modifiers::COMMAND);
-        ui.add_enabled_ui(!self.free_transform, |ui| {
+        if !self.transform_in_bar() {
+            let ctrl = keys::modifiers(ui.ctx(), Modifiers::COMMAND);
             ui_kit::checkbox(ui, &mut self.auto_select, &t!("input3-auto-select"))
                 .on_hover_text(t!("input3-auto-select-tip", key = ctrl));
-        });
-        sep(ui);
+            sep(ui);
+            if self.active_locked() {
+                locked_notice(
+                    ui,
+                    &t!("options-layer-locked"),
+                    &t!("options-layer-locked-hint"),
+                );
+                return;
+            }
+            let response = ui_kit::checkbox(
+                ui,
+                &mut self.show_transform_controls,
+                &t!("tools4-show-transform-controls"),
+            );
+            let tip = t!("tools4-show-transform-controls-tip");
+            ui.ctx()
+                .accesskit_node_builder(response.id, |node| node.set_description(tip.clone()));
+            response.on_hover_text(tip);
+            return;
+        }
         if self.active_locked() {
             locked_notice(
                 ui,
@@ -127,23 +207,7 @@ impl AtelierApp {
         let (Some(full), Some(src)) = (self.full_rect(), self.transform_source()) else {
             return;
         };
-        // Transforming, the reference point; otherwise, in its place (the
-        // bar keeps its size), whether the handles show.
-        if self.transform_rect.is_some() || self.free_transform {
-            self.reference_locator(ui);
-        } else {
-            let tip = format!(
-                "{}\n{}",
-                t!("tools4-show-transform-controls"),
-                t!("tools4-show-transform-controls-tip")
-            );
-            ui_kit::icon_toggle(
-                ui,
-                icon::BOUNDING_BOX,
-                &tip,
-                &mut self.show_transform_controls,
-            );
-        }
+        self.reference_locator(ui);
         sep(ui);
         // A distorted frame: its box, not editable as numbers (same bar,
         // so that the canvas doesn't move when it starts).
@@ -161,16 +225,17 @@ impl AtelierApp {
         let mut w = shown.width().max(1.0) as u32;
         let mut h = shown.height().max(1.0) as u32;
         let limits = -POSITION_LIMIT..=POSITION_LIMIT;
-        let editable = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui) -> bool| {
-            ui.add_enabled_ui(!distorted, |ui| add(ui)).inner
-        };
-        let x_changed = editable(ui, &mut |ui| {
+        let editable =
+            |ui: &mut egui::Ui, width: f32, add: &mut dyn FnMut(&mut egui::Ui) -> bool| {
+                enabled_wrapped(ui, !distorted, width, |ui| add(ui))
+            };
+        let x_changed = editable(ui, 76.0, &mut |ui| {
             ui_kit::number_field(ui, "X", &mut x, limits.clone(), "", 76.0).changed()
         });
-        let y_changed = editable(ui, &mut |ui| {
+        let y_changed = editable(ui, 76.0, &mut |ui| {
             ui_kit::number_field(ui, "Y", &mut y, limits.clone(), "", 76.0).changed()
         });
-        let w_changed = editable(ui, &mut |ui| {
+        let w_changed = editable(ui, 82.0, &mut |ui| {
             size_field(ui, &t!("optbar-width-short"), &t!("options-width"), &mut w)
         });
         ui_kit::icon_toggle(
@@ -179,7 +244,7 @@ impl AtelierApp {
             &t!("options-constrain-proportions"),
             &mut self.keep_ratio,
         );
-        let h_changed = editable(ui, &mut |ui| {
+        let h_changed = editable(ui, 82.0, &mut |ui| {
             size_field(
                 ui,
                 &t!("optbar-height-short"),
@@ -205,7 +270,7 @@ impl AtelierApp {
             ui.end_row();
         }
         let mut angle = self.transform_angle;
-        editable(ui, &mut |ui| {
+        editable(ui, 70.0, &mut |ui| {
             ui_kit::number_field(
                 ui,
                 icon::ARROW_CLOCKWISE,
@@ -245,32 +310,31 @@ impl AtelierApp {
         } else {
             i18n::percent(format!("{sx} × {sy}"))
         };
-        ui.add_enabled_ui(!distorted, |ui| {
-            dropdown_reserving(
-                ui,
-                "scale_presets",
-                Some(&t!("optbar-scale")),
-                &scale,
-                Some(&i18n::percent("100 × 100")),
-                true,
-                0.0,
-                |ui| {
-                    for pct in SCALE_PRESETS {
-                        if ui
-                            .selectable_label(sx == pct && sy == pct, i18n::percent(pct))
-                            .clicked()
-                        {
-                            let s = pct / 100.0;
-                            new_size = Some((
-                                (src.width() * s).round().max(1.0),
-                                (src.height() * s).round().max(1.0),
-                            ));
-                            ui.close();
-                        }
+        dropdown_reserving(
+            ui,
+            "scale_presets",
+            Some(&t!("optbar-scale")),
+            &scale,
+            Some(&i18n::percent("100 × 100")),
+            !distorted,
+            true,
+            0.0,
+            |ui| {
+                for pct in SCALE_PRESETS {
+                    if ui
+                        .selectable_label(sx == pct && sy == pct, i18n::percent(pct))
+                        .clicked()
+                    {
+                        let s = pct / 100.0;
+                        new_size = Some((
+                            (src.width() * s).round().max(1.0),
+                            (src.height() * s).round().max(1.0),
+                        ));
+                        ui.close();
                     }
-                },
-            );
-        });
+                }
+            },
+        );
         if let Some((w, h)) = new_size {
             r = Rect::from_center_size(r.center(), vec2(w, h));
             self.transform_rect = Some(r);
@@ -294,7 +358,7 @@ impl AtelierApp {
         }
         self.warp_switch(ui);
         if distorted {
-            let (apply, cancel) = apply_cancel(ui, true);
+            let (apply, cancel) = apply_cancel_icons(ui, true);
             if apply {
                 self.apply_transform();
             }
@@ -310,7 +374,7 @@ impl AtelierApp {
             self.transform_rect = Some(r);
         }
         let pending = r != src || self.transform_angle != 0.0 || (self.fit_canvas && r != full);
-        let (apply, cancel) = apply_cancel(ui, pending);
+        let (apply, cancel) = apply_cancel_icons(ui, pending);
         if apply {
             self.transform_rect = Some(r);
             self.apply_transform();
@@ -318,6 +382,14 @@ impl AtelierApp {
         if cancel {
             self.reset_pending();
         }
+    }
+
+    /// A transform is pending: the Move tool's bar shows its options.
+    pub(super) fn transform_in_bar(&self) -> bool {
+        self.free_transform
+            || self.transform_rect.is_some()
+            || self.transform_angle != 0.0
+            || self.transform_distorted()
     }
 
     /// Resampling of the transforms: the menu lists the full names, the
@@ -831,6 +903,33 @@ fn apply_cancel(ui: &mut egui::Ui, pending: bool) -> (bool, bool) {
     clicks
 }
 
+/// Cancel and Apply as two icons (✕ ✓) at the right end of the row.
+/// Returns the clicks (apply, cancel).
+fn apply_cancel_icons(ui: &mut egui::Ui, pending: bool) -> (bool, bool) {
+    let (cancel, apply) = (t!("dialog-cancel"), t!("options-apply"));
+    let mut clicks = (false, false);
+    right_aligned(ui, 2.0 * 28.0 + ui.spacing().item_spacing.x, |ui| {
+        clicks.1 = ui_kit::icon_button(ui, icon::X, &cancel, pending).clicked();
+        clicks.0 = ui_kit::icon_button(ui, icon::CHECK, &apply, pending).clicked();
+    });
+    clicks
+}
+
+/// `add`, greyed unless `enabled`, on the next row when its `width`
+/// doesn't fit: decided here, since a child Ui would wrap inside itself
+/// (to the end of the row, past the window's edge).
+fn enabled_wrapped<R>(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    width: f32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    if room(ui) < width {
+        ui.end_row();
+    }
+    ui.add_enabled_ui(enabled, add).inner
+}
+
 /// Width or height field (px); returns `true` if it changed.
 fn size_field(ui: &mut egui::Ui, label: &str, tip: &str, value: &mut u32) -> bool {
     ui_kit::number_field(ui, label, value, 1..=MAX_DIMENSION, "", 82.0)
@@ -859,11 +958,12 @@ fn dropdown<R>(
     lead: f32,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
-    dropdown_reserving(ui, id_salt, label, value, None, mono, lead, add_contents)
+    dropdown_reserving(ui, id_salt, label, value, None, true, mono, lead, add_contents)
 }
 
 /// [`dropdown`] at least as wide as it is with the value `widest`: the bar
 /// keeps its layout while the value changes (the scale during a transform).
+/// Greyed unless `enabled`.
 #[allow(clippy::too_many_arguments)]
 fn dropdown_reserving<R>(
     ui: &mut egui::Ui,
@@ -871,6 +971,7 @@ fn dropdown_reserving<R>(
     label: Option<&str>,
     value: &str,
     widest: Option<&str>,
+    enabled: bool,
     mono: bool,
     lead: f32,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
@@ -903,15 +1004,14 @@ fn dropdown_reserving<R>(
     job.append(value, lead + space, format(font, color::TEXT));
     let s = ui.spacing();
     let width = text + 2.0 * s.button_padding.x + s.icon_width + s.icon_spacing + 2.0;
-    if room(ui) < width {
-        ui.end_row();
-    }
-    let shown = egui::ComboBox::from_id_salt(id_salt)
-        .selected_text(job)
-        .width(width)
-        .height(320.0)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .show_ui(ui, add_contents);
+    let shown = enabled_wrapped(ui, enabled, width, |ui| {
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(job)
+            .width(width)
+            .height(320.0)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show_ui(ui, add_contents)
+    });
     // Named by its label, its value apart (not "Scale100%").
     if let Some(label) = label {
         ui.ctx().accesskit_node_builder(shown.response.id, |node| {

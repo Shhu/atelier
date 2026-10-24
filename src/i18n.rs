@@ -183,6 +183,12 @@ impl Message {
     pub fn new(shown: String, english: String) -> Self {
         Self { shown, english }
     }
+
+    /// The text `f` makes with `t!` (an error's `to_string`, a filter's
+    /// name), in the interface's language and in English.
+    pub fn of(f: impl Fn() -> String) -> Self {
+        Self::new(f(), in_lang(Lang::En, &f))
+    }
 }
 
 /// A text with no English of its own (already English, or not known):
@@ -193,6 +199,19 @@ impl From<String> for Message {
             english: shown.clone(),
             shown,
         }
+    }
+}
+
+/// The text shown.
+impl std::fmt::Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.shown)
+    }
+}
+
+impl From<Message> for String {
+    fn from(message: Message) -> Self {
+        message.shown
     }
 }
 
@@ -260,20 +279,81 @@ macro_rules! t {
 pub(crate) use t;
 
 /// `tm!("key", name = value, …)`: like `t!`, a `Message` with the English
-/// text too (the arguments are evaluated once).
+/// text too (the arguments are evaluated once). An argument that is itself
+/// a `Message` (an error, a filter's name) gives each text its own.
 macro_rules! tm {
     ($id:literal) => {
         $crate::i18n::Message::new($crate::i18n::tr($id, None), $crate::i18n::tr_en($id, None))
     };
     ($id:literal, $($name:ident = $value:expr),+ $(,)?) => {{
-        let mut args = fluent_bundle::FluentArgs::new();
-        $(args.set(stringify!($name), $value);)+
+        let mut shown = fluent_bundle::FluentArgs::new();
+        let mut english = fluent_bundle::FluentArgs::new();
+        $({
+            let value = $value;
+            shown.set(stringify!($name), $crate::i18n::MessageArg::shown(&value));
+            english.set(stringify!($name), $crate::i18n::MessageArg::english(&value));
+        })+
         $crate::i18n::Message::new(
-            $crate::i18n::tr($id, Some(&args)),
-            $crate::i18n::tr_en($id, Some(&args)),
+            $crate::i18n::tr($id, Some(&shown)),
+            $crate::i18n::tr_en($id, Some(&english)),
         )
     }};
 }
+
+/// A value given to `tm!`: the same in both texts, or a `Message`'s two.
+pub trait MessageArg {
+    fn shown(&self) -> fluent_bundle::FluentValue<'static>;
+    fn english(&self) -> fluent_bundle::FluentValue<'static> {
+        self.shown()
+    }
+}
+
+impl MessageArg for Message {
+    fn shown(&self) -> fluent_bundle::FluentValue<'static> {
+        self.shown.clone().into()
+    }
+    fn english(&self) -> fluent_bundle::FluentValue<'static> {
+        self.english.clone().into()
+    }
+}
+
+impl MessageArg for &Message {
+    fn shown(&self) -> fluent_bundle::FluentValue<'static> {
+        (*self).shown()
+    }
+    fn english(&self) -> fluent_bundle::FluentValue<'static> {
+        (*self).english()
+    }
+}
+
+impl MessageArg for String {
+    fn shown(&self) -> fluent_bundle::FluentValue<'static> {
+        self.clone().into()
+    }
+}
+
+impl MessageArg for &String {
+    fn shown(&self) -> fluent_bundle::FluentValue<'static> {
+        (*self).clone().into()
+    }
+}
+
+impl MessageArg for &str {
+    fn shown(&self) -> fluent_bundle::FluentValue<'static> {
+        self.to_string().into()
+    }
+}
+
+macro_rules! number_args {
+    ($($t:ty),+) => {$(
+        impl MessageArg for $t {
+            fn shown(&self) -> fluent_bundle::FluentValue<'static> {
+                (*self).into()
+            }
+        }
+    )+};
+}
+number_args!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64);
 pub(crate) use tm;
 
 #[cfg(test)]

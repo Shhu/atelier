@@ -628,7 +628,8 @@ fn quick_mask_keeps_the_lock_for_layer_commands() {
     h.state_mut().selection = Some(rect(20, 20, 60, 60).into());
     key(&mut h, Key::Q, Modifiers::NONE);
     assert!(quick_mask_on(&h));
-    for action in [Action::Delete, Action::MergeDown, Action::ClearLayerStyle] {
+    // (Delete Layer isn't refused: a lock keeps the pixels, not the layer.)
+    for action in [Action::MergeDown, Action::ClearLayerStyle] {
         h.state_mut().run(action);
         h.run_steps(1);
     }
@@ -715,4 +716,224 @@ fn a_background_wand_step_is_named_after_the_wand() {
     let d = h.state().doc.as_ref().unwrap();
     assert!(h.state().selection.is_some());
     assert_eq!(d.history().0.last().copied(), Some(wand.as_str()));
+}
+
+/// In Quick Mask Mode, the lock still holds for what acts on the layer
+/// itself, outside `run()`'s list: Remove Background, smart commands.
+#[test]
+fn quick_mask_keeps_the_lock_for_remove_background_and_smart_commands() {
+    let mut h = app_with(halves());
+    h.state_mut()
+        .doc
+        .as_mut()
+        .unwrap()
+        .active_layer_mut()
+        .locked = true;
+    h.state_mut().selection = Some(rect(20, 20, 60, 60).into());
+    key(&mut h, Key::Q, Modifiers::NONE);
+    assert!(quick_mask_on(&h));
+    let locked = t!(
+        "status-layer-is-locked",
+        name = h.state().doc.as_ref().unwrap().active_layer().name.as_str()
+    );
+    h.state_mut().status.clear();
+    h.state_mut().run(Action::RemoveBackground);
+    h.run_steps(1);
+    let app = h.state();
+    assert!(app.status.contains(&locked), "{:?}", app.status);
+    assert!(app.subject_job.is_none() && app.subject_waiting.is_none());
+    assert!(app.model_prompt.is_none());
+    h.state_mut().status.clear();
+    h.state_mut()
+        .run(Action::Smart(super::smart_ui::Command::ReplaceContents));
+    h.run_steps(1);
+    assert!(h.state().status.contains(&locked), "{:?}", h.state().status);
+}
+
+/// Select and Mask keeps a locked layer's mask as it is, and adds none:
+/// OK says why and the window stays open for another output.
+#[test]
+fn select_and_mask_respects_the_lock() {
+    let mut h = app_with(halves());
+    mask_with_hole(&mut h);
+    h.state_mut()
+        .doc
+        .as_mut()
+        .unwrap()
+        .active_layer_mut()
+        .locked = true;
+    let steps = h.state().doc.as_ref().unwrap().history().0.len();
+    h.state_mut().run(Action::Select(Command::SelectAndMask));
+    h.run_steps(1);
+    h.state_mut()
+        .sel
+        .select_mask
+        .as_mut()
+        .unwrap()
+        .refine
+        .feather = 6.0;
+    h.state_mut().close_select_mask(true);
+    settle(&mut h);
+    let app = h.state();
+    assert!(app.sel.select_mask.is_some(), "still open");
+    let name = app.doc.as_ref().unwrap().active_layer().name.clone();
+    assert!(
+        app.status
+            .contains(&t!("status-layer-is-locked", name = name.as_str()))
+    );
+    let d = app.doc.as_ref().unwrap();
+    assert_eq!(d.history().0.len(), steps);
+    let m = d.active_layer().mask.as_ref().unwrap();
+    assert_eq!(m.image().get_pixel(60, 100).0[0], 0, "mask unchanged");
+    // Another output is fine.
+    h.state_mut().sel.select_mask.as_mut().unwrap().output = super::select_mask::Output::Selection;
+    h.state_mut().close_select_mask(true);
+    settle(&mut h);
+    assert!(h.state().sel.select_mask.is_none());
+    assert!(h.state().selection.is_some());
+
+    // From a selection, no mask is added to a locked layer.
+    let mut h = app_with(halves());
+    h.state_mut()
+        .doc
+        .as_mut()
+        .unwrap()
+        .active_layer_mut()
+        .locked = true;
+    h.state_mut().selection = Some(rect(20, 20, 60, 60).into());
+    h.state_mut().run(Action::Select(Command::SelectAndMask));
+    h.run_steps(1);
+    h.state_mut().sel.select_mask.as_mut().unwrap().output = super::select_mask::Output::LayerMask;
+    h.state_mut().close_select_mask(true);
+    settle(&mut h);
+    assert!(
+        h.state()
+            .doc
+            .as_ref()
+            .unwrap()
+            .active_layer()
+            .mask
+            .is_none()
+    );
+    assert!(h.state().sel.select_mask.is_some(), "still open");
+}
+
+/// Select and Mask on a layer mask, Output New Layer with Mask: the copy's
+/// mask is refined in place, its settings kept.
+#[test]
+fn select_and_mask_new_layer_with_mask_keeps_the_mask_settings() {
+    let mut h = app_with(halves());
+    mask_with_hole(&mut h);
+    h.state_mut().run(Action::Select(Command::SelectAndMask));
+    h.run_steps(1);
+    h.state_mut().sel.select_mask.as_mut().unwrap().output =
+        super::select_mask::Output::NewLayerWithMask;
+    h.state_mut().close_select_mask(true);
+    settle(&mut h);
+    let d = h.state().doc.as_ref().unwrap();
+    assert_eq!(d.layers.len(), 2);
+    let m = d.active_layer().mask.as_ref().unwrap();
+    assert_eq!(m.default, 255, "the outside stays shown");
+    assert_eq!((m.density, m.feather), (0.5, 3.0));
+    assert!(!m.enabled);
+    let at = |x, y| m.image().get_pixel(x, y).0[0];
+    assert_eq!((at(100, 100), at(10, 10)), (0, 255));
+}
+
+/// Select and Mask on a mask with a density, Output Selection: what the
+/// mask shows is selected (as a Ctrl+click on its thumbnail), not its
+/// stored values.
+#[test]
+fn select_and_mask_selection_from_a_mask_follows_its_density() {
+    let mut h = app_with(halves());
+    mask_with_hole(&mut h);
+    h.state_mut().run(Action::Select(Command::SelectAndMask));
+    h.run_steps(1);
+    h.state_mut().sel.select_mask.as_mut().unwrap().output = super::select_mask::Output::Selection;
+    h.state_mut().close_select_mask(true);
+    settle(&mut h);
+    let sel = selection(&h);
+    let hole = sel.coverage(100, 100);
+    assert!((120..=135).contains(&hole), "about half: {hole}");
+    assert_eq!(sel.coverage(10, 10), 255);
+}
+
+/// A Shift+click with the Magic Wand right after a click computed in the
+/// background is chained after it, not waited for: both apply, in order,
+/// as two steps.
+#[test]
+fn a_quick_second_wand_click_is_chained() {
+    let image = image::RgbaImage::from_fn(2000, 1500, |x, y| match (x < 1000, y < 750) {
+        (true, true) => RED,
+        (false, false) => BLUE,
+        _ => image::Rgba([0, 200, 0, 255]),
+    });
+    let mut h = app_with(Document::new(image, None));
+    h.state_mut().tool = Tool::MagicWand;
+    h.state_mut().wand_contiguous = true;
+    h.run_steps(1);
+    let steps = h.state().doc.as_ref().unwrap().history().0.len();
+    let (a, b) = (screen(&h, 500.0, 300.0), screen(&h, 1500.0, 1200.0));
+    click(&mut h, a, Modifiers::NONE);
+    click(&mut h, b, Modifiers::SHIFT);
+    modifiers(&mut h, Modifiers::NONE);
+    settle(&mut h);
+    let sel = selection(&h);
+    assert_eq!(sel.coverage(500, 300), 255);
+    assert_eq!(sel.coverage(1500, 1200), 255, "the second click added");
+    assert_eq!(sel.coverage(1500, 300), 0);
+    let d = h.state().doc.as_ref().unwrap();
+    assert_eq!(d.history().0.len(), steps + 2, "one step per click");
+}
+
+/// In Quick Mask Mode, the options bar says so whatever the tool, and a
+/// click there leaves it.
+#[test]
+fn quick_mask_notice_in_the_options_bar() {
+    let mut h = app_with(halves());
+    h.state_mut().tool = Tool::Brush;
+    h.state_mut().selection = Some(rect(20, 20, 60, 60).into());
+    key(&mut h, Key::Q, Modifiers::NONE);
+    assert!(quick_mask_on(&h));
+    use egui_kittest::kittest::Queryable as _;
+    let label = format!("{} {}", icon::CIRCLE_HALF, t!("sel5-options-quick-mask"));
+    h.get_by_label(&label).click();
+    h.run_steps(2);
+    assert!(!quick_mask_on(&h));
+    assert!(h.query_by_label(&label).is_none());
+}
+
+/// While a selection is computed in the background, one that combines
+/// with it starts after it on a worker: the call returns at once, and
+/// both apply in order.
+#[test]
+fn a_selection_combined_with_a_pending_one_does_not_wait() {
+    let mut h = app_with(Document::new(image::RgbaImage::new(2000, 1500), None));
+    let steps = h.state().doc.as_ref().unwrap().history().0.len();
+    let big = 1 << 24;
+    let app = h.state_mut();
+    app.select_later(
+        super::select_menu::Then::Select(SelectMode::Replace),
+        big,
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            Some(rect(0, 0, 100, 100).into())
+        },
+    );
+    let start = std::time::Instant::now();
+    app.select_later(
+        super::select_menu::Then::Select(SelectMode::Add),
+        big,
+        move || Some(rect(500, 500, 100, 100).into()),
+    );
+    assert!(
+        start.elapsed().as_millis() < 300,
+        "waited for the first one"
+    );
+    assert!(app.select_busy());
+    settle(&mut h);
+    let sel = selection(&h);
+    assert_eq!((sel.coverage(50, 50), sel.coverage(550, 550)), (255, 255));
+    assert_eq!(sel.coverage(300, 300), 0);
+    assert_eq!(h.state().doc.as_ref().unwrap().history().0.len(), steps + 2);
 }

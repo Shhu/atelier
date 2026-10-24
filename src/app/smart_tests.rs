@@ -297,7 +297,7 @@ fn smart_filter_blending_options() {
     let mut h = app();
     h.state_mut().run(Action::Smart(Command::Convert));
     h.state_mut().run(Action::Filter(FilterKind::FindEdges));
-    h.run_steps(2);
+    settle(&mut h, |app| !app.smart.busy());
     h.state_mut().run(Action::Smart(Command::FilterBlending(0)));
     h.run_steps(2);
     assert!(h.state().modal_open());
@@ -308,8 +308,8 @@ fn smart_filter_blending_options() {
     }
     h.run_steps(2);
     h.key_press(egui::Key::Enter);
-    h.run_steps(2);
-    assert!(!h.state().modal_open());
+    // Rendered again in the background.
+    settle(&mut h, |app| !app.modal_open());
     let f = &smart(&h).filters[0];
     assert_eq!((f.opacity, f.blend), (0.5, BlendMode::Multiply));
 }
@@ -531,7 +531,9 @@ fn replace_contents_updates_every_instance() {
     let before = ids(d);
     let steps = d.history().1;
     d.replace_contents(&path).unwrap();
-    assert_eq!(ids(d), before, "still shared");
+    let after = ids(d);
+    assert!(after.iter().all(|&id| id == after[0]), "still shared");
+    assert_ne!(after[0], before[0], "new contents, a new id");
     assert_eq!(d.history().1, steps + 1);
     for l in d.layers.iter().filter(|l| l.is_smart()) {
         assert_eq!(l.pixel_at(30, 20), Some([0, 255, 0, 255]), "{}", l.name);
@@ -562,4 +564,171 @@ fn a_long_smart_object_rendering_is_cancelled_and_undone() {
     assert!(!h.state().smart.busy());
     assert!(!smart(&h).filters[0].visible, "the change undone");
     assert_eq!(*doc(&h).active_layer().image(), before);
+}
+
+/// A linked file, written by `write`, placed then opened by Edit Contents.
+fn linked_tab(
+    name: &str,
+    file: &str,
+    write: impl FnOnce(&std::path::Path),
+) -> (Harness<'static, AtelierApp>, std::path::PathBuf) {
+    let path = folder(name).join(file);
+    write(&path);
+    let mut h = app();
+    h.state_mut().place_path(&path, true);
+    h.key_press(egui::Key::Enter);
+    let applied = |app: &AtelierApp| !app.transform_pending() && !app.transform_busy();
+    settle(&mut h, applied);
+    h.state_mut().run(Action::Smart(Command::EditContents));
+    h.run_steps(2);
+    assert_eq!(doc(&h).path.as_deref(), Some(path.as_path()));
+    (h, path)
+}
+
+/// Edit Contents of a linked PNG, a layer added: Close › Save asks
+/// whether to merge the layers into the file; Save writes it and the
+/// tab closes (quitting goes on the same way).
+#[test]
+fn layered_link_tab_closes_once_saved() {
+    let (mut h, path) = linked_tab("layered-close", "logo.png", |p| {
+        RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255]))
+            .save(p)
+            .unwrap()
+    });
+    let tabs = h.state().tab_count();
+    h.state_mut().run(Action::NewLayer);
+    h.state_mut().primary = Color32::from_rgb(255, 0, 0);
+    h.state_mut().run(Action::FillPrimary);
+    h.state_mut().run(Action::CloseDocument);
+    h.run_steps(2);
+    assert!(h.state().confirm.is_some(), "Save changes?");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert!(h.state().smart.link_save.is_some(), "merging asked first");
+    assert_eq!(h.state().tab_count(), tabs, "not closed yet");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(h.state().tab_count(), tabs - 1, "closed once saved");
+    let saved = image::open(&path).unwrap().to_rgba8();
+    assert_eq!(saved.get_pixel(5, 5).0, [255, 0, 0, 255], "merged");
+}
+
+/// Same, Cancel at the merge question: nothing written, the tab stays.
+#[test]
+fn layered_link_save_cancelled() {
+    let (mut h, path) = linked_tab("layered-cancel", "logo.png", |p| {
+        RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255]))
+            .save(p)
+            .unwrap()
+    });
+    let tabs = h.state().tab_count();
+    h.state_mut().run(Action::NewLayer);
+    h.state_mut().primary = Color32::from_rgb(255, 0, 0);
+    h.state_mut().run(Action::FillPrimary);
+    h.state_mut().run(Action::Save);
+    h.run_steps(2);
+    assert!(h.state().smart.link_save.is_some());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.state().smart.link_save.is_none());
+    assert_eq!(h.state().tab_count(), tabs);
+    assert!(doc(&h).modified);
+    let file = image::open(&path).unwrap().to_rgba8();
+    assert_eq!(file.get_pixel(5, 5).0, [0, 0, 255, 255], "left as it is");
+}
+
+/// Edit Contents of a linked 16-bit PNG: Ctrl+S says what the file will
+/// lose and, agreed to, writes it; the smart object follows.
+#[test]
+fn linked_16bit_png_saved_back_once_agreed() {
+    let (mut h, path) = linked_tab("deep", "deep.png", |p| {
+        image::ImageBuffer::<Rgba<u16>, _>::from_pixel(20, 20, Rgba([0, 0, 65535, 65535]))
+            .save(p)
+            .unwrap()
+    });
+    h.state_mut().primary = Color32::from_rgb(255, 0, 0);
+    h.state_mut().run(Action::FillPrimary);
+    h.state_mut().run(Action::Save);
+    h.run_steps(2);
+    assert!(h.state().smart.link_save.is_some(), "the loss said first");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert!(!doc(&h).modified, "saved");
+    let file = image::open(&path).unwrap().to_rgba8();
+    assert_eq!(file.get_pixel(5, 5).0, [255, 0, 0, 255]);
+    // Saved again: nothing more to lose, no question.
+    h.state_mut().primary = Color32::from_rgb(0, 255, 0);
+    h.state_mut().run(Action::FillPrimary);
+    h.state_mut().run(Action::Save);
+    h.run_steps(2);
+    assert!(h.state().smart.link_save.is_none());
+    assert!(!doc(&h).modified);
+}
+
+/// Embed Linked on one instance embeds every instance of its contents
+/// (they share them): one step, none left linked.
+#[test]
+fn embed_linked_embeds_every_instance() {
+    let path = folder("embed-all").join("logo.png");
+    RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255]))
+        .save(&path)
+        .unwrap();
+    let mut h = app();
+    h.state_mut().place_path(&path, true);
+    h.key_press(egui::Key::Enter);
+    let applied = |app: &AtelierApp| !app.transform_pending() && !app.transform_busy();
+    settle(&mut h, applied);
+    h.state_mut().run(Action::Duplicate);
+    h.run_steps(1);
+    let steps = doc(&h).history_step();
+    h.state_mut().run(Action::Smart(Command::EmbedLinked));
+    h.run_steps(1);
+    let linked = doc(&h)
+        .layers
+        .iter()
+        .filter_map(|l| l.smart.as_deref())
+        .filter(|s| s.link.is_some())
+        .count();
+    assert_eq!(linked, 0);
+    assert_eq!(doc(&h).history_step(), steps + 1, "one step");
+}
+
+/// OK in a smart filter's dialog puts in what its preview rendered: no
+/// rendering again.
+#[test]
+fn smart_filter_ok_puts_in_its_preview() {
+    let mut h = app();
+    h.state_mut().run(Action::Smart(Command::ConvertForFilters));
+    let original = doc(&h).active_layer().image().clone();
+    h.state_mut().run(Action::Filter(FilterKind::GaussianBlur));
+    settle(&mut h, |app| {
+        matches!(
+            app.preview_shown.as_ref().map(|p| &p.preview),
+            Some(LayerPreview::Filter(_))
+        )
+    });
+    let previewed = h.state().preview_shown.as_ref().unwrap().image.clone();
+    h.key_press(egui::Key::Enter);
+    h.run_steps(1);
+    assert!(!h.state().filters.busy(), "applied");
+    assert!(!h.state().smart.busy(), "not rendered again");
+    assert_eq!(smart(&h).filters.len(), 1);
+    let image = doc(&h).active_layer().image().clone();
+    assert_ne!(image, original);
+    assert_eq!(image, *previewed);
+}
+
+/// A smart object with filters renders on another thread whatever its
+/// size (a filter's cost can't be told), cancellable.
+#[test]
+fn small_smart_objects_with_filters_render_in_the_background() {
+    let mut h = app();
+    h.state_mut().run(Action::Smart(Command::Convert));
+    h.state_mut().start_filter(Filter::Median { radius: 3.0 });
+    assert!(h.state().smart.busy(), "in the background");
+    settle(&mut h, |app| !app.smart.busy());
+    assert_eq!(smart(&h).filters.len(), 1);
+    // Without filters: at once.
+    h.state_mut().run(Action::Smart(Command::ClearFilters));
+    assert!(!h.state().smart.busy());
 }

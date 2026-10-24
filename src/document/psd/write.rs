@@ -9,7 +9,7 @@ use image::{GrayImage, RgbaImage};
 use super::bytes::{Writer, pack_row};
 use super::{adjust, artboard, blend_key, effects};
 use crate::cms::Conversion;
-use crate::document::native::par_map;
+use crate::document::native::{check_layer, par_map};
 use crate::document::{BlendMode, Document, FileError, Layer, LayerKind, PixelRect};
 use crate::guides::Orientation;
 use crate::i18n::t;
@@ -75,6 +75,14 @@ pub(super) fn document(
             }
         })
         .collect();
+    for (c, p) in contents.iter().zip(&pixels) {
+        if let Some(layer) = c {
+            check_layer(layer, p.rect.w, p.rect.h)?;
+            if let Some(m) = &p.mask {
+                check_layer(layer, m.width(), m.height())?;
+            }
+        }
+    }
     let (channels_data, ()) = par_map(&pixels, |p| channels_of(p, cmyk), || ());
     let records: Vec<Record> = contents
         .iter()

@@ -1082,6 +1082,94 @@ fn paste_keeps_the_modifiers_let_go_before_v() {
 }
 
 #[test]
+fn paste_forgets_the_modifiers_of_an_earlier_chord_with_ctrl_held() {
+    let ctrl = Modifiers::COMMAND;
+    let shift_ctrl = ctrl.plus(Modifiers::SHIFT);
+    let all = shift_ctrl.plus(Modifiers::ALT);
+    let key = |key, pressed, modifiers| egui::Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed,
+        repeat: false,
+        modifiers,
+    };
+    // Frames: their time, the modifiers held, then their events.
+    let run = |frames: Vec<(f64, Modifiers, Vec<egui::Event>)>| {
+        let mut chord = PasteChord {
+            idle: true,
+            ..Default::default()
+        };
+        let mut paste = None;
+        for (time, modifiers, events) in frames {
+            let mut input = egui::InputState::default();
+            input.time = time;
+            input.modifiers = modifiers;
+            input.events = events;
+            paste = chord.update(&input).or(paste);
+        }
+        let input = egui::InputState::default();
+        clipboard_action(&input, paste).map(|a| format!("{a:?}"))
+    };
+    let some = |s: &str| Some(s.to_owned());
+    let paste = || egui::Event::Paste(String::new());
+    // Shift+Ctrl+C (a copy event, no key press), Shift let go, Ctrl+V.
+    let frames = vec![
+        (0.0, shift_ctrl, vec![egui::Event::Copy]),
+        (0.1, shift_ctrl, vec![key(Key::C, false, shift_ctrl)]),
+        (0.3, ctrl, vec![]),
+        (0.6, ctrl, vec![paste()]),
+        (0.7, ctrl, vec![key(Key::V, false, ctrl)]),
+    ];
+    assert_eq!(run(frames), some("Paste"));
+    // The same, the clipboard holding an image: no sign of the V press.
+    let frames = vec![
+        (0.0, shift_ctrl, vec![egui::Event::Copy]),
+        (0.3, ctrl, vec![]),
+        (0.7, ctrl, vec![key(Key::V, false, ctrl)]),
+    ];
+    assert_eq!(run(frames), some("Paste"));
+    // Shift+Ctrl+V, then Ctrl+V again.
+    let frames = vec![
+        (0.0, shift_ctrl, vec![paste()]),
+        (0.1, shift_ctrl, vec![key(Key::V, false, shift_ctrl)]),
+        (0.3, ctrl, vec![]),
+        (0.6, ctrl, vec![paste()]),
+        (0.7, ctrl, vec![key(Key::V, false, ctrl)]),
+    ];
+    assert_eq!(run(frames), some("Paste"));
+    // Shift+Ctrl+Z (a key press), then Ctrl+V.
+    let frames = vec![
+        (0.0, shift_ctrl, vec![key(Key::Z, true, shift_ctrl)]),
+        (0.1, shift_ctrl, vec![key(Key::Z, false, shift_ctrl)]),
+        (0.3, ctrl, vec![]),
+        (0.7, ctrl, vec![key(Key::V, false, ctrl)]),
+    ];
+    assert_eq!(run(frames), some("Paste"));
+    // Alt+Shift+Ctrl+E, Alt and Shift let go, then Ctrl+V.
+    let frames = vec![
+        (0.0, all, vec![key(Key::E, true, all)]),
+        (0.1, all, vec![key(Key::E, false, all)]),
+        (0.3, ctrl, vec![]),
+        (0.7, ctrl, vec![key(Key::V, false, ctrl)]),
+    ];
+    assert_eq!(run(frames), some("Paste"));
+    // But Shift let go a moment before V still counts, and Shift held
+    // while V is down too, however long V is held.
+    let frames = vec![
+        (0.0, shift_ctrl, vec![]),
+        (0.05, ctrl, vec![paste()]),
+        (0.6, ctrl, vec![key(Key::V, false, ctrl)]),
+    ];
+    assert_eq!(run(frames), some("PasteInPlace"));
+    let frames = vec![
+        (0.0, shift_ctrl, vec![paste()]),
+        (0.5, ctrl, vec![]),
+        (0.9, ctrl, vec![key(Key::V, false, ctrl)]),
+    ];
+    assert_eq!(run(frames), some("PasteInPlace"));
+}
+
+#[test]
 fn held_toggles_do_not_repeat() {
     let mut h = with_logo();
     for repeat in [false, true, true, true] {
@@ -1278,4 +1366,229 @@ fn alt_click_clips_only_on_the_line_between_two_rows() {
     h.state_mut()
         .click_row(0, right_panel::RowPart::ClipLine(1), Modifiers::ALT);
     assert!(doc(&h).layers[1].clipped, "on the line");
+}
+
+// ------------------------------------------------- Third review
+
+/// Frames, a little time between them (a background preview runs).
+fn frames(h: &mut Harness<'static, AtelierApp>, n: usize) {
+    for _ in 0..n {
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_filter_dialog_keeps_the_keyboard_while_its_preview_computes() {
+    let mut h = with_logo();
+    h.state_mut()
+        .run(Action::Filter(crate::filters::FilterKind::GaussianBlur));
+    frames(&mut h, 20);
+    // Its first field has the keyboard, with no click.
+    assert!(h.ctx.text_edit_focused(), "first field focused");
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.run_steps(1);
+    // Each digit starts a preview: the field keeps the keyboard.
+    for c in ["2", "5"] {
+        h.event(egui::Event::Text(c.into()));
+        frames(&mut h, 4);
+        assert!(h.ctx.text_edit_focused(), "still focused after {c}");
+    }
+    assert!(h.query_all_by_value("25").next().is_some(), "25 typed");
+}
+
+#[test]
+fn dialogs_give_the_keyboard_to_their_first_field() {
+    use crate::filters::FilterKind;
+    for (action, focused) in [
+        (Action::Filter(FilterKind::UnsharpMask), true),
+        (Action::Filter(FilterKind::AddNoise), true),
+        (Action::Adjust(AdjustKind::BrightnessContrast), true),
+        (Action::Adjust(AdjustKind::HueSaturation), true),
+        (Action::FillDialog, true),
+        // Its keys move the points.
+        (Action::Adjust(AdjustKind::Curves), false),
+    ] {
+        let mut h = with_logo();
+        h.state_mut().run(action);
+        frames(&mut h, 45);
+        assert!(h.state().modal_open(), "{action:?} open");
+        assert_eq!(h.ctx.text_edit_focused(), focused, "{action:?}");
+    }
+}
+
+#[test]
+fn enter_while_the_focus_goes_to_the_first_field_is_not_a_buttons() {
+    let mut h = with_logo();
+    h.state_mut()
+        .run(Action::Filter(crate::filters::FilterKind::GaussianBlur));
+    // The focus on its way, over the preview and its zoom buttons.
+    h.run_steps(2);
+    assert!(focus_hunt(&h.ctx).is_some(), "on its way");
+    // Enter then: the focus stops and is let go, so no button takes it
+    // (the dialog's OK does).
+    h.key_press(Key::Enter);
+    h.run_steps(1);
+    assert!(focus_hunt(&h.ctx).is_none(), "stopped");
+    assert!(
+        !h.state().modal_open() || h.ctx.memory(|m| m.focused()).is_none(),
+        "no button focused"
+    );
+}
+
+#[test]
+fn window_menu_shows_a_panel_hidden_with_tab() {
+    let mut h = with_logo();
+    h.key_press(Key::Tab);
+    h.run_steps(3);
+    assert!(h.state().workspace.hide_all);
+    let shown = |h: &Harness<'static, AtelierApp>, id: &str| {
+        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new(id));
+        h.ctx.memory(|m| m.areas().visible_last_frame(&layer))
+    };
+    h.state_mut().run(Action::History);
+    h.run_steps(3);
+    assert!(h.state().history.open && !h.state().workspace.hide_all);
+    assert!(shown(&h, "history"), "History shown");
+    // Hidden again, then Alt+F9: Actions, History still open.
+    h.key_press(Key::Tab);
+    h.run_steps(3);
+    assert!(h.state().workspace.hide_all);
+    h.key_press_modifiers(Modifiers::ALT, Key::F9);
+    h.run_steps(3);
+    assert!(shown(&h, "actions") && shown(&h, "history"));
+    // Shown: Window › History hides it again.
+    h.state_mut().run(Action::History);
+    h.run_steps(3);
+    assert!(!h.state().history.open);
+}
+
+#[test]
+fn ctrl_drag_with_the_selection_tools_and_the_eyedropper_moves() {
+    for tool in [
+        Tool::FreeLasso,
+        Tool::PolyLasso,
+        Tool::Lasso,
+        Tool::MagicWand,
+        Tool::ObjectSelect,
+        Tool::Eyedropper,
+    ] {
+        let mut h = with_logo();
+        h.state_mut().set_tool(tool);
+        h.state_mut().rulers.settings.snap = false;
+        h.run_steps(2);
+        let primary = h.state().primary;
+        let (a, b) = (screen(&h, 120.0, 120.0), screen(&h, 150.0, 130.0));
+        drag(&mut h, a, b, Modifiers::COMMAND);
+        h.run_steps(2);
+        assert_eq!(doc(&h).layers[1].offset, (130, 110), "{tool:?} moved the layer");
+        assert!(h.state().selection.is_none(), "{tool:?}: no selection");
+        assert_eq!(h.state().primary, primary, "{tool:?}: no color picked");
+        assert_eq!(doc(&h).history().0.len(), 2, "{tool:?}: one step");
+    }
+    // With a selection: its pixels, the layer stays.
+    let mut h = with_logo();
+    h.state_mut().set_tool(Tool::FreeLasso);
+    h.state_mut().rulers.settings.snap = false;
+    h.state_mut().selection = Some(Selection {
+        rect: PixelRect {
+            x: 110,
+            y: 110,
+            w: 20,
+            h: 20,
+        },
+        mask: None,
+        inverted: false,
+    });
+    h.run_steps(2);
+    let (a, b) = (screen(&h, 120.0, 120.0), screen(&h, 150.0, 130.0));
+    drag(&mut h, a, b, Modifiers::COMMAND);
+    h.run_steps(2);
+    assert_eq!(doc(&h).layers[1].offset, (100, 100), "layer kept");
+    let moved = h.state().selection.as_ref().map(|s| (s.rect.x, s.rect.y));
+    assert_eq!(moved, Some((140, 120)), "selection moved with its pixels");
+}
+
+#[test]
+fn a_press_that_closes_a_menu_reaches_no_panel() {
+    let mut h = with_logo();
+    let brush = h.get_by_label(&Tool::Brush.name()).rect().center();
+    h.get_by_label("Edit").click();
+    h.run_steps(3);
+    assert!(egui::Popup::is_any_open(&h.ctx));
+    let event = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    let mut swallowed = false;
+    let mut raw = egui::RawInput {
+        events: vec![event(brush, true)],
+        ..Default::default()
+    };
+    swallow_popup_closing_press(&h.ctx, &mut raw, &mut swallowed);
+    assert!(raw.events.is_empty() && swallowed, "press dropped");
+    assert!(!egui::Popup::is_any_open(&h.ctx), "menu closed");
+    raw.events = vec![event(brush, false)];
+    swallow_popup_closing_press(&h.ctx, &mut raw, &mut swallowed);
+    assert!(raw.events.is_empty() && !swallowed, "its release too");
+    // The next press goes through.
+    raw.events = vec![event(brush, true)];
+    swallow_popup_closing_press(&h.ctx, &mut raw, &mut swallowed);
+    assert_eq!(raw.events.len(), 1);
+    // A press in the menu itself, or on another menu title, too.
+    h.run_steps(2);
+    h.get_by_label("Edit").click();
+    h.run_steps(3);
+    let window = h.get_by_label("Window").rect().center();
+    let menu = h
+        .ctx
+        .memory(|m| {
+            m.layer_ids()
+                .filter(|l| l.order == egui::Order::Foreground)
+                .filter(|l| m.areas().visible_last_frame(l))
+                .filter_map(|l| m.area_rect(l.id))
+                // Under the title bar.
+                .find(|r| (30.0..=60.0).contains(&r.top()))
+        })
+        .expect("the Edit menu");
+    for pos in [menu.center(), window] {
+        raw.events = vec![event(pos, true)];
+        swallow_popup_closing_press(&h.ctx, &mut raw, &mut swallowed);
+        assert_eq!(raw.events.len(), 1, "{pos:?} kept");
+        assert!(!swallowed);
+    }
+}
+
+#[test]
+fn a_resized_panel_corner_follows_the_pointer_back() {
+    let mut h = with_logo();
+    h.state_mut().run(Action::History);
+    h.run_steps(4);
+    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("history"));
+    let rect = || h.ctx.memory(|m| m.area_rect(layer.id)).expect("History shown");
+    let before = rect();
+    let corner = before.right_bottom() - vec2(6.0, 6.0);
+    h.hover_at(corner);
+    h.run_steps(1);
+    press(&h, corner, true, Modifiers::NONE);
+    h.run_steps(1);
+    // Far past the minimum size, then back where it started.
+    let far = corner - vec2(600.0, 600.0);
+    for i in 1..=6 {
+        h.hover_at(corner.lerp(far, i as f32 / 6.0));
+        h.run_steps(1);
+    }
+    for i in 1..=6 {
+        h.hover_at(far.lerp(corner, i as f32 / 6.0));
+        h.run_steps(1);
+    }
+    press(&h, corner, false, Modifiers::NONE);
+    h.run_steps(2);
+    let after = h.ctx.memory(|m| m.area_rect(layer.id)).expect("History shown");
+    assert!(
+        (after.size() - before.size()).length() < 1.5,
+        "{before:?} -> {after:?}"
+    );
 }

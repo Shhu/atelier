@@ -195,8 +195,10 @@ struct SelectJob {
     doc: u64,
     then: Then,
     base: Option<Selection>,
-    /// The history position it started from (see `Document::history_step`).
-    step: u64,
+    /// The history generation it started in (see
+    /// `Document::history_generation`): steps recorded meanwhile don't
+    /// matter, an undo or a redo does.
+    generation: u64,
     name: Option<String>,
 }
 
@@ -244,6 +246,9 @@ pub(super) struct SelState {
     pub(super) shape: ShapeOptions,
     pub(super) free_lasso: Option<FreeLasso>,
     job: Option<SelectJob>,
+    /// Selections asked for while `job` runs, each started from the one
+    /// before (a quick second Magic Wand click), applied in order.
+    chained: std::collections::VecDeque<SelectJob>,
     pub(super) modify: Option<ModifyDialog>,
     /// Last amounts of the Modify windows (same order as `ModifyKind::ALL`)
     /// and "Apply effect at canvas bounds".
@@ -267,6 +272,7 @@ impl Default for SelState {
             shape: ShapeOptions::default(),
             free_lasso: None,
             job: None,
+            chained: std::collections::VecDeque::new(),
             modify: None,
             amounts: [10.0, 5.0, 5.0, 5.0, 5.0],
             at_bounds: false,
@@ -485,7 +491,13 @@ impl AtelierApp {
         pixels: u64,
         work: impl FnOnce() -> Option<Selection> + Send + 'static,
     ) {
-        // One at a time, in order: the next one starts from its result.
+        // One at a time, in order: the next one starts from its result,
+        // on a worker when it only combines with it (the interface isn't
+        // held up meanwhile).
+        let work = match self.chain_select_job(then, work) {
+            Some(work) => work,
+            None => return,
+        };
         self.wait_select_job();
         let Some(doc) = &self.doc else { return };
         if pixels <= SYNC_PIXELS {
@@ -514,7 +526,7 @@ impl AtelierApp {
             doc: doc.uid(),
             then,
             base: self.selection.clone(),
-            step: doc.history_step(),
+            generation: doc.history_generation(),
             name: self.sel.step_name.take(),
         });
         self.status = t!("sel-status-working");
@@ -527,7 +539,10 @@ impl AtelierApp {
         match job.result.try_recv() {
             Ok(result) => self.select_job_done(result),
             Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => self.sel.job = None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.sel.job = None;
+                self.sel.chained.clear();
+            }
         }
     }
 
@@ -535,11 +550,69 @@ impl AtelierApp {
     /// next (a command, a click on the canvas) works with it, as if it
     /// had been computed at once.
     pub(super) fn wait_select_job(&mut self) {
-        let Some(job) = &self.sel.job else { return };
-        match job.result.recv() {
-            Ok(result) => self.select_job_done(result),
-            Err(_) => self.sel.job = None,
+        // The ones chained on it too.
+        while let Some(job) = &self.sel.job {
+            match job.result.recv() {
+                Ok(result) => self.select_job_done(result),
+                Err(_) => {
+                    self.sel.job = None;
+                    self.sel.chained.clear();
+                }
+            }
         }
+    }
+
+    /// With a selection being computed, a new one that only combines with
+    /// it (Then::Select) is chained on a worker after it, rather than
+    /// waited for on the interface thread: gives `work` back otherwise.
+    fn chain_select_job<W>(&mut self, then: Then, work: W) -> Option<W>
+    where
+        W: FnOnce() -> Option<Selection> + Send + 'static,
+    {
+        let Then::Select(mode) = then else {
+            return Some(work);
+        };
+        let Some(doc) = &self.doc else {
+            return Some(work);
+        };
+        let (uid, canvas, generation) = (doc.uid(), doc.full_rect(), doc.history_generation());
+        let last = match self.sel.chained.back_mut() {
+            Some(last) => last,
+            None => match &mut self.sel.job {
+                Some(job) => job,
+                None => return Some(work),
+            },
+        };
+        // After a Select and Mask output, there is no selection to start
+        // from: waited for.
+        if last.doc != uid || matches!(last.then, Then::Output(_)) {
+            return Some(work);
+        }
+        // Its result goes on to the interface through this thread, which
+        // then combines the new shape with it.
+        let (forward, earlier) = mpsc::channel();
+        let before = std::mem::replace(&mut last.result, earlier);
+        let (send, result) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let Ok(previous) = before.recv() else { return };
+            let _ = forward.send(previous.clone());
+            ctx.request_repaint();
+            let _job = crate::diag::job("Selection");
+            let _ = send.send(combined(previous.as_ref(), work(), mode, canvas));
+            ctx.request_repaint();
+        });
+        self.sel.chained.push_back(SelectJob {
+            result,
+            doc: uid,
+            then: Then::Select(SelectMode::Replace),
+            // Set once the one before applies (see `select_job_done`).
+            base: None,
+            generation,
+            name: self.sel.step_name.take(),
+        });
+        self.status = t!("sel-status-working");
+        None
     }
 
     /// The selection computed in the background is ready: it applies to
@@ -548,14 +621,18 @@ impl AtelierApp {
         let Some(job) = self.sel.job.take() else {
             return;
         };
+        // The ones chained on it start from its result: dropped with it
+        // when it is (as this returns early), next otherwise.
+        let chained = std::mem::take(&mut self.sel.chained);
         self.status.clear();
         let Some(doc) = self.doc.as_ref().filter(|d| d.uid() == job.doc) else {
             return;
         };
-        // Undone, redone or changed meanwhile: it was computed from
-        // another state, and recording it would wipe the redo list.
-        if doc.history_step() != job.step {
-            self.status = t!("hist4-selection-history-changed");
+        // Undone or redone meanwhile: it was computed from another state,
+        // and recording it would wipe the redo list. Steps recorded forward
+        // (a Layers panel change) don't matter.
+        if doc.history_generation() != job.generation {
+            self.status = t!("hist5-selection-undone");
             return;
         }
         let unchanged = match (&job.base, &self.selection) {
@@ -571,6 +648,19 @@ impl AtelierApp {
         let next = std::mem::replace(&mut self.sel.step_name, job.name);
         self.finish_select(result, job.then);
         self.sel.step_name = next;
+        self.resume_chained(chained);
+    }
+
+    /// After a selection computed in the background applied, the next one
+    /// chained on it waits in its place, from what it left.
+    fn resume_chained(&mut self, mut chained: std::collections::VecDeque<SelectJob>) {
+        let Some(mut next) = chained.pop_front() else {
+            return;
+        };
+        next.base = self.selection.clone();
+        self.sel.job = Some(next);
+        self.sel.chained = chained;
+        self.status = t!("sel-status-working");
     }
 
     /// A selection computed in the background is still to come.

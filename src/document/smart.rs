@@ -45,6 +45,14 @@ impl Contents {
     fn bounds(&self) -> Bounds {
         [0.0, 0.0, self.canvas.0 as f64, self.canvas.1 as f64]
     }
+
+    /// The same contents (instances share them; a copy shows the same).
+    pub fn same_as(&self, other: &Contents) -> bool {
+        Arc::ptr_eq(&self.flat, &other.flat)
+            || (self.canvas == other.canvas
+                && self.layers.len() == other.layers.len()
+                && *self.flat == *other.flat)
+    }
 }
 
 /// Place Linked: the file a smart object shows. Its contents are the last
@@ -65,6 +73,11 @@ impl Link {
             modified: modified_time(path),
             missing: false,
         }
+    }
+
+    /// Its file is missing (found so, or not there now).
+    pub fn gone(&self) -> bool {
+        self.missing || !self.path.exists()
     }
 }
 
@@ -354,9 +367,14 @@ pub struct SmartRender {
 }
 
 impl SmartRender {
-    /// The pixels (a preview's).
-    pub fn into_image(self) -> RgbaImage {
-        self.image
+    /// The pixels taken out (a preview's, shown), the rest kept to be put
+    /// in later with [`Self::with_image`] (the preview applied).
+    pub fn take_image(mut self) -> (RgbaImage, Self) {
+        (std::mem::take(&mut self.image), self)
+    }
+
+    pub fn with_image(self, image: RgbaImage) -> Self {
+        Self { image, ..self }
     }
 }
 
@@ -366,6 +384,11 @@ impl RenderJob {
     pub fn size(&self) -> u64 {
         let (w, h) = self.flat.dimensions();
         w as u64 * h as u64 * (1 + self.filters.len() as u64)
+    }
+
+    /// It runs smart filters (whose cost its size can't tell).
+    pub fn has_filters(&self) -> bool {
+        !self.filters.is_empty()
     }
 
     /// The filter mask moved as `image` at `origin` (canvas), with the
@@ -827,8 +850,10 @@ impl LinkRead {
 pub struct LinkReport {
     /// Names of the layers whose file changed, shown again.
     pub updated: Vec<String>,
-    /// Names of the layers whose file is missing.
+    /// Names of the layers whose file went missing.
     pub missing: Vec<String>,
+    /// Names of the layers whose file was already missing (said once).
+    pub still_missing: Vec<String>,
     /// Names of the layers whose file exists but could not be read.
     pub unreadable: Vec<String>,
 }
@@ -980,7 +1005,7 @@ impl Document {
             id: self.next_id,
             ..self.active_layer().clone()
         };
-        copy.name = t!("doc-layer-copy-name", name = copy.name.as_str());
+        copy.name = self.copy_name(&copy.name);
         if let Some(s) = copy.smart.as_deref_mut() {
             s.contents.id = next_rev();
         }
@@ -1044,7 +1069,9 @@ impl Document {
         };
         let id = old.contents.id;
         let opened = Self::open(path)?;
-        let contents = opened.doc.to_contents(id, file_name(path));
+        // New contents, a new id (shared by the instances): an Edit
+        // Contents tab of the old ones no longer saves over them.
+        let contents = opened.doc.to_contents(next_rev(), file_name(path));
         let (ow, oh) = old.contents.size();
         let (nw, nh) = contents.size();
         let d = [(ow as f64 - nw as f64) / 2.0, (oh as f64 - nh as f64) / 2.0];
@@ -1068,17 +1095,31 @@ impl Document {
     }
 
     /// The contents `id` edited (Edit Contents, saved): every instance of
-    /// it shows them, embedded if it was linked, as one undo step. Returns
-    /// whether one was found.
+    /// it shows them, embedded if its link was missing, as one undo step.
+    /// An instance whose linked file is there follows its file: left as it
+    /// is, under an id of its own. Returns whether one was updated.
     pub fn update_contents(&mut self, id: u64, mut contents: Contents) -> bool {
         let found = |l: &Layer| l.smart.as_ref().is_some_and(|s| s.contents.id == id);
-        if !self.layers.iter().any(found) {
+        let follows_file = |l: &Layer| {
+            l.smart
+                .as_ref()
+                .and_then(|s| s.link.as_ref())
+                .is_some_and(|k| !k.gone())
+        };
+        if !self.layers.iter().any(|l| found(l) && !follows_file(l)) {
             return false;
         }
         self.checkpoint(t!("smart-hist-update"));
         contents.id = id;
         let limit = self.shape_limit();
+        let apart = next_rev();
         for layer in self.layers.iter_mut().filter(|l| found(l)) {
+            if follows_file(layer) {
+                if let Some(s) = layer.smart.as_deref_mut() {
+                    s.contents.id = apart;
+                }
+                continue;
+            }
             if let Some(s) = layer.smart.as_deref_mut() {
                 contents.name = s.contents.name.clone();
                 s.contents = contents.clone();
@@ -1086,6 +1127,43 @@ impl Document {
                 s.link = None;
             }
             layer.render_smart(limit);
+        }
+        true
+    }
+
+    /// Embed Linked: smart object `i` and the other instances of its
+    /// contents linked to the same file hold them from now on (the
+    /// instances share one contents id, so they are embedded together), as
+    /// one undo step. Returns whether it was linked.
+    pub fn embed_linked(&mut self, i: usize, name: String) -> bool {
+        let Some((id, path)) = self
+            .layers
+            .get(i)
+            .and_then(|l| l.smart.as_deref())
+            .and_then(|s| Some((s.contents.id, s.link.as_ref()?.path.clone())))
+        else {
+            return false;
+        };
+        let same = |l: &Layer| {
+            l.smart.as_deref().is_some_and(|s| {
+                s.contents.id == id && s.link.as_ref().is_some_and(|k| k.path == path)
+            })
+        };
+        // An instance linked elsewhere (an older document) keeps its link,
+        // under an id of its own.
+        let apart = next_rev();
+        self.checkpoint(name);
+        for layer in &mut self.layers {
+            let embed = same(layer);
+            if let Some(s) = layer.smart.as_deref_mut()
+                && s.contents.id == id
+            {
+                if embed {
+                    s.link = None;
+                } else if s.link.is_some() {
+                    s.contents.id = apart;
+                }
+            }
         }
         true
     }
@@ -1161,8 +1239,12 @@ impl Document {
                             .and_then(|s| s.link.as_mut())
                             .filter(|l| l.path == f.path);
                         if let Some(link) = link {
+                            if link.missing {
+                                report.still_missing.push(name);
+                            } else {
+                                report.missing.push(name);
+                            }
                             link.missing = true;
-                            report.missing.push(name);
                         }
                     }
                     continue;
@@ -1932,5 +2014,142 @@ mod tests {
         for (a, b) in fitted.0.iter().flatten().zip(bent.0.iter().flatten()) {
             assert!((a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9);
         }
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("atelier-smart5-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A linked logo.png (blue) placed, and an instance of it moved aside.
+    fn two_instances(dir: &Path) -> (Document, PathBuf) {
+        let path = dir.join("logo.png");
+        RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255])).save(&path).unwrap();
+        let mut doc = Document::new(RgbaImage::from_pixel(100, 100, Rgba([255; 4])), None);
+        doc.place_file(&path, true).unwrap();
+        doc.duplicate_active();
+        let i = doc.active;
+        doc.edit_smart(i, "move".into(), |s| s.map = shift_map(s.map, [40.0, 0.0]));
+        (doc, path)
+    }
+
+    fn pixels(doc: &Document) -> Vec<([u8; 4], [u8; 4], bool)> {
+        doc.layers
+            .iter()
+            .filter_map(|l| {
+                let s = l.smart.as_deref()?;
+                let r = l.rect();
+                Some((l.pixel_at(r.x + 5, r.y + 5)?, s.contents.flat.get_pixel(5, 5).0, s.link.is_some()))
+            })
+            .collect()
+    }
+
+    /// Embed Linked on one instance embeds the instances of its contents
+    /// together: the file changing afterwards changes none of them.
+    #[test]
+    fn embed_linked_embeds_the_instances_together() {
+        let dir = temp("embed-together");
+        let (mut doc, path) = two_instances(&dir);
+        let i = doc.active;
+        let depth = doc.history().1;
+        assert!(doc.embed_linked(i, "embed".into()));
+        assert_eq!(doc.history().1, depth + 1, "one step");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        RgbaImage::from_pixel(20, 20, Rgba([0, 255, 0, 255])).save(&path).unwrap();
+        assert_eq!(doc.update_links(), LinkReport::default());
+        let blue = [0, 0, 255, 255];
+        assert_eq!(pixels(&doc), vec![(blue, blue, false); 2]);
+        assert!(!doc.embed_linked(i, "again".into()), "no longer linked");
+    }
+
+    /// Smart objects that differ under one contents id (an older version's
+    /// Embed Linked of one instance, its link then updated): each saved
+    /// with its own contents.
+    #[test]
+    fn diverged_instances_each_saved_with_their_contents() {
+        let dir = temp("diverged");
+        let (mut doc, path) = two_instances(&dir);
+        let i = doc.active;
+        doc.edit_smart(i, "embed".into(), |s| s.link = None);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        RgbaImage::from_pixel(20, 20, Rgba([0, 255, 0, 255])).save(&path).unwrap();
+        for l in &mut doc.layers {
+            if let Some(link) = l.smart.as_deref_mut().and_then(|s| s.link.as_mut()) {
+                link.modified = None;
+            }
+        }
+        assert_eq!(doc.update_links().updated.len(), 1);
+        let before = pixels(&doc);
+        let (blue, green) = ([0, 0, 255, 255], [0, 255, 0, 255]);
+        assert_eq!(before, vec![(green, green, true), (blue, blue, false)]);
+        let saved = dir.join("doc.atelier");
+        doc.save(&saved).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let back = Document::open(&saved).unwrap().doc;
+        assert_eq!(pixels(&back), before);
+        let ids: Vec<u64> = back.layers.iter().filter_map(|l| Some(l.smart.as_deref()?.contents.id)).collect();
+        assert_ne!(ids[0], ids[1], "apart from now on");
+    }
+
+    /// Edit Contents saved for contents whose instances are linked to a
+    /// file that is there and embedded: the embedded one updated, the
+    /// linked one left following its file (still linked, its contents and
+    /// rendering unchanged, under an id of its own).
+    #[test]
+    fn update_contents_leaves_a_present_link_alone() {
+        let dir = temp("update-present");
+        let (mut doc, _path) = two_instances(&dir);
+        let i = doc.active;
+        doc.edit_smart(i, "embed".into(), |s| s.link = None);
+        let id = doc.active_layer().smart.as_deref().unwrap().contents.id;
+        let red = Document::new(RgbaImage::from_pixel(20, 20, Rgba([255, 0, 0, 255])), None);
+        assert!(doc.update_contents(id, red.to_contents(id, "x".into())));
+        let (blue, red) = ([0, 0, 255, 255], [255, 0, 0, 255]);
+        assert_eq!(pixels(&doc), vec![(blue, blue, true), (red, red, false)]);
+        let ids: Vec<u64> = doc.layers.iter().filter_map(|l| Some(l.smart.as_deref()?.contents.id)).collect();
+        assert_ne!(ids[0], id);
+        assert_eq!(ids[1], id);
+        // Its file gone: updated, and embedded.
+        let (mut doc, path) = two_instances(&temp("update-missing"));
+        std::fs::remove_file(&path).unwrap();
+        let id = doc.active_layer().smart.as_deref().unwrap().contents.id;
+        let red_doc = Document::new(RgbaImage::from_pixel(20, 20, Rgba(red)), None);
+        assert!(doc.update_contents(id, red_doc.to_contents(id, "x".into())));
+        assert_eq!(pixels(&doc), vec![(red, red, false); 2]);
+    }
+
+    /// Replace Contents gives the instances new contents under a new id
+    /// (shared): an Edit Contents tab of the old ones finds nothing to
+    /// save over.
+    #[test]
+    fn replace_contents_takes_a_new_id() {
+        let dir = temp("replace-id");
+        let mut doc = Document::new(RgbaImage::from_pixel(100, 100, Rgba([255; 4])), None);
+        doc.add_layer("a".into(), RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255])), (0, 0));
+        assert!(doc.convert_to_smart(&[doc.active]));
+        doc.duplicate_active();
+        let old = doc.active_layer().smart.as_deref().unwrap().contents.id;
+        let other = dir.join("other.png");
+        RgbaImage::from_pixel(20, 20, Rgba([0, 255, 0, 255])).save(&other).unwrap();
+        doc.replace_contents(&other).unwrap();
+        let ids: Vec<u64> = doc.layers.iter().filter_map(|l| Some(l.smart.as_deref()?.contents.id)).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids[0] == ids[1] && ids[0] != old);
+        let stale = Document::new(RgbaImage::from_pixel(20, 20, Rgba([255, 0, 0, 255])), None);
+        assert!(!doc.update_contents(old, stale.to_contents(old, "x".into())));
+    }
+
+    /// A missing link is reported once; looked at again, it is still
+    /// missing, not reported as newly missing.
+    #[test]
+    fn a_missing_link_is_reported_once() {
+        let (mut doc, path) = two_instances(&temp("missing-once"));
+        std::fs::remove_file(&path).unwrap();
+        let first = doc.update_links();
+        assert_eq!((first.missing.len(), first.still_missing.len()), (2, 0));
+        let again = doc.update_links();
+        assert_eq!((again.missing.len(), again.still_missing.len()), (0, 2));
     }
 }

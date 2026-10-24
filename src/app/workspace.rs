@@ -139,6 +139,17 @@ pub(super) enum Command {
     About,
 }
 
+/// Window › History, Channels…: shows or hides a floating panel. With the
+/// panels hidden (Tab), it shows them all again, that one open.
+pub(super) fn toggle_panel(workspace: &mut Workspace, open: &mut bool) {
+    if workspace.hide_all {
+        workspace.hide_all = false;
+        *open = true;
+    } else {
+        *open = !*open;
+    }
+}
+
 impl AtelierApp {
     pub(super) fn workspace_command(&mut self, command: Command) {
         match command {
@@ -149,7 +160,7 @@ impl AtelierApp {
                 self.open_path(&path);
                 // Gone: off both lists (a RAW file opens later, through
                 // Camera Raw).
-                if !path.exists() {
+                if crate::recent::gone(&path) {
                     self.recent.forget(&path);
                 }
             }
@@ -213,6 +224,22 @@ impl AtelierApp {
         } else {
             None
         }
+    }
+
+    /// The hidden group that hides the active layer, its own eye being on.
+    pub(super) fn hidden_group(&self) -> Option<String> {
+        let doc = self.doc.as_ref()?;
+        if !doc.active_layer().visible {
+            return None;
+        }
+        let mut at = doc.parent(doc.active);
+        while let Some(j) = at {
+            if !doc.layers[j].visible {
+                return Some(doc.layers[j].name.clone());
+            }
+            at = doc.parent(j);
+        }
+        None
     }
 
     /// A painting tool over a locked layer.
@@ -461,7 +488,7 @@ impl AtelierApp {
             DialogSpec {
                 modal: false,
                 footer: false,
-                width: 460.0,
+                width: 520.0,
                 resize: Some(420.0),
                 ..DialogSpec::new(
                     "shortcuts",
@@ -480,6 +507,7 @@ impl AtelierApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
+                        let tools = t!("palette-tools");
                         let mut group = None;
                         for (section, label, key) in &rows {
                             let haystack =
@@ -491,12 +519,25 @@ impl AtelierApp {
                                 group = Some(section);
                                 ui.add_space(6.0);
                                 ui_kit::section(ui, section);
+                                // Said once, not on every row of a group.
+                                if *section == tools {
+                                    ui_kit::hint(ui, t!("ui5-shortcuts-cycle-note"));
+                                }
                             }
                             ui.horizontal(|ui| {
-                                ui.label(label);
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| ui_kit::kbd(ui, key),
+                                    |ui| {
+                                        ui_kit::kbd(ui, key);
+                                        // A long list of tools ends with "…",
+                                        // whole on hover.
+                                        ui.with_layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.add(egui::Label::new(label.as_str()).truncate())
+                                            },
+                                        );
+                                    },
                                 );
                             });
                         }
@@ -698,17 +739,20 @@ mod tests {
         }
     }
 
-    /// The Move tool's bar during Free Transform keeps Auto-Select (greyed)
-    /// and never splits Apply from Cancel, whatever the width.
+    /// The Move tool's bar during Free Transform shows the transform's
+    /// options instead of Auto-Select, and never splits Apply from Cancel,
+    /// whatever the width.
     #[test]
     fn the_move_bar_keeps_its_items_and_apply_next_to_cancel() {
         for width in [1600.0, 1366.0, 1024.0, 820.0] {
             let mut h = app([width, 768.0], true);
             h.state_mut().set_tool(Tool::Transform);
+            h.run_steps(2);
+            assert!(h.query_by_label(&t!("input3-auto-select")).is_some());
             h.state_mut()
                 .run(Action::Transform(transform::Command::Free));
             h.run_steps(3);
-            assert!(h.query_by_label(&t!("input3-auto-select")).is_some());
+            assert!(h.query_by_label(&t!("input3-auto-select")).is_none());
             let in_bar = |h: &Harness<'static, AtelierApp>, label: &str| {
                 h.get_all_by_label(label)
                     .map(|n| n.rect())
@@ -847,10 +891,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// An image dropped on the tab bar opens in a tab of its own; dropped
-    /// on the canvas, it is placed in the document.
+    /// An image dropped on an open document is placed, on the tab bar as
+    /// on the canvas: where an OS drag ends is known on no platform.
     #[test]
-    fn a_drop_on_the_tabs_opens_and_on_the_canvas_places() {
+    fn a_drop_on_the_tabs_or_on_the_canvas_places() {
         let dir = std::env::temp_dir().join(format!("atelier-ui4-drop-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dropped.png");
@@ -882,13 +926,13 @@ mod tests {
             }
         };
         // The tab strip, under the title and options bars.
-        drop(&mut h, pos2(400.0, 40.0 + 46.0 + 17.0));
-        assert_eq!(h.state().tab_count(), 2);
+        let tabs = h.state().tab_count();
         let layers = h.state().doc.as_ref().map_or(0, |d| d.layers.len());
+        drop(&mut h, pos2(400.0, 40.0 + 46.0 + 17.0));
         drop(&mut h, pos2(500.0, 400.0));
-        assert_eq!(h.state().tab_count(), 2);
+        assert_eq!(h.state().tab_count(), tabs);
         let after = h.state().doc.as_ref().map_or(0, |d| d.layers.len());
-        assert_eq!(after, layers + 1);
+        assert_eq!(after, layers + 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

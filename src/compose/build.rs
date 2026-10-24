@@ -541,11 +541,19 @@ pub fn signatures(layers: &[Layer], opts: &Options) -> Vec<Sig> {
             (Some(p), _, Some(_)) => (p.version, hash_of(p.rect)),
             (_, Some(p), _) if p.layer == l.id => (p.version, hash_of(p.origin)),
             (_, _, Some(m)) => {
-                // The feathered image shown (see `Mask::shaped_later`).
-                let shown = opts.later_styles.then(|| m.shaped_later(l.offset).2);
+                // The feather radius of the image shown (see
+                // `Mask::shaped_later`: the former one while a new one is
+                // made), and whether it is of these pixels. Not their
+                // revision: a stroke changes only what it painted (`rev`).
+                let feather = if opts.later_styles {
+                    let (_, _, (rev, bits)) = m.shaped_later(l.offset);
+                    (bits, rev == m.rev())
+                } else {
+                    (m.feather.to_bits(), true)
+                };
                 (
                     m.rev(),
-                    debug_hash(&(m.origin(l.offset), m.default, m.density, m.feather, shown)),
+                    debug_hash(&(m.origin(l.offset), m.default, m.density, feather)),
                 )
             }
             _ => (0, 0),

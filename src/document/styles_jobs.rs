@@ -79,6 +79,7 @@ impl Layer {
                 effects: job.key.effects.clone(),
                 styles: Arc::clone(&styles),
                 offset: job.offset.into(),
+                moved: Default::default(),
             });
             if job.key == key {
                 return Some(styles);
@@ -134,6 +135,23 @@ impl Layer {
             && c.rev == self.rev
         {
             c.offset.set(self.offset);
+            c.moved.set((0.0, 0.0));
+        }
+    }
+
+    /// Its shape was just moved by `d` (and drawn again): the styles drawn
+    /// for its former pixels move with it, to the nearest pixel, until
+    /// drawn for the new ones (a drag holds them).
+    pub(super) fn carry_styles(&self, d: crate::vector::Pt) {
+        if let Some(c) = self.styles_cache.borrow().as_ref()
+            && c.rev != self.rev
+        {
+            let (mx, my) = c.moved.get();
+            let (tx, ty) = (mx + d.x, my + d.y);
+            let (rx, ry) = (tx.round(), ty.round());
+            let at = c.offset.get();
+            c.offset.set((at.0 + rx as i64, at.1 + ry as i64));
+            c.moved.set((tx - rx, ty - ry));
         }
     }
 
@@ -153,6 +171,7 @@ impl Layer {
     pub(super) fn placed_styles(&self, c: &StylesCache) -> Arc<Styles> {
         if c.rev == self.rev {
             c.offset.set(self.offset);
+            c.moved.set((0.0, 0.0));
             return Arc::clone(&c.styles);
         }
         let at = c.offset.get();

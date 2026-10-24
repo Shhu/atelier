@@ -389,6 +389,18 @@ impl AtelierApp {
     /// Closes Select and Mask: OK (`apply`) refines the selection at full
     /// size and outputs it.
     pub(super) fn close_select_mask(&mut self, apply: bool) {
+        // A locked layer's mask is neither changed nor added: the window
+        // stays open for another output.
+        if apply
+            && self
+                .sel
+                .select_mask
+                .as_ref()
+                .is_some_and(|sm| sm.output == Output::LayerMask)
+            && self.refuse_if_locked()
+        {
+            return;
+        }
         let (Some(sm), Some(doc)) = (self.sel.select_mask.take(), self.doc.as_ref()) else {
             return;
         };
@@ -402,10 +414,24 @@ impl AtelierApp {
             self.status = t!("sel4-mask-target-changed");
             return;
         }
-        let (source, r) = (sm.source, sm.refine);
+        let (mut source, r) = (sm.source, sm.refine);
         // Its own mask, untouched: nothing to do.
         if sm.own_mask && sm.output == Output::LayerMask && r == Refine::default() {
             return;
+        }
+        // Into the mask itself (or its copy, for a new layer with mask),
+        // its stored values are refined; otherwise what it shows, its
+        // density and feather included, as when its thumbnail is
+        // Ctrl+clicked.
+        if sm.own_mask
+            && matches!(sm.output, Output::Selection | Output::NewLayer)
+            && doc
+                .active_layer()
+                .mask
+                .as_ref()
+                .is_some_and(|m| m.density < 1.0 || m.feather > 0.0)
+        {
+            source = doc.mask_selection(doc.active);
         }
         let to = OutputTo {
             output: sm.output,
@@ -431,6 +457,9 @@ impl AtelierApp {
         let output = to.output;
         if output == Output::Selection {
             self.apply_selection(refined, SelectMode::Replace);
+            return;
+        }
+        if output == Output::LayerMask && self.refuse_if_locked() {
             return;
         }
         let Some(doc) = &mut self.doc else { return };
@@ -475,7 +504,15 @@ impl AtelierApp {
             Output::NewLayerWithMask => {
                 doc.duplicate_active();
                 let layer = doc.active_layer_mut();
-                layer.mask = Some(mask_of(&sel, canvas, layer.offset));
+                let offset = layer.offset;
+                match layer.mask.as_mut() {
+                    // The copy of its own mask is refined in place, its
+                    // settings kept, as with Output To Layer Mask.
+                    Some(mask) if to.own_mask => {
+                        mask.put_over(&sel.to_mask(canvas), canvas, offset);
+                    }
+                    _ => layer.mask = Some(mask_of(&sel, canvas, offset)),
+                }
                 doc.layers[source].visible = false;
             }
             Output::Selection => {}

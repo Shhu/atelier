@@ -4,6 +4,18 @@ use super::keys;
 use super::*;
 use crate::i18n::t;
 
+/// A crop box drawn this many screen pixels on its narrow side, at least:
+/// a slip of the hand while clicking draws none.
+const CROP_SLIP: f32 = 8.0;
+
+/// What was going to happen when "Crop the image?" was asked.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CropThen {
+    Tool(Tool),
+    Tab(usize),
+    Run(Action),
+}
+
 impl AtelierApp {
     /// Preview of the open dialog (transparent color, image adjustment) on
     /// the active layer (inside the selection), without touching the
@@ -178,11 +190,15 @@ impl AtelierApp {
         }
 
         // Alt + click (brush, bucket, eyedropper): pick a color, like Photoshop.
-        // A selection still being computed applies before anything else.
-        if start {
+        // A selection still being computed applies before anything else;
+        // a Magic Wand click is chained after it instead (see
+        // `select_later`), without holding up the interface.
+        let ctrl = ctx.input(|i| i.modifiers.command);
+        if start && (self.tool != Tool::MagicWand || ctrl) {
             self.wait_select_job();
         }
-        let picks = self.tool == Tool::Eyedropper
+        // (Ctrl with the Eyedropper: the Move tool for a moment, below.)
+        let picks = (self.tool == Tool::Eyedropper && !self.snap_off)
             || (alt && matches!(self.tool, Tool::Brush | Tool::Bucket));
         if start
             && picks
@@ -221,10 +237,12 @@ impl AtelierApp {
         let drag_end = released && response.drag_stopped_by(PointerButton::Primary);
         let tool_pointer = pointer.filter(|_| hovered || down || drag_end);
         let mut cursor = None;
-        // Ctrl with a painting tool, or with a marquee and no selection:
-        // the Move tool for a moment, like Photoshop (with a selection, its
-        // pixels; else the selected layers, or with Auto-Select the one
-        // under the pointer). The tool sees neither the press nor the drag.
+        // Ctrl with a painting tool, a lasso, the Magic Wand, Object
+        // Selection or the Eyedropper, or with a marquee and no selection
+        // (with one, the marquee moves its pixels itself): the Move tool for
+        // a moment, like Photoshop (with a selection, its pixels; else the
+        // selected layers, or with Auto-Select the one under the pointer).
+        // The tool sees neither the press nor the drag.
         let paints = matches!(
             self.tool,
             Tool::Brush
@@ -243,13 +261,25 @@ impl AtelierApp {
                 | Tool::Gradient
                 | Tool::Bucket
         );
+        // Not while a lasso is being drawn.
+        let selects = matches!(
+            self.tool,
+            Tool::FreeLasso
+                | Tool::PolyLasso
+                | Tool::Lasso
+                | Tool::MagicWand
+                | Tool::ObjectSelect
+                | Tool::Eyedropper
+        ) && self.lasso.is_none()
+            && self.sel.free_lasso.is_none();
+        let paints_or_selects = paints || selects;
         let marquee = matches!(self.tool, Tool::Select | Tool::Ellipse)
             && self.selection.is_none()
             && self.marquee.is_none();
         let ctrl = self.snap_off;
-        let temp_move = (paints || marquee)
+        let temp_move = (paints_or_selects || marquee)
             && (self.layer_drag.is_some()
-                || (paints && self.select_move.is_some())
+                || (paints_or_selects && self.select_move.is_some())
                 || (start && ctrl));
         if temp_move {
             // Its Ctrl is the Move tool's, not "no snapping".
@@ -258,7 +288,7 @@ impl AtelierApp {
             start = false;
         }
         // Said before the press.
-        let temp_move_hover = !temp_move && (paints || marquee) && ctrl && !down;
+        let temp_move_hover = !temp_move && (paints_or_selects || marquee) && ctrl && !down;
         let down = down && !temp_move;
         // Quick Mask Mode: the Move tool would move the layer under the
         // mask; refused.
@@ -892,6 +922,16 @@ impl AtelierApp {
             if hover == Some(Handle::Move) && !drawn {
                 hover = None;
             }
+            // A double click inside the box applies it, like Enter.
+            let double = self
+                .ctx
+                .input(|i| i.pointer.button_double_clicked(PointerButton::Primary));
+            if double && drawn && hover == Some(Handle::Move) {
+                self.drag = None;
+                self.record_crop();
+                self.apply_canvas();
+                return Some(CursorIcon::Default);
+            }
             if self.crop_draw.is_some() || (hover.is_none() && self.drag.is_none()) {
                 return Some(self.crop_box_input(view, pointer, start, down, shift));
             }
@@ -922,6 +962,18 @@ impl AtelierApp {
         }
         if !is_canvas && !auto_select && !locked && !on_rotate_handle && hover.is_none() {
             hover = Some(Handle::Move);
+        }
+        // A locked or hidden layer doesn't move: said at the press, like
+        // the arrows.
+        let hidden = !is_canvas
+            && !pending
+            && self.doc.as_ref().is_some_and(|d| !d.shown(d.active))
+            && self.selected_indices().len() < 2;
+        if (locked || hidden) && picked.is_none() && self.drag.is_none() && pointer.is_some() {
+            if start && !self.refuse_if_locked() {
+                self.refuse_hidden_layer();
+            }
+            return Some(CursorIcon::NotAllowed);
         }
 
         if start && let Some(p) = pointer {
@@ -1071,16 +1123,31 @@ impl AtelierApp {
     ) -> CursorIcon {
         if start && let Some(p) = pointer {
             self.crop_draw = Some(view.to_image(p));
+            // The corner drawn snaps to the canvas edges, guides, layers.
+            self.snap_targets = self
+                .doc
+                .as_ref()
+                .map(|d| snap_targets(d, &[], &self.rulers.settings));
         }
         if let (Some(from), Some(p), true) = (self.crop_draw, pointer, down) {
             let mut d = view.to_image(p) - from;
             if shift {
                 let side = d.x.abs().max(d.y.abs());
                 d = vec2(side.copysign(d.x), side.copysign(d.y));
+            } else {
+                let corner = from + d;
+                d += self.snap_offset(Rect::from_min_max(corner, corner), Vec2::splat(1.0));
             }
+            // Alt: from the center, like Photoshop.
+            let alt = self.ctx.input(|i| i.modifiers.alt);
+            let r = if alt {
+                Rect::from_two_pos(from - d, from + d)
+            } else {
+                Rect::from_two_pos(from, from + d)
+            };
+            let r = round_rect(r);
             // A click, or a slip of the hand, draws nothing.
-            let r = round_rect(Rect::from_two_pos(from, from + d));
-            if d.x.abs().min(d.y.abs()) * view.zoom >= 3.0
+            if d.x.abs().min(d.y.abs()) * view.zoom >= CROP_SLIP
                 && r.width() >= 1.0
                 && r.height() >= 1.0
                 && fits_max_dimension(r.size(), 0.0)
@@ -1090,8 +1157,81 @@ impl AtelierApp {
         }
         if !down {
             self.crop_draw = None;
+            self.snap_targets = None;
         }
         CursorIcon::Crosshair
+    }
+
+    /// A crop box drawn with the Crop tool, not applied yet.
+    pub(super) fn crop_box_pending(&self) -> bool {
+        self.tool == Tool::Canvas
+            && self.doc.is_some()
+            && self.canvas_rect.is_some_and(|r| Some(r) != self.full_rect())
+    }
+
+    /// Before `then` (another tool, tab, a save…) with a crop box drawn:
+    /// "Crop the image?" is asked, like Photoshop, and `then` waits for
+    /// the answer. Returns whether it asks.
+    pub(super) fn crop_asks(&mut self, then: CropThen) -> bool {
+        if !self.crop_box_pending() {
+            return false;
+        }
+        self.crop_confirm = Some(then);
+        true
+    }
+
+    /// "Crop the image?": Crop, Don't Crop (the box goes), or Cancel (it
+    /// stays, and so does the tool).
+    pub(super) fn crop_confirm_window(&mut self, ctx: &egui::Context) {
+        if self.crop_confirm.is_none() {
+            return;
+        }
+        if !self.crop_box_pending() {
+            self.crop_confirm = None;
+            return;
+        }
+        let center = ctx.content_rect().center();
+        let out = super::dialogs::floating_dialog(
+            ctx,
+            super::dialogs::DialogSpec {
+                pivot: egui::Align2::CENTER_CENTER,
+                width: 360.0,
+                ok: t!("tools5-crop-confirm-crop"),
+                other: Some(t!("tools5-crop-confirm-dont")),
+                first_field: false,
+                ..super::dialogs::DialogSpec::new(
+                    "crop_confirm",
+                    t!("tools5-crop-confirm-title"),
+                    center,
+                )
+            },
+            |ui| {
+                ui.label(t!("tools5-crop-confirm-text"));
+            },
+        );
+        if out.ok || out.other {
+            self.crop_answered(out.ok);
+        } else if out.cancel {
+            self.crop_confirm = None;
+        }
+    }
+
+    /// "Crop the image?" answered Crop (`crop`) or Don't Crop: what was
+    /// asked for goes on.
+    pub(super) fn crop_answered(&mut self, crop: bool) {
+        let Some(then) = self.crop_confirm.take() else {
+            return;
+        };
+        if crop {
+            self.record_crop();
+            self.apply_canvas();
+        }
+        self.reset_pending();
+        match then {
+            CropThen::Tool(tool) => self.set_tool(tool),
+            CropThen::Tab(i) => self.switch_tab(i),
+            CropThen::Run(action) => self.run(action),
+        }
     }
 
     /// Whether the Move tool shows the frame and handles of what it moves:
@@ -1236,6 +1376,7 @@ impl AtelierApp {
             start_bounds: start_bounds.unwrap_or(Rect::NOTHING),
             moved: false,
             copy: false,
+            selected_before: None,
         });
         self.snap_targets = Some(snap_targets(doc, &moved, &self.rulers.settings));
     }
@@ -1245,12 +1386,14 @@ impl AtelierApp {
     /// instead, selected.
     fn copy_dragged(&mut self, drag: LayerDrag) -> LayerDrag {
         let (target, start) = (drag.layers[0].0, drag.start);
+        let before = self.layer_set.clone();
         let Some(target) = self.duplicate_selected(target) else {
             return drag;
         };
         self.start_layer_drag(target, start, true);
         let mut new = self.layer_drag.take().unwrap_or(drag);
         new.copy = true;
+        new.selected_before = Some(before);
         new
     }
 
@@ -1269,7 +1412,13 @@ impl AtelierApp {
                 .iter()
                 .any(|&g| g != i && doc.block(g).contains(&i))
         };
-        let mut copied: Vec<usize> = selected.iter().copied().filter(|&i| !inside(i)).collect();
+        // Nor the locked ones, which don't move: their copy would sit on
+        // them unseen.
+        let mut copied: Vec<usize> = selected
+            .iter()
+            .copied()
+            .filter(|&i| !inside(i) && (i == target || !doc.layers[i].locked))
+            .collect();
         // From the top: a copy goes above its original, the indices below
         // stay.
         copied.sort_unstable_by(|a, b| b.cmp(a));
@@ -1293,6 +1442,16 @@ impl AtelierApp {
         Some(index)
     }
 
+    /// History name of the copies just made by an Alt+drag or Alt+arrow
+    /// (the selected layers are the copies when there are several).
+    pub(super) fn copies_step_name(&self) -> String {
+        if self.layer_set.len() > 1 {
+            t!("tools5-hist-duplicate-layers")
+        } else {
+            t!("menu-layer-duplicate")
+        }
+    }
+
     /// Layers being dragged: they follow the pointer (Shift: horizontally
     /// or vertically), until the button is released, wherever that is.
     fn move_layers(&mut self, view: View, pointer: Option<Pos2>, down: bool) -> CursorIcon {
@@ -1301,6 +1460,22 @@ impl AtelierApp {
         };
         if !down {
             self.snap_targets = None;
+            // Back where it started: no step (nor copies), like Photoshop.
+            let back = self.doc.as_ref().is_some_and(|d| {
+                drag.layers
+                    .iter()
+                    .all(|&(i, at)| d.layers.get(i).is_some_and(|l| l.offset == at))
+            });
+            if drag.moved && back {
+                if let Some(doc) = &mut self.doc {
+                    doc.discard_step();
+                }
+                if let Some(set) = drag.selected_before.take() {
+                    self.layer_set = set;
+                }
+                self.reset_pending();
+                return CursorIcon::Grabbing;
+            }
             if drag.moved
                 && let Some(layer) = self.doc.as_ref().map(|d| &d.layers[drag.layers[0].0])
             {
@@ -1355,6 +1530,7 @@ impl AtelierApp {
             if (dx, dy) != (0, 0) && !drag.moved && drag.copy {
                 drag = self.copy_dragged(drag);
             }
+            let copies_name = self.copies_step_name();
             if let Some(doc) = &mut self.doc {
                 if (dx, dy) != (0, 0) && !drag.moved {
                     doc.checkpoint(t!("xchg-hist-move"));
@@ -1362,7 +1538,7 @@ impl AtelierApp {
                     // The copies and their move: one step.
                     if let (true, Some(mark)) = (drag.copy, mark) {
                         doc.join_since(mark);
-                        doc.rename_last_step(t!("menu-layer-duplicate"));
+                        doc.rename_last_step(copies_name);
                     }
                 }
                 if drag.moved {
@@ -1692,7 +1868,8 @@ impl AtelierApp {
         if let Some(i) = close.or(switch) {
             self.switch_tab(i);
         }
-        if close.is_some() {
+        // Not while "Crop the image?" waits for an answer (the switch).
+        if close.is_some() && self.crop_confirm.is_none() {
             self.run(Action::CloseDocument);
         }
     }

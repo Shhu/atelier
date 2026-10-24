@@ -7,6 +7,7 @@ use std::sync::mpsc;
 
 use image::RgbaImage;
 
+use super::actions_panel::Stopped;
 use super::dialogs::{
     DialogSpec, Steps, Track, block, floating_dialog, full_segmented, gap_between_blocks,
     slider_row_steps, tool_dialog_pos,
@@ -15,7 +16,7 @@ use super::*;
 use crate::filters::{
     Filter, FilterKind, Morphology, Remove, SmartSharpen, Target, ToneFade, Undefined,
 };
-use crate::i18n::t;
+use crate::i18n::{Message, t};
 use ui_kit::color;
 
 /// Last Filter: Alt+Ctrl+F, like Photoshop.
@@ -132,7 +133,7 @@ pub(super) struct Filters {
     /// Settings last applied of each filter: its dialog opens with them.
     settings: HashMap<FilterKind, Filter>,
     /// Last filter applied (Last Filter).
-    last: Option<Filter>,
+    pub(super) last: Option<Filter>,
     /// The Camera Raw Filter's settings, when it was applied after `last`.
     camera_raw: Option<crate::camera_raw::Settings>,
     dialog: Option<FilterDialog>,
@@ -518,10 +519,13 @@ impl AtelierApp {
             return;
         }
         if self.smart_filters_apply() {
-            self.add_smart_filter(filter);
-            self.filters.last = Some(filter);
-            self.filters.settings.insert(filter.kind(), filter);
-            self.record(crate::actions::Recorded::Filter { filter });
+            // Last Filter and the action being recorded get it once
+            // rendered (not cancelled).
+            self.add_smart_filter(filter, move |app| {
+                app.filters.last = Some(filter);
+                app.filters.settings.insert(filter.kind(), filter);
+                app.record(crate::actions::Recorded::Filter { filter });
+            });
             return;
         }
         let Some(doc) = &mut self.doc else { return };
@@ -574,7 +578,6 @@ impl AtelierApp {
             started: self.ctx.input(|i| i.time),
             job,
         });
-        self.record(crate::actions::Recorded::Filter { filter });
     }
 
     /// The filter being applied is done: its pixels replace the layer's.
@@ -606,12 +609,18 @@ impl AtelierApp {
                     }
                     self.filters.last = Some(a.filter);
                     self.filters.settings.insert(a.filter.kind(), a.filter);
+                    // Recorded once done (not when cancelled).
+                    self.record(crate::actions::Recorded::Filter { filter: a.filter });
                 }
                 // The computation failed: nothing changes.
                 None => {
                     doc.end_paint();
                     doc.discard_step();
-                    self.status_failed(tm!("fx3-filter-failed", name = name.as_str()));
+                    let kind = a.filter.kind();
+                    let text = tm!("fx3-filter-failed", name = Message::of(|| title(kind)));
+                    self.actions
+                        .step_stopped(Stopped::Failed(text.shown.clone()));
+                    self.status_failed(text);
                     self.shrink_after_preview();
                 }
             }
@@ -642,14 +651,14 @@ impl AtelierApp {
                     if let Some((failed, layer, rev, _)) = self.filters.adjust.take() {
                         let text = match &failed {
                             LayerPreview::Adjust(a) => {
-                                let name = a.title();
-                                t!("fx4-preview-failed", name = name.as_str())
+                                let name = Message::of(|| a.title());
+                                tm!("fx4-preview-failed", name = name)
                             }
                             LayerPreview::Transparency(_) => {
-                                let name = t!("dialog-transparency-title");
-                                t!("fx4-preview-failed", name = name.as_str())
+                                let name = Message::of(|| t!("dialog-transparency-title"));
+                                tm!("fx4-preview-failed", name = name)
                             }
-                            LayerPreview::Filter(_) => t!("fx4-preview-failed-any"),
+                            LayerPreview::Filter(_) => tm!("fx4-preview-failed-any"),
                         };
                         self.filters.adjust_failed = Some((failed, layer, rev));
                         self.status_failed(text);
@@ -752,7 +761,7 @@ impl AtelierApp {
 
     /// Cancel of the filter being applied (its computation stops): the
     /// layer stays as it was.
-    fn cancel_filter(&mut self) {
+    pub(super) fn cancel_filter(&mut self) {
         let Some(a) = self.filters.applying.take() else {
             return;
         };
@@ -766,6 +775,7 @@ impl AtelierApp {
         self.shrink_after_preview();
         let name = title(a.filter.kind());
         self.status = t!("retouch-status-cancelled", name = name.as_str());
+        self.actions.step_stopped(Stopped::Cancelled);
         self.end_layer_preview();
         self.reset_pending();
     }
@@ -949,8 +959,9 @@ impl AtelierApp {
                     && !job.stopped()
                 {
                     dialog.failed = Some(job.key);
-                    let name = title(dialog.filter.kind());
-                    self.status_failed(tm!("fx3-filter-failed", name = name.as_str()));
+                    let kind = dialog.filter.kind();
+                    let name = Message::of(|| title(kind));
+                    self.status_failed(tm!("fx3-filter-failed", name = name));
                 }
             }
             _ => {}
@@ -1037,7 +1048,12 @@ fn preview_square(ui: &mut egui::Ui, dialog: &mut FilterDialog) {
     if computing {
         let spinner =
             Rect::from_min_size(rect.right_bottom() - vec2(22.0, 22.0), Vec2::splat(14.0));
-        ui.put(spinner, egui::Spinner::new().size(14.0).color(color::MUTED));
+        // Painted, not added: a widget here only while computing would
+        // shift the automatic ids of the fields below and drop their focus.
+        egui::Spinner::new()
+            .size(14.0)
+            .color(color::MUTED)
+            .paint_at(ui, spinner);
     }
     if response.hovered() {
         ui.ctx().set_cursor_icon(if response.dragged() {

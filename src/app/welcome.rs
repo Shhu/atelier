@@ -287,7 +287,7 @@ impl AtelierApp {
             self.open_path(&path);
             // Gone: off both lists. (A file still there stays: a RAW file
             // opens later, through Camera Raw, and a damaged one says why.)
-            if !path.exists() {
+            if crate::recent::gone(&path) {
                 self.recent.forget(&path);
             }
         }

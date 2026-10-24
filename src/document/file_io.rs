@@ -17,6 +17,9 @@ use image::{
 
 use crate::i18n::t;
 
+mod metadata;
+pub use metadata::ImageMetadata;
+
 /// Largest canvas side, in pixels.
 pub const MAX_DIMENSION: u32 = 30_000;
 
@@ -39,6 +42,12 @@ pub enum FileError {
     NewerVersion(u32),
     /// The export format cannot hold an image this large (maximum side).
     FormatTooSmall(ExportFormat, u32),
+    /// A layer (its name and size) larger than any file may hold (see
+    /// [`layer_fits`]): saving it would write a file no reader takes.
+    LayerTooLarge(String, u32, u32),
+    /// Opening the file would take more memory than the computer has (its
+    /// memory, in bytes).
+    OutOfMemory(u64),
 }
 
 impl From<std::io::Error> for FileError {
@@ -90,6 +99,16 @@ impl std::fmt::Display for FileError {
                     max = *max
                 )
             }
+            FileError::LayerTooLarge(name, w, h) => t!(
+                "files5-error-layer-too-large",
+                name = name.as_str(),
+                width = *w,
+                height = *h
+            ),
+            FileError::OutOfMemory(memory) => t!(
+                "files5-error-out-of-memory",
+                memory = (*memory as f64 / f64::from(1 << 30)).round().max(1.0)
+            ),
         };
         f.write_str(&text)
     }
@@ -104,6 +123,135 @@ pub fn check_size(width: u32, height: u32) -> Result<(), FileError> {
     } else {
         Ok(())
     }
+}
+
+/// Largest side of a layer, mask or channel in a file (it may reach far
+/// beyond the canvas).
+pub const MAX_LAYER_SIDE: u32 = 4 * MAX_DIMENSION;
+
+/// A layer, mask or channel of `w` × `h` pixels can be written and read
+/// back: sides up to [`MAX_LAYER_SIDE`], the area of the largest canvas.
+/// The same rule for the readers and the writers of both formats, so that
+/// Atelier never writes a file it refuses to open.
+pub fn layer_fits(w: u32, h: u32) -> bool {
+    w <= MAX_LAYER_SIDE
+        && h <= MAX_LAYER_SIDE
+        && u64::from(w) * u64::from(h) <= u64::from(MAX_DIMENSION).pow(2)
+}
+
+/// The memory the pixels of a document being opened may take, all its
+/// layers, masks, channels and smart objects together: what the computer
+/// has. Each part proves it can hold its pixels (its data can't be
+/// inflated more than deflate allows), and no part is read twice, so only
+/// honest files of that size reach this limit; they are refused rather
+/// than aborting the application when memory runs out.
+pub(super) struct Budget {
+    left: u64,
+    memory: u64,
+}
+
+impl Budget {
+    pub(super) fn new() -> Self {
+        Self::of(physical_memory().unwrap_or(16 << 30))
+    }
+
+    /// A budget of `memory` bytes.
+    pub(super) fn of(memory: u64) -> Self {
+        Self {
+            left: memory,
+            memory,
+        }
+    }
+
+    /// Takes `w` × `h` pixels of `bpp` bytes from the budget.
+    pub(super) fn take(&mut self, w: u32, h: u32, bpp: u64) -> Result<(), FileError> {
+        self.take_bytes(
+            u64::from(w)
+                .saturating_mul(u64::from(h))
+                .saturating_mul(bpp),
+        )
+    }
+
+    pub(super) fn take_bytes(&mut self, bytes: u64) -> Result<(), FileError> {
+        match self.left.checked_sub(bytes) {
+            Some(left) => {
+                self.left = left;
+                Ok(())
+            }
+            None => Err(FileError::OutOfMemory(self.memory)),
+        }
+    }
+
+    /// What is left, in bytes.
+    pub(super) fn left(&self) -> u64 {
+        self.left
+    }
+}
+
+/// The computer's memory, in bytes.
+#[cfg(target_os = "linux")]
+fn physical_memory() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb: u64 = line["MemTotal:".len()..]
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()?;
+    Some(kb * 1024)
+}
+
+#[cfg(windows)]
+fn physical_memory() -> Option<u64> {
+    /// MEMORYSTATUSEX.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Status {
+        length: u32,
+        load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(status: *mut Status) -> i32;
+    }
+    let mut status = Status {
+        length: size_of::<Status>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the call fills the structure whose size it is given.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0).then_some(status.total_phys)
+}
+
+#[cfg(target_os = "macos")]
+fn physical_memory() -> Option<u64> {
+    let mut memory = 0u64;
+    let mut size = size_of::<u64>();
+    // SAFETY: "hw.memsize" is a 64-bit integer, written into `memory`
+    // whose size is given.
+    let ok = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&raw mut memory).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (ok == 0).then_some(memory)
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+fn physical_memory() -> Option<u64> {
+    None
 }
 
 /// Decoder memory limit: what the largest accepted image needs in 16-bit RGBA.
@@ -122,6 +270,8 @@ pub struct FileMetadata {
     /// A Photoshop document's image resources Atelier doesn't use
     /// (resolution, XMP, IPTC, EXIF, print settings…).
     pub psd_resources: std::sync::Arc<Vec<PsdResource>>,
+    /// An image's resolution, XMP, IPTC, comments… in its format.
+    pub image: Option<std::sync::Arc<ImageMetadata>>,
 }
 
 /// An image resource of a Photoshop document, kept as it was.
@@ -152,6 +302,8 @@ pub struct Decoded {
     pub animated: bool,
     /// Its EXIF, orientation reset (the pixels are the right way up).
     pub exif: Option<Vec<u8>>,
+    /// What else it holds that saving in its format writes back.
+    pub metadata: ImageMetadata,
     /// What the image lost on opening, that saving over the file in its
     /// format would lose (translated notes).
     pub losses: Vec<String>,
@@ -175,16 +327,17 @@ pub fn read_image(path: &Path) -> Result<Decoded, FileError> {
     if let Some(exif) = &mut exif {
         let _ = image::metadata::Orientation::remove_from_exif_chunk(exif);
     }
-    let other_metadata = decoder.xmp_metadata().ok().flatten().is_some()
+    let xmp = decoder.xmp_metadata().ok().flatten().is_some()
         || decoder.iptc_metadata().ok().flatten().is_some();
     let mut image = DynamicImage::from_decoder(decoder)?;
     let color = image.color();
     let cmyk = matches!(
         original,
         ExtendedColorType::Cmyk8 | ExtendedColorType::Cmyk16
-    ) || (icc_profile.as_ref())
-        .and_then(|icc| crate::cms::Profile::from_icc(std::sync::Arc::new(icc.clone())))
-        .is_some_and(|p| p.space() == crate::cms::Space::Cmyk);
+    ) || format == Some(ImageFormat::Jpeg) && jpeg_is_cmyk(path)
+        || (icc_profile.as_ref())
+            .and_then(|icc| crate::cms::Profile::from_icc(std::sync::Arc::new(icc.clone())))
+            .is_some_and(|p| p.space() == crate::cms::Space::Cmyk);
     let icc_profile = super::color::rgb_pixels(path, format, &mut image, icc_profile);
     image.apply_orientation(orientation);
     let animated = format.is_some_and(|f| is_animated(path, f));
@@ -203,19 +356,52 @@ pub fn read_image(path: &Path) -> Result<Decoded, FileError> {
         let mode = t!("xchg-psd-mode-cmyk");
         losses.push(t!("xchg-psd-note-mode", mode = mode));
     }
-    // TIFF metadata are tags its writer doesn't keep, EXIF included.
-    if other_metadata
-        || format == Some(ImageFormat::Tiff) && (exif.take().is_some() || tiff_has_metadata(path))
-    {
-        losses.push(t!("files4-note-metadata"));
+    // What saving in the format writes back: XMP and IPTC as they were
+    // in a JPEG, PNG or TIFF; not a TIFF's EXIF (a directory of its own).
+    let (metadata, unkept) = metadata::read(path, format);
+    let carried = match format {
+        Some(ImageFormat::Jpeg | ImageFormat::Png) => !metadata.raw.is_empty(),
+        Some(ImageFormat::Tiff) => !metadata.tiff.is_empty(),
+        _ => false,
+    };
+    if format == Some(ImageFormat::Tiff) {
+        exif = None;
+    }
+    if unkept.images {
+        losses.push(t!("files5-note-images"));
+    }
+    if xmp && !carried || unkept.xmp {
+        losses.push(t!("files5-note-xmp"));
+    }
+    if unkept.exif {
+        losses.push(t!("files5-note-exif"));
+    }
+    if unkept.photoshop {
+        losses.push(t!("files5-note-other-apps"));
     }
     Ok(Decoded {
         image: image.into_rgba8(),
         icc_profile,
         animated,
         exif,
+        metadata,
         losses,
     })
+}
+
+/// A JPEG stores inks (four components: CMYK or YCCK), with a profile or
+/// not (`image` gives them as RGB).
+fn jpeg_is_cmyk(path: &Path) -> bool {
+    use zune_core::colorspace::ColorSpace;
+    let Ok(data) = std::fs::read(path) else {
+        return false;
+    };
+    let mut headers = zune_jpeg::JpegDecoder::new(zune_core::bytestream::ZCursor::new(&data));
+    headers.decode_headers().is_ok()
+        && matches!(
+            headers.input_colorspace(),
+            Some(ColorSpace::CMYK | ColorSpace::YCCK)
+        )
 }
 
 /// A TIFF holds pages after its first.
@@ -224,26 +410,6 @@ fn tiff_has_more(path: &Path) -> bool {
         return false;
     };
     tiff::decoder::Decoder::new(BufReader::new(file)).is_ok_and(|d| d.more_images())
-}
-
-/// A TIFF has a copyright, an author, EXIF, XMP or IPTC.
-fn tiff_has_metadata(path: &Path) -> bool {
-    use tiff::tags::Tag;
-    let Ok(file) = File::open(path) else {
-        return false;
-    };
-    let Ok(mut d) = tiff::decoder::Decoder::new(BufReader::new(file)) else {
-        return false;
-    };
-    [
-        Tag::Copyright,
-        Tag::Artist,
-        Tag::Unknown(700),
-        Tag::Unknown(33723),
-        Tag::Unknown(34665),
-    ]
-    .into_iter()
-    .any(|tag| d.find_tag(tag).ok().flatten().is_some())
 }
 
 /// Size of an image file as it opens (EXIF orientation applied), from its
@@ -378,13 +544,15 @@ pub fn export(
     icc_profile: Option<&[u8]>,
 ) -> Result<(), FileError> {
     write_atomic(path, |out| {
-        encode_image(image, out, format, quality, icc_profile, None, None)
+        encode_image(image, out, format, quality, icc_profile, None, None, None)
     })
 }
 
 /// Encodes `image` in `format` into `out` (see [`export`]), with a
 /// copyright notice where the format has room for it (not GIF), else
-/// with `exif` as it is (PNG, JPEG, WebP).
+/// with `exif` (PNG, JPEG, WebP), its size made the image's; and `kept`,
+/// the metadata of the file it replaces when it is of that format.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_image(
     image: &RgbaImage,
     out: &mut (impl Write + Seek),
@@ -393,17 +561,36 @@ pub fn encode_image(
     icc_profile: Option<&[u8]>,
     copyright: Option<&str>,
     exif: Option<&[u8]>,
+    kept: Option<&ImageMetadata>,
 ) -> Result<(), FileError> {
     let (w, h) = image.dimensions();
     if w.max(h) > format.max_side() {
         return Err(FileError::FormatTooSmall(format, format.max_side()));
     }
+    let kept = kept.filter(|k| k.format == Some(format));
     // TIFF: its own Copyright tag (its encoder takes no EXIF).
     if format == ExportFormat::Tiff {
-        return tiff(image, out, icc_profile, copyright);
+        return tiff(image, out, icc_profile, copyright, kept);
     }
+    let exif = exif.map(|e| metadata::fresh_exif(e, (w, h)));
     let copyright = copyright.map(crate::export::copyright_exif);
-    let meta = (icc_profile, copyright.as_deref().or(exif));
+    let meta = (icc_profile, copyright.as_deref().or(exif.as_deref()));
+    // Written whole, then the kept metadata put in.
+    if let Some(kept) = kept.filter(|_| matches!(format, ExportFormat::Jpeg | ExportFormat::Png)) {
+        let mut data = std::io::Cursor::new(Vec::new());
+        if format == ExportFormat::Jpeg {
+            let mut encoder = JpegEncoder::new_with_quality(&mut data, quality.clamp(1, 100));
+            if let Some(density) = kept.jpeg_density() {
+                encoder.set_pixel_density(density);
+            }
+            let rgb = flatten_on_white(image);
+            encode_with(encoder, rgb.as_raw(), (w, h), ExtendedColorType::Rgb8, meta)?;
+        } else {
+            encode(PngEncoder::new(&mut data), image, meta)?;
+        }
+        out.write_all(&kept.put_back(format, data.into_inner()))?;
+        return Ok(());
+    }
     match format {
         ExportFormat::Png => encode(PngEncoder::new(out), image, meta),
         ExportFormat::Jpeg => {
@@ -464,6 +651,7 @@ fn tiff(
     out: &mut (impl Write + Seek),
     icc: Option<&[u8]>,
     copyright: Option<&str>,
+    kept: Option<&ImageMetadata>,
 ) -> Result<(), FileError> {
     use tiff::encoder::{Compression, TiffEncoder, colortype};
     use tiff::tags::{ExtraSamples, Tag};
@@ -483,6 +671,10 @@ fn tiff(
             }
             if let Some(text) = copyright {
                 tiff_copyright(file.encoder(), text).map_err(failed)?;
+            }
+            if let Some(kept) = kept {
+                kept.write_tiff(file.encoder(), copyright.is_some())
+                    .map_err(failed)?;
             }
             if let Some(icc) = icc {
                 file.encoder()
@@ -760,6 +952,7 @@ mod tests {
             None,
             Some(text),
             None,
+            None,
         )
         .unwrap();
         let data = out.into_inner();
@@ -955,10 +1148,85 @@ mod tests {
             first.write_data(&[5; 12]).unwrap();
             out.write_image::<RGB8>(2, 2, &[6; 12]).unwrap();
         }
-        assert_eq!(
-            losses("pages.tif"),
-            [t!("files4-note-pages"), t!("files4-note-metadata")]
-        );
+        // Its copyright is written back: only the pages are lost.
+        assert_eq!(losses("pages.tif"), [t!("files4-note-pages")]);
+        // An untagged CMYK JPEG (`image` reads it as RGB).
+        let mut cmyk = Vec::new();
+        jpeg_encoder::Encoder::new(&mut cmyk, 90)
+            .encode(&[30; 4 * 8 * 8], 8, 8, jpeg_encoder::ColorType::Cmyk)
+            .unwrap();
+        std::fs::write(dir.join("cmyk.jpg"), cmyk).unwrap();
+        let mode = t!("xchg-psd-mode-cmyk");
+        assert_eq!(losses("cmyk.jpg"), [t!("xchg-psd-note-mode", mode = mode)]);
+    }
+
+    /// Saved over in its format (Save and Close), an image keeps its
+    /// resolution, XMP, IPTC and copyright; its EXIF says its new size.
+    #[test]
+    fn saving_in_place_keeps_the_metadata() {
+        let dir = dir("in-place");
+        let image = RgbaImage::from_pixel(6, 4, image::Rgba([90, 120, 150, 255]));
+        // JPEG at 300 dpi, with XMP.
+        let mut jpeg = Vec::new();
+        let mut encoder = JpegEncoder::new_with_quality(&mut jpeg, 90);
+        encoder.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(300));
+        encoder
+            .write_image(&[50; 3 * 6 * 4], 6, 4, ExtendedColorType::Rgb8)
+            .unwrap();
+        let xmp = b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta>QA rights</x:xmpmeta>";
+        let segment = [
+            &[0xFF, 0xE1][..],
+            &((xmp.len() + 2) as u16).to_be_bytes(),
+            xmp,
+        ]
+        .concat();
+        jpeg.splice(2..2, segment);
+        // PNG at 300 ppi with an XMP chunk; TIFF at 300 dpi, copyright.
+        let mut png = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
+            .unwrap();
+        let png = ImageMetadata {
+            format: Some(ExportFormat::Png),
+            density: Some((300.0, 300.0)),
+            raw: vec![metadata::tests_chunk(
+                b"iTXt",
+                b"XML:com.adobe.xmp\0\0\0\0\0QA rights",
+            )],
+            ..ImageMetadata::default()
+        }
+        .put_back(ExportFormat::Png, png);
+        let tiff_meta = ImageMetadata {
+            format: Some(ExportFormat::Tiff),
+            density: Some((300.0, 300.0)),
+            ..ImageMetadata::default()
+        };
+        let mut tif = std::io::Cursor::new(Vec::new());
+        tiff(&image, &mut tif, None, Some("QA rights"), Some(&tiff_meta)).unwrap();
+        for (name, data, format) in [
+            ("d.jpg", jpeg, ExportFormat::Jpeg),
+            ("d.png", png, ExportFormat::Png),
+            ("d.tif", tif.into_inner(), ExportFormat::Tiff),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, data).unwrap();
+            let opened = read_image(&path).unwrap();
+            assert!(opened.losses.is_empty(), "{name}: {:?}", opened.losses);
+            let mut out = std::io::Cursor::new(Vec::new());
+            let kept = Some(&opened.metadata);
+            encode_image(&image, &mut out, format, 90, None, None, None, kept).unwrap();
+            let saved = dir.join(format!("saved-{name}"));
+            std::fs::write(&saved, out.into_inner()).unwrap();
+            let back = read_image(&saved).unwrap();
+            let (x, y) = back.metadata.density.expect(name);
+            assert!(
+                (x - 300.0).abs() < 0.5 && (y - 300.0).abs() < 0.5,
+                "{name}: {x} {y}"
+            );
+            let bytes = std::fs::read(&saved).unwrap();
+            assert!(bytes.windows(9).any(|w| w == b"QA rights"), "{name}");
+            assert_eq!(back.image.dimensions(), (6, 4));
+        }
     }
 
     /// A TIFF says what its fourth sample is: the transparency (other
@@ -975,6 +1243,7 @@ mod tests {
                 90,
                 None,
                 copyright,
+                None,
                 None,
             )
             .unwrap();

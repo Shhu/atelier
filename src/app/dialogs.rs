@@ -260,6 +260,11 @@ impl AtelierApp {
             DialogSpec {
                 reset: Some(dialog.adjustment != reset),
                 preview: Some(&mut preview),
+                // Their keys move the points and stops.
+                first_field: !matches!(
+                    dialog.adjustment,
+                    Adjustment::Curves(_) | Adjustment::GradientMap(_)
+                ),
                 ..DialogSpec::new(
                     "adjustment",
                     dialog.adjustment.title(),
@@ -399,7 +404,7 @@ impl AtelierApp {
                 keep_alpha: d.preserve_transparency,
                 from_fill: true,
             });
-        } else if !self.refuse_if_locked() {
+        } else if !self.refuse_if_target_locked() {
             let (color, which) = match d.content {
                 FillContent::Foreground => (self.primary, t!("dialog-fill-with-foreground")),
                 FillContent::Background => (self.secondary, t!("dialog-fill-with-background")),
@@ -739,6 +744,11 @@ impl AtelierApp {
         self.confirm = None;
         if out.ok {
             self.save();
+            // A linked file asking first: the close waits for its answer.
+            if let Some(ask) = &mut self.smart.link_save {
+                ask.then = Some(pending);
+                return;
+            }
             if self.doc.as_ref().is_some_and(|d| d.modified) {
                 return; // Save cancelled or failed: stay.
             }
@@ -897,6 +907,8 @@ pub(super) fn panel_pos(ctx: &egui::Context, id: &'static str) -> Pos2 {
             let height = own.map_or(160.0, |r| r.height());
             let pos = free_place(ctx, &others, height);
             places.0.push((id, pos, pass, pass));
+            // Opened from a menu: in front, even over a panel moved there.
+            ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, egui::Id::new(id)));
             pos
         }
     };
@@ -916,26 +928,65 @@ fn free_place(ctx: &egui::Context, others: &[Rect], height: f32) -> Pos2 {
     for _ in 0..16 {
         let probe = Rect::from_min_max(pos2(pos.x - WIDTH, pos.y), pos2(pos.x, pos.y + height));
         match others.iter().find(|r| r.intersects(probe)) {
+            None => return pos,
             Some(r) if r.bottom() + 8.0 + height <= bottom => pos.y = r.bottom() + 8.0,
             Some(_) if pos.x - 2.0 * WIDTH - 8.0 >= left => {
                 pos = pos2(pos.x - WIDTH - 8.0, start.y);
             }
-            _ => break,
+            Some(_) => break,
         }
+    }
+    // No free place: cascaded from the last panel placed, its title bar
+    // left in sight (never exactly over another one).
+    let Some(last) = others.last() else {
+        return start;
+    };
+    let mut pos = pos2(last.right() - CASCADE, last.top() + CASCADE);
+    if pos.y + height > bottom || pos.x - WIDTH < left {
+        pos = pos2(start.x - CASCADE, start.y);
+    }
+    for _ in 0..others.len() {
+        if !others.iter().any(|r| (r.right_top() - pos).length() < 4.0) {
+            break;
+        }
+        pos += vec2(-CASCADE, CASCADE);
     }
     pos
 }
 
-/// Dialogs that open with their first field focused (the others keep
-/// their keys: tools, points, sliders).
-const FOCUS_FIRST_FIELD: [&str; 7] = [
-    "image_size",
-    "canvas_size",
-    "new_document",
-    "rotate_canvas",
-    "sel_modify",
-    "new_guide",
-    "fit_image",
+/// Offset of a floating panel cascaded over another (px).
+const CASCADE: f32 = 28.0;
+
+/// Modal dialogs that don't give the keyboard to their first field: those
+/// with none (confirmations, alerts, progress), and those whose keys go to
+/// something else or that are about choices rather than values. The others
+/// open with it focused, so that "5 Enter" needs no mouse.
+const NO_FIRST_FIELD: [&str; 23] = [
+    "confirm",
+    "flatten_confirm",
+    "rasterize_confirm",
+    "alert",
+    "about",
+    "actions_message",
+    "batch",
+    "batch_alert",
+    "batch_progress",
+    "image_processor",
+    "artboards_replace",
+    "model_prompt",
+    "models_delete",
+    "ai_models",
+    "liquify_revert",
+    // Letters choose their tools.
+    "liquify",
+    "camera_raw",
+    // Mostly a matter of clicks; its hex field is a click away.
+    "color_picker",
+    "color_settings",
+    "assign_profile",
+    "convert_profile",
+    "proof_setup",
+    "grayscale",
 ];
 
 /// The floating panels that Tab hides with the bars and the side panel.
@@ -1005,6 +1056,8 @@ pub(super) struct DialogSpec<'a> {
     /// default height of its body, which then lays out in that height (its
     /// list scrolls itself).
     pub resize: Option<f32>,
+    /// A modal: its first text field takes the keyboard when it opens.
+    pub first_field: bool,
 }
 
 impl DialogSpec<'_> {
@@ -1025,6 +1078,7 @@ impl DialogSpec<'_> {
             note: None,
             footer: true,
             resize: None,
+            first_field: !NO_FIRST_FIELD.contains(&id),
         }
     }
 }
@@ -1061,8 +1115,8 @@ pub(super) fn floating_dialog(
         note,
         footer,
         resize,
+        first_field,
     } = spec;
-    let spec_id = id;
     if !modal
         && HIDDEN_WITH_PANELS.contains(&id)
         && ctx.data(|d| d.get_temp::<bool>(panels_hidden_id()).unwrap_or(false))
@@ -1079,7 +1133,9 @@ pub(super) fn floating_dialog(
     // and footer included: a dialog taller than that scrolls its body.
     let screen = dialog_bounds(ctx);
     // Between header, body and footer: two gaps of 8 px; the border: 2 px.
-    let body_max = (screen.height() - DIALOG_HEADER - DIALOG_FOOTER - 18.0).max(0.0);
+    // Without a footer, its room goes to the body.
+    let footer_room = if footer { DIALOG_FOOTER + 8.0 } else { 0.0 };
+    let body_max = (screen.height() - DIALOG_HEADER - footer_room - 10.0).max(0.0);
     // Its margins aside.
     let body_height = resize.map(|h| {
         resized_to
@@ -1189,8 +1245,19 @@ pub(super) fn floating_dialog(
             if response.hovered() || response.dragged() {
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeNwSe);
             }
-            if response.dragged() {
-                grip_drag = Some((height, response.drag_delta()));
+            // From the size and the pointer at the press: past the minimum
+            // size, the corner comes back with the pointer.
+            let start_id = id.with("grip-start");
+            if response.drag_started()
+                && let Some(press) = ui.input(|i| i.pointer.press_origin())
+            {
+                ui.data_mut(|d| d.insert_temp(start_id, (vec2(width, height), press)));
+            }
+            if response.dragged()
+                && let Some((size, press)) = ui.data(|d| d.get_temp::<(Vec2, Pos2)>(start_id))
+                && let Some(pointer) = ui.input(|i| i.pointer.interact_pos())
+            {
+                grip_drag = Some((size, pointer - press));
             }
         } else {
             // A body that scrolls shows it (its last lines aren't just cut).
@@ -1282,7 +1349,7 @@ pub(super) fn floating_dialog(
         // another modal (a Color Picker opened from this one).
         // Its first field takes the keyboard, so that "1920 Tab 1080
         // Enter" needs no mouse.
-        if opening && FOCUS_FIRST_FIELD.contains(&spec_id) {
+        if opening && first_field {
             super::focus_first_field(ctx);
         }
         if !shown.any_popup_open && !popup_open_at_frame_start(ctx) && shown.is_top_modal {
@@ -1302,11 +1369,12 @@ pub(super) fn floating_dialog(
     let mut offset = offset + (rect.min - pivot.anchor_size(pos + offset, rect.size()).min);
 
     // Resizing: the corner follows the pointer, whatever the pivot.
-    if let Some((height, delta)) = grip_drag {
+    if let Some((start, delta)) = grip_drag {
         let size = vec2(
-            (width + delta.x).max(MIN_PANEL_WIDTH),
-            (height + delta.y).clamp(MIN_PANEL_BODY, body_max.max(MIN_PANEL_BODY)),
+            (start.x + delta.x).max(MIN_PANEL_WIDTH),
+            (start.y + delta.y).clamp(MIN_PANEL_BODY, body_max.max(MIN_PANEL_BODY)),
         );
+        let height = body_height.unwrap_or(start.y);
         let grown = size - vec2(width, height);
         offset += vec2(
             grown.x * pivot.x().to_factor(),

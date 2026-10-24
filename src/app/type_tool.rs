@@ -522,10 +522,9 @@ impl AtelierApp {
                     self.run(Action::Undo);
                 }
             }
-            Key::Z if ctrl => {
-                self.commit_text();
-                self.run(Action::Redo);
-            }
+            // Nothing typed to redo: the edit goes on (a step undone before
+            // it stays undone).
+            Key::Z if ctrl => {}
             // Proof Colors and Gamut Warning, the edit going on (redo is
             // Shift+Ctrl+Z).
             Key::Y if ctrl => self.color_command(if shift {

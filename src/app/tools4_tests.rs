@@ -556,7 +556,7 @@ fn ctrl_t_with_a_work_path_selected_leaves_the_layer() {
     key(&mut h, Key::T, Modifiers::COMMAND);
     assert_eq!(h.state().tool, Tool::PathSelect);
     assert!(h.state().transform_rect.is_none());
-    assert_eq!(h.state().status, t!("tools4-status-path-transform"));
+    assert_eq!(h.state().status, t!("tools5-status-path-transform"));
 }
 
 // --------------------------------------------------------------------- Crop
@@ -564,6 +564,8 @@ fn ctrl_t_with_a_work_path_selected_leaves_the_layer() {
 #[test]
 fn a_crop_drag_draws_a_crop_box() {
     let mut h = logo_app();
+    // (Away from what it would snap to.)
+    h.state_mut().rulers.settings.snap = false;
     h.state_mut().set_tool(Tool::Canvas);
     h.run_steps(1);
     drag(

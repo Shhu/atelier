@@ -84,6 +84,12 @@ impl AtelierApp {
             let numbers = d.history_numbers();
             numbers[..done.min(numbers.len())].to_vec()
         });
+        // A greyed row (undone) clicked, to redo up to it.
+        let redo_row = self
+            .doc
+            .as_ref()
+            .filter(|d| done > d.history().1)
+            .and(wanted.last().copied());
         // A selection still being computed applies first, to the state it
         // was computed from.
         self.wait_select_job();
@@ -98,6 +104,11 @@ impl AtelierApp {
         self.settle_selection();
         let Some(doc) = &mut self.doc else { return };
         let numbers = doc.history_numbers();
+        // What ended first dropped the redo list (a new selection): the
+        // row clicked is gone, the state stays the new one.
+        if redo_row.is_some_and(|n| !numbers.contains(&n)) {
+            return;
+        }
         let done = wanted
             .iter()
             .rev()

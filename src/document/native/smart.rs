@@ -126,18 +126,33 @@ pub(super) fn write_all(
     files: &mut Vec<(String, Vec<u8>)>,
     folder: Option<&Path>,
 ) -> Result<(), FileError> {
-    let mut written = Vec::new();
+    // (id in the document, its contents, id in the file).
+    let mut written: Vec<(u64, &Contents, u64)> = Vec::new();
     for (i, layer) in layers.iter().enumerate() {
         let Some(s) = layer.smart.as_deref() else {
             continue;
         };
-        let contents = format!("smart/{}.atelier", s.contents.id);
-        if !written.contains(&s.contents.id) {
-            let mut data = Cursor::new(Vec::new());
-            write(&Document::from_contents(&s.contents), &mut data, folder)?;
-            files.push((contents.clone(), data.into_inner()));
-            written.push(s.contents.id);
-        }
+        let known = written
+            .iter()
+            .find(|(id, c, _)| *id == s.contents.id && c.same_as(&s.contents));
+        let id = match known {
+            Some(&(_, _, id)) => id,
+            None => {
+                // Smart objects that differ under one id (documents of
+                // older versions): each kept, under an id of its own.
+                let id = if written.iter().any(|(id, ..)| *id == s.contents.id) {
+                    super::super::next_rev()
+                } else {
+                    s.contents.id
+                };
+                let mut data = Cursor::new(Vec::new());
+                write(&Document::from_contents(&s.contents), &mut data, folder)?;
+                files.push((format!("smart/{id}.atelier"), data.into_inner()));
+                written.push((s.contents.id, &s.contents, id));
+                id
+            }
+        };
+        let contents = format!("smart/{id}.atelier");
         let filter_mask = match &s.filter_mask {
             Some(m) => {
                 let mut entry = mask_entry(m, layer.offset);
@@ -153,7 +168,7 @@ pub(super) fn write_all(
         };
         entries[i].smart = Some(SmartEntry {
             contents,
-            id: s.contents.id,
+            id,
             name: s.contents.name.clone(),
             link: s.link.as_ref().map(|l| LinkEntry {
                 path: l.path.clone(),
@@ -259,12 +274,13 @@ pub(super) fn smart_of(
     read: &mut HashMap<u64, Contents>,
     layer_offset: (i64, i64),
     folder: Option<&Path>,
+    claims: &mut Claims,
 ) -> Result<SmartObject, FileError> {
     let contents = match read.get(&e.id) {
         Some(c) => c.clone(),
         None => {
-            let data = read_entry(zip, &e.contents, MAX_CONTENTS)?;
-            let c = read_bytes(&data)?.to_contents(e.id, e.name.clone());
+            let c = (claims.document(zip, &e.contents, MAX_CONTENTS)?)
+                .to_contents(e.id, e.name.clone());
             read.insert(e.id, c.clone());
             c
         }
@@ -305,7 +321,9 @@ pub(super) fn smart_of(
         let filter = match (f.filter, &f.liquify, f.camera_raw) {
             (Some(filter), ..) => SmartFilterKind::Filter(filter),
             (None, Some(name), _) => {
-                let mesh = Mesh::from_bytes(&read_entry(zip, name, MAX_CONTENTS)?);
+                let data = read_entry(zip, name, MAX_CONTENTS.min(claims.budget.left()))?;
+                claims.budget.take_bytes(data.len() as u64)?;
+                let mesh = Mesh::from_bytes(&data);
                 SmartFilterKind::Liquify(Arc::new(mesh.ok_or(FileError::Damaged)?))
             }
             (None, None, Some(settings)) => SmartFilterKind::CameraRaw(Arc::new(settings)),
@@ -323,7 +341,7 @@ pub(super) fn smart_of(
         let image = match &m.image {
             Some(name) => {
                 let size = (m.width, m.height);
-                decode_gray(&read_pixels(zip, name, size, 1)?, size)?
+                decode_gray(&claims.pixels(zip, name, size, 1)?, size)?
             }
             None => GrayImage::new(0, 0),
         };

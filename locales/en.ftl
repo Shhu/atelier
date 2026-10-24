@@ -1764,7 +1764,7 @@ smart-status-placed = Placed: { $path }
 smart-status-replaced = Contents replaced: { $path }
 smart-status-updated = Smart object updated: { $name }
 smart-status-parent-gone = The smart object's document is closed: save these contents as a file.
-smart-status-link-missing = Linked file missing, its last copy shown: { $names }
+smart-status-link-missing = Linked files missing, their last copy shown: { $names }
 smart-status-links-updated = Linked files updated: { $names }
 
 ## Filter › Liquify: the workspace and its tools
@@ -2331,7 +2331,7 @@ input3-hint-selected-layers = the selected layers
 
 files3-quoted-name = "{ $name }"
 files3-psd-note-shapes = shape layers saved as pixels: { $names }
-files3-status-psd-would-lose = A Photoshop file would lose: { $notes }. Save as an Atelier document to keep everything.
+files3-status-psd-would-lose = This PSD file can't be saved again without changes ({ $notes }). Save as an Atelier document to keep everything.
 files3-dialog-save-as-lossy = Save As (an Atelier document keeps everything)
 
 ## Clipboard
@@ -2445,7 +2445,7 @@ ui3-why-not-now = Not available for the active layer or in the current state
 ui3-palette-keywords-image-size = resize scale resample dimensions enlarge shrink resolution dpi ppi
 ui3-palette-keywords-canvas-size = extend expand border margin
 ui3-palette-keywords-rotate = rotate turn flip mirror
-ui3-palette-keywords-crop = crop trim cut
+ui3-palette-keywords-crop = crop trim cut selection
 ui3-palette-keywords-move = move
 ui3-palette-keywords-type = text type font write
 ui3-palette-keywords-black-white = black white grayscale greyscale monochrome
@@ -2511,7 +2511,7 @@ diag-card-rendering-value = { $tiles ->
     [one] { $tiles } tile
    *[other] { $tiles } tiles
 }
-diag-card-rendering-detail = max { $max } per frame · size level { $level } · { $over } short of time (1 min)
+diag-card-rendering-detail = max { $max } per frame · { $over } slow refreshes (1 min)
 diag-card-jobs = Background jobs
 diag-card-jobs-none = None running
 diag-card-ai = AI processing
@@ -2594,7 +2594,7 @@ diag-sys-debug = { $version } (debug build)
 diag-sys-os = System
 diag-sys-gpu = Graphics card
 diag-sys-gpu-unknown = Not known yet
-diag-sys-max-texture = Largest image on the graphics card
+diag-sys-max-texture = Largest image size the graphics card accepts
 diag-sys-cores = Logical processor cores
 diag-sys-threads = Threads of the program
 diag-sys-scale = Display scale
@@ -2609,17 +2609,11 @@ diag-sys-history-budget = History budget
 diag-sys-history-budget-value = { $active } per document, { $total } in all
 diag-sys-since = Measures since
 
-## History: background results dropped after a history change
-hist4-selection-history-changed = The document changed while the selection was being computed: that result was dropped.
-hist4-subject-history-changed = The document changed during the search: run the command again.
-
 ## Saving over a file in its own format
 
 files4-note-frames = the animation's other frames
 files4-note-pages = the other pages
-files4-note-metadata = metadata (copyright, EXIF, XMP or IPTC)
 files4-psd-note-comps = layer comps left out
-files4-status-would-lose = "{ $name }" would lose: { $notes }. Save it as an Atelier document to keep everything.
 
 ## Layers: delete
 tools4-status-last-layer = Could not delete: a document keeps at least one layer.
@@ -2627,12 +2621,6 @@ tools4-status-last-layer = Could not delete: a document keeps at least one layer
 ## Move tool
 tools4-show-transform-controls = Show Transform Controls
 tools4-show-transform-controls-tip = Shows the frame and handles of the selected layer: dragging a handle scales or rotates it. Otherwise a drag only moves.
-
-## Retouching
-tools4-status-heal-unchanged = Nothing changed: the fill gives back the pixels that were there.
-
-## Free Transform
-tools4-status-path-transform = Free Transform applies to layers: drag the path with Path Selection, or transform its whole shape layer.
 
 ## Keys in Quick Mask mode
 input4-quick-mask-delete = In Quick Mask mode, { $delete } clears the selected area from the mask: make a selection first.
@@ -2668,7 +2656,7 @@ fx4-raw-open-failed = { $name } could not be developed: nothing was opened.
 fx4-ai-model-damaged = model file damaged: it was removed and will be downloaded again at the next use
 
 ## Linked smart objects: Edit Contents, files read again
-smart4-status-link-unreadable = Linked file could not be read, its last copy shown: { $names }
+smart4-status-link-unreadable = Linked files that could not be read show their last copy: { $names }
 smart4-status-link-saved = Saved in { $name }: the smart objects linked to it follow.
 smart4-status-link-saved-flat = Saved in { $name } with its layers merged: the smart objects linked to it follow. This tab keeps the layers until closed.
 smart4-status-updated-embedded = Smart object updated and embedded (its linked file is missing): { $name }
@@ -2712,12 +2700,12 @@ ui4-why-no-mask = The active layer has no layer mask
 ui4-why-no-pixels = The active layer has no pixels of its own
 ui4-why-not-smart = The active layer is not a smart object
 ui4-why-not-linked = The smart object is not linked to a file
-ui4-why-not-live = Only type, shape and smart object layers are rasterized
+ui4-why-not-live = Only type, shape and smart object layers can be rasterized
 ui4-why-smart-adjust = Adjustments don't change a smart object: add an adjustment layer above it
 ui4-why-no-layer-below = There is no layer below to merge into
 ui4-why-not-group = The active layer is not a group
 ui4-why-not-artboard = The active layer is not an artboard
-ui4-why-not-top-group = Select a group at the top of the list, outside any artboard
+ui4-why-not-top-group = Select a group that is not inside another group or an artboard
 ui4-why-in-artboard = The layers are already in an artboard
 ui4-why-no-artboards = The image has no artboards
 ui4-why-no-style = The active layer has no layer style
@@ -2784,7 +2772,7 @@ ui4-diag-verdict-errors = { $count ->
    *[other] { $count } errors happened in this session: see the Log tab.
 }
 ui4-diag-verdict-slow = The display is slow at the moment.
-ui4-diag-what-to-send = To report a problem, use Report a Problem: it copies this report, to paste into your message.
+ui4-diag-what-to-send = Report a Problem… copies this report and opens the page: paste it into your message.
 ui4-diag-report = Report a Problem…
 ui4-diag-report-tip = Copies the report, then opens the page where problems are reported
 ui4-diag-status-report = Report copied: paste it into your message on the page that opened.
@@ -2792,7 +2780,7 @@ ui4-diag-just-now = just now
 ui4-diag-tip-frame = Time to draw the window once. Under { $smooth } is smooth; over { $sluggish } feels sluggish.
 ui4-diag-tip-freezes = Moments when the window stopped responding for more than { $freeze }.
 ui4-diag-tip-memory = Memory the program uses, including what it shares with other programs.
-ui4-diag-tip-history = Memory kept to undo, for all the open documents; the oldest steps go beyond the budget.
+ui4-diag-tip-history = Memory kept to undo, for all the open documents; beyond the budget, the oldest steps are dropped.
 ui4-diag-tip-documents = Open documents, the largest one and the layers they hold.
 ui4-diag-tip-rendering = Pieces of the image drawn per refresh. A size level above 0 shows a reduced copy while you zoom out.
 ui4-diag-tip-jobs = Work done without blocking the window (filters, AI, saving…).
@@ -2806,4 +2794,95 @@ ui4-diag-gpu-cpu = software (on the processor)
 ui4-diag-gpu-other = other
 
 ## Keyboard Shortcuts: tools that share a key
-ui4-shortcuts-tools-cycle = { $key }, then { $next } for the next one
+ui4-shortcuts-tools-cycle = { $key } · { $next }
+
+## History: background results after an undo or a redo
+hist5-selection-undone = Undone or redone while the selection was being computed: make it again.
+hist5-subject-undone = Undone or redone during the search: run the command again.
+hist5-subject-selection-changed = The selection changed during the search: run Select Subject again to use it.
+## History: step names
+hist5-delete-layers = Delete Layers
+
+## Files too large to save or to open
+
+files5-error-layer-too-large = the layer "{ $name }" is too large to be saved ({ $width } × { $height } px): crop it or make it smaller
+files5-error-out-of-memory = opening it would take more memory than this computer has ({ $memory } GB)
+
+## What saving over a file in its format would lose
+
+files5-psd-note-animation = the frame animation
+files5-psd-note-spot = the spot colors (kept as alpha channels)
+files5-psd-note-variables = the variables and data sets
+files5-psd-note-other = other data this app doesn't read
+files5-note-images = the other images it holds (HDR gain map, previews)
+files5-note-xmp = its XMP or IPTC metadata
+files5-note-exif = its EXIF metadata
+files5-note-other-apps = data other apps stored in it (layers, image resources)
+files5-status-batch-would-lose = "{ $name }" would lose: { $notes }. Left as it is.
+
+## Quick Mask: notice in the options bar
+
+sel5-options-quick-mask = Quick Mask
+sel5-options-quick-mask-tip = Every tool edits the selection, not the layer: paint with black to mask, with white to select. Click or press { $key } to finish.
+
+## Object Selection
+
+sel5-objsel-tool-left = Object Selection: another tool was chosen before the object was found; that click was dropped.
+
+## Linked file opened by Edit Contents: saved in a format that can't hold everything
+smart5-link-save-title = Save { $name }
+smart5-link-save-merge = { $name } can't hold layers: saving merges them into the file. The smart objects linked to it then show the merged image, and this tab keeps its layers.
+smart5-link-save-lose = Saving { $name } in its format will lose: { $notes }.
+smart5-link-save-ok = Save
+smart5-link-save-as = Save As…
+
+## Batch: Save and Close over files open with unsaved changes
+smart5-batch-open-modified = { $count ->
+    [one] { $names } is open with unsaved changes: nothing was processed. Save or close it, then run the batch again.
+   *[other] { $count } files are open with unsaved changes ({ $names }): nothing was processed. Save or close them, then run the batch again.
+}
+
+## Retouching
+tools5-status-unchanged = Nothing changed: the result is the same as the pixels that were there.
+
+## Transform
+tools5-status-path-transform = Transforms apply to layers: drag the path with Path Selection, or transform its whole shape layer.
+
+## Crop tool
+tools5-crop-confirm-title = Crop
+tools5-crop-confirm-text = Crop the image?
+tools5-crop-confirm-crop = Crop
+tools5-crop-confirm-dont = Don't Crop
+
+## Move tool
+tools5-hist-duplicate-layers = Duplicate Layers
+tools5-layer-copy-numbered = { $name } copy { $number }
+
+## Layer menu: visibility of the selected layers
+ui5-menu-hide-layers = Hide Layers
+ui5-menu-show-layers = Show Layers
+
+## Command palette: other words commands are found by
+ui5-palette-keywords-new = document image blank canvas create
+ui5-palette-keywords-visibility = visibility eye show hide
+ui5-palette-keywords-object-select = quick selection
+ui5-palette-keywords-actions = macro record
+ui5-palette-keywords-undo = step backward back
+ui5-palette-keywords-language = english french
+ui5-palette-keywords-desaturate = desaturate
+ui5-palette-keywords-scale = resize
+ui5-palette-keywords-save-for-web = save for web
+
+## Help > Diagnostics: background jobs
+ui5-op-smart-render = Smart object rendering
+ui5-op-smart-preview = Smart filter preview
+
+## A layer inside a hidden group
+ui5-options-group-hidden-tip = Its group "{ $group }" is hidden: show the group with its eye in the Layers panel
+ui5-status-group-hidden = Could not paint: the group "{ $group }" that holds "{ $name }" is hidden. Show the group with its eye in the Layers panel.
+
+## Keyboard Shortcuts window
+ui5-shortcuts-cycle-note = Shift with a tool's key picks the next tool of its group.
+
+## Files dragged over an open document
+ui5-drop-place-hint = Drop to place in this image. To open in a tab of its own: File › Open ({ $key }).

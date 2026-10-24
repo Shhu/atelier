@@ -87,6 +87,56 @@ impl Sources for FullSize {
     }
 }
 
+/// The images at a level, a pixel of each block taken (its center): about
+/// as fast as the level has pixels, for a coarse view while the true
+/// reductions are made.
+pub struct Sampled(pub u32);
+
+impl Sampled {
+    fn sample<P: Pixel<Subpixel = u8>>(
+        &self,
+        image: &ImageBuffer<P, Vec<u8>>,
+        at: (i64, i64),
+    ) -> Src<P> {
+        let b = 1u32 << self.0;
+        let (w, h) = image.dimensions();
+        let out = ImageBuffer::from_fn(w.div_ceil(b), h.div_ceil(b), |x, y| {
+            *image.get_pixel((x * b + b / 2).min(w - 1), (y * b + b / 2).min(h - 1))
+        });
+        let b = i64::from(b);
+        Src {
+            image: Arc::new(out),
+            at: (at.0.div_euclid(b), at.1.div_euclid(b)),
+        }
+    }
+}
+
+impl Sources for Sampled {
+    fn level(&self) -> u32 {
+        self.0
+    }
+
+    fn rgba(
+        &mut self,
+        _: SourceKey,
+        _: u64,
+        image: &Arc<RgbaImage>,
+        at: (i64, i64),
+    ) -> Src<Rgba<u8>> {
+        self.sample(image, at)
+    }
+
+    fn gray(
+        &mut self,
+        _: SourceKey,
+        _: u64,
+        image: &Arc<GrayImage>,
+        at: (i64, i64),
+    ) -> Src<Luma<u8>> {
+        self.sample(image, at)
+    }
+}
+
 /// Canvas area where the pixels and mask of a layer changed since the last
 /// frame (brush stroke), to reduce only that part again.
 #[derive(Clone, Copy, Debug)]

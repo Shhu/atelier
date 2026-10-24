@@ -108,15 +108,23 @@ pub(super) struct ShapeOptions {
 impl ShapeOptions {
     /// Edges of `tool`'s shapes (a selection tool).
     pub(super) fn edges(&mut self, tool: Tool) -> &mut Edges {
-        let i = match tool {
+        &mut self.edges[Self::index(tool)]
+    }
+
+    /// The same, to read.
+    pub(super) fn edges_of(&self, tool: Tool) -> Edges {
+        self.edges[Self::index(tool)]
+    }
+
+    fn index(tool: Tool) -> usize {
+        match tool {
             Tool::Select => 0,
             Tool::Ellipse => 1,
             Tool::FreeLasso => 2,
             Tool::PolyLasso => 3,
             Tool::Lasso => 4,
             _ => 5,
-        };
-        &mut self.edges[i]
+        }
     }
 }
 
@@ -161,8 +169,11 @@ pub(super) struct SubjectJob {
     /// Remove the background of this layer (id, pixel revision), otherwise
     /// select the subject.
     remove_from: Option<(u64, u64)>,
-    /// The history position searched (see `Document::history_step`).
-    step: u64,
+    /// The history generation searched in (see
+    /// `Document::history_generation`), and the selection then (Select
+    /// Subject: one made since is the user's latest).
+    generation: u64,
+    base: Option<Selection>,
 }
 
 /// Radius (screen pixels) around the first point to close the lasso.
@@ -195,7 +206,8 @@ impl AtelierApp {
     /// Combination mode of a new selection: Shift adds, Alt subtracts,
     /// both intersect; otherwise the mode from the options.
     pub(super) fn selection_mode(&self, shift: bool, alt: bool) -> SelectMode {
-        if self.selection.is_none() {
+        // One being computed counts (a Shift+click right after a click).
+        if self.selection.is_none() && !self.select_busy() {
             return SelectMode::Replace;
         }
         SelectMode::from_modifiers(shift, alt, self.select_mode)
@@ -1028,6 +1040,8 @@ impl AtelierApp {
     /// Starts the search in the background: with the AI model, or by
     /// GrabCut if `use_ai` is false or the AI fails.
     pub(super) fn start_subject(&mut self, remove_background: bool, use_ai: bool) {
+        // From the selection being computed, as if it was there.
+        self.wait_select_job();
         let Some(doc) = &self.doc else { return };
         // The image is made in the background (flattening takes a while).
         let (image, remove_from): (Box<dyn FnOnce() -> _ + Send>, _) = if remove_background {
@@ -1069,7 +1083,8 @@ impl AtelierApp {
             result,
             doc: doc.uid(),
             remove_from,
-            step: doc.history_step(),
+            generation: doc.history_generation(),
+            base: self.selection.clone(),
         });
         self.status = t!("select-subject-searching");
     }
@@ -1091,18 +1106,31 @@ impl AtelierApp {
                 return;
             }
         };
-        let (searched, remove_from, step) = (job.doc, job.remove_from, job.step);
-        self.subject_job = None;
+        let job = self.subject_job.take().expect("checked");
         // Never on another document.
-        let Some(doc) = self.doc.as_mut().filter(|d| d.uid() == searched) else {
-            return;
-        };
-        // Undone, redone or changed meanwhile: found in another image, and
-        // recording it would wipe the redo list.
-        if doc.history_step() != step {
-            self.status = t!("hist4-subject-history-changed");
+        if self.doc.as_ref().is_none_or(|d| d.uid() != job.doc) {
             return;
         }
+        // A selection made before it lands first, in order.
+        self.wait_select_job();
+        let Some(doc) = self.doc.as_mut() else { return };
+        // Undone or redone meanwhile: found in another image, and recording
+        // it would wipe the redo list. Steps recorded forward don't matter.
+        if doc.history_generation() != job.generation {
+            self.status = t!("hist5-subject-undone");
+            return;
+        }
+        // The user selected something else meanwhile: theirs stays.
+        let unchanged = match (&job.base, &self.selection) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.equal(b),
+            _ => false,
+        };
+        if job.remove_from.is_none() && !unchanged {
+            self.status = t!("hist5-subject-selection-changed");
+            return;
+        }
+        let remove_from = job.remove_from;
         if mask.pixels().all(|p| p.0[0] == 0) {
             self.status = t!("select-subject-not-found");
             return;

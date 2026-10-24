@@ -187,6 +187,9 @@ pub(super) struct Snapshot {
     reference: Option<Pt>,
     mode: Mode,
     style: (WarpStyle, f32, bool),
+    /// The state before a warp was applied by a change of mode: going
+    /// back to it gives the applied warp up.
+    switch: bool,
 }
 
 /// A warp applied when switching to another mode, kept pending with the
@@ -296,6 +299,9 @@ pub(super) struct Transforming {
     last: Option<Last>,
     /// Box of the active mask's pixels, for a mask fingerprint.
     mask_bounds: Cell<Option<(u64, Option<PixelRect>)>>,
+    /// Box of the selected pixels a lift would take, for the Move tool's
+    /// frame (by a fingerprint of the layer and the selection).
+    selected_bounds: Cell<Option<(u64, Option<PixelRect>)>>,
     pub(super) mask_preview: Option<MaskPreview>,
     reduced_mask: Option<ReducedMask>,
     /// The other layers transformed with the active one, on their own (see
@@ -304,12 +310,17 @@ pub(super) struct Transforming {
     applying: Option<Applying>,
     /// Ctrl+Z inside Free Transform: the states before each edit.
     undo: Vec<Snapshot>,
+    /// Ctrl+Shift+Z inside it: the states undone, with the state each
+    /// undo left (an edit since then makes them stale).
+    redo: Vec<(Snapshot, Snapshot)>,
     /// The series of edits the last state recorded starts (arrow keys,
     /// a number field dragged): its kind and when it was last edited.
     series: Option<(&'static str, f64)>,
     applied: Option<Applied>,
     /// The mode to go on in once the warp being applied is done.
     reenter: Option<Mode>,
+    /// The Ctrl+Z points from before that warp, and the state then.
+    reenter_undo: Option<(Vec<Snapshot>, Snapshot)>,
 }
 
 impl Transforming {
@@ -340,14 +351,17 @@ impl Default for Transforming {
             step: None,
             last: None,
             mask_bounds: Cell::new(None),
+            selected_bounds: Cell::new(None),
             mask_preview: None,
             reduced_mask: None,
             lifted: Vec::new(),
             applying: None,
             undo: Vec::new(),
+            redo: Vec::new(),
             series: None,
             applied: None,
             reenter: None,
+            reenter_undo: None,
         }
     }
 }
@@ -604,8 +618,9 @@ impl AtelierApp {
             return;
         }
         match cmd {
-            Command::Free if self.path_transform_wanted() => {
-                self.status = t!("tools4-status-path-transform");
+            // Every command but Again (which repeats a layer's transform).
+            _ if !matches!(cmd, Command::Again) && self.path_transform_wanted() => {
+                self.status = t!("tools5-status-path-transform");
             }
             Command::Free => {
                 self.enter_transform();
@@ -675,6 +690,10 @@ impl AtelierApp {
             return false;
         }
         self.set_tool(Tool::Transform);
+        // A crop box drawn: "Crop the image?" first.
+        if self.tool != Tool::Transform {
+            return false;
+        }
         if self.transform_rect.is_some() {
             self.free_transform = true;
             return true;
@@ -747,6 +766,7 @@ impl AtelierApp {
         (x.quad, x.warp, x.reference, x.drag, x.step) = (None, None, None, None, None);
         x.mask_preview = None;
         x.undo.clear();
+        x.redo.clear();
         x.series = None;
     }
 
@@ -766,10 +786,26 @@ impl AtelierApp {
         if !layer.paintable() || doc.mask_targeted() {
             return None;
         }
-        let selected = to_rect(selection.bounds(doc.full_rect())?);
-        let content = to_rect(layer.content_bounds()?);
-        let r = selected.intersect(content);
-        r.is_positive().then_some(r)
+        // The tight box of what a lift takes (selected and not
+        // transparent), so that a handle grabbed stays under the pointer.
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (doc.uid(), layer.id, layer.rev(), layer.offset).hash(&mut h);
+            let r = selection.rect;
+            (r.x, r.y, r.w, r.h, selection.inverted).hash(&mut h);
+            selection.mask.as_ref().map(Arc::as_ptr).hash(&mut h);
+            h.finish()
+        };
+        let bounds = match self.xform.selected_bounds.get() {
+            Some((k, b)) if k == key => b,
+            _ => {
+                let b = selected_pixels_bounds(doc, selection);
+                self.xform.selected_bounds.set(Some((key, b)));
+                b
+            }
+        };
+        bounds.map(to_rect).filter(|r| r.is_positive())
     }
 
     /// Move tool with a selection, like Photoshop: a drag moves the
@@ -841,6 +877,7 @@ impl AtelierApp {
             reference: x.reference,
             mode: x.mode,
             style: (x.style, x.bend, x.vertical),
+            switch: false,
         };
         (s, self.doc.as_ref().map(Document::history_step))
     }
@@ -877,20 +914,56 @@ impl AtelierApp {
     pub(super) fn undo_transform_edit(&mut self) -> bool {
         let now = self.snapshot().0;
         while let Some(s) = self.xform.undo.pop() {
+            if s.switch {
+                // Before the warp applied by a change of mode: it is given
+                // up, and its grid comes back.
+                let Some(applied) = self.xform.applied.take() else {
+                    continue;
+                };
+                if let Some(doc) = &mut self.doc {
+                    doc.rollback_to(applied.mark);
+                }
+                self.selection = applied.selection;
+                self.restore_snapshot(s);
+                self.xform.redo.clear();
+                return true;
+            }
             if s != now && s.rect.is_some() {
-                self.transform_rect = s.rect;
-                self.transform_angle = s.angle;
-                let x = &mut self.xform;
-                (x.quad, x.warp) = (s.quad, s.warp);
-                x.reference = s.reference;
-                x.mode = s.mode;
-                (x.style, x.bend, x.vertical) = s.style;
-                x.series = None;
-                (self.xform.drag, self.drag, self.rotate_drag) = (None, None, None);
+                self.restore_snapshot(s);
+                self.xform.redo.push((now, s));
                 return true;
             }
         }
         false
+    }
+
+    /// Ctrl+Shift+Z during Free Transform: the edit undone last comes
+    /// back. `false` when there is none (or it was edited since).
+    pub(super) fn redo_transform_edit(&mut self) -> bool {
+        let now = self.snapshot().0;
+        match self.xform.redo.pop() {
+            Some((s, left)) if left == now => {
+                self.restore_snapshot(s);
+                self.xform.undo.push(now);
+                true
+            }
+            _ => {
+                self.xform.redo.clear();
+                false
+            }
+        }
+    }
+
+    fn restore_snapshot(&mut self, s: Snapshot) {
+        self.transform_rect = s.rect;
+        self.transform_angle = s.angle;
+        let x = &mut self.xform;
+        (x.quad, x.warp) = (s.quad, s.warp);
+        x.reference = s.reference;
+        x.mode = s.mode;
+        (x.style, x.bend, x.vertical) = s.style;
+        x.series = None;
+        (self.xform.drag, self.drag, self.rotate_drag) = (None, None, None);
     }
 
     /// The layers a transform changes: the selected ones (a group with its
@@ -1049,6 +1122,15 @@ impl AtelierApp {
                 self.xform.warp = None;
                 self.xform.quad = quad;
             } else {
+                // The first warp applied (pixels not lifted): Ctrl+Z can
+                // come back to it, with the points before it.
+                let first = self.xform.applied.is_none() && self.xform.lift.is_none();
+                let before = Snapshot {
+                    switch: true,
+                    ..self.snapshot().0
+                };
+                self.xform.reenter_undo =
+                    first.then(|| (std::mem::take(&mut self.xform.undo), before));
                 let Some(doc) = &self.doc else { return };
                 let applied = self.xform.applied.take().unwrap_or(Applied {
                     mark: doc.history_mark(),
@@ -1074,12 +1156,17 @@ impl AtelierApp {
             return;
         };
         let applied = self.xform.applied.take();
+        let undo = self.xform.reenter_undo.take();
         if !self.enter_transform() {
             // Nothing left to transform: the warp stays applied.
             return;
         }
         self.xform.applied = applied;
         self.xform.mode = mode;
+        if let Some((mut points, before)) = undo.filter(|_| self.xform.applied.is_some()) {
+            points.push(before);
+            self.xform.undo = points;
+        }
     }
 
     /// Warp mode: the grid over the frame, bent by the chosen style.
@@ -1328,7 +1415,15 @@ impl AtelierApp {
         // After a warp applied on the way, the commit joins it (see
         // `finish_transform`).
         let after_warp = self.xform.applied.is_some();
-        if plain && !mask && !smart && !grouped_text && !after_warp && targets.len() == 1 {
+        // A large layer scaled or turned: resampled on another thread too
+        // (seconds at 24 megapixels), a text kept as such the plain way.
+        let large = !moved_only && targets.len() == 1 && {
+            let l = &doc.layers[targets[0]];
+            let (w, h) = l.image().dimensions();
+            l.text.is_none() && !l.is_group() && u64::from(w) * u64::from(h) >= ASYNC_PIXELS
+        };
+        if plain && !mask && !smart && !grouped_text && !after_warp && !large && targets.len() == 1
+        {
             return false;
         }
         let Some(t) = self
@@ -1400,7 +1495,8 @@ impl AtelierApp {
         let filter = self.resize_filter.filter();
         let Some(doc) = &self.doc else { return true };
         let job = doc.transform_job(target, &commit.pixels, &t, filter);
-        if job.size() < ASYNC_PIXELS {
+        // Small and quick: at once (smart filters never are, said).
+        if job.size() < ASYNC_PIXELS && !job.has_filters() {
             self.finish_transform(commit, Some(job.run()));
             return true;
         }
@@ -1524,7 +1620,11 @@ impl AtelierApp {
                 c.layers
                     .iter()
                     .filter(|&&i| doc.layers.get(i).is_some_and(Layer::has_pixels))
-                    .map(|&i| doc.layers[i].rect())
+                    // What shows, not the transparent margins of the box.
+                    .map(|&i| {
+                        let l = &doc.layers[i];
+                        l.content_bounds().unwrap_or(l.rect())
+                    })
                     .reduce(PixelRect::union)
             })
             .flatten();
@@ -2124,6 +2224,25 @@ fn grab_cursor(grab: Grab, dragging: bool) -> CursorIcon {
     }
 }
 
+/// Canvas box of the pixels of the active layer `selection` lifts (the
+/// floating layer's content).
+fn selected_pixels_bounds(doc: &Document, selection: &Selection) -> Option<PixelRect> {
+    let region = selection.bounds(doc.full_rect())?;
+    let pixels = doc.active_pixels(Some(selection))?;
+    let (w, h) = pixels.dimensions();
+    let opaque = |x: u32, y: u32| pixels.get_pixel(x, y).0[3] > 0;
+    let rows: Vec<u32> = (0..h).filter(|&y| (0..w).any(|x| opaque(x, y))).collect();
+    let (&y0, &y1) = (rows.first()?, rows.last()?);
+    let x0 = (0..w).find(|&x| (y0..=y1).any(|y| opaque(x, y)))?;
+    let x1 = (0..w).rev().find(|&x| (y0..=y1).any(|y| opaque(x, y)))?;
+    Some(PixelRect {
+        x: region.x + i64::from(x0),
+        y: region.y + i64::from(y0),
+        w: x1 - x0 + 1,
+        h: y1 - y0 + 1,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2200,3 +2319,4 @@ mod tests {
         assert_eq!(half[0], [17.0, 24.0]);
     }
 }
+

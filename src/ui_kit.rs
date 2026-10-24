@@ -287,6 +287,22 @@ pub fn hint(ui: &mut Ui, text: impl Into<String>) -> Response {
 /// Small label above or before a field.
 pub fn field_label(ui: &mut Ui, text: &str) {
     ui.label(egui::RichText::new(text).size(12.0).color(color::LABEL));
+    // It names the drop-down under it, for screen readers (see `combo`).
+    let here = (ui.id(), ui.ctx().cumulative_pass_nr(), text.to_owned());
+    ui.data_mut(|d| d.insert_temp(field_label_id(), here));
+}
+
+fn field_label_id() -> egui::Id {
+    egui::Id::new("ui-kit-field-label")
+}
+
+/// Names a control for screen readers, its value apart, when its label is
+/// drawn elsewhere.
+pub fn name_control(ui: &Ui, id: egui::Id, name: &str, value: &str) {
+    ui.ctx().accesskit_node_builder(id, |node| {
+        node.set_label(name);
+        node.set_value(value);
+    });
 }
 
 /// Vertical separator between groups of a bar.
@@ -873,12 +889,18 @@ pub fn combo<R>(
         .height(320.0)
         .show_ui(ui, add_contents);
     // Named by its label, its value apart ("Scale" and "100%", not
-    // "Scale100%").
-    if let Some(label) = label {
-        ui.ctx().accesskit_node_builder(shown.response.id, |node| {
-            node.set_label(label);
-            node.set_value(selected);
+    // "Scale100%"); without one, by the `field_label` just above it.
+    let above = || {
+        let (id, pass) = (ui.id(), ui.ctx().cumulative_pass_nr());
+        let above = ui.data_mut(|d| {
+            let above = d.get_temp::<(egui::Id, u64, String)>(field_label_id());
+            d.remove::<(egui::Id, u64, String)>(field_label_id());
+            above
         });
+        above.filter(|l| l.0 == id && l.1 == pass).map(|l| l.2)
+    };
+    if let Some(name) = label.map(str::to_owned).or_else(above) {
+        name_control(ui, shown.response.id, &name, selected);
     }
     shown
 }

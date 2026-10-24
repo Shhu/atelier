@@ -54,7 +54,7 @@ impl AtelierApp {
                 self.report_error(tm!(
                     "status-open-failed",
                     path = name,
-                    error = e.to_string()
+                    error = crate::i18n::Message::of(|| e.to_string())
                 ));
             }
         }
@@ -149,7 +149,7 @@ impl AtelierApp {
         }
     }
 
-    fn save_to(&mut self, path: &Path) {
+    pub(super) fn save_to(&mut self, path: &Path) {
         self.commit_pending();
         // Photoshop refuses too: the other tab would show a file that is
         // no longer its own, and its Save would overwrite this one.
@@ -164,7 +164,7 @@ impl AtelierApp {
         let started = std::time::Instant::now();
         let saved = doc.save(path);
         crate::diag::record(format!("Save: {}", format_of(path)), started.elapsed());
-        let failed = saved.is_err();
+        let mut failed = None;
         self.status = match saved {
             Ok(notes) => {
                 // Saved as a file of its own: no longer a smart object's
@@ -188,15 +188,20 @@ impl AtelierApp {
                     )
                 }
             }
-            Err(e) => t!(
-                "file-status-save-failed",
-                name = file_name(path),
-                error = e.to_string()
-            ),
+            Err(e) => {
+                let message = tm!(
+                    "file-status-save-failed",
+                    name = file_name(path),
+                    error = crate::i18n::Message::of(|| e.to_string())
+                );
+                let shown = message.shown.clone();
+                failed = Some(message);
+                shown
+            }
         };
         // Not saved: said where it can't be missed.
-        if failed {
-            self.report_error(self.status.clone());
+        if let Some(message) = failed {
+            self.report_error(message);
         }
     }
 
@@ -262,7 +267,7 @@ impl AtelierApp {
                 true
             }
             Err(e) => {
-                self.status_failed(tm!("status-copy-failed", error = e.to_string()));
+                self.status_failed(tm!("status-copy-failed", error = crate::i18n::Message::of(|| e.to_string())));
                 false
             }
         }
@@ -300,7 +305,7 @@ impl AtelierApp {
     fn paste_image(&mut self, image: image::RgbaImage, mode: PasteMode) {
         let (w, h) = image.dimensions();
         if let Err(e) = crate::document::check_size(w, h) {
-            self.status_failed(tm!("file-status-paste-failed", error = e.to_string()));
+            self.status_failed(tm!("file-status-paste-failed", error = crate::i18n::Message::of(|| e.to_string())));
             return;
         }
         if mode == PasteMode::Into && self.selection.is_none() {
@@ -364,35 +369,68 @@ impl AtelierApp {
     /// Files dropped on the window: placed as smart objects (Place
     /// Embedded), or each opened in its own tab when no document is open
     /// (Atelier documents always open). They wait while a modal window is
-    /// open.
+    /// open. Where they are dropped can't count: no platform tells where an
+    /// OS drag ends (and the pointer is unknown during it), so the rule is
+    /// one, said while they are dragged over the window.
     pub(super) fn handle_dropped_files(&mut self, ctx: &egui::Context) {
-        // On the canvas, an image is placed in the document; on the tabs
-        // or the panels, it opens in a tab of its own.
-        let canvas = ctx.data(|d| d.get_temp::<Rect>(egui::Id::new(DROP_AREA)));
-        ctx.input(|i| {
-            let at = i.pointer.latest_pos();
-            let on_canvas = match (at, canvas) {
-                (Some(p), Some(area)) => area.contains(p),
-                _ => true,
-            };
-            let paths = i
+        let (hovering, paths) = ctx.input(|i| {
+            let paths: Vec<PathBuf> = i
                 .raw
                 .dropped_files
                 .iter()
-                .map(|f| (f.path().to_path_buf(), on_canvas));
-            self.dropped.extend(paths);
+                .map(|f| f.path().to_path_buf())
+                .collect();
+            (!i.raw.hovered_files.is_empty(), paths)
         });
+        self.dropped.extend(paths);
+        if hovering && self.doc.is_some() {
+            self.drop_hint(ctx);
+        }
         if self.dropped.is_empty() || self.modal_open() {
             return;
         }
         let open = self.doc.is_none();
-        for (path, on_canvas) in std::mem::take(&mut self.dropped) {
-            if open || !on_canvas || is_native(&path) {
+        for path in std::mem::take(&mut self.dropped) {
+            if open || is_native(&path) {
                 self.open_path(&path);
             } else {
                 self.place_path(&path, false);
             }
         }
+    }
+
+    /// Over the canvas while files are dragged in: they will be placed, and
+    /// how to open them instead.
+    fn drop_hint(&self, ctx: &egui::Context) {
+        let Some(area) = ctx.data(|d| d.get_temp::<Rect>(egui::Id::new(DROP_AREA))) else {
+            return;
+        };
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("drop-hint"),
+        ));
+        use ui_kit::color;
+        painter.rect_filled(area, 0.0, color::BG0.gamma_multiply(0.6));
+        painter.rect_stroke(
+            area.shrink(6.0),
+            8.0,
+            egui::Stroke::new(2.0, color::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+        let key = super::keys::shortcut(ctx, &SHORTCUT_OPEN);
+        let galley = painter.layout(
+            t!("ui5-drop-place-hint", key = key),
+            egui::FontId::proportional(15.0),
+            color::TEXT,
+            (area.width() - 80.0).max(120.0),
+        );
+        let at = area.center() - galley.size() / 2.0;
+        painter.rect_filled(
+            Rect::from_min_size(at, galley.size()).expand2(vec2(16.0, 12.0)),
+            8.0,
+            color::BG2,
+        );
+        painter.galley(at, galley, color::TEXT);
     }
 }
 
@@ -704,6 +742,26 @@ mod tests {
             app.tab(i)
                 .is_some_and(|(d, _)| d.layers.len() == 1 && !d.modified)
         }));
+    }
+
+    /// No platform says where an OS drag ends: one rule, wherever the
+    /// pointer was last seen (here over the tabs), and with none known.
+    #[test]
+    fn a_file_dropped_on_an_open_document_is_placed_wherever_it_lands() {
+        let dir = folder("drop-anywhere");
+        let path = dir.join("layer.png");
+        image([0, 0, 255, 255]).save(&path).unwrap();
+        let mut harness = harness(vec![Document::new(image([9, 9, 9, 255]), None)]);
+        harness.run_steps(2);
+        harness.hover_at(pos2(300.0, 52.0));
+        drop_file(&mut harness, &path);
+        harness.run_steps(2);
+        harness.input_mut().events.push(egui::Event::PointerGone);
+        drop_file(&mut harness, &path);
+        harness.run_steps(2);
+        let app = harness.state();
+        assert_eq!(app.tab_count(), 1);
+        assert_eq!(app.doc.as_ref().unwrap().layers.len(), 3);
     }
 
     #[test]

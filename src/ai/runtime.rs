@@ -125,7 +125,7 @@ impl Slot {
                 crate::diag::warn(crate::i18n::tm!(
                     "ui4-log-ai-gpu-failed",
                     name = name.to_string(),
-                    error = e.to_string()
+                    error = crate::i18n::Message::of(|| e.to_string())
                 ));
                 state.cpu_only = true;
                 state.session = None;
@@ -138,6 +138,10 @@ impl Slot {
 
     fn load(&self, cpu_only: bool) -> Result<(Session, Device), String> {
         let path = (self.path)();
+        // Damaged weights load fine: found by their hash, once.
+        if super::models::remove_damaged_once(&path) {
+            return Err(crate::i18n::t!("fx4-ai-model-damaged"));
+        }
         let loaded = session(&path, cpu_only).map_err(|e| {
             // Of the right size but damaged: removed, to download again.
             if super::models::remove_if_damaged(&path) {
@@ -202,7 +206,7 @@ fn session(model: &Path, cpu_only: bool) -> Result<(Session, Device), String> {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string(),
-                error = e.to_string()
+                error = crate::i18n::Message::of(|| e.to_string())
             )),
         }
     }

@@ -10,6 +10,7 @@ use std::sync::mpsc;
 
 use image::RgbaImage;
 
+use super::actions_panel::Stopped;
 use super::dialogs::{
     DialogSpec, Steps, Track, dialog_body_height, floating_dialog, gap_between_blocks, slider_row,
     slider_row_steps,
@@ -647,13 +648,11 @@ impl AtelierApp {
         if self.refuse_hidden_target() {
             return;
         }
-        self.record(crate::actions::Recorded::Liquify {
-            mesh: mesh.to_bytes(),
-        });
         if self.smart_filters_apply() {
-            self.add_smart_filter(SmartFilterKind::Liquify(Arc::clone(&mesh)));
-            self.liquify.last = Some(mesh);
-            self.filters.forget_last();
+            // Last Filter and the action being recorded get it once
+            // rendered (not cancelled).
+            let filter = SmartFilterKind::Liquify(Arc::clone(&mesh));
+            self.add_smart_filter(filter, move |app| app.liquify_applied(mesh));
             return;
         }
         let Some(doc) = &mut self.doc else { return };
@@ -703,6 +702,16 @@ impl AtelierApp {
         });
     }
 
+    /// Liquify applied with `mesh` (its result in, not cancelled): Last
+    /// Filter repeats it, an action being recorded gets it.
+    fn liquify_applied(&mut self, mesh: Arc<Mesh>) {
+        self.record(crate::actions::Recorded::Liquify {
+            mesh: mesh.to_bytes(),
+        });
+        self.liquify.last = Some(mesh);
+        self.filters.forget_last();
+    }
+
     /// The result is in: its pixels replace the layer's.
     fn poll_liquify(&mut self) {
         let Some(applying) = &self.liquify.applying else {
@@ -726,19 +735,22 @@ impl AtelierApp {
                     doc.active_layer_mut().replace_pixels(image);
                     doc.end_paint();
                     self.status = t!("filter-applied", name = name.as_str());
-                    self.liquify.last = Some(a.mesh);
-                    self.filters.forget_last();
+                    self.liquify_applied(a.mesh);
                 }
                 Ok(None) => {
                     doc.end_paint();
                     doc.discard_step();
                     self.status = t!("retouch-status-cancelled", name = name.as_str());
+                    self.actions.step_stopped(Stopped::Cancelled);
                     self.shrink_after_preview();
                 }
                 Err(()) => {
                     doc.end_paint();
                     doc.discard_step();
-                    self.status_failed(tm!("fx3-filter-failed", name = name.as_str()));
+                    let text = tm!("fx3-filter-failed", name = name.as_str());
+                    self.actions
+                        .step_stopped(Stopped::Failed(text.shown.clone()));
+                    self.status_failed(text);
                     self.shrink_after_preview();
                 }
             }

@@ -92,6 +92,31 @@ impl Document {
             .unwrap_or_else(|| make(1))
     }
 
+    /// Name of a copy of a layer named `name`, like Photoshop: "Logo
+    /// copy", then "Logo copy 2"… (a copy's copy too), one no layer has.
+    pub fn copy_name(&self, name: &str) -> String {
+        let suffix = t!("doc-layer-copy-name", name = "");
+        // "Logo copy 3" → "Logo copy" → "Logo".
+        let numbered = name
+            .rsplit_once(' ')
+            .filter(|(_, n)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+            .map_or(name, |(s, _)| s);
+        let stem = numbered
+            .strip_suffix(suffix.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| name.strip_suffix(suffix.as_str()).filter(|s| !s.is_empty()))
+            .unwrap_or(name);
+        let first = t!("doc-layer-copy-name", name = stem);
+        let used = |n: &str| self.layers.iter().any(|l| l.name == n);
+        if !used(&first) {
+            return first;
+        }
+        (2..=self.layers.len() as u32 + 2)
+            .map(|n| t!("tools5-layer-copy-numbered", name = stem, number = n))
+            .find(|n| !used(n))
+            .unwrap_or(first)
+    }
+
     /// A layer without pixels of `kind`.
     fn empty_layer(&mut self, name: String, kind: LayerKind) -> Layer {
         let mut layer = self.make_layer(name, RgbaImage::new(0, 0), (0, 0));
@@ -449,8 +474,8 @@ impl Document {
         let n = copies.len();
         self.layers.splice(r.end..r.end, copies);
         self.active = r.end + n - 1;
-        let top = &mut self.layers[self.active];
-        top.name = t!("doc-layer-copy-name", name = top.name.as_str());
+        let name = self.copy_name(&self.layers[self.active].name);
+        self.layers[self.active].name = name;
     }
 
     /// Deletes the active layer (a group: with its layers); at least one
@@ -481,7 +506,20 @@ impl Document {
         if count == 0 || count >= self.layers.len() {
             return false;
         }
-        self.checkpoint(t!("menu-layer-delete"));
+        // Named for one layer or several (a group counts as one).
+        let mut chosen: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| i < self.layers.len())
+            .collect();
+        chosen.sort_unstable();
+        chosen.dedup();
+        let inside = |i: usize| chosen.iter().any(|&g| g != i && self.block(g).contains(&i));
+        let several = chosen.iter().filter(|&&i| !inside(i)).count() > 1;
+        self.checkpoint(match several {
+            true => t!("hist5-delete-layers"),
+            false => t!("menu-layer-delete"),
+        });
         let lowest = gone.iter().position(|&g| g).unwrap_or(0);
         let mut k = 0;
         self.layers.retain(|_| {

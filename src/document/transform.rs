@@ -127,6 +127,14 @@ impl TransformJob {
         self.layers.iter().map(r).sum()
     }
 
+    /// A smart object it renders runs smart filters (whose cost its size
+    /// can't tell).
+    pub fn has_filters(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|l| l.smart.as_ref().is_some_and(smart::RenderJob::has_filters))
+    }
+
     pub fn run(self) -> Vec<Transformed> {
         let Self {
             t,

@@ -249,7 +249,7 @@ impl AtelierApp {
 
     /// Fill Path: the path's area of the active layer filled.
     fn fill_path(&mut self, s: FillSettings) {
-        if self.refuse_if_locked() {
+        if self.refuse_if_target_locked() {
             return;
         }
         let Some(path) = self.command_path() else {
@@ -277,7 +277,7 @@ impl AtelierApp {
     /// Stroke Path: the Brush (or the Eraser) along each component, with its
     /// current settings; Simulate Pressure tapers the ends.
     fn stroke_path(&mut self, s: StrokeSettings) {
-        if self.refuse_if_locked() {
+        if self.refuse_if_target_locked() {
             return;
         }
         let Some(path) = self.command_path() else {
@@ -727,15 +727,20 @@ fn path_row(
             ..Default::default()
         },
     );
+    // A long name ends with "…" at the row's end, whole on hover.
+    let x = thumb.right() + 10.0;
+    job.wrap = egui::text::TextWrapping::truncate_at_width((rect.right() - 8.0 - x).max(0.0));
     let galley = painter.layout_job(job);
+    let elided = galley.elided;
     painter.galley(
-        pos2(
-            thumb.right() + 10.0,
-            rect.center().y - galley.size().y / 2.0,
-        ),
+        pos2(x, rect.center().y - galley.size().y / 2.0),
         galley,
         ui_kit::color::TEXT,
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
-    response
+    if elided {
+        response.on_hover_text(name)
+    } else {
+        response
+    }
 }

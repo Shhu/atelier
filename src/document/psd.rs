@@ -784,6 +784,82 @@ mod tests {
                 .iter()
                 .all(|r| r.id != 1065)
         );
+        // What isn't kept is said, never dropped silently: a frame
+        // animation, spot colors, variables, unknown data. Count data and
+        // a one-frame animation go along or are left out without loss.
+        let display = |kind: u8| {
+            let mut d = 1u32.to_be_bytes().to_vec();
+            d.extend([0, 0, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 100, kind]);
+            d
+        };
+        let cases: [(Vec<crate::document::PsdResource>, Vec<String>); 6] = [
+            (
+                vec![resource(4000, b"maniIRFR\0\0\0\0")],
+                vec![t!("files5-psd-note-animation")],
+            ),
+            (
+                vec![resource(1077, &display(2))],
+                vec![t!("files5-psd-note-spot")],
+            ),
+            (vec![resource(1077, &display(0))], vec![]),
+            (
+                vec![resource(7000, b"vars")],
+                vec![t!("files5-psd-note-variables")],
+            ),
+            (
+                vec![resource(9999, b"?")],
+                vec![t!("files5-psd-note-other")],
+            ),
+            (vec![resource(1080, b"count")], vec![]),
+        ];
+        for (resources, notes) in cases {
+            let mut doc = sample();
+            doc.file_metadata.psd_resources = Arc::new(resources.clone());
+            let (back, _) = write_read(&doc);
+            assert_eq!(back.notes, notes, "{:?}", resources[0].id);
+        }
+        let mut doc = sample();
+        doc.file_metadata.psd_resources = Arc::new(vec![resource(1080, b"count")]);
+        let (back, _) = write_read(&doc);
+        assert!(
+            back.doc
+                .file_metadata
+                .psd_resources
+                .iter()
+                .any(|r| r.id == 1080)
+        );
+    }
+
+    /// A layer wider than the canvas's limit (Image Size on a layer that
+    /// reaches beyond the canvas) is written and read back, in both formats.
+    #[test]
+    fn layers_wider_than_a_canvas_round_trip() {
+        let mut doc = Document::new(RgbaImage::from_pixel(20_000, 2, Rgba([9, 9, 9, 255])), None);
+        doc.add_layer(
+            "Panorama".into(),
+            RgbaImage::from_pixel(37_500, 2, Rgba([200, 10, 10, 255])),
+            (-3000, 0),
+        );
+        let (back, _) = write_read(&doc);
+        assert_eq!(back.doc.layers[1].image().dimensions(), (37_500, 2));
+        let dir = std::env::temp_dir().join("atelier-psd-wide");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wide.atelier");
+        doc.save(&path).unwrap();
+        let back = Document::open(&path).unwrap().doc;
+        assert_eq!(back.layers[1].image().dimensions(), (37_500, 2));
+    }
+
+    /// The layers of a file decode at once: refused, not aborted, when
+    /// they need more memory than the computer has.
+    #[test]
+    fn the_layers_must_fit_in_memory() {
+        let (data, _) = write::document(&sample(), None).unwrap();
+        assert!(read::document(&data).is_ok());
+        assert!(matches!(
+            read::document_within(&data, crate::document::file_io::Budget::of(1000)),
+            Err(FileError::OutOfMemory(1000))
+        ));
     }
 
     /// Saving over a PSD keeps as many alpha channels as the file writes:

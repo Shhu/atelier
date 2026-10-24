@@ -10,7 +10,7 @@ use image::{GrayImage, RgbaImage};
 use super::bytes::{Reader, Result, unpack_row};
 use super::descriptor::Descriptor;
 use super::{Imported, adjust, artboard, blend_of, effects, vector};
-use crate::document::file_io::{MAX_DIMENSION, check_size};
+use crate::document::file_io::{Budget, check_size, layer_fits};
 use crate::document::native::par_map;
 use crate::document::{BlendMode, Channel, Document, FileError, LayerKind, Mask, PsdResource};
 use crate::guides::{Guide, Orientation};
@@ -97,16 +97,51 @@ struct Resources {
     kept: Vec<PsdResource>,
     /// Layer comps, which name layers by identifiers saving changes.
     comps: bool,
+    /// What saving would lose besides (see [`resources`]).
+    animation: bool,
+    spot: bool,
+    variables: bool,
+    other: bool,
 }
 
 /// Image resources that describe the document rather than its layers,
-/// written back unchanged: resolution, print settings, halftone and
-/// transfer functions, IPTC, copyright flag and URL, global light, slices,
-/// EXIF, XMP, print scale, pixel aspect ratio, clipping path.
-const KEPT: [u16; 19] = [
-    1005, 1011, 1013, 1016, 1028, 1034, 1035, 1037, 1049, 1050, 1058, 1059, 1060, 1062, 1064, 1082,
-    1083, 2999, 10000,
+/// written back unchanged: caption, background color, resolution, print
+/// settings, halftone and transfer functions, IPTC, copyright flag and
+/// URL, global light, spot halftone, document ids, slices, URL list, EXIF,
+/// caption digest, XMP, print scale, pixel aspect ratio, HDR toning,
+/// color samplers, measurement scale, Count tool, print style, clipping
+/// path, Lightroom workflow, print flags.
+const KEPT: [u16; 35] = [
+    1005, 1008, 1010, 1011, 1013, 1016, 1028, 1034, 1035, 1037, 1042, 1043, 1044, 1049, 1050, 1054,
+    1058, 1059, 1060, 1061, 1062, 1064, 1070, 1071, 1073, 1074, 1080, 1082, 1083, 1084, 1085, 2999,
+    3000, 8000, 10000,
 ];
+
+/// Image resources Atelier writes its own of, or that only describe the
+/// file as it was (its thumbnail, version, quick mask, layer and channel
+/// bookkeeping): left out without loss.
+const REWRITTEN: [u16; 21] = [
+    1000, 1001, 1002, 1003, 1004, 1022, 1026, 1033, 1036, 1041, 1046, 1047, 1057, 1066, 1069, 1072,
+    1076, 1078, 1086, 1087, 1088,
+];
+
+/// The frames of a frame animation (plug-in resource "mani", block
+/// "AnDs": its descriptor's list "FrIn"), when it can be read.
+fn animation_frames(data: &[u8]) -> Option<usize> {
+    let at = data.windows(4).position(|w| w == b"AnDs")? + 4;
+    let mut r = Reader::new(data.get(at..)?);
+    r.skip(8).ok()?;
+    let d = Descriptor::read(&mut r).ok()?;
+    Some(d.list(b"FrIn").map_or(1, <[_]>::len))
+}
+
+/// DisplayInfo (1077, or 1007 in old files) says a channel is a spot
+/// color's (kind 2).
+fn has_spot(id: u16, data: &[u8]) -> bool {
+    let (start, stride) = if id == 1077 { (4, 13) } else { (0, 14) };
+    data.get(start..)
+        .is_some_and(|d| d.chunks_exact(stride).any(|c| c[12] == 2))
+}
 
 fn resources(r: &mut Reader) -> Result<Resources> {
     let mut out = Resources::default();
@@ -165,8 +200,20 @@ fn resources(r: &mut Reader) -> Result<Resources> {
                 out.thumbnail = Some(d.bytes(len - 28)?.to_vec());
             }
             1065 => out.comps = true,
+            1007 | 1077 => out.spot |= has_spot(id, raw),
+            1067 => out.spot = true,
+            // A frame animation (and its timeline) names its layers.
+            1075 => out.animation = true,
+            // Photoshop's animation data: one frame is just the layers.
+            4000..=4999 if raw.windows(4).any(|w| w == b"mani") => {
+                out.animation |= animation_frames(raw).is_none_or(|n| n > 1);
+            }
+            4000..=4999 => out.kept.push(kept()),
+            7000 | 7001 | 7003 => out.variables = true,
             _ if KEPT.contains(&id) => out.kept.push(kept()),
-            _ => {}
+            _ if REWRITTEN.contains(&id) => {}
+            // Never silently: what isn't known is a loss.
+            _ => out.other = true,
         }
     }
     if out.alpha_names.is_empty() {
@@ -222,17 +269,11 @@ impl Record<'_> {
     }
 }
 
-/// Refuses a layer or mask box no file can hold: a PSD's sides stop at
-/// 30000, a PSB's area at what a document can hold (as the native reader).
-fn check_rect(rect: [i32; 4], big: bool) -> Result<()> {
+/// Refuses a layer or mask box no file can hold (the same limit as the
+/// native reader's and both writers', [`layer_fits`]; PSD or PSB).
+fn check_rect(rect: [i32; 4]) -> Result<()> {
     let (w, h) = size(rect);
-    let side = if big {
-        4 * MAX_DIMENSION
-    } else {
-        MAX_DIMENSION
-    };
-    let area = u64::from(w) * u64::from(h);
-    if w > side || h > side || area > u64::from(MAX_DIMENSION).pow(2) {
+    if !layer_fits(w, h) {
         return Err(FileError::Damaged);
     }
     Ok(())
@@ -336,7 +377,7 @@ fn layer_info<'a>(r: &mut Reader<'a>, big: bool) -> Result<(Vec<Record<'a>>, boo
 
 fn record<'a>(r: &mut Reader<'a>, big: bool) -> Result<(Record<'a>, Vec<(i16, usize)>)> {
     let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
-    check_rect(rect, big)?;
+    check_rect(rect)?;
     let n = r.u16()? as usize;
     if n > 56 {
         return Err(FileError::Damaged);
@@ -359,7 +400,7 @@ fn record<'a>(r: &mut Reader<'a>, big: bool) -> Result<(Record<'a>, Vec<(i16, us
     let mask_len = x.u32()? as usize;
     let has_real = lengths.iter().any(|(id, _)| *id == -3);
     let mask = (mask_len > 0)
-        .then(|| mask_data(&mut x.sub(mask_len)?, mask_len, has_real, big))
+        .then(|| mask_data(&mut x.sub(mask_len)?, mask_len, has_real))
         .transpose()?;
     let ranges = x.u32()? as usize;
     let blend_if = x
@@ -386,9 +427,9 @@ fn record<'a>(r: &mut Reader<'a>, big: bool) -> Result<(Record<'a>, Vec<(i16, us
     Ok((rec, lengths))
 }
 
-fn mask_data(r: &mut Reader, len: usize, has_real: bool, big: bool) -> Result<MaskData> {
+fn mask_data(r: &mut Reader, len: usize, has_real: bool) -> Result<MaskData> {
     let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
-    check_rect(rect, big)?;
+    check_rect(rect)?;
     let default = r.u8()?;
     let flags = r.u8()?;
     let mut m = MaskData {
@@ -407,7 +448,7 @@ fn mask_data(r: &mut Reader, len: usize, has_real: bool, big: bool) -> Result<Ma
         let flags = r.u8()?;
         let default = r.u8()?;
         let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
-        check_rect(rect, big)?;
+        check_rect(rect)?;
         m.real = Some((rect, default, flags));
     }
     if flags & 16 != 0 && r.remaining() > 0 {
@@ -872,9 +913,33 @@ fn merged_planes(f: &File, wanted: &[usize]) -> Result<Vec<Vec<u8>>> {
 
 /// Reads a Photoshop document from its bytes.
 pub(super) fn document(data: &[u8]) -> Result<Imported> {
+    document_within(data, Budget::new())
+}
+
+/// [`document`], its pixels taken from `budget` (all the layers decode at
+/// once).
+pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Imported> {
     let f = parse(data)?;
     let h = &f.header;
     check_size(h.width, h.height)?;
+    for rec in &f.records {
+        let (w, ht) = size(rec.rect);
+        budget.take(w, ht, 4)?;
+        if let Some(m) = &rec.mask {
+            let (w, ht) = size(m.rect);
+            budget.take(w, ht, 1)?;
+            if let Some((rect, ..)) = m.real {
+                let (w, ht) = size(rect);
+                budget.take(w, ht, 1)?;
+            }
+        }
+        // Rasterized over the canvas.
+        if rec.vector_mask().is_some() {
+            budget.take(h.width, h.height, 1)?;
+        }
+    }
+    // The merged image's channels (the alpha channels, or the flat image).
+    budget.take(h.width, h.height, u64::from(h.channels).max(4))?;
     if h.mode == MULTICHANNEL && h.channels < 3 {
         return Err(FileError::NotPsd);
     }
@@ -1135,6 +1200,17 @@ pub(super) fn document(data: &[u8]) -> Result<Imported> {
     if f.resources.comps {
         notes.lines.push(t!("files4-psd-note-comps"));
     }
+    let lost = [
+        (f.resources.animation, t!("files5-psd-note-animation")),
+        (f.resources.spot, t!("files5-psd-note-spot")),
+        (f.resources.variables, t!("files5-psd-note-variables")),
+        (f.resources.other, t!("files5-psd-note-other")),
+    ];
+    notes.lines.extend(
+        lost.into_iter()
+            .filter(|(lost, _)| *lost)
+            .map(|(_, note)| note),
+    );
     doc.mark_saved();
     Ok(Imported {
         doc,

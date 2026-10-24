@@ -60,6 +60,8 @@ pub(super) struct PaintTools {
     /// A painting tool was used on this text or shape layer (its id): asks
     /// to rasterize it first.
     pub rasterize_confirm: Option<u64>,
+    /// The command that asked it (a fill, a clear…): run once rasterized.
+    pub rasterize_then: Option<Action>,
     /// Alt + right drag under way: where it started (screen), and the size
     /// and hardness then.
     size_drag: Option<(Pos2, f32, f32)>,
@@ -136,6 +138,7 @@ impl Default for PaintTools {
             last_dab: 0.0,
             previews: Vec::new(),
             rasterize_confirm: None,
+            rasterize_then: None,
             size_drag: None,
             size_drag_ended: false,
             bucket: BucketSettings {
@@ -583,23 +586,45 @@ impl AtelierApp {
         if self.doc.as_ref().is_some_and(|d| d.quick_mask().is_some()) {
             return false;
         }
-        if self.refuse_if_locked() {
+        if self.refuse_if_target_locked() {
             return true;
         }
         let Some(doc) = &self.doc else { return true };
         let layer = doc.active_layer();
         if !doc.shown(doc.active) {
-            self.status_failed(tm!(
-                "tools3-status-layer-hidden",
-                name = layer.name.as_str()
-            ));
+            let message = match self.hidden_group() {
+                Some(group) => tm!("ui5-status-group-hidden", name = layer.name.as_str(), group = group),
+                None => tm!("tools3-status-layer-hidden", name = layer.name.as_str()),
+            };
+            self.status_failed(message);
             return true;
         }
         if !doc.mask_targeted() && (layer.text.is_some() || layer.shape.is_some()) {
             self.paint.rasterize_confirm = Some(layer.id);
+            self.paint.rasterize_then = None;
             return true;
         }
         false
+    }
+
+    /// Before `action` changes the pixels of a text or shape layer (a
+    /// fill, a clear): asks to rasterize it first, and runs it then.
+    pub(super) fn rasterize_first(&mut self, action: Action) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        let layer = doc.active_layer();
+        let vector = layer.text.is_some() || layer.shape.is_some();
+        // Clear and Cut do nothing without a selection.
+        let needs_selection = matches!(action, Action::ClearSelection | Action::Cut);
+        if !vector
+            || doc.quick_mask().is_some()
+            || doc.mask_targeted()
+            || (needs_selection && self.selection.is_none())
+        {
+            return false;
+        }
+        self.paint.rasterize_confirm = Some(layer.id);
+        self.paint.rasterize_then = Some(action);
+        true
     }
 
     /// Paint Bucket at `at` (canvas), with the foreground color.
@@ -660,6 +685,7 @@ impl AtelierApp {
             .filter(|l| l.id == id)
         else {
             self.paint.rasterize_confirm = None;
+            self.paint.rasterize_then = None;
             return;
         };
         let text = if layer.text.is_some() {
@@ -687,8 +713,12 @@ impl AtelierApp {
         if out.ok || out.cancel {
             self.paint.rasterize_confirm = None;
         }
+        let then = self.paint.rasterize_then.take_if(|_| out.ok || out.cancel);
         if out.ok {
             self.run(Action::Rasterize);
+            if let Some(action) = then {
+                self.run(action);
+            }
         }
     }
 

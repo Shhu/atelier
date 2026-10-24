@@ -377,10 +377,11 @@ impl Filter {
             Filter::Minimum(m) | Filter::Maximum(m) => {
                 let max = matches!(self, Filter::Maximum(_));
                 let r = m.radius.round().max(1.0) as usize;
-                // A disc's rows go over the tile and its halo: wide tiles
-                // waste less of that work at large radii.
-                let tile = if m.roundness { TILE.max(4 * r) } else { TILE };
-                by_tiles_of(image, r, tile, |t| extreme_tile(t, r, max, m.roundness));
+                if m.roundness {
+                    round_extreme(image, r, max);
+                } else {
+                    by_tiles_of(image, r, TILE, |t| extreme_tile(t, r, max));
+                }
             }
             Filter::Emboss {
                 angle,
@@ -554,13 +555,13 @@ pub fn par_rows<T: Send>(data: &mut [T], row: usize, f: impl Fn(usize, &mut [T])
 }
 
 /// Runs `f` on blocks of columns of `data` (rows of `row` elements; blocks
-/// of `block` elements of each row), in parallel: `f` gets the segments of
-/// a block, from the top row down.
+/// of `block` elements of each row), in parallel: `f` gets the first column
+/// of a block and its segments, from the top row down.
 fn par_columns<T: Send>(
     data: &mut [T],
     row: usize,
     block: usize,
-    f: impl Fn(&mut [&mut [T]]) + Sync,
+    f: impl Fn(usize, &mut [&mut [T]]) + Sync,
 ) {
     if row == 0 || data.is_empty() {
         return;
@@ -575,12 +576,19 @@ fn par_columns<T: Send>(
         }
     }
     let per = blocks.len().div_ceil(threads().max(1));
+    let mut blocks: Vec<(usize, Vec<&mut [T]>)> = blocks.into_iter().enumerate().collect();
     let f = &f;
     let flag = cancel_flag();
     std::thread::scope(|s| {
         for group in blocks.chunks_mut(per) {
             let flag = flag.clone();
-            s.spawn(move || cancellable(flag, || group.iter_mut().for_each(|b| f(b))));
+            s.spawn(move || {
+                cancellable(flag, || {
+                    for (b, segments) in group.iter_mut() {
+                        f(*b * block, segments)
+                    }
+                })
+            });
         }
     });
 }
@@ -712,7 +720,7 @@ fn blur_buffer(buf: &mut [u16], w: usize, passes: &[Pass]) {
         }
     });
     // Columns: a block of them at a time, their pixels side by side.
-    par_columns(buf, row, COLUMN_BLOCK * 4, |segments| {
+    par_columns(buf, row, COLUMN_BLOCK * 4, |_, segments| {
         let lanes = segments[0].len();
         let mut column: Vec<u16> = Vec::with_capacity(segments.len() * lanes);
         for s in segments.iter() {
@@ -1362,49 +1370,159 @@ fn median_tile(t: &Tile, r: usize, threshold: Option<u8>) -> Vec<[u8; 4]> {
 }
 
 /// Minimum or Maximum of each channel (premultiplied: transparency spreads
-/// or shrinks with the colors) over the square or disc of radius `r`.
-fn extreme_tile(t: &Tile, r: usize, max: bool, round: bool) -> Vec<[u8; 4]> {
+/// or shrinks with the colors) over the square of radius `r`.
+fn extreme_tile(t: &Tile, r: usize, max: bool) -> Vec<[u8; 4]> {
     let px: Vec<[u8; 4]> = t.px.iter().map(|&p| premultiply8(p)).collect();
     let (iw, ih) = t.inner();
     let mut out = vec![if max { [0; 4] } else { [255; 4] }; iw * ih];
-    if round {
-        // Rows of the disc: each one over its own half-width.
-        let cancel = cancel_flag();
-        let mut buffers = (Vec::new(), Vec::new());
-        for dy in -(r as i64)..=r as i64 {
-            if cancelled(&cancel) {
-                break;
-            }
-            let half = ((r * r) as f64 - (dy * dy) as f64).sqrt().floor() as usize;
-            for y in 0..ih {
-                let ty = (y as i64 + r as i64 + dy) as usize;
-                let line = &px[ty * t.w + r - half..ty * t.w + r + half + iw];
-                extreme_into(
-                    line,
-                    half,
-                    max,
-                    &mut buffers,
-                    &mut out[y * iw..(y + 1) * iw],
-                );
-            }
-        }
-    } else {
-        // Square: rows, then columns.
-        let mut rows = Vec::with_capacity(iw * t.h);
-        for y in 0..t.h {
-            rows.extend(running_extreme(&px[y * t.w..(y + 1) * t.w], r, max));
-        }
-        let mut column = Vec::with_capacity(t.h);
-        for x in 0..iw {
-            column.clear();
-            column.extend((0..t.h).map(|y| rows[y * iw + x]));
-            for (y, e) in running_extreme(&column, r, max).into_iter().enumerate() {
-                out[y * iw + x] = e;
-            }
+    // Rows, then columns.
+    let mut rows = Vec::with_capacity(iw * t.h);
+    for y in 0..t.h {
+        rows.extend(running_extreme(&px[y * t.w..(y + 1) * t.w], r, max));
+    }
+    let mut column = Vec::with_capacity(t.h);
+    for x in 0..iw {
+        column.clear();
+        column.extend((0..t.h).map(|y| rows[y * iw + x]));
+        for (y, e) in running_extreme(&column, r, max).into_iter().enumerate() {
+            out[y * iw + x] = e;
         }
     }
     out.iter_mut().for_each(|p| *p = unpremultiply8(*p));
     out
+}
+
+/// Rectangles (half-width, half-height) whose union is the disc of radius
+/// `r` (rows of half-width `floor(sqrt(r² - dy²))`), up to a margin: from
+/// a radius of 50 on, a corner of the staircase is left out when every
+/// pixel it alone covers is within `r / 200` (at least 1) pixels of the
+/// others, which can't be seen but takes many fewer rectangles.
+fn disc_rects(r: usize) -> Vec<(usize, usize)> {
+    let half: Vec<usize> = (0..=r)
+        .map(|dy| ((r * r - dy * dy) as f64).sqrt().floor() as usize)
+        .collect();
+    // The corners of the staircase: each row as wide as the rows nearer
+    // the center, wider than the next one.
+    let corners: Vec<(usize, usize)> = (0..=r)
+        .filter(|&dy| dy == r || half[dy + 1] < half[dy])
+        .map(|dy| (half[dy], dy))
+        .collect();
+    let margin = if r < 50 { 0 } else { (r / 200).max(1) };
+    if margin == 0 {
+        return corners;
+    }
+    // Pixels of rows ha < y <= hb beyond wb only `a` and `b` come near:
+    // the farthest one from both.
+    let gap = |(_, ha): (usize, usize), (wb, hb): (usize, usize)| {
+        (ha + 1..=hb)
+            .map(|y| (y - ha).min(half[y].saturating_sub(wb)))
+            .max()
+            .unwrap_or(0)
+    };
+    let mut kept = vec![corners[0]];
+    let mut i = 0;
+    while i + 1 < corners.len() {
+        let mut j = i + 1;
+        while j + 1 < corners.len() && gap(corners[i], corners[j + 1]) <= margin {
+            j += 1;
+        }
+        kept.push(corners[j]);
+        i = j;
+    }
+    kept
+}
+
+/// Minimum or Maximum over the disc of radius `r` (see [`extreme_tile`]):
+/// the extreme over each of [`disc_rects`], two passes each whatever its
+/// size (edges repeated).
+fn round_extreme(image: &mut RgbaImage, r: usize, max: bool) {
+    let (w, h) = (image.width() as usize, image.height() as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let neutral = if max { [0; 4] } else { [255; 4] };
+    let mut px = vec![[0u8; 4]; w * h];
+    let raw = image.as_raw();
+    par_rows(&mut px, w, |y0, band| {
+        for (i, p) in band.iter_mut().enumerate() {
+            let at = (y0 * w + i) * 4;
+            *p = premultiply8([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+        }
+    });
+    let mut out = vec![neutral; w * h];
+    let mut rows = vec![neutral; w * h];
+    let cancel = cancel_flag();
+    let pick = move |a: [u8; 4], b: [u8; 4]| -> [u8; 4] {
+        std::array::from_fn(|c| if max { a[c].max(b[c]) } else { a[c].min(b[c]) })
+    };
+    for (rw, rh) in disc_rects(r) {
+        if cancelled(&cancel) {
+            return;
+        }
+        // Each row over ±rw.
+        let px = &px;
+        par_rows(&mut rows, w, |y0, band| {
+            let (mut line, mut buffers) = (Vec::new(), (Vec::new(), Vec::new()));
+            for (j, row) in band.chunks_exact_mut(w).enumerate() {
+                let src = &px[(y0 + j) * w..(y0 + j + 1) * w];
+                line.clear();
+                line.extend(std::iter::repeat_n(src[0], rw));
+                line.extend_from_slice(src);
+                line.extend(std::iter::repeat_n(src[w - 1], rw));
+                row.fill(neutral);
+                extreme_into(&line, rw, max, &mut buffers, row);
+            }
+        });
+        // Then each column of that over ±rh, into the result: blocks of
+        // columns, a row of the block at a time (van Herk, as
+        // `extreme_into`).
+        let rows = &rows;
+        par_columns(&mut out, w, COLUMN_BLOCK * 4, |x0, segments| {
+            let Some(bw) = segments.first().map(|s| s.len()) else {
+                return;
+            };
+            let (n, k) = (h + 2 * rh, 2 * rh + 1);
+            let line = |i: usize| {
+                let y = i.saturating_sub(rh).min(h - 1);
+                &rows[y * w + x0..y * w + x0 + bw]
+            };
+            let mut from_start = Vec::with_capacity(n * bw);
+            for i in 0..n {
+                let s = line(i);
+                if i % k == 0 {
+                    from_start.extend_from_slice(s);
+                } else {
+                    for (c, &v) in s.iter().enumerate() {
+                        let e = pick(from_start[(i - 1) * bw + c], v);
+                        from_start.push(e);
+                    }
+                }
+            }
+            let mut to_end = vec![neutral; n * bw];
+            for i in (0..n).rev() {
+                let s = line(i);
+                if i + 1 == n || (i + 1) % k == 0 {
+                    to_end[i * bw..(i + 1) * bw].copy_from_slice(s);
+                } else {
+                    for (c, &v) in s.iter().enumerate() {
+                        to_end[i * bw + c] = pick(to_end[(i + 1) * bw + c], v);
+                    }
+                }
+            }
+            for (y, segment) in segments.iter_mut().enumerate() {
+                for (c, o) in segment.iter_mut().enumerate() {
+                    let e = pick(to_end[y * bw + c], from_start[(y + k - 1) * bw + c]);
+                    *o = pick(*o, e);
+                }
+            }
+        });
+    }
+    let raw = image.as_mut();
+    par_rows(raw, w * 4, |y0, band| {
+        for (i, p) in band.chunks_exact_mut(4).enumerate() {
+            p.copy_from_slice(&unpremultiply8(out[y0 * w + i]));
+        }
+    });
 }
 
 /// [`running_extreme`] combined into `out` (its extreme with each
@@ -1947,6 +2065,87 @@ mod tests {
                 }
                 assert_eq!(out.get_pixel(x, y).0[..3], best, "r {r} at ({x}, {y})");
             }
+        }
+    }
+
+    /// The rectangles of a large disc stay inside it and leave out only
+    /// pixels within their margin of it, with few rectangles (two passes
+    /// each, whatever the radius); a small disc is exact.
+    #[test]
+    fn disc_rectangles_cover_the_disc() {
+        for r in [3usize, 40, 50, 120, 500] {
+            let rects = disc_rects(r);
+            let margin = if r < 50 { 0 } else { (r / 200).max(1) };
+            let half = |dy: usize| ((r * r - dy * dy) as f64).sqrt().floor() as usize;
+            for &(w, h) in &rects {
+                assert!(w <= half(h), "r {r}: ({w}, {h}) outside the disc");
+            }
+            // Every pixel of a quarter of the disc: covered, or near.
+            for y in 0..=r {
+                for x in 0..=half(y) {
+                    let d = rects
+                        .iter()
+                        .map(|&(w, h)| x.saturating_sub(w).max(y.saturating_sub(h)))
+                        .min()
+                        .unwrap();
+                    assert!(d <= margin, "r {r}: ({x}, {y}) {d} px away");
+                }
+            }
+        }
+        assert!(disc_rects(500).len() < 100, "{}", disc_rects(500).len());
+    }
+
+    /// Timing of Minimum r500 Roundness at 24 MP: `cargo test --release
+    /// round_minimum_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn round_minimum_timing() {
+        let mut image = RgbaImage::from_fn(6000, 4000, |x, y| {
+            let v = ((x * 7919 + y * 104729) % 251) as u8;
+            Rgba([v, v, v, 255])
+        });
+        for r in [100.0, 500.0] {
+            let t = std::time::Instant::now();
+            Filter::Minimum(Morphology {
+                radius: r,
+                roundness: true,
+            })
+            .apply(&mut image, (0, 0));
+            eprintln!("Minimum r{r} round, 6000 x 4000: {:?}", t.elapsed());
+        }
+    }
+
+    /// From a radius of 50, Maximum is the maximum over the rectangles of
+    /// the disc (a margin left out at its rim).
+    #[test]
+    fn large_round_maximum_is_the_maximum_over_its_rectangles() {
+        let (w, h) = (260u32, 200u32);
+        let image = RgbaImage::from_fn(w, h, |x, y| {
+            let v = ((x * 7919 + y * 104729) % 251) as u8;
+            Rgba([v, 255 - v, v / 3, 255])
+        });
+        let r = 60usize;
+        let mut out = image.clone();
+        Filter::Maximum(Morphology {
+            radius: r as f32,
+            roundness: true,
+        })
+        .apply(&mut out, (0, 0));
+        let rects = disc_rects(r);
+        for (x, y) in [(0, 0), (130, 100), (259, 199), (70, 10), (200, 150)] {
+            let mut best = [0u8; 3];
+            for &(rw, rh) in &rects {
+                let (rw, rh) = (rw as i64, rh as i64);
+                for dy in -rh..=rh {
+                    for dx in -rw..=rw {
+                        let sx = (x as i64 + dx).clamp(0, w as i64 - 1) as u32;
+                        let sy = (y as i64 + dy).clamp(0, h as i64 - 1) as u32;
+                        let p = image.get_pixel(sx, sy).0;
+                        best = std::array::from_fn(|c| best[c].max(p[c]));
+                    }
+                }
+            }
+            assert_eq!(out.get_pixel(x, y).0[..3], best, "at ({x}, {y})");
         }
     }
 
