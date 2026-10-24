@@ -302,16 +302,16 @@ fn filter_row(
     } else {
         color::LABEL
     };
-    painter
-        .with_clip_rect(text.intersect(painter.clip_rect()))
-        .text(
-            pos2(text.left(), rect.center().y),
-            Align2::LEFT_CENTER,
-            name,
-            FontId::proportional(12.0),
-            fg,
-        );
-    let row = row.on_hover_text(t!("smart-filter-row-tip"));
+    // Too long, the name ends with "…" and shows whole on hover.
+    let elided = ui_kit::elided_text(
+        &painter,
+        pos2(text.left(), rect.center().y),
+        &name,
+        FontId::proportional(12.0),
+        fg,
+        text.width(),
+    );
+    let row = ui_kit::row_tip(row, &name, elided, &t!("smart-filter-row-tip"));
     if row.double_clicked() {
         select(click);
         *action = Some(Action::Smart(Command::EditFilter(k)));

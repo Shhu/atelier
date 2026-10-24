@@ -41,14 +41,8 @@ impl AtelierApp {
 
         let menus = self.menus();
         let mut action = None;
-        let (has_doc, has_selection) = (self.doc.is_some(), self.selection.is_some());
-        let why = move |a: Action| {
-            Some(super::palette::unavailable_reason(
-                has_doc,
-                has_selection,
-                a,
-            ))
-        };
+        let facts = self.greyed_facts();
+        let why = move |a: Action| Some(super::palette::unavailable_reason(&facts, a));
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if SYSTEM_BUTTONS {

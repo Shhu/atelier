@@ -43,21 +43,33 @@ impl AtelierApp {
         if self.sel.transform.is_some() {
             return self.selection_transform_options(ui);
         }
-        // Painting a locked layer would be refused: said before the click.
-        if self.paints_on_locked_layer() {
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} {}",
+        // Painting a locked or hidden layer would be refused: said before
+        // the click.
+        if let Some(block) = self.paint_block() {
+            let (glyph, label, tip) = match block {
+                workspace::PaintBlock::Locked => (
                     icon::LOCK_SIMPLE,
-                    t!("options-layer-locked")
-                ))
-                .color(color::MUTED),
-            )
-            .on_hover_text(t!("side-locked-notice"));
+                    t!("options-layer-locked"),
+                    t!("side-locked-notice"),
+                ),
+                workspace::PaintBlock::Hidden => (
+                    icon::EYE_SLASH,
+                    t!("ui4-options-layer-hidden"),
+                    t!("ui4-options-layer-hidden-tip"),
+                ),
+            };
+            ui.label(egui::RichText::new(format!("{glyph} {label}")).color(color::MUTED))
+                .on_hover_text(tip);
             sep(ui);
         }
         match self.tool {
-            Tool::Transform => self.transform_options(ui),
+            Tool::Transform => {
+                // Each change made here is a Ctrl+Z point of the pending
+                // transform.
+                let before = self.snapshot();
+                self.transform_options(ui);
+                self.transform_edited(before, Some("bar"));
+            }
             Tool::Artboard => self.artboard_options(ui),
             Tool::Select
             | Tool::Ellipse
@@ -92,14 +104,15 @@ impl AtelierApp {
     }
 
     fn transform_options(&mut self, ui: &mut egui::Ui) {
-        // The Move tool's, not a pending transform's (the bar keeps its
-        // height while the frame is edited).
-        if !self.free_transform && !self.transform_pending() {
-            let ctrl = keys::modifiers(ui.ctx(), Modifiers::COMMAND);
+        // Always shown (the bar keeps its layout while a move is pending,
+        // and the setting that decides what the next click picks stays in
+        // sight); off limits during Free Transform only.
+        let ctrl = keys::modifiers(ui.ctx(), Modifiers::COMMAND);
+        ui.add_enabled_ui(!self.free_transform, |ui| {
             ui_kit::checkbox(ui, &mut self.auto_select, &t!("input3-auto-select"))
                 .on_hover_text(t!("input3-auto-select-tip", key = ctrl));
-            sep(ui);
-        }
+        });
+        sep(ui);
         if self.active_locked() {
             locked_notice(
                 ui,
@@ -114,7 +127,23 @@ impl AtelierApp {
         let (Some(full), Some(src)) = (self.full_rect(), self.transform_source()) else {
             return;
         };
-        self.reference_locator(ui);
+        // Transforming, the reference point; otherwise, in its place (the
+        // bar keeps its size), whether the handles show.
+        if self.transform_rect.is_some() || self.free_transform {
+            self.reference_locator(ui);
+        } else {
+            let tip = format!(
+                "{}\n{}",
+                t!("tools4-show-transform-controls"),
+                t!("tools4-show-transform-controls-tip")
+            );
+            ui_kit::icon_toggle(
+                ui,
+                icon::BOUNDING_BOX,
+                &tip,
+                &mut self.show_transform_controls,
+            );
+        }
         sep(ui);
         // A distorted frame: its box, not editable as numbers (same bar,
         // so that the canvas doesn't move when it starts).
@@ -136,10 +165,10 @@ impl AtelierApp {
             ui.add_enabled_ui(!distorted, |ui| add(ui)).inner
         };
         let x_changed = editable(ui, &mut |ui| {
-            ui_kit::number_field(ui, "X", &mut x, limits.clone(), "", 86.0).changed()
+            ui_kit::number_field(ui, "X", &mut x, limits.clone(), "", 76.0).changed()
         });
         let y_changed = editable(ui, &mut |ui| {
-            ui_kit::number_field(ui, "Y", &mut y, limits.clone(), "", 86.0).changed()
+            ui_kit::number_field(ui, "Y", &mut y, limits.clone(), "", 76.0).changed()
         });
         let w_changed = editable(ui, &mut |ui| {
             size_field(ui, &t!("optbar-width-short"), &t!("options-width"), &mut w)
@@ -172,7 +201,7 @@ impl AtelierApp {
         sep(ui);
 
         // The angle and its two quarter-turn buttons wrap together.
-        if room(ui) < 78.0 + 2.0 * (8.0 + 28.0) {
+        if room(ui) < 70.0 + 2.0 * (8.0 + 28.0) {
             ui.end_row();
         }
         let mut angle = self.transform_angle;
@@ -183,7 +212,7 @@ impl AtelierApp {
                 &mut angle,
                 -180.0..=180.0,
                 "°",
-                78.0,
+                70.0,
             )
             .on_hover_text(t!("options-rotation"))
             .changed()
@@ -217,11 +246,12 @@ impl AtelierApp {
             i18n::percent(format!("{sx} × {sy}"))
         };
         ui.add_enabled_ui(!distorted, |ui| {
-            dropdown(
+            dropdown_reserving(
                 ui,
                 "scale_presets",
                 Some(&t!("optbar-scale")),
                 &scale,
+                Some(&i18n::percent("100 × 100")),
                 true,
                 0.0,
                 |ui| {
@@ -783,8 +813,11 @@ fn apply_cancel(ui: &mut egui::Ui, pending: bool) -> (bool, bool) {
         + button_width(ui, &apply, true)
         + ui.spacing().item_spacing.x;
     let mut clicks = (false, false);
-    // Short of room, the two buttons become icons rather than a new row.
-    if room(ui) < width {
+    // Short of room, the two buttons become icons rather than a new row;
+    // when even both icons don't fit, the text pair starts the next row
+    // (never one of them alone).
+    let icons = 2.0 * 28.0 + ui.spacing().item_spacing.x;
+    if room(ui) < width && room(ui) >= icons {
         clicks.1 = ui_kit::icon_button(ui, icon::X, &cancel, pending).clicked();
         clicks.0 = ui_kit::icon_button(ui, icon::CHECK, &apply, pending).clicked();
         return clicks;
@@ -800,7 +833,7 @@ fn apply_cancel(ui: &mut egui::Ui, pending: bool) -> (bool, bool) {
 
 /// Width or height field (px); returns `true` if it changed.
 fn size_field(ui: &mut egui::Ui, label: &str, tip: &str, value: &mut u32) -> bool {
-    ui_kit::number_field(ui, label, value, 1..=MAX_DIMENSION, "", 92.0)
+    ui_kit::number_field(ui, label, value, 1..=MAX_DIMENSION, "", 82.0)
         .on_hover_text(tip)
         .changed()
 }
@@ -826,6 +859,22 @@ fn dropdown<R>(
     lead: f32,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
+    dropdown_reserving(ui, id_salt, label, value, None, mono, lead, add_contents)
+}
+
+/// [`dropdown`] at least as wide as it is with the value `widest`: the bar
+/// keeps its layout while the value changes (the scale during a transform).
+#[allow(clippy::too_many_arguments)]
+fn dropdown_reserving<R>(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    label: Option<&str>,
+    value: &str,
+    widest: Option<&str>,
+    mono: bool,
+    lead: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
     let format = |font_id, color| egui::TextFormat {
         font_id,
         color,
@@ -845,17 +894,30 @@ fn dropdown<R>(
         FontId::proportional(ui_kit::TEXT_SIZE)
     };
     let space = if label.is_some() { 8.0 } else { 0.0 };
+    let label_width = |value: &str| {
+        let mut job = job.clone();
+        job.append(value, lead + space, format(font.clone(), color::TEXT));
+        ui.painter().layout_job(job).size().x
+    };
+    let text = label_width(value).max(widest.map_or(0.0, label_width));
     job.append(value, lead + space, format(font, color::TEXT));
-    let text = ui.painter().layout_job(job.clone()).size().x;
     let s = ui.spacing();
     let width = text + 2.0 * s.button_padding.x + s.icon_width + s.icon_spacing + 2.0;
     if room(ui) < width {
         ui.end_row();
     }
-    egui::ComboBox::from_id_salt(id_salt)
+    let shown = egui::ComboBox::from_id_salt(id_salt)
         .selected_text(job)
         .width(width)
         .height(320.0)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .show_ui(ui, add_contents)
+        .show_ui(ui, add_contents);
+    // Named by its label, its value apart (not "Scale100%").
+    if let Some(label) = label {
+        ui.ctx().accesskit_node_builder(shown.response.id, |node| {
+            node.set_label(label);
+            node.set_value(value);
+        });
+    }
+    shown
 }

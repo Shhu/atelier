@@ -5,7 +5,8 @@
 //! [`Document::with_target`]).
 
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use image::{GrayImage, Luma, RgbaImage};
 
@@ -34,7 +35,29 @@ pub struct Mask {
     /// Blur radius of the edges, in pixels (Properties panel).
     pub feather: f32,
     feathered: RefCell<Option<Feathered>>,
+    /// The feathered image being made on a worker thread for the display
+    /// (see [`Mask::shaped_later`]), shared by the mask's copies.
+    feather_job: Arc<Mutex<Option<Arc<FeatherJob>>>>,
 }
+
+/// A feathered image being made: for which revision and radius (its
+/// bits), and it once done.
+struct FeatherJob {
+    key: (u64, u32),
+    done: Mutex<Option<Feathered>>,
+}
+
+/// Feathered images being made.
+static FEATHERING: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether feathered masks are being made for the display (it then looks
+/// again soon).
+pub(super) fn feathers_pending() -> bool {
+    FEATHERING.load(Ordering::Relaxed) > 0
+}
+
+/// Below this many mask pixels, the display feathers at once.
+const FEATHER_AT_ONCE: u64 = 1 << 20;
 
 /// The feathered image for a revision and feather radius (its bits), and
 /// the margin it adds on each side.
@@ -74,6 +97,7 @@ impl Mask {
             density: 1.0,
             feather: 0.0,
             feathered: RefCell::new(None),
+            feather_job: Default::default(),
         }
     }
 
@@ -149,6 +173,26 @@ impl Mask {
         self.set_origin(origin, layer_offset);
     }
 
+    /// `values` (over `area`, canvas) replace the image's there; the image
+    /// grows to cover `area` (the default around what it held), and keeps
+    /// what lies outside it.
+    pub fn put_over(&mut self, values: &GrayImage, area: PixelRect, layer_offset: (i64, i64)) {
+        let (ox, oy) = self.origin(layer_offset);
+        let (iw, ih) = (self.image.width() as i64, self.image.height() as i64);
+        let (x0, y0) = (ox.min(area.x), oy.min(area.y));
+        let (x1, y1) = ((ox + iw).max(area.right()), (oy + ih).max(area.bottom()));
+        let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        let mut out = if (x0, y0, w, h) == (ox, oy, iw as u32, ih as u32) {
+            (*self.image).clone()
+        } else {
+            let mut out = GrayImage::from_pixel(w, h, image::Luma([self.default]));
+            image::imageops::replace(&mut out, &*self.image, ox - x0, oy - y0);
+            out
+        };
+        image::imageops::replace(&mut out, values, area.x - x0, area.y - y0);
+        self.replace(out, (x0, y0), layer_offset);
+    }
+
     /// The image as the compositing reads it (feathered), and the canvas
     /// position of its top-left corner. Density is applied when reading.
     pub fn shaped(&self, layer_offset: (i64, i64)) -> (Arc<GrayImage>, (i64, i64)) {
@@ -162,35 +206,109 @@ impl Mask {
         {
             return (Arc::clone(&f.image), (x - f.margin, y - f.margin));
         }
-        let m = self.margin();
-        let (iw, mu) = (self.image.width() as usize, m as usize);
-        let (w, h) = (iw + 2 * mu, self.image.height() as usize + 2 * mu);
-        // Blurred as a difference from the default value: everything around
-        // the image (its margin, and beyond) counts as the default.
-        let d = self.default as f32;
-        let mut field = vec![0.0f32; w * h];
-        let raw = self.image.as_raw();
-        par_rows(&mut field, w, |first, band| {
-            for (i, line) in band.chunks_exact_mut(w).enumerate() {
-                let Some(py) = (first + i).checked_sub(mu).filter(|&y| y * iw < raw.len()) else {
-                    continue;
-                };
-                let row = &raw[py * iw..][..iw];
-                for (f, &v) in line[mu..mu + iw].iter_mut().zip(row) {
-                    *f = v as f32 - d;
+        let f = feathered(&self.image, self.default, self.feather, self.rev);
+        let (image, m) = (Arc::clone(&f.image), f.margin);
+        *self.feathered.borrow_mut() = Some(f);
+        (image, (x - m, y - m))
+    }
+
+    /// [`Self::shaped`] for the display: when only the feather radius
+    /// changed (its slider) on a large mask, the new image is made on a
+    /// worker thread and the former one shows meanwhile. Also gives what
+    /// the image shown was made from (revision, radius bits).
+    pub fn shaped_later(
+        &self,
+        layer_offset: (i64, i64),
+    ) -> (Arc<GrayImage>, (i64, i64), (u64, u32)) {
+        let key = (self.rev, self.feather.to_bits());
+        let (w, h) = self.image.dimensions();
+        let at_once = || {
+            let (image, origin) = self.shaped(layer_offset);
+            (image, origin, key)
+        };
+        if self.feather <= 0.0 || u64::from(w) * u64::from(h) <= FEATHER_AT_ONCE {
+            return at_once();
+        }
+        let (x, y) = self.origin(layer_offset);
+        let shown = |f: &Feathered| {
+            let image = Arc::clone(&f.image);
+            (image, (x - f.margin, y - f.margin), (f.rev, f.feather))
+        };
+        if let Some(f) = self.feathered.borrow().as_ref()
+            && (f.rev, f.feather) == key
+        {
+            return shown(f);
+        }
+        let mut slot = self.feather_job.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(job) = slot.as_ref() {
+            let done = job.done.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            match done {
+                Some(f) if f.rev == self.rev => {
+                    let out = shown(&f);
+                    *self.feathered.borrow_mut() = Some(f);
+                    if job.key == key {
+                        return out;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    // Still feathering (for this radius or another one).
+                    if let Some(f) = self
+                        .feathered
+                        .borrow()
+                        .as_ref()
+                        .filter(|f| f.rev == self.rev)
+                    {
+                        return shown(f);
+                    }
                 }
             }
+        }
+        // The former image of these pixels shows meanwhile; without one
+        // (other pixels), feathered at once.
+        let Some(former) = self
+            .feathered
+            .borrow()
+            .as_ref()
+            .filter(|f| f.rev == self.rev)
+            .map(shown)
+        else {
+            drop(slot);
+            return at_once();
+        };
+        let job = Arc::new(FeatherJob {
+            key,
+            done: Mutex::new(None),
         });
-        blur(&mut field, w, h, self.feather);
-        let image = GrayImage::from_raw(w as u32, h as u32, to_gray(&field, d)).expect("size");
-        let image = Arc::new(image);
-        *self.feathered.borrow_mut() = Some(Feathered {
-            rev: key.0,
-            feather: key.1,
-            image: Arc::clone(&image),
-            margin: m,
-        });
-        (image, (x - m, y - m))
+        let (image, default, feather, rev) = (
+            Arc::clone(&self.image),
+            self.default,
+            self.feather,
+            self.rev,
+        );
+        let work = Arc::clone(&job);
+        FEATHERING.fetch_add(1, Ordering::Relaxed);
+        let spawned = std::thread::Builder::new()
+            .name("feather".into())
+            .spawn(move || {
+                /// The count goes down even if feathering fails.
+                struct Running;
+                impl Drop for Running {
+                    fn drop(&mut self) {
+                        FEATHERING.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+                let _running = Running;
+                let f = feathered(&image, default, feather, rev);
+                *work.done.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+            });
+        if spawned.is_err() {
+            FEATHERING.fetch_sub(1, Ordering::Relaxed);
+            drop(slot);
+            return at_once();
+        }
+        *slot = Some(job);
+        former
     }
 
     /// The pixels of `area` (image coordinates) just changed, from revision
@@ -289,7 +407,19 @@ impl Mask {
     /// The feathered values over `area` (canvas), row by row: the default
     /// outside the image.
     fn values_over(&self, area: PixelRect, layer_offset: (i64, i64)) -> Vec<u8> {
-        let (image, (ox, oy)) = self.shaped(layer_offset);
+        let (image, origin) = self.shaped(layer_offset);
+        self.placed_over(&image, origin, area)
+    }
+
+    /// The values of the image as stored (neither feathered nor faded by
+    /// the density) over `area` (canvas): the default outside the image.
+    pub fn raw_over(&self, area: PixelRect, layer_offset: (i64, i64)) -> GrayImage {
+        let values = self.placed_over(&self.image, self.origin(layer_offset), area);
+        GrayImage::from_raw(area.w, area.h, values).expect("size")
+    }
+
+    /// `image` placed at `(ox, oy)` over `area`, row by row.
+    fn placed_over(&self, image: &GrayImage, (ox, oy): (i64, i64), area: PixelRect) -> Vec<u8> {
         let (w, h) = (area.w as usize, area.h as usize);
         let mut out = vec![self.default; w * h];
         let (iw, ih) = (image.width() as i64, image.height() as i64);
@@ -545,6 +675,14 @@ impl Document {
         if self.layers[self.active].mask.is_some() {
             return false;
         }
+        self.checkpoint(t!("xchg-hist-add-mask"));
+        self.put_mask(kind, selection);
+        true
+    }
+
+    /// Gives the active layer a new mask of `kind`, targeted, within the
+    /// current step.
+    pub(super) fn put_mask(&mut self, kind: NewMask, selection: Option<&Selection>) {
         let canvas = self.full_rect();
         let mask = match (kind, selection) {
             (NewMask::RevealAll, _) | (NewMask::HideSelection, None) => {
@@ -564,14 +702,12 @@ impl Document {
                 Mask::new(image, (canvas.x, canvas.y), outside, (0, 0))
             }
         };
-        self.checkpoint(t!("xchg-hist-add-mask"));
         let layer = &mut self.layers[self.active];
         let origin = mask.origin((0, 0));
         let mut mask = mask;
         mask.set_origin(origin, layer.offset);
         layer.mask = Some(mask);
         self.mask_target = Some(layer.id);
-        true
     }
 
     /// Removes the active layer's mask.
@@ -955,6 +1091,63 @@ fn write_back(proxy: &Layer, real: &mut Layer, area: Option<PixelRect>, filter: 
 }
 
 /// Values blurred as a difference from the default `d`, as mask values.
+/// `image` (whose surroundings are `default`) blurred by `feather`, with
+/// the margin it adds on each side. Only the box of its pixels that differ
+/// from the default (and its margin) is blurred: elsewhere the blur adds
+/// nothing to the default.
+fn feathered(image: &GrayImage, default: u8, feather: f32, rev: u64) -> Feathered {
+    let m = if feather > 0.0 {
+        (feather * 2.0).ceil() as i64 + 1
+    } else {
+        0
+    };
+    let (iw, ih, mu) = (image.width() as usize, image.height() as usize, m as usize);
+    let (w, h) = (iw + 2 * mu, ih + 2 * mu);
+    let raw = image.as_raw();
+    let mut out = vec![default; w * h];
+    // Box (image coordinates) of the values that differ from the default.
+    let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
+    for (y, row) in raw.chunks_exact(iw.max(1)).enumerate() {
+        let Some(left) = row.iter().position(|&v| v != default) else {
+            continue;
+        };
+        let right = row.iter().rposition(|&v| v != default).unwrap_or(left);
+        (x0, x1) = (x0.min(left), x1.max(right + 1));
+        (y0, y1) = (y0.min(y), y + 1);
+    }
+    if x0 < x1 {
+        // That box and its margin, in the feathered image.
+        let (rw, rh) = (x1 - x0 + 2 * mu, y1 - y0 + 2 * mu);
+        // Blurred as a difference from the default value: everything
+        // around the image (its margin, and beyond) counts as the default.
+        let d = default as f32;
+        let mut field = vec![0.0f32; rw * rh];
+        par_rows(&mut field, rw, |first, band| {
+            for (i, line) in band.chunks_exact_mut(rw).enumerate() {
+                let Some(py) = (first + i).checked_sub(mu).filter(|&j| j < y1 - y0) else {
+                    continue;
+                };
+                let row = &raw[(y0 + py) * iw + x0..][..x1 - x0];
+                for (f, &v) in line[mu..mu + (x1 - x0)].iter_mut().zip(row) {
+                    *f = v as f32 - d;
+                }
+            }
+        });
+        blur(&mut field, rw, rh, feather);
+        let gray = to_gray(&field, d);
+        for (j, part) in gray.chunks_exact(rw).enumerate() {
+            let at = (y0 + j) * w + x0;
+            out[at..at + rw].copy_from_slice(part);
+        }
+    }
+    Feathered {
+        rev,
+        feather: feather.to_bits(),
+        image: Arc::new(GrayImage::from_raw(w as u32, h as u32, out).expect("size")),
+        margin: m,
+    }
+}
+
 fn to_gray(field: &[f32], d: f32) -> Vec<u8> {
     const ROW: usize = 4096;
     let mut out = vec![0u8; field.len()];
@@ -976,6 +1169,76 @@ fn gray([r, g, b, a]: [u8; 4]) -> u8 {
 mod tests {
     use super::*;
     use image::Rgba;
+
+    /// Feathering blurs only around the values that differ from the
+    /// default, with the same result as blurring all of the image.
+    #[test]
+    fn feathering_blurs_only_around_what_differs() {
+        let mut image = GrayImage::from_pixel(300, 200, Luma([255]));
+        for (x, y) in [(40, 30), (41, 30), (200, 150), (299, 199)] {
+            image.put_pixel(x, y, Luma([0]));
+        }
+        for x in 100..140 {
+            image.put_pixel(x, 90, Luma([60]));
+        }
+        let feather = 6.5;
+        let f = feathered(&image, 255, feather, 1);
+        // All of the image, blurred.
+        let m = f.margin as usize;
+        let (w, h) = (300 + 2 * m, 200 + 2 * m);
+        let mut field = vec![0.0f32; w * h];
+        for (x, y, p) in image.enumerate_pixels() {
+            field[(y as usize + m) * w + x as usize + m] = p.0[0] as f32 - 255.0;
+        }
+        blur(&mut field, w, h, feather);
+        let whole = to_gray(&field, 255.0);
+        assert_eq!(f.image.dimensions(), (w as u32, h as u32));
+        let worst = f
+            .image
+            .as_raw()
+            .iter()
+            .zip(&whole)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max();
+        assert!(worst <= Some(1), "{worst:?}");
+        // Nothing but the default: nothing to blur.
+        let plain = feathered(&GrayImage::from_pixel(50, 40, Luma([0])), 0, feather, 1);
+        assert!(plain.image.pixels().all(|p| p.0[0] == 0));
+    }
+
+    /// The display's feathered image of a large mask whose radius changed
+    /// is made on a worker thread: the former one meanwhile, then the same
+    /// as made at once.
+    #[test]
+    fn a_new_feather_radius_shows_once_ready() {
+        let mut image = GrayImage::from_pixel(1100, 1000, Luma([0]));
+        for y in 300..700 {
+            for x in 200..900 {
+                image.put_pixel(x, y, Luma([255]));
+            }
+        }
+        let mut m = Mask::new(image, (0, 0), 0, (0, 0));
+        m.feather = 4.0;
+        let (_, _, first) = m.shaped_later((0, 0));
+        assert_eq!(first, (m.rev(), 4.0f32.to_bits()), "made at once at first");
+        m.feather = 9.0;
+        let (_, at, meanwhile) = m.shaped_later((0, 0));
+        assert_eq!(meanwhile, first, "the former one meanwhile");
+        assert_eq!(at, (-9, -9), "in its place");
+        let start = std::time::Instant::now();
+        let (image, at) = loop {
+            let (image, at, key) = m.shaped_later((0, 0));
+            if key.1 == 9.0f32.to_bits() {
+                break (image, at);
+            }
+            assert!(start.elapsed().as_secs() < 60, "never ready");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let fresh = m.clone();
+        *fresh.feathered.borrow_mut() = None;
+        let (direct, direct_at) = fresh.shaped((0, 0));
+        assert_eq!((at, *image == *direct), (direct_at, true));
+    }
 
     fn doc() -> Document {
         let mut doc = Document::new(RgbaImage::from_pixel(10, 10, Rgba([255, 0, 0, 255])), None);

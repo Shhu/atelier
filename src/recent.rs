@@ -20,6 +20,8 @@ pub struct Entry {
     pub path: PathBuf,
     pub size: (u32, u32),
     pub thumb: Option<TextureHandle>,
+    /// Its place in the list.
+    rank: usize,
 }
 
 #[derive(Default)]
@@ -29,17 +31,20 @@ pub struct Recent {
     entries: Option<Vec<Entry>>,
     /// Dimensions, then thumbnails, read in the background.
     thumbs: Option<Receiver<Found>>,
+    /// Number of dimensions asked for.
+    expected: usize,
 }
 
-/// What the background thread found.
+/// What the background threads found.
 enum Found {
-    /// The files that exist, with their dimensions, in the list's order.
-    Sizes(Vec<(PathBuf, (u32, u32))>),
+    /// The dimensions of the file at a place in the list, `None` if it
+    /// can't be read (missing): sent as each answers.
+    Size(usize, PathBuf, Option<(u32, u32)>),
     Thumb(PathBuf, ColorImage),
 }
 
 /// How long the start screen waits for the dimensions before showing the
-/// list without them (they come later; slow or network drives).
+/// files that answered (the others come later; slow or network drives).
 const SIZES_WAIT: Duration = Duration::from_millis(100);
 
 impl Recent {
@@ -119,20 +124,46 @@ impl Recent {
             let (tx, rx) = channel();
             let paths = self.paths.clone();
             let repaint = ctx.clone();
+            self.expected = paths.len();
             std::thread::spawn(move || {
-                let sizes: Vec<(PathBuf, (u32, u32))> = paths
-                    .into_iter()
-                    .filter_map(|path| {
+                // Each file on a thread of its own: a sleeping disk or an
+                // offline share holds back its own entry only.
+                let (found, sizes) = channel();
+                for (rank, path) in paths.into_iter().enumerate() {
+                    let found = found.clone();
+                    std::thread::spawn(move || {
                         let size = catch_unwind(|| crate::document::file_size(&path));
-                        Some((path.clone(), size.ok()??))
-                    })
-                    .collect();
-                let paths: Vec<PathBuf> = sizes.iter().map(|(p, _)| p.clone()).collect();
-                if tx.send(Found::Sizes(sizes)).is_err() {
-                    return;
+                        let _ = found.send((rank, path, size.ok().flatten()));
+                    });
                 }
-                repaint.request_repaint();
-                for path in paths {
+                drop(found);
+                // The thumbnails one at a time, the dimensions first.
+                let mut queue = std::collections::VecDeque::new();
+                let mut done = false;
+                loop {
+                    let mut answers = Vec::new();
+                    if queue.is_empty() && !done {
+                        match sizes.recv() {
+                            Ok(a) => answers.push(a),
+                            Err(_) => done = true,
+                        }
+                    }
+                    answers.extend(sizes.try_iter());
+                    for (rank, path, size) in answers {
+                        if size.is_some() {
+                            queue.push_back(path.clone());
+                        }
+                        if tx.send(Found::Size(rank, path, size)).is_err() {
+                            return;
+                        }
+                        repaint.request_repaint();
+                    }
+                    let Some(path) = queue.pop_front() else {
+                        if done {
+                            return;
+                        }
+                        continue;
+                    };
                     let thumb = catch_unwind(AssertUnwindSafe(|| {
                         crate::document::file_thumbnail(&path, THUMB.0, THUMB.1)
                     }));
@@ -154,19 +185,34 @@ impl Recent {
             Vec::new()
         });
         if let Some(rx) = &self.thumbs {
-            let waited = first.then(|| rx.recv_timeout(SIZES_WAIT).ok()).flatten();
+            let mut waited = Vec::new();
+            if first {
+                let deadline = std::time::Instant::now() + SIZES_WAIT;
+                let mut sizes = 0;
+                while sizes < self.expected {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    match rx.recv_timeout(left) {
+                        Ok(found) => {
+                            sizes += usize::from(matches!(found, Found::Size(..)));
+                            waited.push(found);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
             for found in waited.into_iter().chain(rx.try_iter()) {
                 match found {
-                    Found::Sizes(sizes) => {
-                        *entries = sizes
-                            .into_iter()
-                            .map(|(path, size)| Entry {
-                                path,
-                                size,
-                                thumb: None,
-                            })
-                            .collect();
+                    Found::Size(rank, path, Some(size)) => {
+                        let at = entries.partition_point(|e| e.rank < rank);
+                        let entry = Entry {
+                            path,
+                            size,
+                            thumb: None,
+                            rank,
+                        };
+                        entries.insert(at, entry);
                     }
+                    Found::Size(_, _, None) => {}
                     Found::Thumb(path, image) => {
                         if let Some(entry) = entries.iter_mut().find(|e| e.path == path) {
                             let name = format!("recent-{}", path.display());
@@ -307,6 +353,39 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(entries, [(good, (3, 2))]);
+    }
+
+    /// A file that doesn't answer (an offline share: here a pipe nobody
+    /// writes to) holds back its own entry only; the list keeps its order.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_file_holds_back_only_its_entry() {
+        let dir = std::env::temp_dir().join("atelier-recent-silent");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let silent = dir.join("share.png");
+        let made = std::process::Command::new("mkfifo").arg(&silent).status();
+        assert!(made.is_ok_and(|s| s.success()));
+        let (a, b) = (dir.join("a.png"), dir.join("b.png"));
+        image::RgbaImage::new(3, 2).save(&a).unwrap();
+        image::RgbaImage::new(5, 4).save(&b).unwrap();
+        let mut recent = Recent::with_paths(vec![b.clone(), silent.clone(), a.clone()]);
+        let ctx = egui::Context::default();
+        let mut entries = Vec::new();
+        for _ in 0..200 {
+            entries = recent
+                .entries(&ctx)
+                .iter()
+                .map(|e| (e.path.clone(), e.size))
+                .collect();
+            if entries.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(entries, [(b, (5, 4)), (a, (3, 2))]);
+        // The pipe answers at last (nothing readable): its reader is let go.
+        drop(std::fs::OpenOptions::new().write(true).open(&silent));
     }
 
     #[cfg(unix)]

@@ -144,21 +144,27 @@ impl AtelierApp {
             // The Move tool: Alt copies, Ctrl picks (or not) the layer
             // under the pointer; in Free Transform, from the center, no
             // snapping.
-            Tool::Transform if !self.free_transform => vec![
-                (shift, t!("input3-hint-axis")),
-                (alt, t!("input3-hint-copy")),
-                (
-                    ctrl,
-                    if self.auto_select {
-                        t!("input3-hint-selected-layers")
-                    } else {
-                        t!("input3-hint-pick-layer")
-                    },
-                ),
-                pair("1…0", t!("hint-layer-opacity")),
-                enter,
-                esc,
-            ],
+            // A drag is applied on release: Enter and Esc only for what the
+            // options bar prepares.
+            Tool::Transform if !self.free_transform => {
+                let mut hints = vec![
+                    (shift, t!("input3-hint-axis")),
+                    (alt, t!("input3-hint-copy")),
+                    (
+                        ctrl,
+                        if self.auto_select {
+                            t!("input3-hint-selected-layers")
+                        } else {
+                            t!("input3-hint-pick-layer")
+                        },
+                    ),
+                    pair("1…0", t!("hint-layer-opacity")),
+                ];
+                if self.transform_pending() {
+                    hints.extend([enter, esc]);
+                }
+                hints
+            }
             Tool::Transform => vec![
                 (shift, t!("hint-move-shift")),
                 (alt, t!("hint-from-center")),

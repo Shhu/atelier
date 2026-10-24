@@ -234,12 +234,17 @@ impl AtelierApp {
         };
         let coverage = cr.coverage();
         // Thumbnail: the selection, or the image.
-        let thumb_key = hash_of((cr.thumb_image, cr.shown.as_ref().map(|(k, _)| *k)));
+        // The image as the canvas shows it (display profile, proof).
+        let (lut_key, lut) = self.color.shown();
+        let shown_key = cr.shown.as_ref().map(|(k, _)| *k);
+        let thumb_key = hash_of((cr.thumb_image, shown_key, lut_key));
         if coverage.is_some() && cr.thumb.as_ref().is_none_or(|(k, _)| *k != thumb_key) {
             let image = match (&cr.reduced, &coverage) {
                 (Reduced::Ready(image, _), _) if cr.thumb_image => {
                     let size = [image.width() as usize, image.height() as usize];
-                    ColorImage::from_rgba_unmultiplied(size, image.as_raw())
+                    let mut rgba = image.as_raw().clone();
+                    super::color_ui::show_through(lut.as_deref(), &mut rgba, false);
+                    ColorImage::from_rgba_unmultiplied(size, &rgba)
                 }
                 (_, Some((mask, _))) => {
                     let size = [mask.width() as usize, mask.height() as usize];

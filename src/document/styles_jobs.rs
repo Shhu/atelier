@@ -19,9 +19,11 @@ struct Key {
     effects: Effects,
 }
 
-/// Styles being drawn for a layer (`None` until done).
+/// Styles being drawn for a layer (`None` until done), and the layer's
+/// place then.
 pub(super) struct Job {
     key: Key,
+    offset: (i64, i64),
     done: Mutex<Option<Arc<Styles>>>,
 }
 
@@ -33,9 +35,10 @@ pub(super) type JobSlot = Arc<Mutex<Option<Arc<Job>>>>;
 /// Jobs still running.
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether styles are being drawn (the display then looks again soon).
+/// Whether styles (or feathered masks) are being drawn (the display then
+/// looks again soon).
 pub fn styles_pending() -> bool {
-    RUNNING.load(Ordering::Relaxed) > 0
+    RUNNING.load(Ordering::Relaxed) > 0 || super::masks::feathers_pending()
 }
 
 impl Layer {
@@ -60,7 +63,7 @@ impl Layer {
             && c.effects == key.effects
             && (held || (c.rev, c.mask) == (key.rev, key.mask))
         {
-            return Some(Arc::clone(&c.styles));
+            return Some(self.placed_styles(c));
         }
         let mut slot = self.styles_job.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(job) = slot.as_ref() {
@@ -75,6 +78,7 @@ impl Layer {
                 mask: job.key.mask,
                 effects: job.key.effects.clone(),
                 styles: Arc::clone(&styles),
+                offset: job.offset.into(),
             });
             if job.key == key {
                 return Some(styles);
@@ -82,6 +86,7 @@ impl Layer {
         }
         let job = Arc::new(Job {
             key,
+            offset: self.offset,
             done: Mutex::new(None),
         });
         let (image, mask, offset) = (
@@ -122,6 +127,16 @@ impl Layer {
         self.styles_cached()
     }
 
+    /// Its pixels are about to change: the styles drawn for them stay
+    /// where the layer is now (see [`Self::placed_styles`]).
+    pub(super) fn anchor_styles(&self) {
+        if let Some(c) = self.styles_cache.borrow().as_ref()
+            && c.rev == self.rev
+        {
+            c.offset.set(self.offset);
+        }
+    }
+
     /// The last styles drawn for the layer, whatever its pixels and
     /// settings since.
     pub fn styles_cached(&self) -> Option<Arc<Styles>> {
@@ -129,7 +144,34 @@ impl Layer {
             return None;
         }
         let cache = self.styles_cache.borrow();
-        cache.as_ref().map(|c| Arc::clone(&c.styles))
+        cache.as_ref().map(|c| self.placed_styles(c))
+    }
+
+    /// Styles drawn for other pixels stay where they were in the canvas
+    /// (a shape edited: its image's box, so the layer's place, changes);
+    /// those of the same pixels move with the layer.
+    pub(super) fn placed_styles(&self, c: &StylesCache) -> Arc<Styles> {
+        if c.rev == self.rev {
+            c.offset.set(self.offset);
+            return Arc::clone(&c.styles);
+        }
+        let at = c.offset.get();
+        let (dx, dy) = (at.0 - self.offset.0, at.1 - self.offset.1);
+        if (dx, dy) == (0, 0) {
+            return Arc::clone(&c.styles);
+        }
+        let shift = |list: &[crate::compose::styles::FxImage]| {
+            let mut list = list.to_vec();
+            for f in &mut list {
+                f.offset = (f.offset.0 + dx, f.offset.1 + dy);
+            }
+            list
+        };
+        Arc::new(Styles {
+            exterior: shift(&c.styles.exterior),
+            interior: shift(&c.styles.interior),
+            version: c.styles.version,
+        })
     }
 }
 

@@ -721,6 +721,8 @@ pub(super) fn explained_menu_entries(
     action: &mut Option<Action>,
     why: Why<'_>,
 ) {
+    // Next to options, plain items keep the room of their check mark too.
+    let indent = entries.iter().any(|e| matches!(e, MenuEntry::Check(..)));
     for entry in entries {
         match entry {
             MenuEntry::Separator => {
@@ -736,11 +738,32 @@ pub(super) fn explained_menu_entries(
                 });
             }
             MenuEntry::Item(label, enabled, shortcut, act) => {
-                let mut button = egui::Button::new(label.as_str());
-                if let Some(s) = shortcut {
-                    button = button.shortcut_text(keys::shortcut(ui.ctx(), s));
+                let mut button = if indent {
+                    let mut text = egui::text::LayoutJob::default();
+                    let font = egui::TextStyle::Button.resolve(ui.style());
+                    let format = |color| egui::TextFormat::simple(font.clone(), color);
+                    text.append(icon::CHECK, 0.0, format(Color32::TRANSPARENT));
+                    text.append(label, 6.0, format(Color32::PLACEHOLDER));
+                    egui::Button::new(text)
+                } else {
+                    egui::Button::new(label.as_str())
+                };
+                let key = shortcut.map(|s| keys::shortcut(ui.ctx(), s));
+                if let Some(key) = &key {
+                    button = button.shortcut_text(key.as_str());
                 }
                 let response = ui.add_enabled(*enabled, button);
+                if indent {
+                    // Named without the room left for the mark (and with
+                    // its keys, as egui names a button).
+                    let name = match &key {
+                        Some(key) => format!("{label} {key}"),
+                        None => label.clone(),
+                    };
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, *enabled, &name)
+                    });
+                }
                 if !*enabled && let Some(text) = why(*act) {
                     response.clone().on_disabled_hover_text(text);
                 }

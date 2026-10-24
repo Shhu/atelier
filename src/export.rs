@@ -32,6 +32,10 @@ pub struct ExportOptions {
     /// Use Proof Setup: converted to the proof profile (View › Proof
     /// Setup), CMYK in JPEG, TIFF and PSD.
     pub use_proof: bool,
+    /// EXIF written as it is when there is no copyright (Save and Close
+    /// gives a file its own back).
+    #[serde(skip)]
+    pub exif: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl Default for ExportOptions {
@@ -45,6 +49,7 @@ impl Default for ExportOptions {
             srgb: true,
             embed_profile: true,
             use_proof: false,
+            exif: None,
         }
     }
 }
@@ -60,9 +65,10 @@ impl ExportOptions {
     }
 
     /// Size of the exported image for a canvas of `size`: never larger
-    /// than Atelier opens.
+    /// than Atelier opens, nor than the format holds.
     pub fn size(&self, (w, h): (u32, u32)) -> (u32, u32) {
-        let largest = f64::from(crate::document::MAX_DIMENSION) / f64::from(w.max(h).max(1));
+        let max = self.format.max_side().min(crate::document::MAX_DIMENSION);
+        let largest = f64::from(max) / f64::from(w.max(h).max(1));
         let k = (f64::from(self.scale.max(0.0)) / 100.0).min(largest);
         let side = |v: u32| ((f64::from(v) * k).round() as u32).max(1);
         (side(w), side(h))
@@ -89,6 +95,7 @@ impl ExportOptions {
             self.quality,
             icc,
             self.copyright.as_deref(),
+            self.exif.as_deref().map(Vec::as_slice),
         )?;
         Ok(out.into_inner())
     }
@@ -105,7 +112,9 @@ impl ExportOptions {
         let icc = self.embed_profile.then(|| cmyk.to.icc().as_slice());
         let mut out = Cursor::new(Vec::new());
         let (format, quality) = (self.format, self.quality);
-        crate::document::encode_cmyk(&ink, image.dimensions(), &mut out, format, quality, icc)?;
+        let copyright = self.copyright.as_deref();
+        let size = image.dimensions();
+        crate::document::encode_cmyk(&ink, size, &mut out, format, quality, icc, copyright)?;
         Ok(out.into_inner())
     }
 }
@@ -171,6 +180,14 @@ mod tests {
             ..ExportOptions::default()
         };
         assert_eq!(options.size((6000, 4000)), (30_000, 20_000));
+        // Nor than the format holds.
+        let webp = ExportOptions {
+            format: ExportFormat::WebP,
+            ..options
+        };
+        assert_eq!(webp.size((6000, 4000)), (16_383, 10_922));
+        let image = RgbaImage::new(webp.size((6000, 4000)).0, 1);
+        assert!(webp.encode(&image, None).is_ok());
     }
 
     #[test]

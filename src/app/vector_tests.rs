@@ -245,8 +245,8 @@ fn the_pen_in_shape_mode_and_path_selection_move_shapes_as_vectors() {
     let shape = d.active_layer().shape.as_ref().expect("a shape layer");
     assert!(shape.path.subpaths[0].closed);
     assert_eq!(d.flatten().get_pixel(50, 50).0, [0, 0, 255, 255]);
-    // Path Selection: dragged, the shape moves (rendered again, not
-    // resampled).
+    // Path Selection: dragged, the shape moves (by whole pixels at 100 %:
+    // its image as it is, never resampled).
     h.state_mut().set_tool(Tool::PathSelect);
     gesture(&mut h, (50.0, 50.0), &[(90.0, 60.0)], Modifiers::NONE);
     let d = doc(&h);
@@ -391,4 +391,48 @@ fn vector_capture() {
     h.run_steps(4);
     let image = h.render().expect("render");
     image.save(&out).expect("writing the capture");
+}
+
+/// Moving a whole styled shape with Path Selection only moves its image
+/// (not rendered again), and while a gesture edits a shape its styles are
+/// held (drawn again once, at the end).
+#[test]
+fn path_selection_moves_a_styled_shape_without_rendering_it_again() {
+    use crate::vector::{Bounds, Live, Shape, ShapeKind, ShapeStroke, pt};
+    let mut h = app(Tool::PathSelect);
+    let live = Live::new(
+        ShapeKind::Rectangle,
+        Bounds::of(pt(20.0, 20.0), pt(80.0, 70.0)),
+    );
+    let shape = Shape::live(live, Paint::Color([255, 0, 0]), ShapeStroke::default());
+    let d = h.state_mut().doc.as_mut().unwrap();
+    d.add_shape_layer("R".into(), "R", shape);
+    let fx = &mut d.active_layer_mut().effects;
+    fx.stroke.enabled = true;
+    fx.stroke.width = 4.0;
+    h.run_steps(2);
+    let (rev, offset) = (doc(&h).active_layer().rev(), doc(&h).active_layer().offset);
+    let start = screen(&h, 50.0, 45.0);
+    h.hover_at(start);
+    h.run_steps(1);
+    h.drag_at(start);
+    h.run_steps(1);
+    let to = screen(&h, 61.0, 52.0);
+    for i in 1..=4 {
+        h.hover_at(start.lerp(to, i as f32 / 4.0));
+        h.run_steps(1);
+        assert!(doc(&h).effects_held(), "held during the gesture");
+    }
+    h.event(egui::Event::PointerButton {
+        pos: to,
+        button: PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    h.run_steps(2);
+    let layer = doc(&h).active_layer();
+    assert!(!doc(&h).effects_held(), "released with the gesture");
+    assert_eq!(layer.rev(), rev, "the same image");
+    assert_eq!(layer.offset, (offset.0 + 11, offset.1 + 7));
+    assert_eq!(doc(&h).flatten().get_pixel(60, 50).0, [255, 0, 0, 255]);
 }

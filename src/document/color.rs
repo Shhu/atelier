@@ -82,11 +82,18 @@ impl Document {
     }
 
     fn recolor(&mut self, r: &dyn Recolor) {
+        // Built once: a transform costs milliseconds, and a document has
+        // a few colors per layer.
+        let c = Prepared {
+            run: r.recolorer(),
+            profile: r.profile(),
+            grays: r.grays(),
+        };
         if let Some(real) = &mut self.swapped {
-            convert_layer(real, r);
+            convert_layer(real, &c);
         }
         for layer in &mut self.layers {
-            convert_layer(layer, r);
+            convert_layer(layer, &c);
         }
     }
 
@@ -111,7 +118,7 @@ impl Document {
         let ink = to_cmyk(&self.flatten(), cmyk)?;
         let size = (self.width(), self.height());
         file_io::write_atomic(path, |out| {
-            file_io::encode_cmyk(&ink, size, out, format, quality, Some(cmyk.to.icc()))
+            file_io::encode_cmyk(&ink, size, out, format, quality, Some(cmyk.to.icc()), None)
         })?;
         Ok(Vec::new())
     }
@@ -126,8 +133,7 @@ pub fn to_cmyk(image: &image::RgbaImage, cmyk: &Conversion) -> Result<Vec<u8>, F
 
 /// What changes every color of a document.
 trait Recolor {
-    fn pixels(&self, image: &mut image::RgbaImage);
-    fn color(&self, rgb: [u8; 3]) -> [u8; 3];
+    fn recolorer(&self) -> cms::Recolorer;
     /// The profile the colors are then in, if it changes.
     fn profile(&self) -> Option<&Arc<Vec<u8>>> {
         None
@@ -140,36 +146,53 @@ trait Recolor {
 }
 
 impl Recolor for Conversion<'_> {
-    fn pixels(&self, image: &mut image::RgbaImage) {
-        self.convert_rgba(image);
+    fn recolorer(&self) -> cms::Recolorer {
+        Conversion::recolorer(self)
     }
 
     fn profile(&self) -> Option<&Arc<Vec<u8>>> {
         Some(self.to.icc())
     }
-
-    fn color(&self, rgb: [u8; 3]) -> [u8; 3] {
-        Conversion::color(self, rgb)
-    }
 }
 
 impl Recolor for Grayscale<'_> {
-    fn pixels(&self, image: &mut image::RgbaImage) {
-        self.convert_rgba(image);
+    fn recolorer(&self) -> cms::Recolorer {
+        Grayscale::recolorer(self)
     }
 
     fn grays(&self) -> bool {
         true
     }
+}
+
+/// A [`Recolor`] with its transforms built.
+struct Prepared<'a> {
+    run: cms::Recolorer,
+    profile: Option<&'a Arc<Vec<u8>>>,
+    grays: bool,
+}
+
+impl Prepared<'_> {
+    fn pixels(&self, image: &mut image::RgbaImage) {
+        self.run.convert_rgba(image);
+    }
 
     fn color(&self, rgb: [u8; 3]) -> [u8; 3] {
-        Grayscale::color(self, rgb)
+        self.run.color(rgb)
+    }
+
+    fn profile(&self) -> Option<&Arc<Vec<u8>>> {
+        self.profile
+    }
+
+    fn grays(&self) -> bool {
+        self.grays
     }
 }
 
 /// A layer's colors changed: its pixels as they are (a text, a shape or a
 /// smart object stays one) and the colors its contents are drawn with.
-fn convert_layer(layer: &mut Layer, c: &dyn Recolor) {
+fn convert_layer(layer: &mut Layer, c: &Prepared) {
     if let Some(s) = layer.smart.as_deref_mut() {
         // Its contents converted, then rendered again from them.
         s.recolor(&mut |l| convert_layer(l, c), c.profile());
@@ -222,6 +245,13 @@ fn convert_layer(layer: &mut Layer, c: &dyn Recolor) {
                 (h.hue, h.saturation) = (0.0, 0.0);
             }
             Adjustment::BlackWhite(b) if c.grays() => b.tint = false,
+            // Per-channel corrections tint: only the composite one stays.
+            Adjustment::Curves(curves) if c.grays() => {
+                curves.channels = Default::default();
+            }
+            Adjustment::Levels(levels) if c.grays() => {
+                levels.channels = Default::default();
+            }
             _ => {}
         },
         _ => {}
@@ -249,6 +279,11 @@ fn convert_layer(layer: &mut Layer, c: &dyn Recolor) {
         rgba(color);
     }
     gradient(&mut fx.gradient_overlay.fill);
+    if let Some(board) = &mut layer.artboard
+        && let super::ArtboardBackground::Custom(v) = &mut board.background
+    {
+        rgb(v);
+    }
 }
 
 /// Pixels decoded with a profile that isn't an RGB one, made RGB through
@@ -645,5 +680,96 @@ mod tests {
             assert_eq!(profile, Some(cms::srgb().icc().as_slice()));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn cmyk_jpegs_keep_one_pixel_detail_at_low_quality() {
+        let dir = std::env::temp_dir().join(format!("atelier-cmyk-q-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 1-px red / white columns, and 1-px black / white columns.
+        let photo = RgbaImage::from_fn(96, 64, |x, y| match (x % 2 == 0, y < 32) {
+            (true, true) => Rgba([230, 20, 30, 255]),
+            (true, false) => Rgba([0, 0, 0, 255]),
+            _ => Rgba([255, 255, 255, 255]),
+        });
+        let doc = Document::new(photo.clone(), None);
+        let c = Conversion {
+            from: cms::srgb(),
+            to: cms::default_cmyk(),
+            intent: Intent::RelativeColorimetric,
+            bpc: true,
+        };
+        let path = dir.join("q80.jpg");
+        doc.export_cmyk(&path, ExportFormat::Jpeg, 80, &c).unwrap();
+        let back = Document::open(&path).unwrap().doc;
+        let (mut error, mut n) = (0.0f64, 0.0f64);
+        for y in 4..60 {
+            for x in 4..92 {
+                let a = photo.get_pixel(x, y).0;
+                let b = back.layers[0].pixel_at(x as i64, y as i64).unwrap();
+                error += (0..3).map(|c| a[c].abs_diff(b[c]) as f64).sum::<f64>() / 3.0;
+                n += 1.0;
+            }
+        }
+        // Half-resolution inks: about 100; whole: a few levels.
+        assert!(error / n < 20.0, "mean error {}", error / n);
+        let white = back.layers[0].pixel_at(11, 10).unwrap();
+        assert!(
+            white[..3].iter().all(|&v| v > 200),
+            "white column {white:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grayscale_neutralizes_per_channel_curves_levels_and_artboards() {
+        let photo = RgbaImage::from_fn(64, 48, |x, y| {
+            Rgba([(x * 4) as u8, (y * 5) as u8, 200, 255])
+        });
+        let mut curves = crate::pixel_ops::Curves::default();
+        curves.channels[0] =
+            crate::pixel_ops::Curve::from_points(&[[0.0, 0.0], [128.0, 190.0], [255.0, 255.0]])
+                .unwrap();
+        let mut levels = crate::pixel_ops::Levels::default();
+        levels.channels[2].gamma = 0.5;
+        for adjustment in [Adjustment::Curves(curves), Adjustment::Levels(levels)] {
+            let mut doc = Document::new(photo.clone(), None);
+            doc.add_adjustment_layer(adjustment, None);
+            doc.grayscale(&Grayscale { of: cms::srgb() });
+            let spread = |p: &Rgba<u8>| p[0].abs_diff(p[1]).max(p[0].abs_diff(p[2]));
+            let worst = doc.flatten().pixels().map(spread).max().unwrap();
+            assert!(worst <= 1, "spread {worst}");
+        }
+        let mut doc = Document::new(RgbaImage::new(32, 32), None);
+        let rect = crate::document::PixelRect {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 16,
+        };
+        let background = super::super::ArtboardBackground::Custom([200, 40, 40]);
+        doc.add_artboard("a".into(), "A".into(), rect, background);
+        doc.grayscale(&Grayscale { of: cms::srgb() });
+        let board = doc
+            .layers
+            .iter()
+            .find_map(|l| l.artboard)
+            .expect("artboard");
+        assert!(
+            matches!(board.background, super::super::ArtboardBackground::Custom([r, g, b]) if r == g && g == b),
+            "{:?}",
+            board.background
+        );
+    }
+
+    #[test]
+    fn grayscale_of_many_layers_builds_its_transforms_once() {
+        let mut doc = Document::new(RgbaImage::new(16, 16), None);
+        for i in 0..200 {
+            doc.add_layer(format!("l{i}"), RgbaImage::new(4, 4), (0, 0));
+        }
+        let t = std::time::Instant::now();
+        doc.grayscale(&Grayscale { of: cms::srgb() });
+        // Two transforms per color: about 26 s.
+        assert!(t.elapsed().as_secs_f32() < 5.0, "{:?}", t.elapsed());
     }
 }

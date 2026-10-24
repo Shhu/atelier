@@ -644,6 +644,9 @@ impl AtelierApp {
         mesh: Arc<Mesh>,
         frame: Option<((i64, i64), (u32, u32))>,
     ) {
+        if self.refuse_hidden_target() {
+            return;
+        }
         self.record(crate::actions::Recorded::Liquify {
             mesh: mesh.to_bytes(),
         });
@@ -705,10 +708,11 @@ impl AtelierApp {
         let Some(applying) = &self.liquify.applying else {
             return;
         };
+        // Disconnected: the computation failed (panicked).
         let result = match applying.rx.try_recv() {
-            Ok(image) => image,
+            Ok(image) => Ok(image),
             Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Err(()),
         };
         let Some(a) = self.liquify.applying.take() else {
             return;
@@ -718,17 +722,24 @@ impl AtelierApp {
             && (doc.uid(), doc.active_layer().id) == (a.doc, a.layer)
         {
             match result {
-                Some(image) => {
+                Ok(Some(image)) => {
                     doc.active_layer_mut().replace_pixels(image);
                     doc.end_paint();
                     self.status = t!("filter-applied", name = name.as_str());
                     self.liquify.last = Some(a.mesh);
                     self.filters.forget_last();
                 }
-                None => {
+                Ok(None) => {
                     doc.end_paint();
                     doc.discard_step();
                     self.status = t!("retouch-status-cancelled", name = name.as_str());
+                    self.shrink_after_preview();
+                }
+                Err(()) => {
+                    doc.end_paint();
+                    doc.discard_step();
+                    self.status_failed(tm!("fx3-filter-failed", name = name.as_str()));
+                    self.shrink_after_preview();
                 }
             }
         }

@@ -660,15 +660,20 @@ impl Liquify {
             }
             Effect::Smooth => {
                 let r = ((radius / self.mesh.spacing as f32 / 6.0).round() as usize).max(1);
-                let average = self.box_average(rect, r);
+                let mut average = self.box_average(rect, r);
                 let w = x1 - x0;
-                for j in y0..y1 {
-                    for i in x0..x1 {
-                        let t = 1.0 - (-SMOOTH_SPEED * k * weight(self, i, j)).exp();
-                        let a = average[(j - y0) * w + i - x0];
-                        let o = &mut self.mesh.offsets[j * cols + i];
-                        *o = [o[0] + (a[0] - o[0]) * t, o[1] + (a[1] - o[1]) * t];
+                // In place: the average becomes the new offset.
+                let this = &*self;
+                par_rows(&mut average, w, |first, band| {
+                    for (n, a) in band.iter_mut().enumerate() {
+                        let (i, j) = (x0 + n % w, y0 + first + n / w);
+                        let t = 1.0 - (-SMOOTH_SPEED * k * weight(this, i, j)).exp();
+                        let o = this.mesh.node(i, j);
+                        *a = [o[0] + (a[0] - o[0]) * t, o[1] + (a[1] - o[1]) * t];
                     }
+                });
+                for (row, j) in average.chunks_exact(w).zip(y0..y1) {
+                    self.mesh.offsets[j * cols + x0..j * cols + x1].copy_from_slice(row);
                 }
             }
             _ => {
@@ -714,30 +719,39 @@ impl Liquify {
         let n = (2 * r + 1) as f32;
         let add = |a: [f32; 2], b: [f32; 2]| [a[0] + b[0], a[1] + b[1]];
         let sub = |a: [f32; 2], b: [f32; 2]| [a[0] - b[0], a[1] - b[1]];
-        // Horizontal pass over the rows needed by the vertical one.
-        let mut horizontal = Vec::with_capacity(w * (yb - ya) as usize);
-        for j in ya..yb {
-            let j = j.clamp(0, rows - 1) as usize;
-            let at = |i: isize| self.mesh.node(i.clamp(0, cols - 1) as usize, j);
-            let first = x0 as isize;
-            let mut sum = (first - r..=first + r).fold([0.0; 2], |s, i| add(s, at(i)));
-            for i in first..x1 as isize {
-                horizontal.push([sum[0] / n, sum[1] / n]);
-                sum = sub(add(sum, at(i + r + 1)), at(i - r));
-            }
-        }
-        let k = (2 * r + 1) as usize;
-        let mut out = vec![[0.0; 2]; w * (y1 - y0)];
-        for i in 0..w {
-            let at = |j: usize| horizontal[j * w + i];
-            let mut sum = (0..k).fold([0.0; 2], |s, j| add(s, at(j)));
-            for j in 0..y1 - y0 {
-                out[j * w + i] = [sum[0] / n, sum[1] / n];
-                if j + 1 < y1 - y0 {
-                    sum = sub(add(sum, at(j + k)), at(j));
+        // Horizontal pass over the rows needed by the vertical one (rows on
+        // all the cores).
+        let mut horizontal = vec![[0.0; 2]; w * (yb - ya) as usize];
+        par_rows(&mut horizontal, w, |first, band| {
+            for (line, j) in band.chunks_exact_mut(w).zip(ya + first as isize..) {
+                let j = j.clamp(0, rows - 1) as usize;
+                let at = |i: isize| self.mesh.node(i.clamp(0, cols - 1) as usize, j);
+                let first = x0 as isize;
+                let mut sum = (first - r..=first + r).fold([0.0; 2], |s, i| add(s, at(i)));
+                for (out, i) in line.iter_mut().zip(first..) {
+                    *out = [sum[0] / n, sum[1] / n];
+                    sum = sub(add(sum, at(i + r + 1)), at(i - r));
                 }
             }
-        }
+        });
+        // Vertical pass: each band of rows starts its own running sums.
+        let k = (2 * r + 1) as usize;
+        let mut out = vec![[0.0; 2]; w * (y1 - y0)];
+        let horizontal = &horizontal;
+        par_rows(&mut out, w, |first, band| {
+            let len = band.len() / w;
+            for i in 0..w {
+                let at = |j: usize| horizontal[j * w + i];
+                let mut sum = (first..first + k).fold([0.0; 2], |s, j| add(s, at(j)));
+                for j in 0..len {
+                    band[j * w + i] = [sum[0] / n, sum[1] / n];
+                    if j + 1 < len {
+                        let top = first + j;
+                        sum = sub(add(sum, at(top + k)), at(top));
+                    }
+                }
+            }
+        });
         out
     }
 }
@@ -1198,12 +1212,20 @@ mod tests {
 
     #[test]
     fn box_average_matches_the_direct_sum() {
-        let mut liquify = Liquify::new(Mesh::new(60, 40));
+        // Small (one thread) and large (bands of rows on several).
+        for (w, h) in [(60, 40), (400, 300)] {
+            box_average_matches_the_direct_sum_on(w, h);
+        }
+    }
+
+    fn box_average_matches_the_direct_sum_on(width: u32, height: u32) {
+        let mut liquify = Liquify::new(Mesh::new(width, height));
         let brush = Brush {
-            size: 20.0,
+            size: width as f32 / 3.0,
             ..Brush::default()
         };
-        liquify.stroke(Effect::Warp, &brush, [10.0, 10.0], [30.0, 25.0], 0.0, 1.0);
+        let to = [width as f32 / 2.0, height as f32 * 0.6];
+        liquify.stroke(Effect::Warp, &brush, [10.0, 10.0], to, 0.0, 1.0);
         let mesh = &liquify.mesh;
         let (cols, rows) = (mesh.cols as isize, mesh.rows as isize);
         for (rect, r) in [([0, 0, mesh.cols, mesh.rows], 3), ([2, 3, 9, 7], 5)] {

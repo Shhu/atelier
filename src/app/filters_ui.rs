@@ -85,6 +85,14 @@ impl Group {
     }
 }
 
+/// The filter whose `Debug` name is `name` (what Diagnostics measured).
+pub(super) fn kind_named(name: &str) -> Option<FilterKind> {
+    GROUPS
+        .iter()
+        .flat_map(|(_, kinds)| kinds.iter().copied())
+        .find(|k| format!("{k:?}") == name)
+}
+
 /// Name of a filter (its dialog's title).
 pub(super) fn title(kind: FilterKind) -> String {
     match kind {
@@ -135,6 +143,9 @@ pub(super) struct Filters {
     /// Preview of an adjustment (or Make Transparent) being computed: what
     /// for (the layer's id and revision), and the computation.
     adjust: Option<(LayerPreview, u64, u64, Job<RgbaImage>)>,
+    /// The preview whose computation failed (for that layer and revision):
+    /// not started again.
+    adjust_failed: Option<(LayerPreview, u64, u64)>,
 }
 
 /// A layer enlarged to the canvas for a dialog's preview: its document and
@@ -218,7 +229,7 @@ enum Ready {
 /// Computation on another thread, and what it was started for. Dropping
 /// it stops the filters it applies (a preview no longer wanted, a filter
 /// cancelled).
-struct Job<T> {
+pub(super) struct Job<T> {
     key: u64,
     region: [u32; 4],
     rx: mpsc::Receiver<T>,
@@ -227,7 +238,7 @@ struct Job<T> {
 
 impl<T: Send + 'static> Job<T> {
     /// `name`: what it is measured as (see `crate::diag`), if anything.
-    fn spawn(
+    pub(super) fn spawn(
         ctx: &egui::Context,
         key: u64,
         region: [u32; 4],
@@ -252,17 +263,22 @@ impl<T: Send + 'static> Job<T> {
     }
 
     /// Stops the filters it applies: what it gives is then meaningless.
-    fn stop(&self) {
+    pub(super) fn stop(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
-    fn stopped(&self) -> bool {
+    /// What it was started for.
+    pub(super) fn key(&self) -> u64 {
+        self.key
+    }
+
+    pub(super) fn stopped(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
 
     /// What the computation gave: `Err(())` once it failed (its thread
     /// panicked), `Ok(None)` while it runs.
-    fn poll(&self) -> Result<Option<T>, ()> {
+    pub(super) fn poll(&self) -> Result<Option<T>, ()> {
         match self.rx.try_recv() {
             Ok(out) => Ok(Some(out)),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
@@ -340,6 +356,13 @@ fn fresh_seed() -> u32 {
 }
 
 impl AtelierApp {
+    /// A filter was applied this session: Filter › Last Filter can repeat it.
+    pub(super) fn has_last_filter(&self) -> bool {
+        self.filters.last.is_some()
+            || self.filters.camera_raw.is_some()
+            || self.liquify.last.is_some()
+    }
+
     /// The Filter menu (between Select and View, like Photoshop).
     pub(super) fn filter_menu(&self) -> (String, Vec<MenuEntry>) {
         use MenuEntry::{Item, Separator, Submenu};
@@ -347,10 +370,7 @@ impl AtelierApp {
         let mut entries = vec![
             Item(
                 t!("filter-last"),
-                has_doc
-                    && (self.filters.last.is_some()
-                        || self.filters.camera_raw.is_some()
-                        || self.liquify.last.is_some()),
+                has_doc && self.has_last_filter(),
                 Some(&SHORTCUT_LAST_FILTER),
                 Action::LastFilter,
             ),
@@ -591,7 +611,8 @@ impl AtelierApp {
                 None => {
                     doc.end_paint();
                     doc.discard_step();
-                    self.status_failed(t!("fx3-filter-failed", name = name.as_str()));
+                    self.status_failed(tm!("fx3-filter-failed", name = name.as_str()));
+                    self.shrink_after_preview();
                 }
             }
         }
@@ -618,13 +639,32 @@ impl AtelierApp {
                     }
                 }
                 Err(()) => {
-                    self.filters.adjust = None;
+                    if let Some((failed, layer, rev, _)) = self.filters.adjust.take() {
+                        let text = match &failed {
+                            LayerPreview::Adjust(a) => {
+                                let name = a.title();
+                                t!("fx4-preview-failed", name = name.as_str())
+                            }
+                            LayerPreview::Transparency(_) => {
+                                let name = t!("dialog-transparency-title");
+                                t!("fx4-preview-failed", name = name.as_str())
+                            }
+                            LayerPreview::Filter(_) => t!("fx4-preview-failed-any"),
+                        };
+                        self.filters.adjust_failed = Some((failed, layer, rev));
+                        self.status_failed(text);
+                    }
                     return self.end_layer_preview();
                 }
             }
         }
         if let Some(p) = &self.preview_shown
             && (&p.preview, p.layer, p.rev) == (&preview, id, rev)
+        {
+            return;
+        }
+        if let Some((failed, layer, rev_then)) = &self.filters.adjust_failed
+            && (failed, *layer, *rev_then) == (&preview, id, rev)
         {
             return;
         }
@@ -653,13 +693,39 @@ impl AtelierApp {
     /// A hidden layer is not filtered (its result could not be seen): says
     /// so. Returns `true` then.
     pub(super) fn refuse_hidden_target(&mut self) -> bool {
-        let Some(doc) = &self.doc else { return false };
-        if doc.shown(doc.active) {
-            return false;
+        self.refuse_hidden(true)
+    }
+
+    /// The same for the other commands that change the active layer's
+    /// pixels (Fill, adjustments, Make Transparent, Content-Aware Fill).
+    pub(super) fn refuse_hidden_layer(&mut self) -> bool {
+        self.refuse_hidden(false)
+    }
+
+    fn refuse_hidden(&mut self, filter: bool) -> bool {
+        match self.hidden_target(filter) {
+            Some(text) => {
+                self.status = text;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Why the active layer can't be changed: it is hidden (or in a hidden
+    /// group). `filter`: in a filter's words. In Quick Mask Mode, the mask
+    /// is changed instead, always shown.
+    pub(super) fn hidden_target(&self, filter: bool) -> Option<String> {
+        let doc = self.doc.as_ref()?;
+        if doc.shown(doc.active) || doc.quick_mask().is_some() {
+            return None;
         }
         let name = doc.active_layer().name.as_str();
-        self.status = t!("fx3-filter-layer-hidden", name = name);
-        true
+        Some(if filter {
+            t!("fx3-filter-layer-hidden", name = name)
+        } else {
+            t!("fx4-layer-hidden", name = name)
+        })
     }
 
     /// A dialog closed without changing the layer: the layer it enlarged
@@ -696,6 +762,8 @@ impl AtelierApp {
             doc.end_paint();
             doc.discard_step();
         }
+        // A layer the dialog enlarged is put back as it was.
+        self.shrink_after_preview();
         let name = title(a.filter.kind());
         self.status = t!("retouch-status-cancelled", name = name.as_str());
         self.end_layer_preview();
@@ -882,7 +950,7 @@ impl AtelierApp {
                 {
                     dialog.failed = Some(job.key);
                     let name = title(dialog.filter.kind());
-                    self.status_failed(t!("fx3-filter-failed", name = name.as_str()));
+                    self.status_failed(tm!("fx3-filter-failed", name = name.as_str()));
                 }
             }
             _ => {}
@@ -1678,6 +1746,59 @@ mod tests {
         h.key_press(egui::Key::Escape);
         h.run_steps(2);
         assert_eq!(size(&h), ((10, 8), (5, 6)));
+    }
+
+    #[test]
+    fn a_layer_enlarged_for_the_preview_shrinks_back_when_the_result_is_cancelled() {
+        let mut h = app();
+        let doc = h.state_mut().doc.as_mut().unwrap();
+        let layer = doc.active_layer_mut();
+        layer.replace_pixels(RgbaImage::from_pixel(10, 8, image::Rgba([200, 0, 0, 255])));
+        layer.offset = (5, 6);
+        let app = h.state_mut();
+        app.run(Action::Filter(FilterKind::Minimum));
+        let filter = app.filters.dialog.take().expect("dialog").filter;
+        // OK, then cancelled while it computes.
+        app.start_filter(filter);
+        assert!(app.filters.applying.is_some());
+        app.cancel_filter();
+        let doc = app.doc.as_ref().unwrap();
+        let l = doc.active_layer();
+        assert_eq!((l.image().dimensions(), l.offset), ((10, 8), (5, 6)));
+        assert!(!doc.can_undo());
+    }
+
+    #[test]
+    fn hidden_layers_are_neither_filled_nor_adjusted() {
+        let mut h = app();
+        let app = h.state_mut();
+        app.doc.as_mut().unwrap().active_layer_mut().visible = false;
+        let before = pixels(&h);
+        let app = h.state_mut();
+        for action in [
+            Action::FillPrimary,
+            Action::FillDialog,
+            Action::MakeTransparent,
+            Action::Adjust(AdjustKind::Invert),
+            Action::Adjust(AdjustKind::Levels),
+        ] {
+            app.status.clear();
+            app.run(action);
+            assert_eq!(
+                Some(&app.status),
+                app.hidden_target(false).as_ref(),
+                "{action:?}"
+            );
+        }
+        assert!(app.fill_dialog.is_none() && app.adjust.is_none() && app.transparency.is_none());
+        let doc = app.doc.as_ref().unwrap();
+        assert!(!doc.can_undo());
+        assert_eq!(pixels(&h), before);
+        // Shown again: filled.
+        let app = h.state_mut();
+        app.doc.as_mut().unwrap().active_layer_mut().visible = true;
+        app.run(Action::FillPrimary);
+        assert!(app.doc.as_ref().unwrap().can_undo());
     }
 
     #[test]

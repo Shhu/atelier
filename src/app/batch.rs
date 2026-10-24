@@ -207,6 +207,8 @@ struct Current {
     source: Option<PathBuf>,
     /// Opened by the batch: closed after.
     opened: bool,
+    /// A copy of a file open in another tab: closed when the batch stops.
+    copy: bool,
 }
 
 /// A batch running.
@@ -296,7 +298,7 @@ fn images_in(folder: &Path, subfolders: bool) -> Vec<PathBuf> {
 }
 
 /// Export format of a file name's extension.
-fn format_of(path: &Path) -> Option<ExportFormat> {
+pub(super) fn format_of(path: &Path) -> Option<ExportFormat> {
     let ext = path.extension()?.to_str()?;
     ExportFormat::ALL
         .into_iter()
@@ -876,7 +878,13 @@ impl AtelierApp {
         let Some(item) = run.items.pop_front() else {
             return self.end_batch();
         };
-        let (action, copies) = (run.action, run.copies);
+        let (action, copies, save_in_place) = (run.action, run.copies, run.save_in_place);
+        let open_tab = match &item {
+            Item::File(path) if save_in_place && !crate::camera_raw::raw::is_raw(path) => {
+                self.tab_of(path)
+            }
+            _ => None,
+        };
         let (current, error) = match item {
             Item::Tab(uid) => match (0..self.tab_count())
                 .find(|&i| self.tab(i).is_some_and(|(d, _)| d.uid() == uid))
@@ -899,6 +907,19 @@ impl AtelierApp {
                 // Closed meanwhile.
                 None => (None, None),
             },
+            // Already open, to be saved over: the tab itself, like
+            // Photoshop, unless it has unsaved changes (its next Save would
+            // replace the batch's work, or the batch its changes).
+            Item::File(path) if open_tab.is_some() => {
+                let i = open_tab.unwrap_or_default();
+                if self.tab(i).is_some_and(|(d, _)| d.modified) {
+                    let name = files::file_name(&path);
+                    (None, Some(t!("smart4-batch-open-modified", name = name)))
+                } else {
+                    self.switch_tab(i);
+                    (self.current_document(false), None)
+                }
+            }
             // Already open: a copy of its own, the tab and its unsaved
             // changes left as they are.
             Item::File(path)
@@ -907,7 +928,8 @@ impl AtelierApp {
                 match Document::open(&path) {
                     Ok(opened) => {
                         self.add_tab(opened.doc);
-                        (self.current_document(true), None)
+                        let current = self.current_document(true);
+                        (current.map(|c| Current { copy: true, ..c }), None)
                     }
                     Err(e) => {
                         let shown = path.display().to_string();
@@ -957,11 +979,20 @@ impl AtelierApp {
             name: doc.display_name(),
             source: doc.path.clone(),
             opened,
+            copy: false,
         })
     }
 
     /// After the action: the document's files saved, the document closed.
     fn finish_document(&mut self, cur: Current) {
+        self.finish_current(&cur);
+        // Stopped: a copy of a file open in another tab isn't left open.
+        if cur.copy && self.automate.run.is_none() {
+            self.close_by_uid(cur.uid);
+        }
+    }
+
+    fn finish_current(&mut self, cur: &Current) {
         // The action failed: logged, and the document isn't saved.
         let failed = self.actions.take_batch_error();
         if let Some(error) = &failed
@@ -982,7 +1013,7 @@ impl AtelierApp {
         let mut saved = false;
         if on_document && failed.is_none() {
             for output in &outputs {
-                if let Err(e) = self.save_output(output, &cur, serial)
+                if let Err(e) = self.save_output(output, cur, serial)
                     && !self.batch_error(t!(
                         "words3-label-value",
                         label = cur.name.as_str(),
@@ -1096,7 +1127,7 @@ impl AtelierApp {
     }
 
     /// Save and Close: the document over its own file, in its format.
-    fn save_in_place(&mut self, quality: u8) -> Result<(), String> {
+    pub(super) fn save_in_place(&mut self, quality: u8) -> Result<(), String> {
         let Some(doc) = &mut self.doc else {
             return Ok(());
         };
@@ -1113,15 +1144,28 @@ impl AtelierApp {
                 ));
             }
         }
-        if crate::document::is_native(&path) || crate::document::is_psd(&path) {
+        if crate::document::is_native(&path) || files::has_extension(&path, "psd") {
             return doc.save(&path).map(|_| ()).map_err(|e| e.to_string());
         }
         let Some(format) = format_of(&path) else {
             return Err(t!("actions-error-format", name = files::file_name(&path)));
         };
+        // Nor an image replaced by one holding less (its other frames or
+        // pages, its depth, its inks, its metadata).
+        if !doc.file_notes.is_empty() {
+            return Err(t!(
+                "files4-status-would-lose",
+                name = files::file_name(&path),
+                notes = doc.file_notes.join(" · ")
+            ));
+        }
+        // Its own profile and EXIF back.
         let options = ExportOptions {
             format,
             quality,
+            srgb: false,
+            embed_profile: true,
+            exif: doc.file_metadata.exif.clone(),
             ..ExportOptions::default()
         };
         self.write_export(&options, &path)?;
@@ -1217,7 +1261,11 @@ impl AtelierApp {
         );
         if out.ok || out.cancel {
             let done = run.done as u32;
+            let copy = run.current.as_ref().filter(|c| c.copy).map(|c| c.uid);
             self.automate.run = None;
+            if let Some(uid) = copy {
+                self.close_by_uid(uid);
+            }
             self.stop_playing();
             self.status = t!("actions-batch-cancelled", count = done);
         }
@@ -1556,6 +1604,72 @@ mod tests {
         assert!(dest.join("JPEG/photo-2.jpg").exists());
     }
 
+    /// Save and Close never replaces an image by one holding less (an
+    /// animation's other frames, 16 bits), and gives a file its own
+    /// profile and EXIF back.
+    #[test]
+    fn save_and_close_keeps_what_files_hold() {
+        use image::ImageEncoder as _;
+        let (src, logs) = (folder("save-close-losses"), folder("save-close-losses-log"));
+        let gif = src.join("anim.gif");
+        let mut encoder = image::codecs::gif::GifEncoder::new(std::fs::File::create(&gif).unwrap());
+        for v in [10, 20, 30] {
+            let frame = image::Frame::new(RgbaImage::from_pixel(4, 4, Rgba([v, v, v, 255])));
+            encoder.encode_frame(frame).unwrap();
+        }
+        drop(encoder);
+        let deep = src.join("deep.png");
+        image::ImageBuffer::<Rgba<u16>, _>::from_pixel(4, 4, Rgba([9000, 9000, 9000, 65535]))
+            .save(&deep)
+            .unwrap();
+        let adobe = crate::cms::WorkingRgb::AdobeRgb.profile().icc().to_vec();
+        let wide = src.join("wide.png");
+        let mut encoder =
+            image::codecs::png::PngEncoder::new(std::fs::File::create(&wide).unwrap());
+        encoder.set_icc_profile(adobe.clone()).unwrap();
+        encoder
+            .write_image(&[40; 4 * 4 * 3], 4, 4, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let photo = src.join("photo.jpg");
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+            std::fs::File::create(&photo).unwrap(),
+            95,
+        );
+        encoder
+            .set_exif_metadata(crate::export::copyright_exif("QA-EXIF-KEPT"))
+            .unwrap();
+        encoder
+            .write_image(&[40; 4 * 4 * 3], 4, 4, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let before = |p: &Path| std::fs::read(p).unwrap();
+        let (gif_before, deep_before) = (before(&gif), before(&deep));
+        let mut h = app();
+        let d = BatchDialog {
+            folder: Some(src.clone()),
+            destination: Destination::SaveAndClose,
+            log: true,
+            log_file: Some(logs.join("log.txt")),
+            ..BatchDialog::default()
+        };
+        h.state_mut().start_batch(&d);
+        run(&mut h);
+        assert_eq!(before(&gif), gif_before, "the animation is kept");
+        assert_eq!(before(&deep), deep_before, "16 bits are kept");
+        let log = std::fs::read_to_string(logs.join("log.txt")).unwrap();
+        assert_eq!(log.lines().count(), 2, "{log}");
+        // Saved with their own profile, colors not converted, and EXIF.
+        let mut decoder = image::codecs::png::PngDecoder::new(std::io::BufReader::new(
+            std::fs::File::open(&wide).unwrap(),
+        ))
+        .unwrap();
+        use image::ImageDecoder as _;
+        assert_eq!(decoder.icc_profile().unwrap(), Some(adobe));
+        assert_eq!(value(&wide), 215);
+        let jpeg = std::fs::read(&photo).unwrap();
+        assert!(jpeg.windows(12).any(|w| w == b"QA-EXIF-KEPT"));
+        assert!(value(&photo) > 200, "the action ran");
+    }
+
     /// Save and Close with Log Errors: a document that can't be saved is
     /// logged and stays open, its work kept.
     #[test]
@@ -1592,10 +1706,12 @@ mod tests {
         assert_eq!(images_in(&src, true), [src.join("a.png")]);
     }
 
-    /// A file of the folder already open with unsaved changes: the batch
-    /// works on a copy of its own, the tab is left as it was.
+    /// Save and Close on a file of the folder already open with unsaved
+    /// changes: left alone, said so (its next Save would replace the
+    /// batch's work); open without changes: that tab is processed and
+    /// closed, like Photoshop.
     #[test]
-    fn batch_leaves_an_open_copy_of_a_file_alone() {
+    fn save_and_close_with_the_file_open_in_a_tab() {
         let src = folder("open-copy");
         let path = src.join("x.png");
         png(&path, (4, 4), 40);
@@ -1610,12 +1726,46 @@ mod tests {
         };
         h.state_mut().start_batch(&d);
         run(&mut h);
-        assert_eq!(value(&path), 215, "the file was processed");
+        assert_eq!(value(&path), 40, "the file left as it is");
+        assert!(h.state().automate.alert.is_some(), "said so");
         assert_eq!(h.state().tab_count(), 1);
         let doc = h.state().doc.as_ref().unwrap();
         assert!(doc.uid() == uid && doc.modified);
-        let pixel = doc.flatten().get_pixel(0, 0).0;
-        assert_eq!(pixel[0], 40, "the tab is untouched");
+        assert_eq!(
+            doc.flatten().get_pixel(0, 0).0[0],
+            40,
+            "the tab is untouched"
+        );
+        // Saved: processed in that tab, then closed.
+        h.state_mut().automate.alert = None;
+        h.state_mut().doc.as_mut().unwrap().modified = false;
+        h.state_mut().start_batch(&d);
+        run(&mut h);
+        assert_eq!(value(&path), 215, "the file was processed");
+        assert_eq!(h.state().tab_count(), 0);
+        assert!(h.state().automate.alert.is_none());
+    }
+
+    /// Saved to a folder, a file open in a tab is processed as a copy of
+    /// its own; the batch stopped, that copy is closed (never two tabs of
+    /// one file left).
+    #[test]
+    fn batch_copy_of_an_open_file_closed_when_stopped() {
+        let src = folder("open-copy-stop");
+        let out = folder("open-copy-stop-out");
+        let path = src.join("x.png");
+        png(&path, (4, 4), 40);
+        let mut h = app();
+        h.state_mut().open_path(&path);
+        h.state_mut().doc.as_mut().unwrap().modified = true;
+        // The output exists and isn't replaced: an error, the batch stops.
+        png(&out.join("x_01.png"), (4, 4), 0);
+        let d = batch(&src, &out);
+        h.state_mut().start_batch(&d);
+        run(&mut h);
+        assert!(h.state().automate.alert.is_some(), "stopped");
+        assert_eq!(h.state().tab_count(), 1, "the copy closed");
+        assert!(h.state().doc.as_ref().unwrap().modified, "the tab kept");
     }
 
     /// The Image Processor on open documents works on copies: the

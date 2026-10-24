@@ -3,6 +3,7 @@
 //! the open documents, the system), and a report of it all to paste into a
 //! message or an issue. What is measured, and how, is in `crate::diag`.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::dialogs::{DialogSpec, floating_dialog};
@@ -10,7 +11,7 @@ use super::models_window::size_text;
 use super::*;
 use crate::ai::models::Model;
 use crate::ai::runtime::Device;
-use crate::diag::{self, FrameStats, Freeze, Level, LogEntry, OpStats, TileStats};
+use crate::diag::{self, Doing, FrameStats, Freeze, Level, LogEntry, OpStats, TileStats};
 use crate::document::{HISTORY_BUDGET, TOTAL_HISTORY_BUDGET};
 use ui_kit::color;
 
@@ -28,6 +29,12 @@ const FIVE_MINUTES: Duration = Duration::from_secs(300);
 const MAX_ROWS: usize = 100;
 const REPORT_ROWS: usize = 30;
 const REPORT_LOG: usize = 40;
+/// Frame times that feel smooth, and sluggish beyond.
+const SMOOTH: Duration = Duration::from_millis(16);
+const SLUGGISH: Duration = Duration::from_millis(33);
+/// Text color of the errors (lighter than the close button's red, for
+/// contrast on the window's background).
+const ERROR_TEXT: Color32 = Color32::from_rgb(0xff, 0x6b, 0x5e);
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub(super) enum Tab {
@@ -79,12 +86,146 @@ pub(super) struct Snapshot {
     errors: u32,
     jobs: Vec<String>,
     memory: Option<diag::Memory>,
+    /// Memory the display's copies take (see `AtelierApp::display_bytes`).
+    display_bytes: usize,
     threads: Option<u32>,
     docs: Vec<DocInfo>,
     ai_devices: Vec<Device>,
     ai_installed: Vec<Model>,
     color: ColorInfo,
     system: SystemInfo,
+    names: Names,
+}
+
+/// The names shown for what was measured, in the interface's language:
+/// by the `Debug` name of a command or tool, by an English menu label.
+#[derive(Default)]
+struct Names {
+    by_action: HashMap<String, String>,
+    by_english: HashMap<String, String>,
+}
+
+impl Names {
+    /// What `name` (as recorded) is called in the interface.
+    fn operation(&self, name: &str) -> String {
+        if let Some(label) = self.by_action.get(name) {
+            return label.clone();
+        }
+        if let Some(label) = static_operation(name) {
+            return label;
+        }
+        if let Some(base) = name.strip_suffix(" (AI)") {
+            return t!("ui4-op-ai", name = self.operation(base));
+        }
+        if let Some(tool) = name.strip_prefix("Stroke end: ") {
+            return t!("ui4-op-stroke", tool = self.tool(tool));
+        }
+        let upper = |f: &str| f.to_uppercase();
+        if let Some(f) = name.strip_prefix("Open: ") {
+            return t!("ui4-op-open", format = upper(f));
+        }
+        if let Some(f) = name.strip_prefix("Save: ") {
+            return t!("ui4-op-save", format = upper(f));
+        }
+        if let Some(f) = name.strip_prefix("Export: ") {
+            return t!("ui4-op-export", format = upper(f));
+        }
+        let filter =
+            |k: &str| filters_ui::kind_named(k).map_or_else(|| k.to_owned(), filters_ui::title);
+        if let Some(k) = name.strip_prefix("Filter dialog preview: ") {
+            return t!("ui4-op-filter-preview", name = filter(k));
+        }
+        if let Some(k) = name.strip_prefix("Filter: ") {
+            return t!("ui4-op-filter", name = filter(k));
+        }
+        self.by_english
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_owned())
+    }
+
+    /// A tool by its `Debug` name.
+    fn tool(&self, name: &str) -> String {
+        Tool::ALL
+            .into_iter()
+            .find(|t| format!("{t:?}") == name)
+            .map_or_else(|| name.to_owned(), Tool::name)
+    }
+
+    /// What the window was doing during a freeze, in a line.
+    fn doing(&self, d: &Doing) -> String {
+        let mut parts = vec![t!("ui4-diag-doing-tool", tool = self.tool(&d.tool))];
+        if let Some(dialog) = d.dialog {
+            parts.push(t!("ui4-diag-doing-dialog", name = dialog_label(dialog)));
+        }
+        if d.stroke {
+            parts.push(t!("ui4-diag-doing-stroke"));
+        } else if d.pointer_down {
+            parts.push(t!("ui4-diag-doing-pointer"));
+        }
+        if !d.ran.is_empty() {
+            let ran: Vec<String> = d
+                .ran
+                .iter()
+                .map(|(name, took)| format!("{} {}", self.operation(name), duration(*took)))
+                .collect();
+            parts.push(t!("ui4-diag-doing-ran", operations = ran.join(", ")));
+        }
+        if !d.jobs.is_empty() {
+            let jobs: Vec<String> = d.jobs.iter().map(|j| self.operation(j)).collect();
+            parts.push(t!("ui4-diag-doing-jobs", jobs = jobs.join(", ")));
+        }
+        parts.join(" · ")
+    }
+}
+
+/// The operations measured under a fixed English name, as shown.
+fn static_operation(name: &str) -> Option<String> {
+    Some(match name {
+        "History: record step" => t!("ui4-op-history-record"),
+        "History: go to step" => t!("ui4-op-history-go"),
+        "Transform commit" => t!("ui4-op-transform-commit"),
+        "Transform" => t!("ui4-op-transform"),
+        "Selection" => t!("ui4-op-selection"),
+        "Color Range: reduce" => t!("ui4-op-color-range"),
+        "Export As: flatten" => t!("ui4-op-export-flatten"),
+        "Export As: preview" => t!("ui4-op-export-preview"),
+        "Magnetic Lasso edges" => t!("ui4-op-magnetic"),
+        "Camera Raw: read" => t!("ui4-op-raw-read"),
+        "Camera Raw: develop" => t!("ui4-op-raw-develop"),
+        "Camera Raw: preview" => t!("ui4-op-raw-preview"),
+        "Linked files: read" => t!("ui4-op-linked-read"),
+        "Object Selection: hover preview" => t!("ui4-op-objsel-hover"),
+        "Object Selection: pick" => t!("ui4-op-objsel-pick"),
+        "Object Selection: image analysis" => t!("ui4-op-objsel-analysis"),
+        _ => return None,
+    })
+}
+
+/// The name of a dialog open during a freeze (see `dialog_name`).
+fn dialog_label(name: &str) -> String {
+    let trimmed = |s: String| s.trim_end_matches('…').to_owned();
+    match name {
+        "Adjustment" => t!("menu-image-adjustments"),
+        "Layer Style" => t!("core-menu-layer-style"),
+        "Filter" => t!("filter-menu"),
+        "Liquify" => t!("liquify-title"),
+        "Smart Filter" => t!("smart-filters"),
+        "Fill" => trimmed(t!("menu-edit-fill")),
+        "Content-Aware Fill" => trimmed(t!("retouch-menu-content-aware-fill")),
+        "Image Size" => trimmed(t!("menu-image-image-size")),
+        "Canvas Size" => trimmed(t!("menu-image-canvas-size")),
+        "Rotate" => t!("menu-image-rotation"),
+        "Export As" => trimmed(t!("file-menu-export-as")),
+        "New Document" => t!("ui4-diag-dialog-new"),
+        "Command Palette" => t!("ui4-diag-dialog-palette"),
+        "Color" => t!("diag-card-color"),
+        "Select" => t!("menu-select"),
+        "Automate" => t!("actions-menu-automate"),
+        "AI Models" => trimmed(t!("models-menu")),
+        "Diagnostics" => t!("diag-title"),
+        other => other.to_owned(),
+    }
 }
 
 struct DocInfo {
@@ -155,7 +296,7 @@ impl DocInfo {
     fn kinds_en(&self) -> String {
         let names = [
             "pixels",
-            "text",
+            "type",
             "shape",
             "smart object",
             "adjustment",
@@ -213,33 +354,43 @@ impl AtelierApp {
 
     /// What was going on during a frame that started at `start`: the tool,
     /// the dialog, the operations it ran, the background jobs.
-    pub(super) fn freeze_context(&self, start: Instant) -> String {
-        let mut parts = vec![format!("tool {:?}", self.tool)];
-        if let Some(dialog) = self.dialog_name() {
-            parts.push(format!("dialog {dialog}"));
+    pub(super) fn freeze_context(&self, start: Instant) -> Doing {
+        Doing {
+            tool: format!("{:?}", self.tool),
+            dialog: self.dialog_name(),
+            stroke: self.stroke.is_some(),
+            pointer_down: self.ctx.input(|i| i.pointer.any_down()),
+            ran: diag::ops_since(start).into_iter().take(3).collect(),
+            jobs: diag::running_jobs(),
         }
-        if self.stroke.is_some() {
-            parts.push("stroke in progress".to_owned());
-        } else if self.ctx.input(|i| i.pointer.any_down()) {
-            parts.push("pointer down".to_owned());
-        }
-        let ops = diag::ops_since(start);
-        if !ops.is_empty() {
-            let ran: Vec<String> = ops
-                .iter()
-                .take(3)
-                .map(|(name, took)| format!("{name} {}", en_duration(*took)))
-                .collect();
-            parts.push(format!("ran {}", ran.join(", ")));
-        }
-        let jobs = diag::running_jobs();
-        if !jobs.is_empty() {
-            parts.push(format!("jobs {}", jobs.join(", ")));
-        }
-        parts.join(" · ")
     }
 
-    /// The dialog or workspace open, if any (English, for developers).
+    /// What Diagnostics shows of the names it measured, in the interface's
+    /// language.
+    fn names(&self) -> Names {
+        let mut names = Names::default();
+        for (action, label) in self.command_names(&self.ctx) {
+            names
+                .by_action
+                .entry(format!("{action:?}"))
+                .or_insert(label);
+        }
+        // The jobs measured under a menu's English name ("Content-Aware
+        // Fill"): the same command's name now.
+        let english = i18n::in_lang(Lang::En, || self.command_names(&self.ctx));
+        for (action, english) in english {
+            if let Some(label) = names.by_action.get(&format!("{action:?}")) {
+                names
+                    .by_english
+                    .entry(english)
+                    .or_insert_with(|| label.clone());
+            }
+        }
+        names
+    }
+
+    /// The dialog or workspace open, if any (English, the name it is
+    /// measured by; see `dialog_label`).
     fn dialog_name(&self) -> Option<&'static str> {
         let open = [
             (self.adjust.is_some(), "Adjustment"),
@@ -331,12 +482,14 @@ impl AtelierApp {
             errors,
             jobs: diag::running_jobs(),
             memory: diag::process_memory(),
+            display_bytes: self.display_bytes(),
             threads: diag::thread_count(),
             docs,
             ai_devices,
             ai_installed: Model::ALL.into_iter().filter(|m| m.ready()).collect(),
             color,
             system,
+            names: self.names(),
         }
     }
 
@@ -396,6 +549,7 @@ impl AtelierApp {
             return;
         };
         let mut copy = false;
+        let mut report = false;
         let mut open_logs = false;
         let mut clear = false;
         let subtitle = self.subtitle();
@@ -432,6 +586,16 @@ impl AtelierApp {
                         true,
                     )
                     .clicked();
+                    report = ui_kit::button_with_icon(
+                        ui,
+                        Some(icon::BUG),
+                        &t!("ui4-diag-report"),
+                        Kind::Normal,
+                        None,
+                        true,
+                    )
+                    .on_hover_text(t!("ui4-diag-report-tip"))
+                    .clicked();
                     open_logs = ui_kit::button_with_icon(
                         ui,
                         Some(icon::FOLDER_OPEN),
@@ -451,17 +615,32 @@ impl AtelierApp {
                     )
                     .clicked();
                 });
+                // In plain words first: is anything wrong?
+                let (verdict, worrying) = verdict(&snap);
+                ui.horizontal_wrapped(|ui| {
+                    let (glyph, tint) = if worrying {
+                        (icon::WARNING, workspace::WARNING)
+                    } else {
+                        (icon::CHECK_CIRCLE, color::ACCENT_TEXT)
+                    };
+                    ui.label(egui::RichText::new(glyph).size(15.0).color(tint));
+                    ui.label(egui::RichText::new(verdict).color(color::TEXT));
+                });
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(t!("diag-note"))
-                            .size(12.0)
-                            .color(color::LABEL),
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            t!("ui4-diag-what-to-send"),
+                            t!("diag-note")
+                        ))
+                        .size(12.0)
+                        .color(color::LABEL),
                     )
                     .wrap(),
                 );
                 let count = |label: String, n: usize| match n {
                     0 => label,
-                    n => format!("{label} {n}"),
+                    n => format!("{label} ({n})"),
                 };
                 ui_kit::segmented(
                     ui,
@@ -503,8 +682,14 @@ impl AtelierApp {
             ctx.copy_text(self.diagnostics_report());
             self.status = t!("diag-status-copied");
         }
+        // The report copied, then the page where problems are reported.
+        if report {
+            ctx.copy_text(self.diagnostics_report());
+            self.status = t!("ui4-diag-status-report");
+            ctx.open_url(egui::OpenUrl::new_tab(workspace::ISSUES_URL));
+        }
         if open_logs && let Err(e) = models_window::open_folder(&diag::log_dir()) {
-            self.status = t!("diag-open-logs-failed", error = e.to_string());
+            self.status_failed(tm!("diag-open-logs-failed", error = e.to_string()));
         }
         if clear {
             diag::clear();
@@ -541,7 +726,7 @@ impl AtelierApp {
         ];
         match &self.diagnostics.gpu {
             Some(gpu) => {
-                let mut text = format!("{} · {} · {}", gpu.name, gpu.backend, gpu.kind);
+                let mut text = format!("{} · {} · {}", gpu.name, gpu.backend, gpu_kind(&gpu.kind));
                 if !gpu.driver.is_empty() {
                     text = format!("{text} · {}", gpu.driver);
                 }
@@ -580,10 +765,7 @@ impl AtelierApp {
                 total = size_text(TOTAL_HISTORY_BUDGET as u64)
             ),
         ));
-        rows.push((
-            t!("diag-sys-since"),
-            t!("diag-ago", duration = duration(snap.since.elapsed())),
-        ));
+        rows.push((t!("diag-sys-since"), ago(snap.since.elapsed())));
         key_values(ui, egui::Id::new("diag-system"), &rows);
         ui.add_space(8.0);
         ui_kit::hint(
@@ -593,8 +775,13 @@ impl AtelierApp {
     }
 
     /// The report copied by "Copy diagnostics": Markdown, in English (for
-    /// whoever reads it), without personal data.
+    /// whoever reads it, whatever the interface's language), without
+    /// personal data.
     pub(super) fn diagnostics_report(&self) -> String {
+        i18n::in_lang(Lang::En, || self.english_report())
+    }
+
+    fn english_report(&self) -> String {
         let snap = self.diagnostics_snapshot();
         let mut r = String::new();
         let now = snap.taken;
@@ -610,7 +797,7 @@ impl AtelierApp {
             env!("CARGO_PKG_VERSION")
         ));
         r.push_str(&format!(
-            "- System: {}/{}{}, {} processor threads, {} program threads\n",
+            "- System: {}/{}{}, {} logical cores, {} program threads\n",
             std::env::consts::OS,
             std::env::consts::ARCH,
             if s.flatpak { " (Flatpak)" } else { "" },
@@ -655,10 +842,10 @@ impl AtelierApp {
         r.push_str("\n### Overview\n\n");
         let f = &snap.frames;
         r.push_str(&format!(
-            "- Frame time (1 min): average {}, max {}, {} frames\n",
+            "- Frame time (1 min): average {}, max {}, {}\n",
             en_duration(f.average),
             en_duration(f.max),
-            f.frames
+            plural(f.frames, "frame")
         ));
         let minute: Vec<&Freeze> = snap
             .freezes
@@ -686,6 +873,10 @@ impl AtelierApp {
             )),
             None => r.push_str("- Process memory: unknown\n"),
         }
+        r.push_str(&format!(
+            "- Display copies (reduced layers, tiles): {}\n",
+            en_size(snap.display_bytes)
+        ));
         let history: usize = snap.docs.iter().map(|d| d.history_bytes).sum();
         r.push_str(&format!(
             "- History memory: {} of {} for all tabs\n",
@@ -694,15 +885,19 @@ impl AtelierApp {
         ));
         let t = &snap.tiles;
         r.push_str(&format!(
-            "- Canvas rendering: level {}, last frame {} tiles, max {} per frame, {} frames over the time budget (1 min)\n",
-            t.level, t.last, t.max, t.over_budget
+            "- Canvas rendering: level {}, last frame {}, max {} per frame, {} over the time budget (1 min)\n",
+            t.level,
+            plural(t.last, "tile"),
+            t.max,
+            plural(t.over_budget, "frame")
         ));
         r.push_str(&format!(
             "- Background jobs: {}\n",
             if snap.jobs.is_empty() {
                 "none".to_owned()
             } else {
-                snap.jobs.join(", ")
+                let jobs: Vec<String> = snap.jobs.iter().map(|j| snap.names.operation(j)).collect();
+                jobs.join(", ")
             }
         ));
         let runtime = if cfg!(windows) {
@@ -746,8 +941,9 @@ impl AtelierApp {
             on_off(c.gamut),
         ));
         r.push_str(&format!(
-            "- Messages: {} warnings, {} errors\n",
-            snap.warnings, snap.errors
+            "- Messages: {}, {}\n",
+            plural(snap.warnings, "warning"),
+            plural(snap.errors, "error")
         ));
 
         r.push_str("\n### Freezes (5 min)\n\n");
@@ -759,7 +955,7 @@ impl AtelierApp {
                 "- {} ago: {} — {}\n",
                 en_duration(now.saturating_duration_since(z.at)),
                 en_duration(z.took),
-                z.context
+                snap.names.doing(&z.context)
             ));
         }
 
@@ -773,6 +969,14 @@ impl AtelierApp {
                 .into_iter()
                 .take(REPORT_ROWS)
             {
+                // As named in the interface, with the name it is measured
+                // by when that differs.
+                let shown = snap.names.operation(name);
+                let name = if shown == name {
+                    shown
+                } else {
+                    format!("{shown} (`{name}`)")
+                };
                 r.push_str(&format!(
                     "| {name}{} | {} | {} | {} | {} | {} ago |\n",
                     if o.background { " (background)" } else { "" },
@@ -798,7 +1002,7 @@ impl AtelierApp {
                     (None, _) => "not saved".to_owned(),
                 };
                 r.push_str(&format!(
-                    "| {}{}{} | {format} | {} × {} | {} ({}) | {} of {} steps, {} | {} | {} |\n",
+                    "| {}{}{} | {format} | {} × {} | {} ({}) | {} of {}, {} | {} | {} |\n",
                     i + 1,
                     if d.active { " (active)" } else { "" },
                     if d.modified { " (modified)" } else { "" },
@@ -807,7 +1011,7 @@ impl AtelierApp {
                     d.layers(),
                     d.kinds_en(),
                     d.done,
-                    d.steps,
+                    plural(d.steps as u64, "step"),
                     en_size(d.history_bytes),
                     en_size(d.layer_bytes),
                     d.profile,
@@ -825,7 +1029,7 @@ impl AtelierApp {
                 "- {} {} {}\n",
                 diag::timestamp(e.wall),
                 e.level.code(),
-                e.message.replace('\n', " ")
+                e.english.replace('\n', " ")
             ));
         }
         // Whatever slipped through (a profile or GPU name with the home
@@ -856,6 +1060,8 @@ struct Card {
     title: String,
     value: String,
     detail: String,
+    /// What it measures, in plain words (its tooltip).
+    tip: String,
     /// Something to look at (shown in the warning color).
     warn: bool,
 }
@@ -901,11 +1107,17 @@ fn cards(snap: &Snapshot) -> Vec<Card> {
                 max = duration(f.max),
                 frames = f.frames
             ),
-            warn: f.average > Duration::from_millis(33),
+            tip: t!(
+                "ui4-diag-tip-frame",
+                smooth = duration(SMOOTH),
+                sluggish = duration(SLUGGISH)
+            ),
+            warn: f.average > SLUGGISH,
         },
         Card {
             glyph: icon::SNOWFLAKE,
             title: t!("diag-card-freezes"),
+            tip: t!("ui4-diag-tip-freezes", freeze = duration(diag::FREEZE)),
             value: minute.len().to_string(),
             detail: t!(
                 "diag-card-freezes-detail",
@@ -918,18 +1130,27 @@ fn cards(snap: &Snapshot) -> Vec<Card> {
         Card {
             glyph: icon::MEMORY,
             title: t!("diag-card-memory"),
+            tip: t!("ui4-diag-tip-memory"),
             value: snap
                 .memory
                 .map_or_else(|| "–".to_owned(), |m| size_text(m.resident)),
             detail: match snap.memory.and_then(|m| m.private) {
-                Some(p) => t!("diag-card-memory-detail", private = size_text(p)),
-                None => t!("diag-unknown"),
+                Some(p) => t!(
+                    "perf4-diag-memory-detail",
+                    private = size_text(p),
+                    display = size_text(snap.display_bytes as u64)
+                ),
+                None => t!(
+                    "perf4-diag-memory-display",
+                    display = size_text(snap.display_bytes as u64)
+                ),
             },
             warn: false,
         },
         Card {
             glyph: icon::CLOCK_COUNTER_CLOCKWISE,
             title: t!("diag-card-history"),
+            tip: t!("ui4-diag-tip-history"),
             value: size_text(history as u64),
             detail: t!(
                 "diag-card-history-detail",
@@ -941,6 +1162,7 @@ fn cards(snap: &Snapshot) -> Vec<Card> {
         Card {
             glyph: icon::IMAGES,
             title: t!("diag-card-documents"),
+            tip: t!("ui4-diag-tip-documents"),
             value: snap.docs.len().to_string(),
             detail: match largest {
                 Some(d) => t!(
@@ -956,6 +1178,7 @@ fn cards(snap: &Snapshot) -> Vec<Card> {
         Card {
             glyph: icon::SQUARES_FOUR,
             title: t!("diag-card-rendering"),
+            tip: t!("ui4-diag-tip-rendering"),
             value: t!("diag-card-rendering-value", tiles = t.last),
             detail: t!(
                 "diag-card-rendering-detail",
@@ -968,6 +1191,7 @@ fn cards(snap: &Snapshot) -> Vec<Card> {
         Card {
             glyph: icon::SPINNER,
             title: t!("diag-card-jobs"),
+            tip: t!("ui4-diag-tip-jobs"),
             value: snap.jobs.len().to_string(),
             detail: if snap.jobs.is_empty() {
                 t!("diag-card-jobs-none")
@@ -979,6 +1203,7 @@ fn cards(snap: &Snapshot) -> Vec<Card> {
         Card {
             glyph: icon::SPARKLE,
             title: t!("diag-card-ai"),
+            tip: t!("ui4-diag-tip-ai"),
             value: if devices.is_empty() {
                 t!("diag-ai-unused")
             } else {
@@ -994,6 +1219,7 @@ fn cards(snap: &Snapshot) -> Vec<Card> {
         Card {
             glyph: icon::PALETTE,
             title: t!("diag-card-color"),
+            tip: t!("ui4-diag-tip-color"),
             value: c.document.clone().unwrap_or_else(|| c.working_rgb.clone()),
             detail: t!(
                 "diag-card-color-detail",
@@ -1009,6 +1235,7 @@ fn cards(snap: &Snapshot) -> Vec<Card> {
         Card {
             glyph: icon::WARNING,
             title: t!("diag-card-log"),
+            tip: t!("ui4-diag-tip-log"),
             value: (snap.warnings + snap.errors).to_string(),
             detail: t!(
                 "diag-card-log-detail",
@@ -1021,7 +1248,7 @@ fn cards(snap: &Snapshot) -> Vec<Card> {
 }
 
 fn card(ui: &mut egui::Ui, width: f32, c: &Card) {
-    egui::Frame::new()
+    let shown = egui::Frame::new()
         .fill(color::BG1)
         .stroke(UiStroke::new(1.0, color::LINE))
         .corner_radius(8)
@@ -1033,6 +1260,9 @@ fn card(ui: &mut egui::Ui, width: f32, c: &Card) {
                 card_body(ui, c);
             });
         });
+    let id = egui::Id::new(("diag-card", c.glyph));
+    ui.interact(shown.response.rect, id, Sense::hover())
+        .on_hover_text(&c.tip);
 }
 
 fn card_body(ui: &mut egui::Ui, c: &Card) {
@@ -1098,16 +1328,11 @@ fn operations(ui: &mut egui::Ui, snap: &Snapshot, sort: &mut Sort) {
             ui.painter().text(
                 rect.left_center(),
                 egui::Align2::LEFT_CENTER,
-                t!(
-                    "diag-ago",
-                    duration = duration(now.saturating_duration_since(z.at))
-                ),
+                ago(now.saturating_duration_since(z.at)),
                 egui::FontId::proportional(12.0),
                 color::LABEL,
             );
-            ui.add(
-                egui::Label::new(egui::RichText::new(&z.context).font(ui_kit::mono(12.0))).wrap(),
-            );
+            ui.add(egui::Label::new(snap.names.doing(&z.context)).wrap());
         });
     }
     ui.add_space(8.0);
@@ -1162,7 +1387,8 @@ fn operations(ui: &mut egui::Ui, snap: &Snapshot, sort: &mut Sort) {
             for (name, o) in sorted(&snap.ops, *sort).into_iter().take(MAX_ROWS) {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    ui.label(egui::RichText::new(name).font(ui_kit::mono(12.0)));
+                    ui.label(snap.names.operation(name))
+                        .on_hover_text(egui::RichText::new(name).font(ui_kit::mono(12.0)));
                     if o.background {
                         ui.label(
                             egui::RichText::new(icon::ARROWS_CLOCKWISE)
@@ -1177,8 +1403,11 @@ fn operations(ui: &mut egui::Ui, snap: &Snapshot, sort: &mut Sort) {
                 cell(ui, number(duration(o.last), false), true);
                 cell(ui, number(duration(o.total / o.count.max(1)), false), true);
                 cell(ui, number(duration(o.max), slow), true);
-                let ago = duration(now.saturating_duration_since(o.last_at));
-                cell(ui, header(t!("diag-ago", duration = ago)), false);
+                cell(
+                    ui,
+                    header(ago(now.saturating_duration_since(o.last_at))),
+                    false,
+                );
                 ui.end_row();
             }
         });
@@ -1191,8 +1420,8 @@ fn log_tab(ui: &mut egui::Ui, snap: &Snapshot) {
     for e in snap.log.iter().rev() {
         let (label, tint) = match e.level {
             Level::Warning => (t!("diag-level-warning"), workspace::WARNING),
-            Level::Error => (t!("diag-level-error"), color::CLOSE_HOVER),
-            Level::Panic => (t!("diag-level-panic"), color::CLOSE_HOVER),
+            Level::Error => (t!("diag-level-error"), ERROR_TEXT),
+            Level::Panic => (t!("diag-level-panic"), ERROR_TEXT),
         };
         ui.horizontal_top(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(110.0, 18.0), Sense::hover());
@@ -1207,10 +1436,7 @@ fn log_tab(ui: &mut egui::Ui, snap: &Snapshot) {
             ui.painter().text(
                 rect.left_center(),
                 egui::Align2::LEFT_CENTER,
-                t!(
-                    "diag-ago",
-                    duration = duration(snap.taken.saturating_duration_since(e.at))
-                ),
+                ago(snap.taken.saturating_duration_since(e.at)),
                 egui::FontId::proportional(12.0),
                 color::LABEL,
             );
@@ -1233,7 +1459,10 @@ fn documents(ui: &mut egui::Ui, snap: &Snapshot) {
         if d.active {
             title = format!("{title} · {}", t!("diag-doc-active"));
         }
-        ui_kit::section(ui, &title);
+        // File names keep their case.
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(&title).font(ui_kit::medium(ui_kit::TEXT_SIZE)));
+        ui.add_space(4.0);
         let format = match (&d.format, d.embedded) {
             (_, true) => t!("diag-doc-embedded"),
             (Some(f), _) => f.to_uppercase(),
@@ -1321,7 +1550,10 @@ fn duration(d: Duration) -> String {
     let secs = d.as_secs_f64();
     if secs < 1.0 {
         let ms = secs * 1000.0;
-        let value = if ms < 1.0 {
+        let value = if ms < 0.005 {
+            // Not "0,00 ms": too short to count.
+            format!("< {}", i18n::decimal(0.01, 2))
+        } else if ms < 1.0 {
             i18n::decimal(ms, 2)
         } else if ms < 10.0 {
             i18n::short_decimal(ms)
@@ -1339,12 +1571,64 @@ fn duration(d: Duration) -> String {
     }
 }
 
+/// "just now" under a second, otherwise "21 s ago".
+fn ago(d: Duration) -> String {
+    if d < Duration::from_secs(1) {
+        t!("ui4-diag-just-now")
+    } else {
+        t!("diag-ago", duration = duration(d))
+    }
+}
+
+/// The window's first line: in plain words, whether anything is wrong
+/// (and whether it is worth a look).
+fn verdict(snap: &Snapshot) -> (String, bool) {
+    let now = snap.taken;
+    let froze = snap
+        .freezes
+        .iter()
+        .filter(|z| now.saturating_duration_since(z.at) <= MINUTE)
+        .count();
+    if froze > 0 {
+        (t!("ui4-diag-verdict-froze", count = froze), true)
+    } else if snap.errors > 0 {
+        (t!("ui4-diag-verdict-errors", count = snap.errors), true)
+    } else if snap.frames.frames > 0 && snap.frames.average > SLUGGISH {
+        (t!("ui4-diag-verdict-slow"), true)
+    } else {
+        (t!("ui4-diag-verdict-fine"), false)
+    }
+}
+
+/// The kind of graphics card, in words (wgpu's `DeviceType`).
+fn gpu_kind(kind: &str) -> String {
+    match kind {
+        "IntegratedGpu" => t!("ui4-diag-gpu-integrated"),
+        "DiscreteGpu" => t!("ui4-diag-gpu-discrete"),
+        "VirtualGpu" => t!("ui4-diag-gpu-virtual"),
+        "Cpu" => t!("ui4-diag-gpu-cpu"),
+        _ => t!("ui4-diag-gpu-other"),
+    }
+}
+
+/// "1 warning", "2 warnings": the report's English plurals.
+fn plural(n: impl Into<u64>, word: &str) -> String {
+    let n = n.into();
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
+}
+
 /// The same for the report, always in English.
 fn en_duration(d: Duration) -> String {
     let secs = d.as_secs_f64();
     if secs < 1.0 {
         let ms = secs * 1000.0;
-        if ms < 1.0 {
+        if ms < 0.005 {
+            "< 0.01 ms".to_owned()
+        } else if ms < 1.0 {
             format!("{ms:.2} ms")
         } else if ms < 10.0 {
             format!("{ms:.1} ms")
@@ -1389,7 +1673,12 @@ impl AtelierApp {
         diag::frame(Instant::now(), Duration::from_millis(112));
         diag::freeze(
             Duration::from_millis(112),
-            "tool Brush · stroke in progress · ran Stroke end: Brush 104 ms".to_owned(),
+            Doing {
+                tool: "Brush".into(),
+                stroke: true,
+                ran: vec![("Stroke end: Brush".into(), Duration::from_millis(104))],
+                ..Doing::default()
+            },
         );
         diag::warn("Opened poster.psd simplified: 2 adjustment layers rasterized");
         diag::error("Can't save poster.png: no space left on device");
@@ -1455,7 +1744,14 @@ mod tests {
         assert!(h.query_by_label(&t!("diag-card-memory")).is_some());
         // The tabs show what they list.
         let log = t!("diag-tab-log");
-        let tab = h.get_by_label_contains(&log).rect().center();
+        // The tab (other tests running at the same time may add log lines
+        // that name it too).
+        let tab = h
+            .query_all_by_label_contains(&log)
+            .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+            .expect("the Log tab")
+            .rect()
+            .center();
         click(&mut h, tab);
         assert_eq!(h.state().diagnostics.tab, Tab::Log);
         // Its close button closes it.
@@ -1537,17 +1833,42 @@ mod tests {
         let freeze = diag::measures(|m| {
             m.freezes(Instant::now(), MINUTE)
                 .into_iter()
-                .find(|z| z.context.contains("Test operation 5c2"))
+                .find(|z| z.context.ran.iter().any(|(n, _)| n == "Test operation 5c2"))
                 .cloned()
         })
         .expect("recorded");
         assert!(freeze.took > diag::FREEZE);
-        assert!(freeze.context.contains("tool Brush"), "{}", freeze.context);
-        assert!(
-            freeze.context.contains("dialog Image Size"),
-            "{}",
-            freeze.context
+        assert_eq!(freeze.context.tool, "Brush");
+        assert_eq!(freeze.context.dialog, Some("Image Size"));
+        // Shown in the interface's words.
+        let names = h.state().names();
+        let shown = names.doing(&freeze.context);
+        assert!(shown.contains(&Tool::Brush.name()), "{shown}");
+        assert!(shown.contains("Image Size"), "{shown}");
+    }
+
+    /// In French, the window names operations and freezes in French; the
+    /// copied report stays in English, its messages too, with plurals.
+    #[test]
+    fn the_window_speaks_the_language_and_the_report_english() {
+        let mut h = app(Some(PathBuf::from("logo.png")));
+        i18n::set_lang(Lang::Fr);
+        h.state_mut().run(Action::NewLayer);
+        diag::record("Filter: GaussianBlur", Duration::from_millis(380));
+        diag::record("Stroke end: Canvas", Duration::from_millis(12));
+        diag::error(tm!("status-open-failed", path = "plage.psd", error = "x"));
+        let names = h.state().names();
+        assert_eq!(names.operation("NewLayer"), "Nouveau calque");
+        assert_eq!(
+            names.operation("Filter: GaussianBlur"),
+            "Filtre\u{a0}: Flou gaussien"
         );
+        assert!(names.operation("Stroke end: Canvas").contains("Recadrage"));
+        let report = h.state().diagnostics_report();
+        i18n::set_lang(Lang::En);
+        assert!(report.contains("| New Layer (`NewLayer`)"), "{report}");
+        assert!(report.contains("Could not open plage.psd"), "{report}");
+        assert!(!report.contains(" 1 warnings") && !report.contains(" 1 errors"));
     }
 
     /// Commands are measured by `run`, under their name.

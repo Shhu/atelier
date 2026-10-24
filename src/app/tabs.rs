@@ -100,6 +100,8 @@ impl AtelierApp {
     /// being prepared and closing the windows that act on it.
     fn park(&mut self) -> Option<ParkedDoc> {
         self.doc.as_ref()?;
+        // A selection being computed lands in its own document.
+        self.wait_select_job();
         self.commit_pending();
         self.sync_selection();
         self.leave_select_modes();
@@ -111,6 +113,10 @@ impl AtelierApp {
         self.flatten_confirm = false;
         self.forget_document_jobs();
         self.end_layer_preview();
+        // A stroke or shape edit cut short: its effects are drawn again.
+        if let Some(doc) = &mut self.doc {
+            doc.hold_effects(false);
+        }
         let parked = ParkedDoc {
             doc: self.doc.take()?,
             thumbs: std::mem::take(&mut self.thumbs),

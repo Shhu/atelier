@@ -93,7 +93,15 @@ impl Sources for FullSize {
 pub struct Hint {
     pub layer: u64,
     pub rect: crate::document::PixelRect,
+    /// Versions of the pixels and mask (see `compose::source_versions`)
+    /// the change started from, if known, and led to: a reduction is
+    /// redone in part only from a version the hints go on from.
+    pub from: Option<[u64; 2]>,
+    pub to: [u64; 2],
 }
+
+/// Hints kept per layer; older ones are merged beyond this.
+const MAX_HINTS: usize = 32;
 
 #[derive(Clone)]
 enum Reduced {
@@ -116,7 +124,9 @@ struct Entry {
 pub struct LevelCache {
     level: u32,
     entries: HashMap<SourceKey, Entry>,
-    hints: Vec<Hint>,
+    /// Per layer, the changes since its reductions were last made, in
+    /// order, each going on from the one before.
+    hints: HashMap<u64, Vec<Hint>>,
     /// Keys asked for since the last [`Self::retain_used`].
     used: std::collections::HashSet<SourceKey>,
 }
@@ -126,7 +136,7 @@ impl LevelCache {
         Self {
             level,
             entries: HashMap::new(),
-            hints: Vec::new(),
+            hints: HashMap::new(),
             used: Default::default(),
         }
     }
@@ -136,6 +146,7 @@ impl LevelCache {
     /// read when zooming out.
     pub fn coarser(&self) -> Self {
         let mut next = Self::new(self.level + 1);
+        next.hints = self.hints.clone();
         if self.level == 0 {
             return next;
         }
@@ -149,9 +160,32 @@ impl LevelCache {
         next
     }
 
-    /// Some pixels of a layer changed, only there (see [`Hint`]).
+    /// Some pixels of a layer changed, only there (see [`Hint`]). Kept
+    /// until the next [`Self::retain_used`], however many frames later.
     pub fn hint(&mut self, hint: Hint) {
-        self.hints.push(hint);
+        let chain = self.hints.entry(hint.layer).or_default();
+        // Something else changed the layer in between: the earlier hints
+        // no longer lead to its pixels.
+        if chain.last().is_some_and(|last| Some(last.to) != hint.from) {
+            chain.clear();
+        }
+        chain.push(hint);
+        if chain.len() > MAX_HINTS {
+            let second = chain.remove(1);
+            let first = &mut chain[0];
+            first.rect = first.rect.union(second.rect);
+            first.to = second.to;
+        }
+    }
+
+    /// Takes on the hints of `other`, after its own (a level made on a
+    /// worker thread meanwhile).
+    pub fn hints_from(&mut self, other: &mut Self) {
+        for chain in std::mem::take(&mut other.hints).into_values() {
+            for hint in chain {
+                self.hint(hint);
+            }
+        }
     }
 
     /// Forgets the images not asked for since the last call, and the hints.
@@ -159,6 +193,17 @@ impl LevelCache {
         let used = std::mem::take(&mut self.used);
         self.entries.retain(|k, _| used.contains(k));
         self.hints.clear();
+    }
+
+    /// Memory its reduced images take.
+    pub fn bytes(&self) -> usize {
+        self.entries
+            .values()
+            .map(|e| match &e.image {
+                Reduced::Rgba(i) => i.as_raw().len(),
+                Reduced::Gray(i) => i.as_raw().len(),
+            })
+            .sum()
     }
 
     fn block(&self) -> u32 {
@@ -173,15 +218,28 @@ impl LevelCache {
     /// The blocks of a reduced image to redo, when a hint covers the change
     /// of a source that kept its place and size (pixels and masks only: the
     /// styles spread).
-    fn partial(&self, key: SourceKey, at: (i64, i64), size: (u32, u32)) -> Option<[u32; 4]> {
+    fn partial(
+        &self,
+        key: SourceKey,
+        version: u64,
+        at: (i64, i64),
+        size: (u32, u32),
+    ) -> Option<[u32; 4]> {
         let e = self.entries.get(&key)?;
         if key.slot > 1 || e.at != at || e.size != size {
             return None;
         }
-        let r = self
-            .hints
+        // The hints from the version reduced to the one asked for.
+        let slot = key.slot as usize;
+        let chain = self.hints.get(&key.layer)?;
+        let start = chain
             .iter()
-            .filter(|h| h.layer == key.layer)
+            .position(|h| h.from.is_some_and(|f| f[slot] == e.version))?;
+        if chain.last()?.to[slot] != version {
+            return None;
+        }
+        let r = chain[start..]
+            .iter()
             .map(|h| h.rect)
             .reduce(crate::document::PixelRect::union)?;
         let own = crate::document::PixelRect {
@@ -233,7 +291,7 @@ impl Sources for LevelCache {
             };
         }
         let size = image.dimensions();
-        let partial = self.partial(key, at, size);
+        let partial = self.partial(key, version, at, size);
         let reduced = match (partial, self.entries.remove(&key)) {
             (
                 Some(area),
@@ -289,7 +347,7 @@ impl Sources for LevelCache {
             };
         }
         let size = image.dimensions();
-        let partial = self.partial(key, at, size);
+        let partial = self.partial(key, version, at, size);
         let reduced = match (partial, self.entries.remove(&key)) {
             (
                 Some(area),
@@ -458,12 +516,58 @@ mod tests {
                 w: 1,
                 h: 1,
             },
+            from: Some([1, 0]),
+            to: [2, 0],
         });
         let next = cache.rgba(key, 2, &Arc::new(image.clone()), (3, -1));
         assert_eq!(next.image.get_pixel(2, 1).0, [0, 255, 0, 255]);
         assert_eq!(*next.image, reduce_rgba(&image, 2));
         let gray = reduce_gray(&GrayImage::from_raw(2, 1, vec![0, 255]).unwrap(), 2);
         assert_eq!(gray.get_pixel(0, 0).0, [128]);
+    }
+
+    /// Hints given over frames where nothing was reduced all apply; a
+    /// change they don't lead from makes it reduce everything again.
+    #[test]
+    fn hints_left_over_from_earlier_frames_still_apply() {
+        let px = |x, y| crate::document::PixelRect { x, y, w: 1, h: 1 };
+        let hint = |rect, from, to| Hint {
+            layer: 1,
+            rect,
+            from: Some([from, 0]),
+            to: [to, 0],
+        };
+        let key = SourceKey { layer: 1, slot: 0 };
+        let mut image = RgbaImage::from_pixel(8, 8, Rgba([255, 255, 255, 255]));
+        let mut cache = LevelCache::new(1);
+        let _ = cache.rgba(key, 1, &Arc::new(image.clone()), (0, 0));
+        // Two frames painted without a composite in between (outside the
+        // view, or while a level was made), then one more.
+        for (k, (x, y)) in [(0, 0), (6, 6), (3, 4)].into_iter().enumerate() {
+            image.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+            cache.hint(hint(px(x as i64, y as i64), k as u64 + 1, k as u64 + 2));
+        }
+        let next = cache.rgba(key, 4, &Arc::new(image.clone()), (0, 0));
+        assert_eq!(*next.image, reduce_rgba(&image, 2));
+        cache.retain_used();
+
+        // A change without a hint (a filter), then a stroke.
+        image = RgbaImage::from_pixel(8, 8, Rgba([0, 255, 0, 255]));
+        image.put_pixel(1, 1, Rgba([0, 0, 255, 255]));
+        cache.hint(hint(px(1, 1), 5, 6));
+        let next = cache.rgba(key, 6, &Arc::new(image.clone()), (0, 0));
+        assert_eq!(*next.image, reduce_rgba(&image, 2));
+
+        // Hints merged beyond the limit still cover every change.
+        cache.retain_used();
+        for k in 0..(MAX_HINTS as u64 + 5) {
+            let (x, y) = ((k % 8) as u32, (k / 8 % 8) as u32);
+            image.put_pixel(x, y, Rgba([k as u8, 0, 0, 255]));
+            cache.hint(hint(px(x as i64, y as i64), 6 + k, 7 + k));
+        }
+        let last = 7 + MAX_HINTS as u64 + 4;
+        let next = cache.rgba(key, last, &Arc::new(image.clone()), (0, 0));
+        assert_eq!(*next.image, reduce_rgba(&image, 2));
     }
 
     /// The next level made from this one (zooming out) is the reduction of

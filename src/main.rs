@@ -54,7 +54,8 @@ fn main() -> eframe::Result {
         )
         .with_app_id("io.github.Shhu.Atelier")
         .with_inner_size([1200.0, 800.0])
-        .with_min_inner_size([600.0, 400.0])
+        // Room for every menu (the French ones are the widest).
+        .with_min_inner_size([660.0, 400.0])
         .with_drag_and_drop(true);
     // Own title bar (src/app/titlebar.rs). On macOS the system's window
     // buttons stay, over it; elsewhere there is no system frame at all.

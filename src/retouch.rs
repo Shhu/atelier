@@ -63,6 +63,12 @@ pub fn unpremultiply(p: Px) -> [u8; 4] {
     [c(p[0]), c(p[1]), c(p[2]), a.round() as u8]
 }
 
+/// `top` over `under` (premultiplied).
+fn over(top: Px, under: Px) -> Px {
+    let k = 1.0 - top[3] / 255.0;
+    std::array::from_fn(|c| top[c] + under[c] * k)
+}
+
 /// The pixels of `image` in `[x0, y0, x1, y1]`, premultiplied, row by row.
 pub fn region_px(image: &RgbaImage, [x0, y0, x1, y1]: [u32; 4]) -> Vec<Px> {
     let mut out = Vec::with_capacity(((x1 - x0) * (y1 - y0)) as usize);
@@ -125,13 +131,17 @@ impl CloneSource {
 /// `offset`) take on the colors of what surrounds them, and are laid over
 /// `base` by the coverage. The healed pixels on the edge of `r` (if inside
 /// the image) keep their current value and the area is healed to meet
-/// them: a part of a longer stroke.
+/// them: a part of a longer stroke. With `seen` (what was visible there
+/// before the stroke, the layer included, the same size as it), the colors
+/// met are those seen: an empty layer is healed opaque, like Photoshop's
+/// Current & Below.
 pub fn heal_area(
     image: &mut RgbaImage,
     base: &RgbaImage,
     coverage: impl Fn(u32, u32) -> f32,
     (sample, offset): (&RgbaImage, (i64, i64)),
     r: DirtyRect,
+    seen: Option<&RgbaImage>,
 ) {
     let (iw, ih) = image.dimensions();
     let (w, h) = (r.w as usize, r.h as usize);
@@ -158,11 +168,18 @@ pub fn heal_area(
                 || (x + 1 == r.x + r.w && x + 1 < iw)
                 || (y + 1 == r.y + r.h && y + 1 < ih);
             let healed = covered && inside;
-            dest.push(premultiply(if healed && edge {
+            let kept = healed && edge;
+            let layer = premultiply(if kept {
                 image.get_pixel(x, y).0
             } else {
                 base.get_pixel(x, y).0
-            }));
+            });
+            dest.push(match seen {
+                // What is healed already, over what was seen.
+                Some(v) if kept => over(layer, premultiply(v.get_pixel(x, y).0)),
+                Some(v) => premultiply(v.get_pixel(x, y).0),
+                None => layer,
+            });
             src.push(s);
             free.push(healed && !edge);
         }
@@ -184,8 +201,10 @@ pub fn heal_area(
 /// A fill laid over the layer: `filled` (a region of it, its hole painted
 /// in) over `base` (the same region as it is) by `coverage` (0..1, row by
 /// row) times `opacity`. With `adapt` (Color Adaptation), the fill first
-/// takes on the colors around the hole (healing blend). `keep_alpha`:
-/// Preserve Transparency.
+/// takes on the colors around the hole (healing blend): those of `seen`
+/// if given (what is visible there, when sampled from all layers: an
+/// empty layer then gets opaque pixels), otherwise the layer's.
+/// `keep_alpha`: Preserve Transparency.
 pub fn blend_fill(
     base: &RgbaImage,
     filled: &RgbaImage,
@@ -193,13 +212,21 @@ pub fn blend_fill(
     adapt: bool,
     opacity: f32,
     keep_alpha: bool,
+    seen: Option<&RgbaImage>,
 ) -> RgbaImage {
     let (w, h) = base.dimensions();
     let inside: Vec<bool> = coverage.iter().map(|&c| c > 0.0).collect();
     let dest = region_px(base, [0, 0, w, h]);
     let src = region_px(filled, [0, 0, w, h]);
     let result = if adapt {
-        heal::heal(&dest, &src, &inside, w as usize, h as usize)
+        let target = seen.map(|s| region_px(s, [0, 0, w, h]));
+        heal::heal(
+            target.as_ref().unwrap_or(&dest),
+            &src,
+            &inside,
+            w as usize,
+            h as usize,
+        )
     } else {
         src
     };
@@ -345,7 +372,7 @@ mod tests {
             h: 41,
         };
         let cover = |x: u32, y: u32| coverage[(y * w + x) as usize] as f32 / 65535.0;
-        heal_area(&mut image, &base, cover, (&base, (-60, 0)), r);
+        heal_area(&mut image, &base, cover, (&base, (-60, 0)), r, None);
         let center = image.get_pixel(90, 40).0;
         // Blue around: blue it stays, not the source's green.
         assert!(center[2] > 150 && center[1] < 160, "{center:?}");
@@ -379,7 +406,7 @@ mod tests {
         }
         let filled = proximity_fill(&damaged, &hole).unwrap();
         let coverage: Vec<f32> = hole.iter().map(|&h| f32::from(u8::from(h))).collect();
-        let out = blend_fill(&damaged, &filled, &coverage, true, 1.0, false);
+        let out = blend_fill(&damaged, &filled, &coverage, true, 1.0, false, None);
         for (i, &h) in hole.iter().enumerate() {
             let (x, y) = (i as u32 % w, i as u32 / w);
             let (p, q) = (out.get_pixel(x, y).0, image.get_pixel(x, y).0);

@@ -505,7 +505,7 @@ zoombar-actual-pixels = 100%
 
 ## Start screen (no image open)
 
-welcome-title = Open an image
+welcome-title = Create or open an image
 welcome-subtitle = Drop a file anywhere in the window, or pick one.
 welcome-recent = Recent
 welcome-forget-recent = Remove from List
@@ -1930,7 +1930,7 @@ actions-yes = Yes
 actions-no = No
 actions-scale = Scale
 actions-folder = Folder
-actions-document-folder = The document’s folder
+actions-document-folder = The document's folder
 
 ## Playing actions
 
@@ -1943,10 +1943,10 @@ actions-status-save-failed = Could not save the actions: { $error }
 actions-error-step = "{ $step }" (action "{ $action }") could not be played: { $error }
 actions-error-no-document = no document is open.
 actions-error-no-selection = there is no selection.
-actions-error-unknown = this version of Atelier doesn’t know this command.
+actions-error-unknown = this version of Atelier doesn't know this command.
 actions-error-no-folder = the document was never saved: it has no folder.
 actions-error-exists = { $name } already exists.
-actions-error-format = { $name } can’t be saved in its format.
+actions-error-format = { $name } can't be saved in its format.
 actions-error-not-actions = Not an actions file.
 
 ## File › Automate, File › Scripts
@@ -1958,7 +1958,7 @@ actions-fit-image-menu = Fit Image…
 actions-processor-menu = Image Processor…
 actions-fit-image-title = Fit Image
 actions-constrain-within = Constrain Within
-actions-dont-enlarge = Don’t Enlarge
+actions-dont-enlarge = Don't Enlarge
 
 ## Batch
 
@@ -2279,7 +2279,7 @@ artboard-status-export-failed = Export failed: { $error }
 ## Image Processor
 
 actions-use-proof = Use Proof Setup
-actions-use-proof-tip = JPEG and TIFF files converted to the document’s proof profile (CMYK)
+actions-use-proof-tip = JPEG and TIFF files converted to the document's proof profile (CMYK)
 
 ## Color management: profile names
 
@@ -2300,7 +2300,7 @@ hist3-quick-mask = Quick Mask
 hist3-oldest-state = Oldest State Kept
 
 ## Selection computed in the background
-hist3-selection-changed = The selection changed while the previous one was being computed: that result was dropped.
+hist3-selection-changed = The selection changed while the previous one was being computed: the earlier result was not applied.
 
 ## Move tool options
 input3-auto-select = Auto-Select
@@ -2310,7 +2310,6 @@ input3-auto-select-tip = A click selects the layer under the pointer. Hold { $ke
 input3-eyedropper-hint = Click: foreground · { $alt_click }: background
 input3-visibility-tip = Show / hide ({ $alt_click }: this one only)
 input3-curves-hint = Click to add a point; drag it off the graph (or { $ctrl_click }, { $delete }) to remove it. Arrows: move the point, { $next }: next point.
-input3-layer-row-tip = Drag to reorder, or into a group · double-click on the name: rename, beside it: layer style · { $alt_click }: clip to the layer below · { $ctrl_click } on a thumbnail: its pixels or mask as the selection · on the mask: { $shift_click } turns it off or on, { $alt_click } shows it alone
 input3-clone-hint = { $alt_click } to set the source, then paint to copy it
 input3-healing-hint = { $alt_click } to set the source, then paint: its texture blends into the colors around
 input3-channel-row-tip = Click: show alone · { $ctrl_click }: load as selection · Double-click: rename
@@ -2352,12 +2351,12 @@ files3-status-artboards-busy = Artboards are still being exported.
 ## Painting and retouching (fix3 tools)
 
 tools3-status-source-empty = Nothing copied: the source area is empty (Sample: { $sample }).
-tools3-status-layer-hidden = Could not paint: "{ $name }" is hidden.
+tools3-status-layer-hidden = Could not paint: "{ $name }" is hidden. Show it with its eye in the Layers panel.
 tools3-rasterize-text = The type layer "{ $name }" must be rasterized before painting on it. Its text will no longer be editable.
 tools3-rasterize-shape = The shape layer "{ $name }" must be rasterized before painting on it. Its shape will no longer be editable.
 tools3-rasterize-ok = Rasterize
 tools3-bucket-all-layers = All Layers
-tools3-bucket-all-layers-tip = Fills by the colors all the visible layers show, on the active layer
+tools3-bucket-all-layers-tip = Picks the area from all the visible layers, fills on the active layer
 
 ## Layer › Remove Background (fix3 tools)
 
@@ -2366,7 +2365,6 @@ tools3-status-remove-background-pixels = Remove Background works on a pixel, typ
 ## Actions panel: Clear All Actions, the actions file
 smart3-actions-clear-all-question = Delete all actions?
 smart3-actions-damaged = The saved actions could not be read ({ $error }): the default actions are shown, and the file was kept as { $backup }.
-smart3-actions-unreadable = The saved actions could not be read ({ $error }): the default actions are shown, and changes to actions won't be saved until Atelier restarts.
 smart3-actions-not-recorded = Not recorded: this command can't be part of an action.
 smart3-actions-not-saved = The actions could not be saved: { $error }
 
@@ -2394,7 +2392,7 @@ fx3-ai-error-write = the file could not be written ({ $error })
 fx3-model-ready-run-again = { $name } is ready: run the command again (the selection or the layer changed meanwhile).
 
 ## Content-Aware Fill, Spot Healing Brush
-fx3-ai-skipped-transparency = AI model not used: the area has transparent pixels, filled with patches instead.
+fx3-ai-skipped-transparency = The area has transparent pixels: filled with patches, without the AI model.
 
 ## Start screen
 ui3-status-welcome = Create an image ({ $new }), open one ({ $open }) or drop it into the window.
@@ -2444,12 +2442,12 @@ ui3-why-nothing-to-undo = Nothing to undo
 ui3-why-nothing-to-redo = Nothing to redo
 ui3-why-not-now = Not available for the active layer or in the current state
 # Other words a command is found by (space-separated, never shown)
-ui3-palette-keywords-image-size = resize scale resample dimensions enlarge shrink
+ui3-palette-keywords-image-size = resize scale resample dimensions enlarge shrink resolution dpi ppi
 ui3-palette-keywords-canvas-size = extend expand border margin
 ui3-palette-keywords-rotate = rotate turn flip mirror
 ui3-palette-keywords-crop = crop trim cut
 ui3-palette-keywords-move = move
-ui3-palette-keywords-type = type font write
+ui3-palette-keywords-type = text type font write
 ui3-palette-keywords-black-white = black white grayscale greyscale monochrome
 ui3-palette-keywords-export = jpg jpeg png webp gif save web
 ui3-palette-keywords-save = psd
@@ -2474,12 +2472,12 @@ diag-title = Diagnostics
 diag-uptime = up for { $duration }
 diag-copy = Copy diagnostics
 diag-open-logs = Open the logs folder
-diag-open-logs-failed = Can't open the logs folder ({ $error }).
+diag-open-logs-failed = Could not open the logs folder ({ $error }).
 diag-clear = Clear measures
-diag-note = The copy lists versions, system, measures and recent messages: folders become file names, no image content.
+diag-note = The copy lists the versions, the system, the measures and the recent messages. File paths are reduced to file names; no image content is included.
 diag-status-copied = Diagnostics copied: paste them into a message or an issue.
 diag-tab-overview = Overview
-diag-tab-operations = Slow operations
+diag-tab-operations = Operations
 diag-tab-log = Log
 diag-tab-documents = Documents
 diag-tab-system = System
@@ -2495,9 +2493,8 @@ diag-card-frame-detail = max { $max } over the last minute · { $frames ->
    *[other] { $frames } frames
 }
 diag-card-freezes = Freezes (1 min)
-diag-card-freezes-detail = { $total } in total · max { $max } · { $five } over 5 min
+diag-card-freezes-detail = { $total } in total · max { $max } · { $five } in the last 5 min
 diag-card-memory = Process memory
-diag-card-memory-detail = private { $private }
 diag-card-history = History memory
 diag-card-history-detail = of { $budget } for all tabs · { $steps ->
     [one] { $steps } step
@@ -2509,15 +2506,15 @@ diag-card-documents-detail = largest { $width } × { $height } · { $layers ->
    *[other] { $layers } layers
 } in all
 diag-card-documents-none = No document open
-diag-card-rendering = Canvas rendering
+diag-card-rendering = Canvas display
 diag-card-rendering-value = { $tiles ->
     [one] { $tiles } tile
    *[other] { $tiles } tiles
 }
-diag-card-rendering-detail = max { $max } per frame · level { $level } · { $over } over budget (1 min)
+diag-card-rendering-detail = max { $max } per frame · size level { $level } · { $over } short of time (1 min)
 diag-card-jobs = Background jobs
 diag-card-jobs-none = None running
-diag-card-ai = AI runtime
+diag-card-ai = AI processing
 diag-ai-unused = Not used yet
 diag-card-ai-detail = { $installed } of { $total } models installed
 diag-card-color = Color
@@ -2568,8 +2565,8 @@ diag-kind-pixels = { $count ->
    *[other] { $count } pixel layers
 }
 diag-kind-text = { $count ->
-    [one] { $count } text
-   *[other] { $count } texts
+    [one] { $count } type layer
+   *[other] { $count } type layers
 }
 diag-kind-shape = { $count ->
     [one] { $count } shape
@@ -2597,9 +2594,9 @@ diag-sys-debug = { $version } (debug build)
 diag-sys-os = System
 diag-sys-gpu = Graphics card
 diag-sys-gpu-unknown = Not known yet
-diag-sys-max-texture = Largest texture
-diag-sys-cores = Processor threads
-diag-sys-threads = Program threads
+diag-sys-max-texture = Largest image on the graphics card
+diag-sys-cores = Logical processor cores
+diag-sys-threads = Threads of the program
 diag-sys-scale = Display scale
 diag-sys-window = Window
 diag-sys-language = Language
@@ -2611,3 +2608,202 @@ diag-sys-monitor-assumed = { $name } (assumed)
 diag-sys-history-budget = History budget
 diag-sys-history-budget-value = { $active } per document, { $total } in all
 diag-sys-since = Measures since
+
+## History: background results dropped after a history change
+hist4-selection-history-changed = The document changed while the selection was being computed: that result was dropped.
+hist4-subject-history-changed = The document changed during the search: run the command again.
+
+## Saving over a file in its own format
+
+files4-note-frames = the animation's other frames
+files4-note-pages = the other pages
+files4-note-metadata = metadata (copyright, EXIF, XMP or IPTC)
+files4-psd-note-comps = layer comps left out
+files4-status-would-lose = "{ $name }" would lose: { $notes }. Save it as an Atelier document to keep everything.
+
+## Layers: delete
+tools4-status-last-layer = Could not delete: a document keeps at least one layer.
+
+## Move tool
+tools4-show-transform-controls = Show Transform Controls
+tools4-show-transform-controls-tip = Shows the frame and handles of the selected layer: dragging a handle scales or rotates it. Otherwise a drag only moves.
+
+## Retouching
+tools4-status-heal-unchanged = Nothing changed: the fill gives back the pixels that were there.
+
+## Free Transform
+tools4-status-path-transform = Free Transform applies to layers: drag the path with Path Selection, or transform its whole shape layer.
+
+## Keys in Quick Mask mode
+input4-quick-mask-delete = In Quick Mask mode, { $delete } clears the selected area from the mask: make a selection first.
+
+## Layers panel
+input4-layer-row-tip = Drag to reorder, or into a group · double-click on the name: rename, beside it: layer style · { $alt_click } on the line between two layers: clip the upper one to the lower one · { $ctrl_click } on a thumbnail: its pixels or mask as the selection · on the mask: { $shift_click } turns it off or on, { $alt_click } shows it alone, double-click: its properties
+
+## Select and Mask
+
+sel4-mask-needs-selection = Select and Mask needs a selection, or a targeted layer mask.
+sel4-mask-target-changed = Select and Mask closed: the layer, its mask or the history changed meanwhile.
+
+## Quick Mask
+
+sel4-quick-mask-no-move = Quick Mask Mode: moving and transforming are not available. Press { $key } to finish first.
+sel4-tab-quick-mask = { $zoom } (Quick Mask)
+
+## Object Selection
+
+sel4-objsel-dropped = Object Selection: the image changed before the object was found. Click again.
+
+## Hidden layer: Fill, adjustments, Make Transparent, Content-Aware Fill (and their action steps)
+fx4-layer-hidden = "{ $name }" is hidden: show it to change it.
+
+## A dialog's preview on the canvas failed
+fx4-preview-failed = The preview of { $name } could not be computed.
+fx4-preview-failed-any = The preview could not be computed.
+
+## Camera Raw: opening a raw file failed
+fx4-raw-open-failed = { $name } could not be developed: nothing was opened.
+
+## AI models: a downloaded file that does not load
+fx4-ai-model-damaged = model file damaged: it was removed and will be downloaded again at the next use
+
+## Linked smart objects: Edit Contents, files read again
+smart4-status-link-unreadable = Linked file could not be read, its last copy shown: { $names }
+smart4-status-link-saved = Saved in { $name }: the smart objects linked to it follow.
+smart4-status-link-saved-flat = Saved in { $name } with its layers merged: the smart objects linked to it follow. This tab keeps the layers until closed.
+smart4-status-updated-embedded = Smart object updated and embedded (its linked file is missing): { $name }
+
+## Actions panel: the actions file
+smart4-actions-unreadable = The saved actions could not be read ({ $error }): the default actions are shown, and changes to actions are not saved.
+smart4-actions-change-not-saved = This change is not saved: the actions file could not be read. Use Save All Actions… in the Actions panel to keep your actions.
+smart4-actions-banner = Changes to actions are not saved: the actions file could not be read.
+smart4-actions-save-all = Save All Actions…
+
+## Batch
+smart4-batch-open-modified = { $name } is open with unsaved changes: left as it is. Save or close it, then run the batch again.
+
+## Artboards to files
+smart4-artboards-exist = { $count ->
+    [one] A file with the name of an artboard already exists in that folder.
+   *[other] { $count } files with the names of the artboards already exist in that folder.
+}
+smart4-artboards-replace = Replace
+smart4-artboards-keep-both = Keep Both
+
+## Help > Diagnostics: memory card
+
+perf4-diag-memory-detail = private { $private }, display copies { $display }
+perf4-diag-memory-display = display copies { $display }
+
+## Window menu: the side panel
+ui4-menu-layers-properties = Layers and Properties
+
+## Command palette: other words commands are found by
+ui4-palette-keywords-quick-export = png export save web
+ui4-palette-keywords-place = import insert add image file
+ui4-palette-keywords-quit = quit close
+ui4-palette-keywords-quick-mask = quick mask
+ui4-palette-keywords-red-eye = red eyes pupil
+
+## Why a greyed command can't run (menus and palette)
+ui4-why-no-recent = The list of recent files is empty
+ui4-why-has-mask = The active layer already has a layer mask
+ui4-why-no-mask = The active layer has no layer mask
+ui4-why-no-pixels = The active layer has no pixels of its own
+ui4-why-not-smart = The active layer is not a smart object
+ui4-why-not-linked = The smart object is not linked to a file
+ui4-why-not-live = Only type, shape and smart object layers are rasterized
+ui4-why-smart-adjust = Adjustments don't change a smart object: add an adjustment layer above it
+ui4-why-no-layer-below = There is no layer below to merge into
+ui4-why-not-group = The active layer is not a group
+ui4-why-not-artboard = The active layer is not an artboard
+ui4-why-not-top-group = Select a group at the top of the list, outside any artboard
+ui4-why-in-artboard = The layers are already in an artboard
+ui4-why-no-artboards = The image has no artboards
+ui4-why-no-style = The active layer has no layer style
+ui4-why-no-guides = There are no guides
+ui4-why-no-saved-selection = No selection was saved in this image
+ui4-why-no-last-selection = There is no earlier selection to bring back
+ui4-why-no-filter-yet = No filter applied yet
+ui4-why-no-transform-yet = No transformation applied yet
+ui4-why-busy = Already running: wait for it to finish
+
+## Options bar: a hidden layer the tools would refuse
+ui4-options-layer-hidden = Layer hidden
+ui4-options-layer-hidden-tip = The tools don't paint on a hidden layer: show it with its eye in the Layers panel
+
+## Diagnostics' log: messages written for it
+ui4-log-ai-gpu-failed = { $name }: the graphics card failed ({ $error }), running on the processor instead
+ui4-log-ai-gpu-not-loaded = { $name }: could not be loaded on the graphics card ({ $error }), running on the processor instead
+ui4-log-model-damaged = { $name }: damaged file, removed
+ui4-log-objsel-picked-again = Object Selection: the image changed during a click, the object was picked again
+
+## Diagnostics: what was measured, as named in the window
+ui4-op-ai = { $name } (AI)
+ui4-op-stroke = End of a stroke: { $tool }
+ui4-op-open = Open ({ $format })
+ui4-op-save = Save ({ $format })
+ui4-op-export = Export ({ $format })
+ui4-op-filter = Filter: { $name }
+ui4-op-filter-preview = Filter preview: { $name }
+ui4-op-history-record = History: recording a step
+ui4-op-history-go = History: going to a step
+ui4-op-transform-commit = Applying a transformation
+ui4-op-transform = Transformation
+ui4-op-selection = Selection
+ui4-op-color-range = Color Range: reduced image
+ui4-op-export-flatten = Export As: flattening
+ui4-op-export-preview = Export As: preview
+ui4-op-magnetic = Magnetic Lasso: edges
+ui4-op-raw-read = Camera Raw: reading the file
+ui4-op-raw-develop = Camera Raw: developing
+ui4-op-raw-preview = Camera Raw: preview
+ui4-op-linked-read = Linked files: reading
+ui4-op-objsel-hover = Object Selection: preview under the pointer
+ui4-op-objsel-pick = Object Selection: picking
+ui4-op-objsel-analysis = Object Selection: analyzing the image
+
+## Diagnostics: what the window was doing during a freeze
+ui4-diag-doing-tool = Tool: { $tool }
+ui4-diag-doing-dialog = Window: { $name }
+ui4-diag-doing-stroke = stroke in progress
+ui4-diag-doing-pointer = mouse button down
+ui4-diag-doing-ran = ran { $operations }
+ui4-diag-doing-jobs = in the background: { $jobs }
+ui4-diag-dialog-new = New Document
+ui4-diag-dialog-palette = Command Palette
+
+## Diagnostics window: the verdict, what to send, tooltips
+ui4-diag-verdict-fine = Everything looks normal.
+ui4-diag-verdict-froze = { $count ->
+    [one] Atelier froze once in the last minute.
+   *[other] Atelier froze { $count } times in the last minute.
+}
+ui4-diag-verdict-errors = { $count ->
+    [one] An error happened in this session: see the Log tab.
+   *[other] { $count } errors happened in this session: see the Log tab.
+}
+ui4-diag-verdict-slow = The display is slow at the moment.
+ui4-diag-what-to-send = To report a problem, use Report a Problem: it copies this report, to paste into your message.
+ui4-diag-report = Report a Problem…
+ui4-diag-report-tip = Copies the report, then opens the page where problems are reported
+ui4-diag-status-report = Report copied: paste it into your message on the page that opened.
+ui4-diag-just-now = just now
+ui4-diag-tip-frame = Time to draw the window once. Under { $smooth } is smooth; over { $sluggish } feels sluggish.
+ui4-diag-tip-freezes = Moments when the window stopped responding for more than { $freeze }.
+ui4-diag-tip-memory = Memory the program uses, including what it shares with other programs.
+ui4-diag-tip-history = Memory kept to undo, for all the open documents; the oldest steps go beyond the budget.
+ui4-diag-tip-documents = Open documents, the largest one and the layers they hold.
+ui4-diag-tip-rendering = Pieces of the image drawn per refresh. A size level above 0 shows a reduced copy while you zoom out.
+ui4-diag-tip-jobs = Work done without blocking the window (filters, AI, saving…).
+ui4-diag-tip-ai = Where the AI models ran: the graphics card or the processor.
+ui4-diag-tip-color = The document's color profile and the monitor's.
+ui4-diag-tip-log = Warnings and errors since the start; the Log tab lists them.
+ui4-diag-gpu-integrated = integrated
+ui4-diag-gpu-discrete = dedicated
+ui4-diag-gpu-virtual = virtual
+ui4-diag-gpu-cpu = software (on the processor)
+ui4-diag-gpu-other = other
+
+## Keyboard Shortcuts: tools that share a key
+ui4-shortcuts-tools-cycle = { $key }, then { $next } for the next one

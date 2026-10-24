@@ -377,7 +377,10 @@ impl Filter {
             Filter::Minimum(m) | Filter::Maximum(m) => {
                 let max = matches!(self, Filter::Maximum(_));
                 let r = m.radius.round().max(1.0) as usize;
-                by_tiles(image, r, |t| extreme_tile(t, r, max, m.roundness));
+                // A disc's rows go over the tile and its halo: wide tiles
+                // waste less of that work at large radii.
+                let tile = if m.roundness { TILE.max(4 * r) } else { TILE };
+                by_tiles_of(image, r, tile, |t| extreme_tile(t, r, max, m.roundness));
             }
             Filter::Emboss {
                 angle,
@@ -1062,14 +1065,14 @@ impl Tile {
         self.px.iter().map(|&p| f(p)).collect()
     }
 
-    /// The tile with the colors of (partly) transparent pixels mixed, by
-    /// their transparency, with those of the visible pixels around them: the
-    /// filters that read straight colors then don't depend on the hidden
-    /// colors of fully transparent pixels (black, or anything left by
-    /// painting or a file).
+    /// The tile with the colors of fully transparent pixels replaced by
+    /// those of the visible pixels around them (weighted by their opacity):
+    /// the filters that read straight colors then don't depend on hidden
+    /// colors (black, or anything left by painting or a file). A pixel with
+    /// any opacity keeps its own color.
     fn visible_colors(&self) -> Tile {
         let mut px = self.px.clone();
-        if self.px.iter().all(|p| p[3] == 255) {
+        if self.px.iter().all(|p| p[3] > 0) {
             return Tile { px, ..*self };
         }
         let alpha = self.plane(|p| p[3] as f32);
@@ -1079,15 +1082,13 @@ impl Tile {
             let mut sums = self.plane(|p| p[c] as f32 * p[3] as f32);
             gauss_plane(&mut sums, self.w, self.h, 3.0);
             for (i, p) in px.iter_mut().enumerate() {
-                let a = alpha[i];
-                if a < 255.0 {
+                if alpha[i] == 0.0 {
                     let around = if weights[i] > 1e-3 {
                         sums[i] / weights[i]
                     } else {
                         0.0
                     };
-                    let v = (a * p[c] as f32 + (255.0 - a) * around) / 255.0;
-                    p[c] = v.round().clamp(0.0, 255.0) as u8;
+                    p[c] = around.round().clamp(0.0, 255.0) as u8;
                 }
             }
         }
@@ -1098,16 +1099,26 @@ impl Tile {
 /// Runs `f` on tiles of `image` (read from a copy of it) and writes the
 /// pixels it returns for each tile: its inner part, row by row.
 fn by_tiles(image: &mut RgbaImage, halo: usize, f: impl Fn(&Tile) -> Vec<[u8; 4]> + Sync) {
+    by_tiles_of(image, halo, TILE, f);
+}
+
+/// [`by_tiles`] with tiles `tile` pixels wide.
+fn by_tiles_of(
+    image: &mut RgbaImage,
+    halo: usize,
+    tile: usize,
+    f: impl Fn(&Tile) -> Vec<[u8; 4]> + Sync,
+) {
     let src = image.clone();
     let w = image.width() as usize;
     par_rows(image.as_mut(), w * 4, |y0, band| {
         let rows = band.len() / (w * 4);
         let cancel = cancel_flag();
-        for x0 in (0..w).step_by(TILE) {
+        for x0 in (0..w).step_by(tile) {
             if cancelled(&cancel) {
                 return;
             }
-            let tw = TILE.min(w - x0);
+            let tw = tile.min(w - x0);
             let out = f(&Tile::gather(&src, (x0, y0), (tw, rows), halo));
             for (y, line) in out.chunks_exact(tw).enumerate() {
                 let at = (y * w + x0) * 4;
@@ -1355,13 +1366,11 @@ fn median_tile(t: &Tile, r: usize, threshold: Option<u8>) -> Vec<[u8; 4]> {
 fn extreme_tile(t: &Tile, r: usize, max: bool, round: bool) -> Vec<[u8; 4]> {
     let px: Vec<[u8; 4]> = t.px.iter().map(|&p| premultiply8(p)).collect();
     let (iw, ih) = t.inner();
-    let pick = |a: [u8; 4], b: [u8; 4]| -> [u8; 4] {
-        std::array::from_fn(|c| if max { a[c].max(b[c]) } else { a[c].min(b[c]) })
-    };
     let mut out = vec![if max { [0; 4] } else { [255; 4] }; iw * ih];
     if round {
         // Rows of the disc: each one over its own half-width.
         let cancel = cancel_flag();
+        let mut buffers = (Vec::new(), Vec::new());
         for dy in -(r as i64)..=r as i64 {
             if cancelled(&cancel) {
                 break;
@@ -1370,12 +1379,13 @@ fn extreme_tile(t: &Tile, r: usize, max: bool, round: bool) -> Vec<[u8; 4]> {
             for y in 0..ih {
                 let ty = (y as i64 + r as i64 + dy) as usize;
                 let line = &px[ty * t.w + r - half..ty * t.w + r + half + iw];
-                for (o, e) in out[y * iw..(y + 1) * iw]
-                    .iter_mut()
-                    .zip(running_extreme(line, half, max))
-                {
-                    *o = pick(*o, e);
-                }
+                extreme_into(
+                    line,
+                    half,
+                    max,
+                    &mut buffers,
+                    &mut out[y * iw..(y + 1) * iw],
+                );
             }
         }
     } else {
@@ -1395,6 +1405,39 @@ fn extreme_tile(t: &Tile, r: usize, max: bool, round: bool) -> Vec<[u8; 4]> {
     }
     out.iter_mut().for_each(|p| *p = unpremultiply8(*p));
     out
+}
+
+/// [`running_extreme`] combined into `out` (its extreme with each
+/// window's), with `buffers` reused from a call to the next.
+fn extreme_into(
+    line: &[[u8; 4]],
+    r: usize,
+    max: bool,
+    (from_start, to_end): &mut (Vec<[u8; 4]>, Vec<[u8; 4]>),
+    out: &mut [[u8; 4]],
+) {
+    let k = 2 * r + 1;
+    let n = line.len();
+    let pick = |a: [u8; 4], b: [u8; 4]| -> [u8; 4] {
+        std::array::from_fn(|c| if max { a[c].max(b[c]) } else { a[c].min(b[c]) })
+    };
+    from_start.clear();
+    from_start.extend_from_slice(line);
+    for i in 1..n {
+        if i % k != 0 {
+            from_start[i] = pick(from_start[i - 1], line[i]);
+        }
+    }
+    to_end.clear();
+    to_end.extend_from_slice(line);
+    for i in (0..n.saturating_sub(1)).rev() {
+        if (i + 1) % k != 0 {
+            to_end[i] = pick(to_end[i + 1], line[i]);
+        }
+    }
+    for (i, o) in out.iter_mut().enumerate().take(n + 1 - k) {
+        *o = pick(*o, pick(to_end[i], from_start[i + k - 1]));
+    }
 }
 
 /// Extreme of each window of 2r + 1 values of `line` (van Herk / Gil-Werman:
@@ -1877,6 +1920,37 @@ mod tests {
     }
 
     #[test]
+    fn round_maximum_is_the_maximum_over_the_disc() {
+        let (w, h) = (300u32, 90u32);
+        let image = RgbaImage::from_fn(w, h, |x, y| {
+            let v = ((x * 7919 + y * 104729) % 251) as u8;
+            Rgba([v, v / 2, 255 - v, 255])
+        });
+        for r in [5usize, 40] {
+            let mut out = image.clone();
+            Filter::Maximum(Morphology {
+                radius: r as f32,
+                roundness: true,
+            })
+            .apply(&mut out, (0, 0));
+            for (x, y) in [(0, 0), (150, 45), (299, 89), (160, 3), (77, 60)] {
+                let mut best = [0u8; 3];
+                let ri = r as i64;
+                for dy in -ri..=ri {
+                    let half = ((ri * ri - dy * dy) as f64).sqrt().floor() as i64;
+                    for dx in -half..=half {
+                        let sx = (x as i64 + dx).clamp(0, w as i64 - 1) as u32;
+                        let sy = (y as i64 + dy).clamp(0, h as i64 - 1) as u32;
+                        let p = image.get_pixel(sx, sy).0;
+                        best = std::array::from_fn(|c| best[c].max(p[c]));
+                    }
+                }
+                assert_eq!(out.get_pixel(x, y).0[..3], best, "r {r} at ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
     fn colors_of_transparent_pixels_do_not_bleed() {
         // Red opaque square on transparent black: the blurred edge stays
         // red, only more transparent.
@@ -1955,6 +2029,43 @@ mod tests {
                     let d = (0..4).map(|c| p[c].abs_diff(q[c])).max().unwrap();
                     assert!(d <= 2, "{kind:?}: {p:?} vs {q:?}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn semi_transparent_pixels_keep_their_own_colors() {
+        // The same colors, opaque and at half opacity: the filters that read
+        // straight colors give the same colors.
+        let image = |alpha: u8| {
+            RgbaImage::from_fn(64, 64, |x, y| {
+                let on = (x / 8 + y / 8) % 2 == 0;
+                let n = ((x * 37 + y * 91) % 23) as u8;
+                if on {
+                    Rgba([220 - n, 60 + n, 40, alpha])
+                } else {
+                    Rgba([30 + n, 90, 200 - n, alpha])
+                }
+            })
+        };
+        let quiet = Filter::ReduceNoise(ReduceNoise {
+            strength: 0.0,
+            preserve_details: 60.0,
+            color_noise: 0.0,
+            sharpen_details: 0.0,
+        });
+        for filter in [
+            FilterKind::Emboss.initial(),
+            FilterKind::FindEdges.initial(),
+            FilterKind::ReduceNoise.initial(),
+            quiet,
+        ] {
+            let (mut a, mut b) = (image(255), image(128));
+            filter.apply(&mut a, (0, 0));
+            filter.apply(&mut b, (0, 0));
+            for (p, q) in a.pixels().zip(b.pixels()) {
+                let d = (0..3).map(|c| p[c].abs_diff(q[c])).max().unwrap();
+                assert!(d <= 1, "{filter:?}: {p:?} vs {q:?}");
             }
         }
     }

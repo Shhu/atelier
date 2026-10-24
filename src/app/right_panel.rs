@@ -19,6 +19,11 @@ const ROW_HEIGHT: f32 = 44.0;
 const ROW_GAP: f32 = 2.0;
 /// Rows shown before the list scrolls.
 const VISIBLE_ROWS: usize = 5;
+/// Below this panel height, the list shows this many rows before scrolling.
+const SHORT_PANEL: f32 = 650.0;
+const SHORT_VISIBLE_ROWS: usize = 3;
+/// Room the Properties keep above the Layers, when the panel has it.
+const PROPERTIES_MIN: f32 = 160.0;
 /// Buttons under the list, with their top border.
 const FOOTER_HEIGHT: f32 = 41.0;
 /// Gap between the fields of a row.
@@ -44,20 +49,27 @@ impl AtelierApp {
             );
             return;
         };
-        let rows = n.clamp(1, VISIBLE_ROWS) as f32;
-        let most = VISIBLE_ROWS as f32 * (ROW_HEIGHT + ROW_GAP) - ROW_GAP;
-        let list_height = (rows * ROW_HEIGHT + (rows - 1.0) * ROW_GAP + sub).min(most);
-        // The Layers part: as dragged, or fitted to the list.
-        let dragged = self.workspace.layout.layers_height;
-        let layers_height = dragged.unwrap_or(HEADING_HEIGHT + list_height + 6.0 + FOOTER_HEIGHT);
-        // Properties scroll: when the panel is short, they give up room
-        // first, down to the layers' heading, one row and their buttons.
-        let layers_min = HEADING_HEIGHT + ROW_HEIGHT + 6.0 + FOOTER_HEIGHT;
-        let props_min = if dragged.is_some() {
-            HEADING_HEIGHT
+        // A low panel lists fewer rows before scrolling, for the Properties.
+        let visible = if full.height() < SHORT_PANEL {
+            SHORT_VISIBLE_ROWS
         } else {
-            120.0
+            VISIBLE_ROWS
         };
+        let rows = n.clamp(1, visible) as f32;
+        let most = visible as f32 * (ROW_HEIGHT + ROW_GAP) - ROW_GAP;
+        let list_height = (rows * ROW_HEIGHT + (rows - 1.0) * ROW_GAP + sub).min(most);
+        // The Layers part: as dragged (a share of the panel), or fitted to
+        // the list.
+        let dragged = self.workspace.layout.layers_share;
+        let layers_height = dragged.map_or(
+            HEADING_HEIGHT + list_height + 6.0 + FOOTER_HEIGHT,
+            |share| share * full.height(),
+        );
+        // Properties scroll: when the panel is short, they give up room
+        // first, down to the layers' heading, one row and their buttons;
+        // otherwise they keep a few lines whatever the split.
+        let layers_min = HEADING_HEIGHT + ROW_HEIGHT + 6.0 + FOOTER_HEIGHT;
+        let props_min = PROPERTIES_MIN;
         let split = (full.bottom() - layers_height)
             .max(full.top() + props_min)
             .min(full.bottom() - layers_min)
@@ -87,13 +99,14 @@ impl AtelierApp {
             .on_hover_cursor(egui::CursorIcon::ResizeVertical);
         let layout = &mut self.workspace.layout;
         if response.double_clicked() {
-            layout.layers_height = None;
+            layout.layers_share = None;
             self.workspace.save_layout();
         } else if response.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-            let most = (full.height() - HEADING_HEIGHT).max(layers_min);
+            let most = (full.height() - PROPERTIES_MIN).max(layers_min);
             let height = full.bottom() - split - response.drag_delta().y;
-            layout.layers_height = Some(height.clamp(layers_min, most));
+            let share = height.clamp(layers_min, most) / full.height().max(1.0);
+            layout.layers_share = Some(share.clamp(0.0, 1.0));
         }
         if response.drag_stopped() {
             self.workspace.save_layout();
@@ -104,6 +117,10 @@ impl AtelierApp {
                 split + 0.5,
                 egui::Stroke::new(2.0, color::ACCENT),
             );
+        } else {
+            // A grip in the middle, so that the border can be found.
+            let grip = Rect::from_center_size(pos2(full.center().x, split + 3.0), vec2(28.0, 2.0));
+            ui.painter().rect_filled(grip, 1.0, color::LINE_HOVER);
         }
     }
 
@@ -161,7 +178,7 @@ impl AtelierApp {
                 self.artboard_section(ui, locked);
                 if let LayerKind::Adjustment(a) = &mut content {
                     let title = a.title();
-                    let histogram = self.below_histogram(a);
+                    let histogram = self.below_histogram(ui.ctx(), a);
                     let primary = self.primary.to_srgba_unmultiplied();
                     let state = &mut self.panel_editor;
                     if state.0 != layer_id {
@@ -239,6 +256,17 @@ impl AtelierApp {
             .filter(|c| c.0)
             .map(|(_, prop)| (property_step(prop, layer), prop))
             .collect();
+        // A text being typed ends first (an empty new one goes away).
+        if !steps.is_empty() {
+            self.commit_text();
+            if self
+                .doc
+                .as_ref()
+                .is_none_or(|d| d.active_layer().id != layer_id)
+            {
+                return;
+            }
+        }
         for (step, prop) in steps {
             self.record_change(step, Some((layer_id, prop)));
         }
@@ -262,33 +290,80 @@ impl AtelierApp {
     }
 
     /// Histograms of what an adjustment layer adjusts (Levels, Curves): the
-    /// image as composited, once per history step.
-    fn below_histogram(&mut self, a: &Adjustment) -> Option<Histograms> {
+    /// layers below it as composited, made again on a worker thread when
+    /// they change (the former ones shown meanwhile).
+    pub(super) fn below_histogram(
+        &mut self,
+        ctx: &egui::Context,
+        a: &Adjustment,
+    ) -> Option<Histograms> {
         if !matches!(a, Adjustment::Levels(_) | Adjustment::Curves(_)) {
             return None;
         }
         let doc = self.doc.as_ref()?;
-        let key = (doc.uid(), doc.history_step());
-        if self.histogram.as_ref().is_none_or(|(k, _)| *k != key) {
+        let layers = doc.render_layers();
+        let below = &layers[..doc.active];
+        let held = doc.effects_held();
+        let opts = crate::compose::Options {
+            held,
+            later_styles: true,
+            ..Default::default()
+        };
+        let sigs = crate::compose::signatures(below, &opts);
+        let (uid, layer) = (doc.uid(), doc.active_layer().id);
+        let key = hash_of((uid, layer, format!("{sigs:?}")));
+        let h = &mut self.below_histogram;
+        if let Some(job) = h.job.take_if(|j| j.1.is_finished())
+            && let Ok((cache, histograms)) = job.1.join()
+        {
+            if job.0 == (uid, layer) {
+                h.shown = Some((job.2, (uid, layer), histograms));
+            }
+            h.cache = Some((uid, cache));
+        }
+        if h.job.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        } else if h.shown.as_ref().is_none_or(|(k, _, _)| *k != key) {
             // The layers below it, reduced to about 1000 px.
             let canvas = doc.full_rect();
             let side = canvas.w.max(canvas.h) as f32;
             let level = (side / 1024.0).log2().ceil().max(0.0) as u32;
-            let mut sources = crate::compose::LevelCache::new(level);
-            let layers = doc.render_layers();
-            let below = &layers[..doc.active];
-            let opts = crate::compose::Options::default();
-            let plan = crate::compose::plan(below, canvas, &mut sources, &opts);
-            let b = 1u32 << level;
-            let r = PixelRect {
-                x: 0,
-                y: 0,
-                w: canvas.w.div_ceil(b),
-                h: canvas.h.div_ceil(b),
-            };
-            self.histogram = Some((key, crate::pixel_ops::histogram(&plan.render(r))));
+            let mut sources = h
+                .cache
+                .take()
+                .filter(|(d, c)| *d == uid && crate::compose::Sources::level(c) == level)
+                .map_or_else(|| crate::compose::LevelCache::new(level), |(_, c)| c);
+            let below = below.to_vec();
+            let job = std::thread::Builder::new()
+                .name("histogram".into())
+                .spawn(move || {
+                    let opts = crate::compose::Options {
+                        held,
+                        later_styles: true,
+                        ..Default::default()
+                    };
+                    let plan = crate::compose::plan(&below, canvas, &mut sources, &opts);
+                    sources.retain_used();
+                    let b = 1u32 << level;
+                    let r = PixelRect {
+                        x: 0,
+                        y: 0,
+                        w: canvas.w.div_ceil(b),
+                        h: canvas.h.div_ceil(b),
+                    };
+                    let histograms = crate::pixel_ops::histogram(&plan.render(r));
+                    (sources, histograms)
+                });
+            if let Ok(job) = job {
+                h.job = Some(((uid, layer), job, key));
+                ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            }
         }
-        self.histogram.as_ref().map(|(_, h)| *h)
+        // Those of another layer are not shown meanwhile.
+        h.shown
+            .as_ref()
+            .filter(|(_, of, _)| *of == (uid, layer))
+            .map(|(_, _, h)| *h)
     }
 
     /// X, Y, W, H and rotation of the active layer. With a transform pending
@@ -742,7 +817,29 @@ impl AtelierApp {
                     let on = |r: Option<Rect>| {
                         at.is_some_and(|p| r.is_some_and(|r| r.expand(2.0).contains(p)))
                     };
-                    let part = if on(mask_rect) {
+                    // Alt over the line between two rows: clipping the one
+                    // above to the one below, like Photoshop (its cursor
+                    // says so before the click).
+                    let clip_line = |p: Pos2| {
+                        if (p.y - rect.bottom()).abs() <= CLIP_LINE {
+                            Some(i)
+                        } else if (p.y - rect.top()).abs() <= CLIP_LINE && i + 1 < doc.layers.len()
+                        {
+                            Some(i + 1)
+                        } else {
+                            None
+                        }
+                    };
+                    if modifiers.alt
+                        && !modifiers.command
+                        && row.hover_pos().is_some_and(|p| clip_line(p).is_some())
+                    {
+                        ui.ctx().set_cursor_icon(CursorIcon::Alias);
+                    }
+                    let clip = at.filter(|_| modifiers.alt).and_then(clip_line);
+                    let part = if let Some(above) = clip {
+                        RowPart::ClipLine(above)
+                    } else if on(mask_rect) {
                         RowPart::Mask
                     } else if on(chain_rect) {
                         RowPart::Chain
@@ -764,6 +861,10 @@ impl AtelierApp {
                         } else if part == RowPart::Thumbnail && layer.is_smart() {
                             let edit = smart_ui::Command::EditContents;
                             menu_action = Some(Action::Smart(edit));
+                        } else if part == RowPart::Mask {
+                            // The mask, in Properties (its density and
+                            // feather), not the layer's style.
+                            click = Some((i, RowPart::Mask, Modifiers::NONE));
                         } else if layer.has_pixels() {
                             menu_action = Some(Action::LayerStyle(None));
                         }
@@ -852,6 +953,30 @@ impl AtelierApp {
             }
         }
 
+        // A text being typed ends first; an empty new one goes away, so the
+        // rows are found again by layer.
+        let ids = self.doc.as_ref().map(|d| {
+            let id = |i: usize| d.layers.get(i).map(|l| l.id);
+            let click = click.and_then(|c: (usize, _, _)| id(c.0));
+            (
+                visibility.and_then(|v| id(v.0)),
+                fold.and_then(id),
+                unlock.and_then(id),
+                click,
+            )
+        });
+        if (visibility.is_some() || unlock.is_some()) && self.type_tool.edit.is_some() {
+            self.commit_text();
+            let find = |id: Option<u64>| {
+                let d = self.doc.as_ref()?;
+                d.layers.iter().position(|l| Some(l.id) == id)
+            };
+            let (v, f, u, c) = ids.unwrap_or_default();
+            visibility = visibility.and_then(|(_, visible, solo)| Some((find(v)?, visible, solo)));
+            fold = fold.and(find(f));
+            unlock = unlock.and(find(u));
+            click = click.and_then(|(_, part, modifiers)| Some((find(c)?, part, modifiers)));
+        }
         if let Some((i, visible, solo)) = visibility {
             let step = if visible && !solo {
                 t!("xchg-hist-show-layer")
@@ -880,9 +1005,9 @@ impl AtelierApp {
             && let Some(doc) = &mut self.doc
             && let LayerKind::Group { expanded } = &mut doc.layers[i].kind
         {
-            // Not an undo step, like Photoshop.
+            // Not an undo step, like Photoshop (and undo keeps it).
             *expanded = !*expanded;
-            doc.modified = true;
+            doc.mark_modified();
         }
         if let Some((i, part, modifiers)) = click {
             self.click_row(i, part, modifiers);
@@ -899,7 +1024,11 @@ impl AtelierApp {
                 let layer = &mut doc.layers[i];
                 layer.locked = false;
                 let name = layer.name.as_str();
-                self.status = format!("🔓 {}", t!("status-layer-unlocked", name = name));
+                self.status = format!(
+                    "{} {}",
+                    icon::LOCK_SIMPLE_OPEN,
+                    t!("status-layer-unlocked", name = name)
+                );
             }
         }
         if let Some((from, above)) = reorder {
@@ -926,10 +1055,12 @@ impl AtelierApp {
     /// selection), the chain (link).
     pub(super) fn click_row(&mut self, i: usize, part: RowPart, modifiers: Modifiers) {
         match part {
-            RowPart::Name if modifiers.alt && !modifiers.command => {
-                if let Some(doc) = &mut self.doc {
-                    let clip = !doc.layers[i].clipped;
-                    if doc.set_clipping(i, clip) {
+            RowPart::ClipLine(above) if !modifiers.command => {
+                if let Some(doc) = &mut self.doc
+                    && above < doc.layers.len()
+                {
+                    let clip = !doc.layers[above].clipped;
+                    if doc.set_clipping(above, clip) {
                         self.reset_pending();
                     }
                 }
@@ -976,7 +1107,7 @@ impl AtelierApp {
                 doc.target_mask(false);
                 self.mask_view = false;
             }
-            RowPart::Name => {}
+            RowPart::Name | RowPart::ClipLine(_) => {}
         }
     }
 
@@ -1065,11 +1196,13 @@ impl AtelierApp {
     fn thumbnail(&mut self, ctx: &egui::Context, i: usize, mask: bool) -> Option<egui::TextureId> {
         let doc = self.doc.as_ref()?;
         let layer = doc.render_layer(i);
+        // The pixels as the canvas shows them (display profile, proof).
+        let (lut_key, lut) = self.color.shown();
         let key = match (&layer.mask, mask) {
             (Some(m), true) => hash_of((m.rev(), m.origin(layer.offset), doc.full_rect())),
             (None, true) => return None,
             _ if !layer.has_pixels() || layer.text.is_some() => return None,
-            _ => layer.rev(),
+            _ => hash_of((layer.rev(), lut_key)),
         };
         let now = ctx.input(|inp| inp.time);
         let entry = (layer.id, mask);
@@ -1082,7 +1215,11 @@ impl AtelierApp {
         let (tw, th) = ((38.0 * ppp).round() as u32, (26.0 * ppp).round() as u32);
         let image = match &layer.mask {
             Some(m) if mask => mask_thumbnail(m, layer.offset, doc.full_rect(), tw, th),
-            _ => layer_thumbnail(layer.image(), tw, th),
+            _ => {
+                let mut image = layer_thumbnail(layer.image(), tw, th);
+                color_ui::show_through(lut.as_deref(), image.as_mut(), false);
+                image
+            }
         };
         let image = ColorImage::from_rgba_unmultiplied(
             [image.width() as usize, image.height() as usize],
@@ -1124,7 +1261,12 @@ pub(super) enum RowPart {
     Thumbnail,
     Chain,
     Mask,
+    /// Alt on the line between two rows: the layer above it (clipping).
+    ClipLine(usize),
 }
+
+/// How far from the line between two rows (points) Alt+click clips.
+const CLIP_LINE: f32 = 4.0;
 
 /// Indentation of one level of group in the list.
 const INDENT: f32 = 16.0;
@@ -1284,7 +1426,7 @@ fn line() -> UiStroke {
 /// Help of a row of the Layers panel.
 fn layer_row_tip(ctx: &egui::Context) -> String {
     t!(
-        "input3-layer-row-tip",
+        "input4-layer-row-tip",
         alt_click = keys::click(ctx, Modifiers::ALT),
         ctrl_click = keys::click(ctx, Modifiers::COMMAND),
         shift_click = keys::click(ctx, Modifiers::SHIFT)
@@ -1807,4 +1949,34 @@ fn row_icon(ui: &mut Ui, rect: Rect, id: Id, glyph: &str, fg: Color32, tip: &str
         fg,
     );
     response.on_hover_text(tip)
+}
+
+/// The histograms of what an adjustment layer adjusts (see
+/// `AtelierApp::below_histogram`).
+#[derive(Default)]
+pub(super) struct BelowHistogram {
+    /// Those shown: fingerprint of the layers below, document and layer.
+    shown: Option<(u64, (u64, u64), Histograms)>,
+    /// Being made: for which document and layer, and fingerprint.
+    #[allow(clippy::type_complexity)]
+    job: Option<(
+        (u64, u64),
+        std::thread::JoinHandle<(crate::compose::LevelCache, Histograms)>,
+        u64,
+    )>,
+    /// The layers reduced, kept between them (of a document).
+    cache: Option<(u64, crate::compose::LevelCache)>,
+}
+
+impl BelowHistogram {
+    /// Memory its reductions take.
+    pub(super) fn bytes(&self) -> usize {
+        self.cache.as_ref().map_or(0, |(_, c)| c.bytes())
+    }
+
+    /// Whether they are being made.
+    #[cfg(test)]
+    pub(super) fn busy(&self) -> bool {
+        self.job.is_some()
+    }
 }

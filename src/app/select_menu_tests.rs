@@ -498,3 +498,221 @@ fn large_selections_are_computed_in_the_background() {
     assert_eq!(sel.coverage(1500, 1000), 255);
     assert!(sel.coverage(100, 100) < 128, "corner rounded");
 }
+
+/// A layer mask with a black square in its middle, targeted.
+fn mask_with_hole(h: &mut Harness<'_, AtelierApp>) {
+    let doc = h.state_mut().doc.as_mut().unwrap();
+    assert!(doc.add_mask(crate::document::NewMask::RevealAll, None));
+    let offset = doc.active_layer().offset;
+    let m = doc.active_layer_mut().mask.as_mut().unwrap();
+    let white = image::GrayImage::from_pixel(200, 200, image::Luma([255]));
+    m.replace(white, (0, 0), offset);
+    for y in 60..140 {
+        for x in 60..140 {
+            m.pixels_mut().put_pixel(x, y, image::Luma([0]));
+        }
+    }
+    m.density = 0.5;
+    m.feather = 3.0;
+    m.enabled = false;
+    m.set_linked(false, offset);
+    doc.target_mask(true);
+}
+
+/// Select and Mask on a layer mask refines it as stored, in place: what
+/// lies outside the canvas, its density, feather, link and enabled state
+/// stay. OK without a change records nothing.
+#[test]
+fn select_and_mask_refines_a_layer_mask_in_place() {
+    let mut h = app_with(halves());
+    mask_with_hole(&mut h);
+    let steps = h.state().doc.as_ref().unwrap().history().0.len();
+    h.state_mut().run(Action::Select(Command::SelectAndMask));
+    h.run_steps(1);
+    assert!(h.state().sel.select_mask.is_some(), "opened on the mask");
+    h.state_mut().close_select_mask(true);
+    settle(&mut h);
+    let d = h.state().doc.as_ref().unwrap();
+    assert_eq!(d.history().0.len(), steps, "nothing to record");
+
+    h.state_mut().run(Action::Select(Command::SelectAndMask));
+    h.run_steps(1);
+    h.state_mut()
+        .sel
+        .select_mask
+        .as_mut()
+        .unwrap()
+        .refine
+        .feather = 6.0;
+    h.state_mut().close_select_mask(true);
+    settle(&mut h);
+    let d = h.state().doc.as_ref().unwrap();
+    assert_eq!(d.history().0.len(), steps + 1, "one step");
+    let m = d.active_layer().mask.as_ref().unwrap();
+    assert_eq!(m.default, 255, "the outside stays shown");
+    assert_eq!((m.density, m.feather), (0.5, 3.0));
+    assert!(!m.linked() && !m.enabled);
+    let at = |x, y| m.image().get_pixel(x, y).0[0];
+    assert_eq!((at(100, 100), at(10, 10)), (0, 255), "raw values refined");
+    assert!(at(60, 100) > 30 && at(60, 100) < 230, "edge feathered");
+    h.state_mut().undo();
+    let m = h
+        .state()
+        .doc
+        .as_ref()
+        .unwrap()
+        .active_layer()
+        .mask
+        .as_ref()
+        .unwrap();
+    assert_eq!(m.image().get_pixel(60, 100).0[0], 0);
+}
+
+/// Another layer chosen while Select and Mask is open: it closes, and
+/// nothing lands on that layer.
+#[test]
+fn select_and_mask_closes_when_its_layer_changes() {
+    let mut h = app_with(halves());
+    mask_with_hole(&mut h);
+    {
+        let doc = h.state_mut().doc.as_mut().unwrap();
+        doc.add_layer(
+            "B".into(),
+            image::RgbaImage::from_pixel(200, 200, RED),
+            (0, 0),
+        );
+        doc.active = 0;
+        doc.target_mask(true);
+    }
+    h.state_mut().run(Action::Select(Command::SelectAndMask));
+    h.run_steps(1);
+    assert!(h.state().sel.select_mask.is_some());
+    h.state_mut().select_layer(1);
+    h.run_steps(2);
+    assert!(h.state().sel.select_mask.is_none());
+    assert_eq!(h.state().status, t!("sel4-mask-target-changed"));
+    assert!(h.state().doc.as_ref().unwrap().layers[1].mask.is_none());
+}
+
+/// A Hide All mask is refined too (from nothing); without a selection or a
+/// mask, the command says what it needs.
+#[test]
+fn select_and_mask_opens_on_an_empty_mask_and_explains_otherwise() {
+    let mut h = app_with(halves());
+    h.state_mut().run(Action::Select(Command::SelectAndMask));
+    h.run_steps(1);
+    assert!(h.state().sel.select_mask.is_none());
+    assert_eq!(h.state().status, t!("sel4-mask-needs-selection"));
+    let doc = h.state_mut().doc.as_mut().unwrap();
+    assert!(doc.add_mask(crate::document::NewMask::HideAll, None));
+    h.state_mut().selection = Some(rect(10, 10, 20, 20).into());
+    h.state_mut().run(Action::Select(Command::SelectAndMask));
+    h.run_steps(1);
+    assert!(h.state().sel.select_mask.is_some());
+}
+
+/// In Quick Mask Mode, the layer commands keep the layer's lock (the
+/// tools and fills edit the mask, whatever the lock).
+#[test]
+fn quick_mask_keeps_the_lock_for_layer_commands() {
+    let mut h = app_with(halves());
+    {
+        let doc = h.state_mut().doc.as_mut().unwrap();
+        doc.add_layer(
+            "B".into(),
+            image::RgbaImage::from_pixel(200, 200, RED),
+            (0, 0),
+        );
+        doc.active_layer_mut().locked = true;
+    }
+    h.state_mut().selection = Some(rect(20, 20, 60, 60).into());
+    key(&mut h, Key::Q, Modifiers::NONE);
+    assert!(quick_mask_on(&h));
+    for action in [Action::Delete, Action::MergeDown, Action::ClearLayerStyle] {
+        h.state_mut().run(action);
+        h.run_steps(1);
+    }
+    let d = h.state().doc.as_ref().unwrap();
+    assert_eq!(d.layers.len(), 2, "the locked layer stays");
+    // A fill still edits the mask.
+    let before = d.quick_mask().unwrap().get_pixel(150, 150).0[0];
+    h.state_mut().primary = egui::Color32::WHITE;
+    h.state_mut().run(Action::FillPrimary);
+    h.run_steps(1);
+    let d = h.state().doc.as_ref().unwrap();
+    assert_eq!(before, 0);
+    assert_eq!(d.quick_mask().unwrap().get_pixel(150, 150).0[0], 255);
+}
+
+/// A filter's preview in Quick Mask Mode shows on the red overlay, not as
+/// a mask of the layer.
+#[test]
+fn quick_mask_previews_show_on_its_overlay() {
+    let mut h = app_with(halves());
+    h.state_mut().selection = Some(rect(20, 20, 60, 60).into());
+    key(&mut h, Key::Q, Modifiers::NONE);
+    let key0 = h.state().quick_mask_overlay().unwrap().key;
+    h.state_mut()
+        .run(Action::Filter(crate::filters::FilterKind::GaussianBlur));
+    let start = std::time::Instant::now();
+    while h.state().preview_shown.is_none() {
+        assert!(start.elapsed().as_secs() < 30, "no preview");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.run_steps(1);
+    }
+    let app = h.state();
+    let p = app.preview_shown.as_ref().unwrap();
+    assert!(p.quick_mask);
+    assert_ne!(app.quick_mask_overlay().unwrap().key, key0, "previewed");
+    let doc = app.doc.as_ref().unwrap();
+    let mut opts = crate::compose::Options::default();
+    p.options(&mut opts, doc.active_layer().offset);
+    assert!(
+        opts.mask.is_none() && opts.pixels.is_none(),
+        "not on the layer"
+    );
+}
+
+/// In Quick Mask Mode, the Move tool and Free Transform are refused: they
+/// would move the layer under the mask.
+#[test]
+fn quick_mask_refuses_moving_and_transforming() {
+    let mut h = app_with(halves());
+    h.state_mut().selection = Some(rect(20, 20, 60, 60).into());
+    key(&mut h, Key::Q, Modifiers::NONE);
+    h.state_mut().tool = Tool::Transform;
+    h.run_steps(1);
+    let (from, to) = (screen(&h, 50.0, 50.0), screen(&h, 150.0, 150.0));
+    drag(&mut h, from, to, Modifiers::NONE);
+    let d = h.state().doc.as_ref().unwrap();
+    assert_eq!(d.layers[0].offset, (0, 0));
+    assert_eq!(d.quick_mask().unwrap().get_pixel(50, 50).0[0], 255);
+    assert_eq!(
+        h.state().status,
+        t!("sel4-quick-mask-no-move", key = keys::key(Key::Q))
+    );
+    h.state_mut().status.clear();
+    h.state_mut()
+        .run(Action::Transform(transform::Command::Free));
+    h.run_steps(1);
+    assert!(h.state().transform_rect.is_none());
+    assert!(!h.state().status.is_empty());
+}
+
+/// A background Magic Wand click is named after the wand, even when
+/// another tool is chosen before it lands.
+#[test]
+fn a_background_wand_step_is_named_after_the_wand() {
+    let image = image::RgbaImage::from_fn(2000, 1500, |x, _| if x < 1000 { RED } else { BLUE });
+    let mut h = app_with(Document::new(image, None));
+    h.state_mut().tool = Tool::MagicWand;
+    h.run_steps(1);
+    let at = screen(&h, 500.0, 500.0);
+    click(&mut h, at, Modifiers::NONE);
+    let wand = Tool::MagicWand.name();
+    h.state_mut().tool = Tool::Brush;
+    settle(&mut h);
+    let d = h.state().doc.as_ref().unwrap();
+    assert!(h.state().selection.is_some());
+    assert_eq!(d.history().0.last().copied(), Some(wand.as_str()));
+}

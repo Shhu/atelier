@@ -283,3 +283,131 @@ fn undo_and_redo_restore_the_targeted_mask() {
     app.redo();
     assert!(app.doc.as_ref().unwrap().mask_targeted());
 }
+
+#[test]
+fn a_history_click_waits_for_the_selection_being_computed() {
+    let mut h = app(3000, 2000);
+    {
+        let app = h.state_mut();
+        app.selection = Some(rect(0, 0, 100, 100));
+        app.commit_selection(Some("select".into()));
+        let d = app.doc.as_mut().unwrap();
+        d.checkpoint("later 1".into());
+        d.checkpoint("later 2".into());
+    }
+    h.state_mut()
+        .run(Action::Select(select_menu::Command::Similar));
+    assert!(h.state().select_busy());
+    h.state_mut().go_to_history(1);
+    settle(&mut h);
+    // Applied before the click, then undone with the steps after it:
+    // nothing lost.
+    let (names, done) = doc(&h).history();
+    assert_eq!(done, 1);
+    assert_eq!(&names[..3], ["select", "later 1", "later 2"]);
+    assert_eq!(names.len(), 4);
+}
+
+#[test]
+fn a_selection_computed_from_an_undone_state_is_dropped() {
+    let mut h = app(3000, 2000);
+    {
+        let app = h.state_mut();
+        app.selection = Some(rect(100, 100, 2800, 1800));
+        app.commit_selection(Some("select".into()));
+        app.doc.as_mut().unwrap().checkpoint("later".into());
+        app.modify_selection_step(ModifyKind::Feather, 40.0, false, false);
+        assert!(app.select_busy());
+        // An undo that does not wait (the history moved meanwhile).
+        app.doc.as_mut().unwrap().undo();
+    }
+    settle(&mut h);
+    assert!(doc(&h).can_redo(), "the redo list is kept");
+    assert_eq!(doc(&h).history().0, ["select", "later"]);
+}
+
+#[test]
+fn select_subject_found_after_an_undo_is_dropped() {
+    let mut h = app(400, 300);
+    {
+        let app = h.state_mut();
+        let mut img = image::RgbaImage::from_pixel(400, 300, image::Rgba([20, 40, 200, 255]));
+        for y in 100..200 {
+            for x in 150..250 {
+                img.put_pixel(x, y, image::Rgba([240, 30, 20, 255]));
+            }
+        }
+        app.doc = Some(Document::new(img, None));
+        let d = app.doc.as_mut().unwrap();
+        d.checkpoint("a".into());
+        d.checkpoint("b".into());
+        app.start_subject(false, false);
+        app.run(Action::Undo);
+    }
+    let start = std::time::Instant::now();
+    while h.state().subject_job.is_some() {
+        assert!(start.elapsed().as_secs() < 60, "subject never found");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        h.run_steps(1);
+    }
+    assert!(doc(&h).can_redo());
+    assert_eq!(doc(&h).history(), (vec!["a", "b"], 1));
+    assert!(h.state().selection.is_none());
+}
+
+#[test]
+fn a_modify_queued_behind_another_keeps_its_name() {
+    let mut h = app(3000, 2000);
+    h.state_mut().selection = Some(rect(100, 100, 2800, 1800));
+    h.state_mut().settle_selection();
+    h.state_mut()
+        .modify_selection_step(ModifyKind::Feather, 30.0, false, false);
+    h.state_mut()
+        .modify_selection_step(ModifyKind::Contract, 10.0, false, false);
+    settle(&mut h);
+    let names: Vec<String> = doc(&h).history().0.iter().map(|s| s.to_string()).collect();
+    let name = |k: ModifyKind| select_menu::step_label(k.menu_label());
+    assert_eq!(
+        names,
+        [name(ModifyKind::Feather), name(ModifyKind::Contract)]
+    );
+}
+
+#[test]
+fn esc_on_a_text_keeps_a_layers_panel_change() {
+    let mut h = app(64, 64);
+    let app = h.state_mut();
+    app.doc.as_mut().unwrap().add_empty_layer();
+    app.create_text(pos2(10.0, 30.0), None);
+    app.type_text("abc");
+    // The Layers panel's eye on the background (as `layers_list` does).
+    app.record_change("Hide Layer".into(), None);
+    app.doc.as_mut().unwrap().layers[0].visible = false;
+    app.type_text("d");
+    app.cancel_text();
+    let d = app.doc.as_ref().unwrap();
+    assert!(!d.layers[0].visible);
+    assert!(
+        d.layers.iter().any(|l| l.text.is_some()),
+        "the text was committed"
+    );
+}
+
+#[test]
+fn clicking_the_current_row_with_an_empty_text_redoes_nothing() {
+    let mut h = app(64, 64);
+    let app = h.state_mut();
+    for i in 0..4 {
+        app.doc.as_mut().unwrap().checkpoint(format!("s{i}"));
+    }
+    app.undo();
+    app.undo();
+    app.create_text(pos2(10.0, 30.0), None);
+    let (_, done) = app.doc.as_ref().unwrap().history();
+    app.go_to_history(done);
+    // The empty text goes away, the undone steps stay undone.
+    assert_eq!(
+        app.doc.as_ref().unwrap().history(),
+        (vec!["s0", "s1", "s2", "s3"], 2)
+    );
+}

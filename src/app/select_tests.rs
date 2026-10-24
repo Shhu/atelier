@@ -231,7 +231,7 @@ fn layer_drag_released_off_canvas_ends() {
     let mut d = Document::new(opaque(400, 300, RED), None);
     d.add_layer("logo".into(), opaque(50, 50, BLUE), (20, 20));
     let mut h = app_with(d);
-    h.state_mut().tool = Tool::Canvas;
+    h.state_mut().tool = Tool::Transform;
     h.run_steps(1);
     let (from, to) = (screen(&h, 45.0, 45.0), OFF_CANVAS);
     drag(&mut h, from, to, Modifiers::NONE);
@@ -292,8 +292,16 @@ fn arrows_follow_the_tool() {
     h.key_press(Key::ArrowRight);
     h.run_steps(1);
     assert_eq!(doc(&h).layers[1].offset, (0, 0));
-    // Move tool: the layer.
+    // Move tool: the selected pixels, like its drag…
     h.state_mut().tool = Tool::Transform;
+    h.key_press(Key::ArrowRight);
+    h.run_steps(1);
+    assert_eq!(h.state().selection, Some(rect(52, 51, 50, 50).into()));
+    assert_eq!(doc(&h).layers[1].offset, (0, 0));
+    assert_eq!(doc(&h).layers[1].alpha_at(51, 60), 0);
+    assert_eq!(doc(&h).layers[1].pixel_at(101, 60), Some(BLUE.0));
+    // …and without a selection, the layer.
+    h.state_mut().deselect();
     h.key_press(Key::ArrowRight);
     h.run_steps(1);
     assert_eq!(doc(&h).layers[1].offset, (1, 0));
@@ -334,23 +342,31 @@ fn reselect_forgets_a_selection_from_before_a_crop() {
     assert!(app.selection.is_none() && app.last_selection.is_none());
 }
 
-/// Photo + logo, Move tool: the logo is moved (pending), then grabbed again
-/// where it is shown.
+/// Photo + logo, Move tool: each drag is applied on release, a "Move"
+/// step, and the logo is grabbed again where it is.
 #[test]
-fn second_drag_of_a_pending_move_keeps_the_element() {
+fn each_move_drag_is_a_step_applied_on_release() {
     let mut d = Document::new(opaque(400, 300, RED), None);
     d.add_layer("logo".into(), opaque(50, 50, BLUE), (20, 20));
     let mut h = app_with(d);
     h.state_mut().tool = Tool::Transform;
     h.run_steps(1);
+    let steps = doc(&h).history().1;
     let (from, to) = (screen(&h, 45.0, 45.0), screen(&h, 245.0, 45.0));
     drag(&mut h, from, to, Modifiers::NONE);
+    assert!(h.state().transform_rect.is_none(), "nothing pending");
+    assert_eq!(doc(&h).layers[1].offset, (220, 20));
+    // Esc doesn't take it back.
+    h.key_press(Key::Escape);
+    h.run_steps(1);
+    assert_eq!(doc(&h).layers[1].offset, (220, 20));
     let (from, to) = (screen(&h, 245.0, 45.0), screen(&h, 245.0, 105.0));
     drag(&mut h, from, to, Modifiers::NONE);
-    let app = h.state();
-    assert_eq!(doc(&h).active, 1);
-    let r = app.transform_rect.expect("pending move");
-    assert_eq!(round_rect(r).min, pos2(220.0, 80.0));
+    let d = doc(&h);
+    assert_eq!(d.active, 1);
+    assert_eq!(d.layers[1].offset, (220, 80));
+    assert_eq!(d.history().1, steps + 2);
+    assert_eq!(d.history().0[steps + 1], t!("xchg-hist-move"));
 }
 
 /// "Fit canvas": grabbing B applies A's move (the canvas origin moves),
@@ -368,14 +384,17 @@ fn grabbing_another_element_with_fit_canvas_does_not_jump() {
     h.run_steps(1);
     let (from, to) = (screen(&h, 125.0, 125.0), screen(&h, 135.0, 125.0));
     drag(&mut h, from, to, Modifiers::NONE);
-    let (from, to) = (screen(&h, 325.0, 225.0), screen(&h, 335.0, 225.0));
+    // A's box became the canvas: B is now at (190, 100).
+    let d = doc(&h);
+    assert_eq!((d.width(), d.height()), (50, 50));
+    assert_eq!(d.layers[2].offset, (190, 100));
+    // B grabbed where it shows, then the canvas takes its box.
+    let (from, to) = (screen(&h, 215.0, 125.0), screen(&h, 225.0, 125.0));
     drag(&mut h, from, to, Modifiers::NONE);
     let d = doc(&h);
     assert_eq!(d.active, 2);
-    // A's box became the canvas: B is now at (190, 100).
-    assert_eq!(d.layers[2].offset, (190, 100));
-    let r = h.state().transform_rect.expect("pending move of B");
-    assert_eq!(round_rect(r).min, pos2(200.0, 100.0));
+    assert_eq!(d.layers[2].offset, (0, 0));
+    assert_eq!(d.layers[1].offset, (-200, -100));
 }
 
 /// Shift+drag along a guide's axis: snapping doesn't push it off the axis.
@@ -389,8 +408,8 @@ fn snapping_keeps_a_shift_constrained_move_on_its_axis() {
     h.run_steps(1);
     let (from, to) = (screen(&h, 125.0, 128.0), screen(&h, 155.0, 128.0));
     drag(&mut h, from, to, Modifiers::SHIFT);
-    let r = h.state().transform_rect.expect("pending move");
-    assert_eq!(r.min.y, 103.0);
+    assert_eq!(doc(&h).layers[2].offset.1, 103);
+    assert_ne!(doc(&h).layers[2].offset.0, 100);
 }
 
 #[test]
@@ -401,15 +420,11 @@ fn multi_selected_layers_move_together_with_the_mouse() {
     let mut h = app_with(d);
     let ids: Vec<u64> = doc(&h).layers[1..].iter().map(|l| l.id).collect();
     h.state_mut().layer_set = ids;
-    for (tool, dx) in [(Tool::Canvas, 10.0), (Tool::Transform, 20.0)] {
-        h.state_mut().tool = tool;
-        h.run_steps(1);
-        let (x, y) = doc(&h).layers[1].offset;
-        let (x, y) = (x as f32 + 25.0, y as f32 + 25.0);
-        let (from, to) = (screen(&h, x, y), screen(&h, x + dx, y));
-        drag(&mut h, from, to, Modifiers::NONE);
-        assert!(h.state().layer_drag.is_none());
-    }
+    h.state_mut().tool = Tool::Transform;
+    h.run_steps(1);
+    let (from, to) = (screen(&h, 45.0, 45.0), screen(&h, 75.0, 45.0));
+    drag(&mut h, from, to, Modifiers::NONE);
+    assert!(h.state().layer_drag.is_none());
     let d = doc(&h);
     assert_eq!(d.layers[1].offset, (50, 20));
     assert_eq!(d.layers[2].offset, (230, 100));

@@ -50,7 +50,7 @@ fn select_subject_with(slot: &'static Slot, image: &RgbaImage) -> Result<GrayIma
     Ok(full)
 }
 
-/// The model on an image; transparency is never the subject.
+/// The model on an image: the coverage of its subject.
 fn run(slot: &'static Slot, image: &RgbaImage) -> Result<GrayImage, String> {
     let resized = image::imageops::resize(image, SIZE, SIZE, FilterType::Triangle);
     let n = (SIZE * SIZE) as usize;
@@ -75,12 +75,14 @@ fn run(slot: &'static Slot, image: &RgbaImage) -> Result<GrayImage, String> {
         let v = 1.0 / (1.0 + (-logits[(y * SIZE + x) as usize]).exp());
         image::Luma([(v * 255.0).round() as u8])
     });
-    let mut out =
-        image::imageops::resize(&mask, image.width(), image.height(), FilterType::Triangle);
-    for (m, p) in out.pixels_mut().zip(image.pixels()) {
-        m.0[0] = ((m.0[0] as u32 * p.0[3] as u32) / 255) as u8;
-    }
-    Ok(out)
+    // Not limited by the pixels' opacity: Remove Background's mask comes on
+    // top of it (Select Subject limits it, see `select_tools`).
+    Ok(image::imageops::resize(
+        &mask,
+        image.width(),
+        image.height(),
+        FilterType::Triangle,
+    ))
 }
 
 #[cfg(test)]

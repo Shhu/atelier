@@ -169,8 +169,14 @@ fn notes(doc: &Document, layers: &[Layer], kept: usize, cmyk: bool) -> Vec<Strin
 /// What saving `doc` as a Photoshop document would lose (as [`document`]
 /// says it, without writing).
 pub(super) fn losses(doc: &Document) -> Vec<String> {
-    // At most the channels left with a transparent merged image.
-    notes(doc, &doc.render_layers(), MAX_CHANNELS - 4, false)
+    // The channels [`document`] keeps; only that many need the merged
+    // image's transparency to tell.
+    let mut kept = doc.channels.len();
+    if kept > MAX_CHANNELS - 4 {
+        let transparent = doc.flatten().pixels().any(|p| p.0[3] < 255);
+        kept = kept.min(MAX_CHANNELS - 3 - usize::from(transparent));
+    }
+    notes(doc, &doc.render_layers(), kept, false)
 }
 
 /// First index of the block of group `g` (itself and the layers below it
@@ -202,14 +208,30 @@ fn resources(
         r.bytes(&data.data);
         r.zeros(data.data.len() % 2);
     };
-    // 72 pixels per inch.
-    resource(r, 1005, &|r| {
-        for _ in 0..2 {
-            r.u32(72 << 16);
-            r.u16(1);
-            r.u16(1);
-        }
-    });
+    // What the file opened held beside the layers, as it was: its
+    // resolution first (72 pixels per inch without one).
+    let kept = &doc.file_metadata.psd_resources;
+    let raw = |r: &mut Writer, res: &crate::document::PsdResource| {
+        r.bytes(b"8BIM");
+        r.u16(res.id);
+        r.pascal(&res.name, 2);
+        r.u32(res.data.len() as u32);
+        r.bytes(&res.data);
+        r.zeros(res.data.len() % 2);
+    };
+    match kept.iter().find(|k| k.id == 1005) {
+        Some(res) => raw(r, res),
+        None => resource(r, 1005, &|r| {
+            for _ in 0..2 {
+                r.u32(72 << 16);
+                r.u16(1);
+                r.u16(1);
+            }
+        }),
+    }
+    for res in kept.iter().filter(|k| k.id != 1005) {
+        raw(r, res);
+    }
     resource(r, 1024, &|r| r.u16(target as u16));
     if !doc.guides.is_empty() {
         resource(r, 1032, &|r| {

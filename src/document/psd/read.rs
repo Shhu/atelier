@@ -12,7 +12,7 @@ use super::descriptor::Descriptor;
 use super::{Imported, adjust, artboard, blend_of, effects, vector};
 use crate::document::file_io::{MAX_DIMENSION, check_size};
 use crate::document::native::par_map;
-use crate::document::{BlendMode, Channel, Document, FileError, LayerKind, Mask};
+use crate::document::{BlendMode, Channel, Document, FileError, LayerKind, Mask, PsdResource};
 use crate::guides::{Guide, Orientation};
 use crate::i18n::t;
 
@@ -93,7 +93,20 @@ struct Resources {
     /// The Paths panel's saved paths (name, records) and Work Path.
     paths: Vec<(String, Vec<u8>)>,
     work_path: Option<Vec<u8>>,
+    /// Resources written back as they are (see [`KEPT`]).
+    kept: Vec<PsdResource>,
+    /// Layer comps, which name layers by identifiers saving changes.
+    comps: bool,
 }
+
+/// Image resources that describe the document rather than its layers,
+/// written back unchanged: resolution, print settings, halftone and
+/// transfer functions, IPTC, copyright flag and URL, global light, slices,
+/// EXIF, XMP, print scale, pixel aspect ratio, clipping path.
+const KEPT: [u16; 19] = [
+    1005, 1011, 1013, 1016, 1028, 1034, 1035, 1037, 1049, 1050, 1058, 1059, 1060, 1062, 1064, 1082,
+    1083, 2999, 10000,
+];
 
 fn resources(r: &mut Reader) -> Result<Resources> {
     let mut out = Resources::default();
@@ -102,8 +115,14 @@ fn resources(r: &mut Reader) -> Result<Resources> {
         let id = r.u16()?;
         let name = r.pascal(2)?;
         let len = r.u32()? as usize;
-        let mut d = r.sub(len)?;
+        let raw = r.bytes(len)?;
+        let mut d = Reader::new(raw);
         r.skip(len % 2)?;
+        let kept = || PsdResource {
+            id,
+            name: name.to_vec(),
+            data: raw.to_vec(),
+        };
         match id {
             1039 => out.icc = Some(d.bytes(len)?.to_vec()),
             1006 => {
@@ -134,7 +153,10 @@ fn resources(r: &mut Reader) -> Result<Resources> {
                     out.guides.push(Guide::new(orientation, at));
                 }
             }
-            1037 => out.global_angle = Some(d.i32()? as f64),
+            1037 => {
+                out.global_angle = Some(d.i32()? as f64);
+                out.kept.push(kept());
+            }
             1025 => out.work_path = Some(d.bytes(len)?.to_vec()),
             2000..=2997 => out.paths.push((mac_roman(name), d.bytes(len)?.to_vec())),
             // Format (1: JPEG), sizes…, then the JFIF data.
@@ -142,6 +164,8 @@ fn resources(r: &mut Reader) -> Result<Resources> {
                 d.skip(24)?;
                 out.thumbnail = Some(d.bytes(len - 28)?.to_vec());
             }
+            1065 => out.comps = true,
+            _ if KEPT.contains(&id) => out.kept.push(kept()),
             _ => {}
         }
     }
@@ -198,10 +222,17 @@ impl Record<'_> {
     }
 }
 
-/// Refuses a layer or mask box no file can hold (as the native reader).
-fn check_rect(rect: [i32; 4]) -> Result<()> {
+/// Refuses a layer or mask box no file can hold: a PSD's sides stop at
+/// 30000, a PSB's area at what a document can hold (as the native reader).
+fn check_rect(rect: [i32; 4], big: bool) -> Result<()> {
     let (w, h) = size(rect);
-    if w > 4 * MAX_DIMENSION || h > 4 * MAX_DIMENSION {
+    let side = if big {
+        4 * MAX_DIMENSION
+    } else {
+        MAX_DIMENSION
+    };
+    let area = u64::from(w) * u64::from(h);
+    if w > side || h > side || area > u64::from(MAX_DIMENSION).pow(2) {
         return Err(FileError::Damaged);
     }
     Ok(())
@@ -305,7 +336,7 @@ fn layer_info<'a>(r: &mut Reader<'a>, big: bool) -> Result<(Vec<Record<'a>>, boo
 
 fn record<'a>(r: &mut Reader<'a>, big: bool) -> Result<(Record<'a>, Vec<(i16, usize)>)> {
     let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
-    check_rect(rect)?;
+    check_rect(rect, big)?;
     let n = r.u16()? as usize;
     if n > 56 {
         return Err(FileError::Damaged);
@@ -328,7 +359,7 @@ fn record<'a>(r: &mut Reader<'a>, big: bool) -> Result<(Record<'a>, Vec<(i16, us
     let mask_len = x.u32()? as usize;
     let has_real = lengths.iter().any(|(id, _)| *id == -3);
     let mask = (mask_len > 0)
-        .then(|| mask_data(&mut x.sub(mask_len)?, mask_len, has_real))
+        .then(|| mask_data(&mut x.sub(mask_len)?, mask_len, has_real, big))
         .transpose()?;
     let ranges = x.u32()? as usize;
     let blend_if = x
@@ -355,9 +386,9 @@ fn record<'a>(r: &mut Reader<'a>, big: bool) -> Result<(Record<'a>, Vec<(i16, us
     Ok((rec, lengths))
 }
 
-fn mask_data(r: &mut Reader, len: usize, has_real: bool) -> Result<MaskData> {
+fn mask_data(r: &mut Reader, len: usize, has_real: bool, big: bool) -> Result<MaskData> {
     let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
-    check_rect(rect)?;
+    check_rect(rect, big)?;
     let default = r.u8()?;
     let flags = r.u8()?;
     let mut m = MaskData {
@@ -376,7 +407,7 @@ fn mask_data(r: &mut Reader, len: usize, has_real: bool) -> Result<MaskData> {
         let flags = r.u8()?;
         let default = r.u8()?;
         let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
-        check_rect(rect)?;
+        check_rect(rect, big)?;
         m.real = Some((rect, default, flags));
     }
     if flags & 16 != 0 && r.remaining() > 0 {
@@ -425,7 +456,7 @@ fn decompress(
         0 => Ok(r.bytes(size)?.to_vec()),
         1 => {
             let counts = rle_counts(r, h, big)?;
-            if !rle_fits(&counts, row) {
+            if !rle_fits(&counts, row) || counts.iter().sum::<usize>() > r.remaining() {
                 return Err(FileError::Damaged);
             }
             let mut out = vec![0; size];
@@ -435,7 +466,11 @@ fn decompress(
             Ok(out)
         }
         2 | 3 => {
-            // Grows with what the data really holds.
+            // Grows with what the data really holds, which deflate
+            // shrinks at most about 1032 times.
+            if r.remaining().saturating_mul(1100) + (1 << 16) < size {
+                return Err(FileError::Damaged);
+            }
             let mut out = Vec::new();
             flate2::read::ZlibDecoder::new(r.bytes(r.remaining())?)
                 .take(size as u64)
@@ -1096,6 +1131,10 @@ pub(super) fn document(data: &[u8]) -> Result<Imported> {
         mode => crate::document::color::rgb_profile(f.resources.icc, matches!(mode, RGB | INDEXED)),
     }
     .map(Arc::new);
+    doc.file_metadata.psd_resources = Arc::new(f.resources.kept.clone());
+    if f.resources.comps {
+        notes.lines.push(t!("files4-psd-note-comps"));
+    }
     doc.mark_saved();
     Ok(Imported {
         doc,

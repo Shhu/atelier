@@ -285,8 +285,10 @@ impl AtelierApp {
         }
         if let Some(path) = open_path {
             self.open_path(&path);
-            if self.doc.is_none() {
-                self.recent.remove(&path);
+            // Gone: off both lists. (A file still there stays: a RAW file
+            // opens later, through Camera Raw, and a damaged one says why.)
+            if !path.exists() {
+                self.recent.forget(&path);
             }
         }
         if let Some(action) = action {

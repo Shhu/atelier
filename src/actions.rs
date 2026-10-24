@@ -440,7 +440,15 @@ impl Library {
     }
 
     fn load_from(path: &Path) -> Load {
-        let error = match read(path) {
+        let mut result = read(path);
+        // Locked a moment (antivirus, file sync): read again once.
+        if let Err(FileError::Io(e)) = &result
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            result = read(path);
+        }
+        let error = match result {
             Ok(sets) => return Load::fine(Self { sets }),
             Err(FileError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Load::fine(Self::defaults());
@@ -460,7 +468,7 @@ impl Library {
                     .to_string_lossy()
                     .into_owned()
             ),
-            None => t!("smart3-actions-unreadable", error = error.to_string()),
+            None => t!("smart4-actions-unreadable", error = error.to_string()),
         };
         Load {
             library: Self::defaults(),
@@ -699,7 +707,29 @@ pub fn batch_name(
         name.push('.');
         name.push_str(ext);
     }
-    name
+    windows_safe(&name, stem)
+}
+
+/// `name` as Windows keeps it: without the trailing dots and spaces it
+/// would drop (before the extension too), never a device name, never
+/// hidden (then named after the document, `doc`).
+fn windows_safe(name: &str, doc: &str) -> String {
+    let trailing = |c: char| c == '.' || c.is_whitespace();
+    let name = name.trim_end_matches(trailing);
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    };
+    let stem = match stem.trim_end_matches(trailing) {
+        "" => doc,
+        stem => stem,
+    };
+    if crate::document::windows_device(stem) {
+        let n = stem.find('.').unwrap_or(stem.len());
+        format!("{}_{}{ext}", &stem[..n], &stem[n..])
+    } else {
+        format!("{stem}{ext}")
+    }
 }
 
 /// 1 → a, 26 → z, 27 → aa…
@@ -940,6 +970,21 @@ mod tests {
             batch_name(&[NamePart::Extension], "x", 1, "gif", date),
             "x.gif"
         );
+        // Names Windows would refuse or change: device names, trailing
+        // dots and spaces.
+        let text = |t: &str| [NamePart::Text(t.into())];
+        assert_eq!(batch_name(&text("con"), "x", 1, "png", date), "con_.png");
+        assert_eq!(
+            batch_name(&text("NUL.a"), "x", 1, "png", date),
+            "NUL_.a.png"
+        );
+        assert_eq!(
+            batch_name(&text("draft. "), "x", 1, "png", date),
+            "draft.png"
+        );
+        assert_eq!(batch_name(&text("  "), "x", 1, "png", date), "x.png");
+        let parts = [NamePart::Extension, NamePart::Text(". ".into())];
+        assert_eq!(batch_name(&parts, "x", 1, "jpg", date), "x.jpg");
         assert_eq!(serial_letter(1), "a");
         assert_eq!(serial_letter(26), "z");
         assert_eq!(serial_letter(27), "aa");

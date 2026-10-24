@@ -302,13 +302,22 @@ impl Conversion<'_> {
     /// Converts the RGB pixels of `image` (transparency kept), on all the
     /// cores. Returns `false` if the profiles can't be used for that.
     pub fn convert_rgba(&self, image: &mut RgbaImage) -> bool {
-        let format = PixelFormat::RGBA_8;
-        let Some(t) = self.transform::<u8, u8>((format, format), Flags::COPY_ALPHA) else {
-            return false;
-        };
-        let row = image.width() as usize * 4;
-        crate::pixel_ops::par_bands(image.as_mut(), row, |band| t.transform_in_place(band));
-        true
+        self.recolorer().convert_rgba(image)
+    }
+
+    /// The transforms of this conversion, built once for many images and
+    /// colors (building one costs milliseconds).
+    pub fn recolorer(&self) -> Recolorer {
+        let (rgba, rgb) = (PixelFormat::RGBA_8, PixelFormat::RGB_8);
+        Recolorer {
+            rgba: self
+                .transform((rgba, rgba), Flags::COPY_ALPHA)
+                .map(|t| vec![t]),
+            rgb: self
+                .transform((rgb, rgb), Flags::default())
+                .map(|t| vec![t]),
+            grays: false,
+        }
     }
 
     /// CMYK values (0: no ink, 255: full) of opaque RGB pixels (3 bytes
@@ -365,19 +374,6 @@ impl Conversion<'_> {
         true
     }
 
-    /// One RGB color converted to an RGB destination.
-    pub fn color(&self, rgb: [u8; 3]) -> [u8; 3] {
-        let f = PixelFormat::RGB_8;
-        match self.transform::<[u8; 3], [u8; 3]>((f, f), Flags::default()) {
-            Some(t) => {
-                let mut out = [[0u8; 3]];
-                t.transform_pixels(&[rgb], &mut out);
-                out[0]
-            }
-            None => rgb,
-        }
-    }
-
     /// One RGB color in CMYK, ink percentages (0..100).
     pub fn color_to_cmyk(&self, rgb: [u8; 3]) -> Option<[f32; 4]> {
         let ink = apply16::<3, 4>(
@@ -424,34 +420,64 @@ impl Grayscale<'_> {
         ])
     }
 
-    /// `image`'s pixels in gray (transparency kept), on all the cores.
+    /// The transforms there and back, built once for many images and
+    /// colors.
+    pub fn recolorer(&self) -> Recolorer {
+        let rgba = (PixelFormat::RGBA_8, PixelFormat::GRAYA_8);
+        let rgb = (PixelFormat::RGB_8, PixelFormat::GRAY_8);
+        Recolorer {
+            rgba: self.there_and_back(rgba, Flags::COPY_ALPHA).map(Vec::from),
+            rgb: self.there_and_back(rgb, Flags::default()).map(Vec::from),
+            grays: true,
+        }
+    }
+}
+
+/// A conversion's (or Grayscale's) transforms, built once: one, or there
+/// and back through the gray space.
+pub struct Recolorer {
+    rgba: Option<Vec<Shared<u8, u8>>>,
+    rgb: Option<Vec<Shared<u8, u8>>>,
+    grays: bool,
+}
+
+impl Recolorer {
+    /// Converts the RGB pixels of `image` (transparency kept), on all the
+    /// cores. Returns `false` if the profiles can't be used for that.
     pub fn convert_rgba(&self, image: &mut RgbaImage) -> bool {
-        let formats = (PixelFormat::RGBA_8, PixelFormat::GRAYA_8);
-        let Some([there, back]) = self.there_and_back(formats, Flags::COPY_ALPHA) else {
+        let Some(ts) = &self.rgba else {
             return false;
         };
         let row = image.width() as usize * 4;
-        crate::pixel_ops::par_bands(image.as_mut(), row, |band| {
-            let mut gray = vec![0u8; band.len() / 2];
-            there.transform_pixels(band, &mut gray);
-            back.transform_pixels(&gray, band);
-            for p in band.chunks_exact_mut(4) {
-                let v = neutral([p[0], p[1], p[2]]);
-                p[..3].fill(v);
+        crate::pixel_ops::par_bands(image.as_mut(), row, |band| match ts.as_slice() {
+            [there, back] => {
+                let mut gray = vec![0u8; band.len() / 2];
+                there.transform_pixels(band, &mut gray);
+                back.transform_pixels(&gray, band);
+                for p in band.chunks_exact_mut(4) {
+                    let v = neutral([p[0], p[1], p[2]]);
+                    p[..3].fill(v);
+                }
             }
+            [t] => t.transform_in_place(band),
+            _ => {}
         });
         true
     }
 
+    /// One RGB color converted (unchanged if the profiles can't be used).
     pub fn color(&self, rgb: [u8; 3]) -> [u8; 3] {
-        let formats = (PixelFormat::RGB_8, PixelFormat::GRAY_8);
-        let Some([there, back]) = self.there_and_back(formats, Flags::default()) else {
-            return rgb;
-        };
-        let (mut gray, mut out) = ([0u8], [0u8; 3]);
-        there.transform_pixels(&rgb, &mut gray);
-        back.transform_pixels(&gray, &mut out);
-        [neutral(out); 3]
+        let mut out = [0u8; 3];
+        match self.rgb.as_deref() {
+            Some([there, back]) => {
+                let mut gray = [0u8];
+                there.transform_pixels(&rgb, &mut gray);
+                back.transform_pixels(&gray, &mut out);
+            }
+            Some([t]) => t.transform_pixels(&rgb, &mut out),
+            _ => return rgb,
+        }
+        if self.grays { [neutral(out); 3] } else { out }
     }
 }
 
@@ -835,23 +861,23 @@ mod tests {
         let c = conv(srgb(), WorkingRgb::AdobeRgb.profile());
         let near = |a: [u8; 3], b: [u8; 3]| (0..3).all(|i| a[i].abs_diff(b[i]) <= 2);
         assert!(
-            near(c.color([255, 0, 0]), [219, 0, 0]),
+            near(c.recolorer().color([255, 0, 0]), [219, 0, 0]),
             "{:?}",
-            c.color([255, 0, 0])
+            c.recolorer().color([255, 0, 0])
         );
         assert!(
-            near(c.color([0, 255, 0]), [144, 255, 60]),
+            near(c.recolorer().color([0, 255, 0]), [144, 255, 60]),
             "{:?}",
-            c.color([0, 255, 0])
+            c.recolorer().color([0, 255, 0])
         );
         assert!(
-            near(c.color([0, 0, 255]), [0, 0, 250]),
+            near(c.recolorer().color([0, 0, 255]), [0, 0, 250]),
             "{:?}",
-            c.color([0, 0, 255])
+            c.recolorer().color([0, 0, 255])
         );
         // White and black stay.
-        assert_eq!(c.color([255; 3]), [255; 3]);
-        assert_eq!(c.color([0; 3]), [0; 3]);
+        assert_eq!(c.recolorer().color([255; 3]), [255; 3]);
+        assert_eq!(c.recolorer().color([0; 3]), [0; 3]);
     }
 
     #[test]
@@ -950,7 +976,7 @@ mod tests {
             [250, 251, 3],
             [0, 0, 0],
         ] {
-            let (a, b) = (lut.apply(rgb), c.color(rgb));
+            let (a, b) = (lut.apply(rgb), c.recolorer().color(rgb));
             assert!(
                 (0..3).all(|i| a[i].abs_diff(b[i]) <= 2),
                 "{rgb:?}: {a:?} {b:?}"
@@ -990,14 +1016,14 @@ mod tests {
     #[test]
     fn grayscale_keeps_the_lightness() {
         let g = Grayscale { of: srgb() };
-        let gray = g.color([200, 40, 40]);
+        let gray = g.recolorer().color([200, 40, 40]);
         assert!(gray[0] == gray[1] && gray[1] == gray[2], "{gray:?}");
         // Red is darker than its value: its lightness (L* about 47).
         assert!((100..=125).contains(&gray[0]), "{gray:?}");
-        assert_eq!(g.color([255; 3]), [255; 3]);
-        assert_eq!(g.color([0; 3]), [0; 3]);
+        assert_eq!(g.recolorer().color([255; 3]), [255; 3]);
+        assert_eq!(g.recolorer().color([0; 3]), [0; 3]);
         let mut image = RgbaImage::from_pixel(3, 1, image::Rgba([200, 40, 40, 77]));
-        assert!(g.convert_rgba(&mut image));
+        assert!(g.recolorer().convert_rgba(&mut image));
         let p = image.get_pixel(1, 0).0;
         assert_eq!(p, [gray[0], gray[1], gray[2], 77]);
     }

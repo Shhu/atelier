@@ -8,7 +8,6 @@ use std::io::{BufReader, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use image::codecs::gif::{GifDecoder, GifEncoder};
-use image::codecs::tiff::TiffEncoder;
 use image::codecs::webp::{WebPDecoder, WebPEncoder};
 use image::codecs::{jpeg::JpegEncoder, png::PngDecoder, png::PngEncoder};
 use image::{
@@ -114,6 +113,26 @@ fn limits() -> Limits {
     limits
 }
 
+/// What a document's file holds beside the pixels and layers, given back
+/// when the document is saved in that format again.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FileMetadata {
+    /// An image's EXIF (camera, date, copyright…), orientation reset.
+    pub exif: Option<std::sync::Arc<Vec<u8>>>,
+    /// A Photoshop document's image resources Atelier doesn't use
+    /// (resolution, XMP, IPTC, EXIF, print settings…).
+    pub psd_resources: std::sync::Arc<Vec<PsdResource>>,
+}
+
+/// An image resource of a Photoshop document, kept as it was.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PsdResource {
+    pub id: u16,
+    /// Its name, Mac OS Roman (usually empty).
+    pub name: Vec<u8>,
+    pub data: Vec<u8>,
+}
+
 /// A document just opened.
 pub struct Opened {
     pub doc: super::Document,
@@ -131,6 +150,11 @@ pub struct Decoded {
     pub icc_profile: Option<Vec<u8>>,
     /// The file is an animation: only its first frame was read.
     pub animated: bool,
+    /// Its EXIF, orientation reset (the pixels are the right way up).
+    pub exif: Option<Vec<u8>>,
+    /// What the image lost on opening, that saving over the file in its
+    /// format would lose (translated notes).
+    pub losses: Vec<String>,
 }
 
 /// Decodes an image file whatever its extension says (a PNG named .jpg,
@@ -146,14 +170,80 @@ pub fn read_image(path: &Path) -> Result<Decoded, FileError> {
     decoder.set_limits(limits())?;
     let orientation = decoder.orientation()?;
     let icc_profile = decoder.icc_profile().ok().flatten();
+    let original = decoder.original_color_type();
+    let mut exif = decoder.exif_metadata().ok().flatten();
+    if let Some(exif) = &mut exif {
+        let _ = image::metadata::Orientation::remove_from_exif_chunk(exif);
+    }
+    let other_metadata = decoder.xmp_metadata().ok().flatten().is_some()
+        || decoder.iptc_metadata().ok().flatten().is_some();
     let mut image = DynamicImage::from_decoder(decoder)?;
+    let color = image.color();
+    let cmyk = matches!(
+        original,
+        ExtendedColorType::Cmyk8 | ExtendedColorType::Cmyk16
+    ) || (icc_profile.as_ref())
+        .and_then(|icc| crate::cms::Profile::from_icc(std::sync::Arc::new(icc.clone())))
+        .is_some_and(|p| p.space() == crate::cms::Space::Cmyk);
     let icc_profile = super::color::rgb_pixels(path, format, &mut image, icc_profile);
     image.apply_orientation(orientation);
+    let animated = format.is_some_and(|f| is_animated(path, f));
+    let mut losses = Vec::new();
+    if animated {
+        losses.push(t!("files4-note-frames"));
+    }
+    if format == Some(ImageFormat::Tiff) && tiff_has_more(path) {
+        losses.push(t!("files4-note-pages"));
+    }
+    let bits = color.bits_per_pixel() / u16::from(color.channel_count().max(1));
+    if bits > 8 {
+        losses.push(t!("xchg-psd-note-depth", bits = bits));
+    }
+    if cmyk {
+        let mode = t!("xchg-psd-mode-cmyk");
+        losses.push(t!("xchg-psd-note-mode", mode = mode));
+    }
+    // TIFF metadata are tags its writer doesn't keep, EXIF included.
+    if other_metadata
+        || format == Some(ImageFormat::Tiff) && (exif.take().is_some() || tiff_has_metadata(path))
+    {
+        losses.push(t!("files4-note-metadata"));
+    }
     Ok(Decoded {
         image: image.into_rgba8(),
         icc_profile,
-        animated: format.is_some_and(|f| is_animated(path, f)),
+        animated,
+        exif,
+        losses,
     })
+}
+
+/// A TIFF holds pages after its first.
+fn tiff_has_more(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    tiff::decoder::Decoder::new(BufReader::new(file)).is_ok_and(|d| d.more_images())
+}
+
+/// A TIFF has a copyright, an author, EXIF, XMP or IPTC.
+fn tiff_has_metadata(path: &Path) -> bool {
+    use tiff::tags::Tag;
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let Ok(mut d) = tiff::decoder::Decoder::new(BufReader::new(file)) else {
+        return false;
+    };
+    [
+        Tag::Copyright,
+        Tag::Artist,
+        Tag::Unknown(700),
+        Tag::Unknown(33723),
+        Tag::Unknown(34665),
+    ]
+    .into_iter()
+    .any(|tag| d.find_tag(tag).ok().flatten().is_some())
 }
 
 /// Size of an image file as it opens (EXIF orientation applied), from its
@@ -266,7 +356,7 @@ impl ExportFormat {
     }
 
     /// Largest side the format can store.
-    fn max_side(self) -> u32 {
+    pub fn max_side(self) -> u32 {
         match self {
             // What Atelier itself opens.
             ExportFormat::Png | ExportFormat::Tiff => MAX_DIMENSION,
@@ -288,12 +378,13 @@ pub fn export(
     icc_profile: Option<&[u8]>,
 ) -> Result<(), FileError> {
     write_atomic(path, |out| {
-        encode_image(image, out, format, quality, icc_profile, None)
+        encode_image(image, out, format, quality, icc_profile, None, None)
     })
 }
 
 /// Encodes `image` in `format` into `out` (see [`export`]), with a
-/// copyright notice where the format has room for it (not GIF).
+/// copyright notice where the format has room for it (not GIF), else
+/// with `exif` as it is (PNG, JPEG, WebP).
 pub fn encode_image(
     image: &RgbaImage,
     out: &mut (impl Write + Seek),
@@ -301,17 +392,18 @@ pub fn encode_image(
     quality: u8,
     icc_profile: Option<&[u8]>,
     copyright: Option<&str>,
+    exif: Option<&[u8]>,
 ) -> Result<(), FileError> {
     let (w, h) = image.dimensions();
     if w.max(h) > format.max_side() {
         return Err(FileError::FormatTooSmall(format, format.max_side()));
     }
     // TIFF: its own Copyright tag (its encoder takes no EXIF).
-    if let (ExportFormat::Tiff, Some(text)) = (format, copyright) {
-        return tiff_with_copyright(image, out, icc_profile, text);
+    if format == ExportFormat::Tiff {
+        return tiff(image, out, icc_profile, copyright);
     }
-    let exif = copyright.map(crate::export::copyright_exif);
-    let meta = (icc_profile, exif.as_deref());
+    let copyright = copyright.map(crate::export::copyright_exif);
+    let meta = (icc_profile, copyright.as_deref().or(exif));
     match format {
         ExportFormat::Png => encode(PngEncoder::new(out), image, meta),
         ExportFormat::Jpeg => {
@@ -320,13 +412,13 @@ pub fn encode_image(
             encode_with(encoder, rgb.as_raw(), (w, h), ExtendedColorType::Rgb8, meta)
         }
         ExportFormat::WebP => encode(WebPEncoder::new_lossless(out), image, meta),
-        ExportFormat::Tiff => encode(TiffEncoder::new(out), image, meta),
         ExportFormat::Gif => {
             // Speed 10: the quantizer's usual compromise.
             let mut encoder = GifEncoder::new_with_speed(out, 10);
             encoder.encode(image.as_raw(), w, h, ExtendedColorType::Rgba8)?;
             Ok(())
         }
+        ExportFormat::Tiff => unreachable!("written by `tiff`"),
         ExportFormat::Psd => unreachable!("written with its layers by `Document::export`"),
     }
 }
@@ -364,40 +456,90 @@ fn encode_with(
     Ok(())
 }
 
-/// An RGBA TIFF with its profile and a Copyright tag.
-fn tiff_with_copyright(
+/// An LZW-compressed TIFF with its profile and a Copyright tag if given:
+/// RGB when opaque, else RGBA with its fourth sample said to be the
+/// transparency (other applications would take it for an extra channel).
+fn tiff(
     image: &RgbaImage,
     out: &mut (impl Write + Seek),
     icc: Option<&[u8]>,
-    copyright: &str,
+    copyright: Option<&str>,
 ) -> Result<(), FileError> {
-    use tiff::encoder::{Compression, TiffEncoder, colortype::RGBA8};
-    let tiff = |e: tiff::TiffError| FileError::Io(std::io::Error::other(e.to_string()));
+    use tiff::encoder::{Compression, TiffEncoder, colortype};
+    use tiff::tags::{ExtraSamples, Tag};
+    let failed = |e: tiff::TiffError| FileError::Io(std::io::Error::other(e.to_string()));
     let mut encoder = TiffEncoder::new(out)
-        .map_err(tiff)?
+        .map_err(failed)?
         .with_compression(Compression::Lzw);
     let (w, h) = image.dimensions();
-    let mut file = encoder.new_image::<RGBA8>(w, h).map_err(tiff)?;
-    // In UTF-8, as readers expect today (the crate only writes ASCII).
+    macro_rules! write {
+        ($kind:ty, $data:expr, $extra:expr) => {{
+            let mut file = encoder.new_image::<$kind>(w, h).map_err(failed)?;
+            if let Some(extra) = $extra {
+                let extra: &[u16] = &[ExtraSamples::to_u16(&extra)];
+                file.encoder()
+                    .write_tag(Tag::ExtraSamples, extra)
+                    .map_err(failed)?;
+            }
+            if let Some(text) = copyright {
+                tiff_copyright(file.encoder(), text).map_err(failed)?;
+            }
+            if let Some(icc) = icc {
+                file.encoder()
+                    .write_tag(Tag::IccProfile, icc)
+                    .map_err(failed)?;
+            }
+            file.write_data($data).map_err(failed)
+        }};
+    }
+    if image.pixels().all(|p| p.0[3] == 255) {
+        let rgb = DynamicImage::ImageRgba8(image.clone()).into_rgb8();
+        write!(colortype::RGB8, rgb.as_raw(), None::<ExtraSamples>)
+    } else {
+        write!(
+            colortype::RGBA8,
+            image.as_raw(),
+            Some(ExtraSamples::UnassociatedAlpha)
+        )
+    }
+}
+
+/// A TIFF's Copyright tag, in UTF-8 as readers expect today (the crate
+/// only writes ASCII).
+fn tiff_copyright<W: Write + Seek, K: tiff::encoder::TiffKind>(
+    encoder: &mut tiff::encoder::DirectoryEncoder<'_, W, K>,
+    copyright: &str,
+) -> tiff::TiffResult<()> {
     let mut text = crate::export::copyright_text(copyright).into_bytes();
     text.push(0);
-    let entry = (file.encoder())
-        .write_entry_bytes(tiff::tags::Type::ASCII, &text)
-        .map_err(tiff)?;
+    let entry = encoder.write_entry_bytes(tiff::tags::Type::ASCII, &text)?;
     let mut tags = tiff::Directory::empty();
     tags.extend([(tiff::tags::Tag::Copyright, entry)]);
-    file.encoder().extend_from(&tags);
-    if let Some(icc) = icc {
-        file.encoder()
-            .write_tag(tiff::tags::Tag::IccProfile, icc)
-            .map_err(tiff)?;
-    }
-    file.write_data(image.as_raw()).map_err(tiff)
+    encoder.extend_from(&tags);
+    Ok(())
+}
+
+/// The JPEG quantization table of Annex K (luminance) at `quality`, scaled
+/// as libjpeg does, for the four inks of a CMYK JPEG.
+fn cmyk_quantization(quality: u8) -> [u16; 64] {
+    const ANNEX_K: [u16; 64] = [
+        16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69,
+        56, 14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81,
+        104, 113, 92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99,
+    ];
+    let quality = u32::from(quality.clamp(1, 100));
+    let scale = if quality < 50 {
+        5000 / quality
+    } else {
+        200 - quality * 2
+    };
+    ANNEX_K.map(|v| ((u32::from(v) * scale + 50) / 100).clamp(1, 255) as u16)
 }
 
 /// Encodes CMYK pixels (4 bytes each, 0 = no ink) of `size` into `out`
 /// as a JPEG (Adobe's marker, the inks inverted as Photoshop writes them)
-/// or an LZW-compressed TIFF, with their profile if given.
+/// or an LZW-compressed TIFF, with their profile and a copyright notice
+/// if given.
 pub fn encode_cmyk(
     cmyk: &[u8],
     (w, h): (u32, u32),
@@ -405,6 +547,7 @@ pub fn encode_cmyk(
     format: ExportFormat,
     quality: u8,
     icc: Option<&[u8]>,
+    copyright: Option<&str>,
 ) -> Result<(), FileError> {
     if w.max(h) > format.max_side() {
         return Err(FileError::FormatTooSmall(format, format.max_side()));
@@ -412,10 +555,27 @@ pub fn encode_cmyk(
     let invalid = |e: String| FileError::Io(std::io::Error::other(e));
     match format {
         ExportFormat::Jpeg => {
-            let mut encoder = jpeg_encoder::Encoder::new(out, quality.clamp(1, 100));
+            let quality = quality.clamp(1, 100);
+            let mut encoder = jpeg_encoder::Encoder::new(out, quality);
+            // The encoder treats cyan, magenta and yellow as chroma: below
+            // quality 90 they would be stored at half resolution (one pixel
+            // of each 2×2 block kept) and quantized more coarsely. Every ink
+            // carries detail, so all four are kept whole, with one table.
+            encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+            let table = cmyk_quantization(quality);
+            encoder.set_quantization_tables(
+                jpeg_encoder::QuantizationTableType::Custom(Box::new(table)),
+                jpeg_encoder::QuantizationTableType::Custom(Box::new(table)),
+            );
             if let Some(icc) = icc {
                 encoder
                     .add_icc_profile(icc)
+                    .map_err(|e| invalid(e.to_string()))?;
+            }
+            if let Some(text) = copyright {
+                let exif = [b"Exif\0\0".as_slice(), &crate::export::copyright_exif(text)].concat();
+                encoder
+                    .add_app_segment(1, exif)
                     .map_err(|e| invalid(e.to_string()))?;
             }
             encoder
@@ -429,6 +589,9 @@ pub fn encode_cmyk(
                 .map_err(tiff)?
                 .with_compression(Compression::Lzw);
             let mut image = encoder.new_image::<CMYK8>(w, h).map_err(tiff)?;
+            if let Some(text) = copyright {
+                tiff_copyright(image.encoder(), text).map_err(tiff)?;
+            }
             if let Some(icc) = icc {
                 image
                     .encoder()
@@ -589,7 +752,16 @@ mod tests {
         let image = RgbaImage::from_pixel(4, 4, image::Rgba([9, 9, 9, 255]));
         let mut out = std::io::Cursor::new(Vec::new());
         let text = "© 2026 Élodie";
-        encode_image(&image, &mut out, ExportFormat::Tiff, 90, None, Some(text)).unwrap();
+        encode_image(
+            &image,
+            &mut out,
+            ExportFormat::Tiff,
+            90,
+            None,
+            Some(text),
+            None,
+        )
+        .unwrap();
         let data = out.into_inner();
         assert!(data.windows(text.len()).any(|w| w == text.as_bytes()));
         let back = image::load_from_memory(&data).unwrap().into_rgba8();
@@ -720,5 +892,132 @@ mod tests {
         let still = dir.join("still.png");
         RgbaImage::new(2, 2).save(&still).unwrap();
         assert!(!read_image(&still).unwrap().animated);
+    }
+
+    /// The EXIF kept for saving over the file has its orientation reset
+    /// (the pixels are already the right way up).
+    #[test]
+    fn exif_is_kept_without_its_orientation() {
+        let mut jpeg = Vec::new();
+        let mut encoder = JpegEncoder::new_with_quality(&mut jpeg, 90);
+        let exif: Vec<u8> = [
+            b"MM\0\x2a\0\0\0\x08".as_slice(),
+            &[0, 1],
+            &[0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0],
+            &[0, 0, 0, 0],
+        ]
+        .concat();
+        encoder.set_exif_metadata(exif.clone()).unwrap();
+        encoder
+            .write_image(&[200; 4 * 2 * 3], 4, 2, ExtendedColorType::Rgb8)
+            .unwrap();
+        let path = dir("exif-kept").join("phone.jpg");
+        std::fs::write(&path, jpeg).unwrap();
+        let decoded = read_image(&path).unwrap();
+        let kept = decoded.exif.expect("kept");
+        assert_eq!(kept.len(), exif.len());
+        assert_eq!(
+            image::metadata::Orientation::from_exif_chunk(&kept),
+            Some(image::metadata::Orientation::NoTransforms)
+        );
+        assert!(decoded.losses.is_empty(), "{:?}", decoded.losses);
+    }
+
+    /// What saving an image over its file in its format would lose is
+    /// known on opening: other frames or pages, depth, inks, metadata.
+    #[test]
+    fn what_an_image_loses_is_known_on_opening() {
+        let dir = dir("losses");
+        let losses = |name: &str| read_image(&dir.join(name)).unwrap().losses;
+        // Plain: nothing.
+        RgbaImage::new(2, 2).save(dir.join("plain.png")).unwrap();
+        assert!(losses("plain.png").is_empty());
+        // Animated GIF.
+        let mut encoder =
+            image::codecs::gif::GifEncoder::new(File::create(dir.join("a.gif")).unwrap());
+        for v in [10, 20, 30] {
+            let frame = image::Frame::new(RgbaImage::from_pixel(4, 4, image::Rgba([v, v, v, 255])));
+            encoder.encode_frame(frame).unwrap();
+        }
+        drop(encoder);
+        assert_eq!(losses("a.gif"), [t!("files4-note-frames")]);
+        // 16 bits.
+        image::ImageBuffer::<image::Rgba<u16>, _>::from_pixel(2, 2, image::Rgba([9000; 4]))
+            .save(dir.join("deep.png"))
+            .unwrap();
+        assert_eq!(losses("deep.png"), [t!("xchg-psd-note-depth", bits = 16)]);
+        // A TIFF of two pages, with a copyright.
+        {
+            use tiff::encoder::{TiffEncoder, colortype::RGB8};
+            let mut out = TiffEncoder::new(File::create(dir.join("pages.tif")).unwrap()).unwrap();
+            let mut first = out.new_image::<RGB8>(2, 2).unwrap();
+            tiff_copyright(first.encoder(), "QA").unwrap();
+            first.write_data(&[5; 12]).unwrap();
+            out.write_image::<RGB8>(2, 2, &[6; 12]).unwrap();
+        }
+        assert_eq!(
+            losses("pages.tif"),
+            [t!("files4-note-pages"), t!("files4-note-metadata")]
+        );
+    }
+
+    /// A TIFF says what its fourth sample is: the transparency (other
+    /// applications would show an extra channel); opaque, it has three.
+    #[test]
+    fn tiff_transparency_is_said_to_be_one() {
+        use tiff::tags::Tag;
+        let samples = |image: &RgbaImage, copyright: Option<&str>| {
+            let mut out = std::io::Cursor::new(Vec::new());
+            encode_image(
+                image,
+                &mut out,
+                ExportFormat::Tiff,
+                90,
+                None,
+                copyright,
+                None,
+            )
+            .unwrap();
+            let bytes = out.into_inner();
+            let mut d = tiff::decoder::Decoder::new(std::io::Cursor::new(&bytes)).unwrap();
+            let n = d.get_tag_u32(Tag::SamplesPerPixel).unwrap();
+            let extra = d
+                .find_tag(Tag::ExtraSamples)
+                .unwrap()
+                .map(|v| v.into_u32().unwrap());
+            let back = image::load_from_memory(&bytes).unwrap().into_rgba8();
+            assert_eq!(back, *image);
+            (n, extra)
+        };
+        let opaque = RgbaImage::from_pixel(3, 2, image::Rgba([1, 2, 3, 255]));
+        let clear = RgbaImage::from_pixel(3, 2, image::Rgba([1, 2, 3, 100]));
+        for copyright in [None, Some("QA")] {
+            assert_eq!(samples(&opaque, copyright), (3, None));
+            assert_eq!(samples(&clear, copyright), (4, Some(2)));
+        }
+    }
+
+    /// CMYK files carry the copyright too.
+    #[test]
+    fn cmyk_files_carry_the_copyright() {
+        for format in [ExportFormat::Jpeg, ExportFormat::Tiff] {
+            let mut out = std::io::Cursor::new(Vec::new());
+            let ink = [10u8; 4 * 8 * 8];
+            encode_cmyk(
+                &ink,
+                (8, 8),
+                &mut out,
+                format,
+                80,
+                None,
+                Some("QA-Copyright-2026"),
+            )
+            .unwrap();
+            let bytes = out.into_inner();
+            assert!(
+                bytes.windows(17).any(|w| w == b"QA-Copyright-2026"),
+                "{format:?}"
+            );
+        }
     }
 }

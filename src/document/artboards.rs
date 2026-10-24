@@ -70,6 +70,8 @@ pub struct ArtboardFiles {
     /// JPEG quality, 1 to 100.
     pub quality: u8,
     pub options: ArtboardExport,
+    /// Files of the same names replaced (else numbered: both kept).
+    pub replace: bool,
 }
 
 /// Side of an artboard, where the "+" buttons add the next one.
@@ -461,7 +463,7 @@ impl Document {
             for (name, image) in render() {
                 let stem = artboard_file_stem(&format!("{}{name}", files.prefix), &mut used);
                 let ext = files.format.extensions()[0];
-                let path = unused_artboard_path(&files.folder, &stem, ext, &mut used);
+                let path = artboard_path(&files.folder, &stem, ext, &mut used, files.replace);
                 let profile = profile.as_deref().map(Vec::as_slice);
                 super::file_io::export(&image, &path, files.format, files.quality, profile)?;
                 written.push(path);
@@ -509,6 +511,20 @@ impl Document {
     }
 }
 
+/// A file name Windows keeps for a device ("CON", "nul.png", "COM1"…).
+pub fn windows_device(name: &str) -> bool {
+    let base = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && base.as_bytes()[3].is_ascii_digit())
+}
+
 /// A file name made of `name`: the characters file systems refuse
 /// replaced, never hidden, empty or a Windows device name, numbered if
 /// already `used` (whatever the case).
@@ -525,21 +541,9 @@ pub fn artboard_file_stem(name: &str, used: &mut Vec<String>) -> String {
         .collect();
     // Windows drops trailing dots and spaces; a leading dot hides a file.
     let clean = clean.trim_matches(|c: char| c.is_whitespace() || c == '.');
-    let device = |s: &str| {
-        let base = s
-            .split('.')
-            .next()
-            .unwrap_or("")
-            .trim_end()
-            .to_ascii_uppercase();
-        matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-            || (base.len() == 4
-                && (base.starts_with("COM") || base.starts_with("LPT"))
-                && base.as_bytes()[3].is_ascii_digit())
-    };
     let clean = match clean {
         "" => t!("artboard-name", number = 1),
-        c if device(c) => format!("{c}_"),
+        c if windows_device(c) => format!("{c}_"),
         c => c.to_string(),
     };
     let mut stem = clean.clone();
@@ -552,15 +556,35 @@ pub fn artboard_file_stem(name: &str, used: &mut Vec<String>) -> String {
     stem
 }
 
-/// The file `stem`.`ext` in `folder`, numbered while one of that name
-/// exists ("Artboard 1-2.png"): an export never replaces a file. The name
+/// The file names `names` (with `prefix`) are exported to in `folder`
+/// with extension `ext`, those that exist: replaced, or kept with the
+/// new files numbered (see [`artboard_path`]).
+pub fn existing_artboard_files(folder: &Path, prefix: &str, names: &[String], ext: &str) -> usize {
+    let mut used = Vec::new();
+    names
+        .iter()
+        .filter(|name| {
+            let stem = artboard_file_stem(&format!("{prefix}{name}"), &mut used);
+            folder.join(format!("{stem}.{ext}")).exists()
+        })
+        .count()
+}
+
+/// The file `stem`.`ext` in `folder`: replaced if `replace`, else
+/// numbered while one of that name exists ("Artboard 1-2.png"). The name
 /// is then `used`.
-pub fn unused_artboard_path(
+pub fn artboard_path(
     folder: &Path,
     stem: &str,
     ext: &str,
     used: &mut Vec<String>,
+    replace: bool,
 ) -> PathBuf {
+    if replace {
+        let path = folder.join(format!("{stem}.{ext}"));
+        used.push(path_stem(&path));
+        return path;
+    }
     let mut path = folder.join(format!("{stem}.{ext}"));
     let mut n = 2;
     while path.exists() || (n > 2 && used.contains(&path_stem(&path))) {
@@ -754,14 +778,25 @@ mod tests {
                 background: true,
                 overlapping: false,
             },
+            replace: false,
         };
         let which = doc.artboards();
+        let names: Vec<String> = which.iter().map(|&i| doc.layers[i].name.clone()).collect();
+        assert_eq!(existing_artboard_files(&folder, "doc_", &names, "png"), 0);
         let written = doc.export_artboards_later(&which, files.clone())().unwrap();
         assert_eq!(written.len(), 2);
+        assert_eq!(existing_artboard_files(&folder, "doc_", &names, "png"), 2);
         // Again: numbered, the first files kept.
-        let again = doc.export_artboards_later(&which, files)().unwrap();
+        let again = doc.export_artboards_later(&which, files.clone())().unwrap();
         assert!(again.iter().all(|p| !written.contains(p) && p.exists()));
         assert!(written.iter().all(|p| p.exists()));
+        // Replacing: the same files.
+        let replace = ArtboardFiles {
+            replace: true,
+            ..files
+        };
+        let replaced = doc.export_artboards_later(&which, replace)().unwrap();
+        assert_eq!(replaced, written);
         for (path, &i) in written.iter().zip(&which) {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             assert!(name.starts_with("doc_") && name.ends_with(".png"), "{name}");

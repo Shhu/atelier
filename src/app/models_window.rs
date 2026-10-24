@@ -118,6 +118,7 @@ impl AtelierApp {
     pub(super) fn forget_document_jobs(&mut self) {
         self.model_prompt = None;
         self.subject_job = None;
+        self.subject_waiting = None;
         self.after_download.clear();
         self.forget_waiting_fill();
         self.object_select.leave_document();
@@ -149,7 +150,7 @@ impl AtelierApp {
                 Err(e @ DownloadError::Cancelled) => self.status = e.to_string(),
                 Err(e) => {
                     let error = e.to_string();
-                    self.status_failed(t!(
+                    self.status_failed(tm!(
                         "models-status-failed",
                         name = model.name(),
                         error = error
@@ -165,8 +166,15 @@ impl AtelierApp {
     /// Continues what waited for a model, now downloaded.
     fn model_downloaded(&mut self, then: AfterDownload) {
         match then {
-            AfterDownload::SelectSubject => self.find_subject(false),
-            AfterDownload::RemoveBackground => self.find_subject(true),
+            AfterDownload::SelectSubject | AfterDownload::RemoveBackground => {
+                let asked = self.subject_waiting.take();
+                if asked.is_some_and(|c| c == self.subject_context()) {
+                    self.find_subject(then == AfterDownload::RemoveBackground);
+                } else {
+                    let name = Model::Subject.name();
+                    self.status = t!("fx3-model-ready-run-again", name = name);
+                }
+            }
             // The Object Selection tool starts its analysis here.
             AfterDownload::ObjectSelection => {}
             AfterDownload::ContentAwareFill => self.content_aware_downloaded(),
@@ -281,7 +289,7 @@ impl AtelierApp {
         if out.other {
             let root = models::root();
             if let Err(e) = open_folder(&root) {
-                self.status_failed(t!("models-open-folder-failed", error = e.to_string()));
+                self.status_failed(tm!("models-open-folder-failed", error = e.to_string()));
             }
         }
         if out.ok || out.cancel {
@@ -457,7 +465,7 @@ impl AtelierApp {
             }
             match model.delete() {
                 Ok(()) => self.status = t!("models-status-deleted", name = model.name()),
-                Err(e) => self.status_failed(t!(
+                Err(e) => self.status_failed(tm!(
                     "models-status-delete-failed",
                     name = model.name(),
                     error = e

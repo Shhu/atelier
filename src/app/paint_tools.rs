@@ -63,6 +63,9 @@ pub(super) struct PaintTools {
     /// Alt + right drag under way: where it started (screen), and the size
     /// and hardness then.
     size_drag: Option<(Pos2, f32, f32)>,
+    /// That drag ended this frame: the right button's release opens no
+    /// menu.
+    pub(super) size_drag_ended: bool,
     pub bucket: BucketSettings,
 }
 
@@ -134,6 +137,7 @@ impl Default for PaintTools {
             previews: Vec::new(),
             rasterize_confirm: None,
             size_drag: None,
+            size_drag_ended: false,
             bucket: BucketSettings {
                 mode: BlendMode::Normal,
                 opacity: 1.0,
@@ -484,6 +488,7 @@ impl AtelierApp {
         };
         if !down {
             self.paint.size_drag = None;
+            self.paint.size_drag_ended = true;
             return false;
         }
         if let Some(p) = pointer {
@@ -520,10 +525,12 @@ impl AtelierApp {
             Tip::Sampled(t) => t.aspect(),
         } * self.paint.roundness;
         let (sin, cos) = (-self.paint.angle.to_radians()).sin_cos();
+        // Segments of about 4 screen pixels: round at any size.
+        let n = ((radius * std::f32::consts::TAU / 4.0) as usize).clamp(48, 512);
         let outline = |r: f32| -> Vec<Pos2> {
-            (0..48)
+            (0..n)
                 .map(|i| {
-                    let a = i as f32 / 48.0 * std::f32::consts::TAU;
+                    let a = i as f32 / n as f32 * std::f32::consts::TAU;
                     let (u, v) = (a.cos() * r, a.sin() * r * minor);
                     pos + vec2(u * cos - v * sin, u * sin + v * cos)
                 })
@@ -582,7 +589,10 @@ impl AtelierApp {
         let Some(doc) = &self.doc else { return true };
         let layer = doc.active_layer();
         if !doc.shown(doc.active) {
-            self.status = t!("tools3-status-layer-hidden", name = layer.name.as_str());
+            self.status_failed(tm!(
+                "tools3-status-layer-hidden",
+                name = layer.name.as_str()
+            ));
             return true;
         }
         if !doc.mask_targeted() && (layer.text.is_some() || layer.shape.is_some()) {
@@ -635,15 +645,7 @@ impl AtelierApp {
     /// A painting tool is chosen and the active layer is locked or hidden:
     /// it would be refused (see `paint_refuses`).
     pub(super) fn paint_blocked(&self) -> bool {
-        let paints = self.tool.sized_brush()
-            || matches!(self.tool, Tool::Gradient | Tool::Bucket | Tool::RedEye);
-        let Some(doc) = self.doc.as_ref().filter(|_| paints) else {
-            return false;
-        };
-        if doc.quick_mask().is_some() {
-            return false;
-        }
-        doc.active_layer().locked || !doc.shown(doc.active)
+        self.paint_block().is_some()
     }
 
     /// Asks to rasterize the text or shape layer a painting tool was used on.

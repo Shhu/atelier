@@ -146,12 +146,18 @@ impl Document {
             let w = canvas.w as usize;
             let (x0, x1) = ((r.x - canvas.x) as usize, (r.right() - canvas.x) as usize);
             let (y0, y1) = ((r.y - canvas.y) as usize, (r.bottom() - canvas.y) as usize);
-            let changed = (y0..y1).any(|y| {
-                (x0..x1).any(|x| {
-                    let i = y * w + x;
-                    gray(src[i * 4..i * 4 + 4].try_into().expect("4")) != mask.as_raw()[i]
-                })
-            });
+            // Compared on all the cores (24 MP after each stroke).
+            let raw = mask.as_raw();
+            let changed = crate::mask_ops::par_collect(y1 - y0, |rows| {
+                let changed = rows.map(|j| y0 + j).any(|y| {
+                    (x0..x1).any(|x| {
+                        let i = y * w + x;
+                        gray(src[i * 4..i * 4 + 4].try_into().expect("4")) != raw[i]
+                    })
+                });
+                vec![changed]
+            })
+            .contains(&true);
             if !changed {
                 return;
             }

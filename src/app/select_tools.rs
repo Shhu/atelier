@@ -50,9 +50,11 @@ impl LassoEdges {
 pub(super) struct Marquee {
     from: Pos2,
     mode: SelectMode,
-    /// Shift (square) and Alt (from the center) active: false when these keys
-    /// were used to choose the mode at click time.
-    constrain: bool,
+    /// Shift (square) and Alt (from the center) active: false while the key
+    /// that chose the mode at click time (Add, Subtract) is still held; once
+    /// let go, pressing it again constrains, like Photoshop.
+    shift_live: bool,
+    alt_live: bool,
     /// Elliptical Marquee.
     ellipse: bool,
     /// Pointer in the previous frame (image): Space held moves the marquee.
@@ -146,6 +148,10 @@ pub(super) struct FreeLasso {
     to: Option<Pos2>,
 }
 
+/// What Select Subject or Remove Background is asked on: the document
+/// (its id, active layer's id, history position) and the selection.
+pub(super) type SubjectContext = (Option<(u64, u64, u64)>, Option<Selection>);
+
 /// Subject search in the background (a few hundred milliseconds).
 pub(super) struct SubjectJob {
     /// Subject coverage, and a note to display (fallback method).
@@ -155,6 +161,8 @@ pub(super) struct SubjectJob {
     /// Remove the background of this layer (id, pixel revision), otherwise
     /// select the subject.
     remove_from: Option<(u64, u64)>,
+    /// The history position searched (see `Document::history_step`).
+    step: u64,
 }
 
 /// Radius (screen pixels) around the first point to close the lasso.
@@ -260,7 +268,8 @@ impl AtelierApp {
             self.marquee = Some(Marquee {
                 from: ip,
                 mode,
-                constrain: !modifiers_chose_mode,
+                shift_live: !(modifiers_chose_mode && shift),
+                alt_live: !(modifiers_chose_mode && alt),
                 ellipse: self.tool == Tool::Ellipse,
                 last: ip,
             });
@@ -271,6 +280,8 @@ impl AtelierApp {
                 m.from += ip - m.last;
             }
             m.last = ip;
+            m.shift_live |= !shift;
+            m.alt_live |= !alt;
         }
         let Some(m) = self.marquee else {
             // The hand: what is under it can be taken and moved.
@@ -299,7 +310,7 @@ impl AtelierApp {
     /// option says; Shift: a square (circle), Alt: from the center.
     fn marquee_rect(&self, m: Marquee, to: Pos2, shift: bool, alt: bool) -> PixelRect {
         let o = &self.sel.shape;
-        let centered = alt && m.constrain;
+        let centered = alt && m.alt_live;
         if o.style == MarqueeStyle::FixedSize {
             // The fixed box follows the pointer: by its corner, or its center.
             let (w, h) = o.size;
@@ -321,7 +332,7 @@ impl AtelierApp {
             let (rw, rh) = (o.ratio.0.max(0.001), o.ratio.1.max(0.001));
             let k = (d.x.abs() / rw).max(d.y.abs() / rh);
             d = vec2((k * rw).copysign(d.x), (k * rh).copysign(d.y));
-        } else if shift && m.constrain {
+        } else if shift && m.shift_live {
             let side = d.x.abs().max(d.y.abs());
             d = vec2(side.copysign(d.x), side.copysign(d.y));
         }
@@ -343,6 +354,15 @@ impl AtelierApp {
         self.select_shape(rect, m.ellipse, m.mode, feather, antialias);
     }
 
+    /// The step of a selection tool's shape is named after the tool now:
+    /// computed in the background, it may land once another tool is
+    /// chosen.
+    fn name_tool_step(&mut self) {
+        if self.tool.selects() && self.sel.step_name.is_none() {
+            self.sel.step_name = Some(self.tool.name());
+        }
+    }
+
     /// A marquee's shape, made (feathered) and combined with the selection
     /// by `mode`.
     pub(super) fn select_shape(
@@ -357,6 +377,7 @@ impl AtelierApp {
             return;
         };
         let pixels = rect.w as u64 * rect.h as u64;
+        self.name_tool_step();
         self.select_later(Then::Select(mode), pixels, move || {
             let shape = if ellipse {
                 Selection::ellipse(rect, canvas, antialias)
@@ -518,6 +539,7 @@ impl AtelierApp {
         };
         let contiguous = self.wand_contiguous;
         let area = w as u64 * h as u64;
+        self.name_tool_step();
         self.select_later(Then::Select(mode), area, move || {
             let image = pixels();
             let mask =
@@ -725,6 +747,7 @@ impl AtelierApp {
             (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
         }
         let pixels = ((x1 - x0).max(0.0) * (y1 - y0).max(0.0)) as u64;
+        self.name_tool_step();
         self.select_later(Then::Select(mode), pixels, move || {
             feathered(
                 Selection::from_polygon(&points, canvas, antialias),
@@ -985,10 +1008,21 @@ impl AtelierApp {
         } else {
             AfterDownload::SelectSubject
         };
-        // Model not downloaded yet: asked first, then continued once there.
+        // Model not downloaded yet: asked first, then continued once there
+        // (if nothing changed meanwhile).
         if self.request_model(then) {
             self.start_subject(remove_background, true);
+        } else {
+            self.subject_waiting = Some(self.subject_context());
         }
+    }
+
+    pub(super) fn subject_context(&self) -> SubjectContext {
+        let doc = self.doc.as_ref();
+        (
+            doc.map(|d| (d.uid(), d.active_layer().id, d.history_step())),
+            self.selection.clone(),
+        )
     }
 
     /// Starts the search in the background: with the AI model, or by
@@ -1021,12 +1055,21 @@ impl AtelierApp {
             } else {
                 (crate::grabcut::select_subject(&image), None)
             };
-            let _ = send.send(found);
+            // A selection only where something shows; a layer mask (Remove
+            // Background) is applied over the layer's opacity already.
+            let (mut mask, note) = found;
+            if !remove_background {
+                for (m, p) in mask.pixels_mut().zip(image.pixels()) {
+                    m.0[0] = ((m.0[0] as u32 * p.0[3] as u32) / 255) as u8;
+                }
+            }
+            let _ = send.send((mask, note));
         });
         self.subject_job = Some(SubjectJob {
             result,
             doc: doc.uid(),
             remove_from,
+            step: doc.history_step(),
         });
         self.status = t!("select-subject-searching");
     }
@@ -1036,23 +1079,30 @@ impl AtelierApp {
         let Some(job) = &self.subject_job else { return };
         let (mask, note) = match job.result.try_recv() {
             Ok(found) => found,
+            // The status says so from the start (not every frame: other
+            // messages stay readable).
             Err(mpsc::TryRecvError::Empty) => {
-                self.status = t!("select-subject-searching");
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 return;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.subject_job = None;
-                self.status_failed(t!("select-subject-failed"));
+                self.status_failed(tm!("select-subject-failed"));
                 return;
             }
         };
-        let (searched, remove_from) = (job.doc, job.remove_from);
+        let (searched, remove_from, step) = (job.doc, job.remove_from, job.step);
         self.subject_job = None;
         // Never on another document.
         let Some(doc) = self.doc.as_mut().filter(|d| d.uid() == searched) else {
             return;
         };
+        // Undone, redone or changed meanwhile: found in another image, and
+        // recording it would wipe the redo list.
+        if doc.history_step() != step {
+            self.status = t!("hist4-subject-history-changed");
+            return;
+        }
         if mask.pixels().all(|p| p.0[0] == 0) {
             self.status = t!("select-subject-not-found");
             return;

@@ -51,6 +51,9 @@ pub(super) struct TypeEdit {
     undo_len: HistoryMark,
     /// Its layer was created for it: dropped if it ends empty.
     created: bool,
+    /// The text before the edit (of an existing layer): an edit that ends
+    /// with it leaves no step.
+    original: Option<TextData>,
     /// When the caret last moved: it shows steadily, then blinks.
     moved: f64,
     /// Ctrl+Z / Ctrl+Shift+Z while typing: the text and its caret and
@@ -60,6 +63,9 @@ pub(super) struct TypeEdit {
     /// When the text last changed; a space or a line typed ends a series.
     changed: f64,
     new_series: bool,
+    /// What an input method is composing (not in the text yet): shown at
+    /// the caret, underlined.
+    pub preedit: String,
 }
 
 /// A text as it was during an edit: its data, its caret and anchor.
@@ -79,12 +85,14 @@ impl TypeEdit {
             goal_x: None,
             typing: None,
             undo_len,
+            original: None,
             created,
             moved: now,
             undo: Vec::new(),
             redo: Vec::new(),
             changed: f64::NEG_INFINITY,
             new_series: false,
+            preedit: String::new(),
         }
     }
 
@@ -231,7 +239,9 @@ impl AtelierApp {
         let (x, y) = canvas_to_text(offset, &t, at);
         let caret = self.text_engine().layout(&t).hit(x, y);
         self.prop_session = None;
-        self.type_tool.edit = Some(TypeEdit::new(id, caret, undo_len, false, now));
+        let mut edit = TypeEdit::new(id, caret, undo_len, false, now);
+        edit.original = Some(t);
+        self.type_tool.edit = Some(edit);
         self.status = t!("type-status-typing");
     }
 
@@ -246,11 +256,19 @@ impl AtelierApp {
         let Some(i) = doc.layers.iter().position(|l| l.id == edit.layer) else {
             return;
         };
-        if !doc.layers[i]
-            .text
-            .as_ref()
-            .is_some_and(|t| t.text.is_empty())
-        {
+        let text = doc.layers[i].text.as_ref();
+        if !text.is_some_and(|t| t.text.is_empty()) {
+            // Back to the text it started with, by its own steps only: no
+            // step is left.
+            let (names, done) = doc.history();
+            let typed = done > 0 && names[done - 1] == t!("xchg-hist-edit-type");
+            if edit.original.is_some()
+                && text == edit.original.as_ref()
+                && typed
+                && doc.steps_since(edit.undo_len) == 1
+            {
+                doc.rollback_to(edit.undo_len);
+            }
             self.status = t!("type-status-committed");
             return;
         }
@@ -430,9 +448,20 @@ impl AtelierApp {
                     let s = s.replace("\r\n", "\n").replace('\r', "\n");
                     self.type_text(&s);
                 }
-                // What an input method (Chinese, Japanese, Korean…) composed.
-                egui::Event::Ime(egui::ImeEvent::Commit(s)) if !s.is_empty() => {
-                    self.type_text(&s);
+                // What an input method (Chinese, Japanese, Korean…) is
+                // composing, then composed.
+                egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                    if let Some(edit) = &mut self.type_tool.edit {
+                        edit.preedit = text;
+                    }
+                }
+                egui::Event::Ime(egui::ImeEvent::Commit(s)) => {
+                    if let Some(edit) = &mut self.type_tool.edit {
+                        edit.preedit.clear();
+                    }
+                    if !s.is_empty() {
+                        self.type_text(&s);
+                    }
                 }
                 egui::Event::Copy | egui::Event::Cut => {
                     if let Some(s) = self.selected_text() {
@@ -479,7 +508,7 @@ impl AtelierApp {
                 }
             }
             // The edit's own changes first, like Photoshop: the edit goes on.
-            Key::Z | Key::Y if ctrl && self.undo_typing(shift || key == Key::Y) => {}
+            Key::Z if ctrl && self.undo_typing(shift) => {}
             Key::Z if ctrl && !shift => {
                 // A new text with nothing typed: it goes, nothing else.
                 let empty_new = self.type_tool.edit.as_ref().is_some_and(|e| e.created)
@@ -493,10 +522,17 @@ impl AtelierApp {
                     self.run(Action::Undo);
                 }
             }
-            Key::Z | Key::Y if ctrl => {
+            Key::Z if ctrl => {
                 self.commit_text();
                 self.run(Action::Redo);
             }
+            // Proof Colors and Gamut Warning, the edit going on (redo is
+            // Shift+Ctrl+Z).
+            Key::Y if ctrl => self.color_command(if shift {
+                color_ui::Command::GamutWarning
+            } else {
+                color_ui::Command::ProofColors
+            }),
             Key::ArrowLeft | Key::ArrowRight if alt => {
                 // Tracking, like Photoshop: 20/1000 em (Ctrl: 100).
                 let step = if ctrl { 100.0 } else { 20.0 };
@@ -1002,6 +1038,29 @@ impl AtelierApp {
                 should_interrupt_composition: false,
             });
         });
+        // The text being composed, at the caret, underlined.
+        if !edit.preedit.is_empty() {
+            let size = (cursor_rect.height() * 0.8).clamp(8.0, 200.0);
+            let galley = painter.layout_no_wrap(
+                edit.preedit.clone(),
+                egui::FontId::proportional(size),
+                Color32::BLACK,
+            );
+            let at = pos2(
+                cursor_rect.left(),
+                cursor_rect.center().y - galley.size().y / 2.0,
+            );
+            let r = Rect::from_min_size(at, galley.size()).expand(2.0);
+            painter.rect_filled(r, 2.0, Color32::WHITE);
+            painter.line_segment(
+                [
+                    pos2(r.left() + 2.0, r.bottom() - 1.0),
+                    pos2(r.right() - 2.0, r.bottom() - 1.0),
+                ],
+                UiStroke::new(1.0, Color32::BLACK),
+            );
+            painter.galley(at, galley, Color32::BLACK);
+        }
         // The caret: shown for a while after it moved, then blinking.
         let now = self.ctx.input(|i| i.time);
         let phase = (now - edit.moved).max(0.0) % 1.0;

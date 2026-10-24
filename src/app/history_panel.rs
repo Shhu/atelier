@@ -78,6 +78,15 @@ impl AtelierApp {
     /// as many undos or redos.
     pub(super) fn go_to_history(&mut self, done: usize) {
         let _measured = crate::diag::timer("History: go to step");
+        // The steps up to the one clicked, by number: what ends first may
+        // add steps, or remove one (an empty text given up).
+        let wanted = self.doc.as_ref().map_or_else(Vec::new, |d| {
+            let numbers = d.history_numbers();
+            numbers[..done.min(numbers.len())].to_vec()
+        });
+        // A selection still being computed applies first, to the state it
+        // was computed from.
+        self.wait_select_job();
         self.finish_stroke();
         // A text being typed is committed first, as by Undo: its own steps
         // are then ordinary ones.
@@ -87,7 +96,14 @@ impl AtelierApp {
         }
         self.reset_pending();
         self.settle_selection();
-        if self.doc.as_mut().is_some_and(|d| d.go_to_step(done)) {
+        let Some(doc) = &mut self.doc else { return };
+        let numbers = doc.history_numbers();
+        let done = wanted
+            .iter()
+            .rev()
+            .find_map(|n| numbers.iter().position(|m| m == n))
+            .map_or(0, |i| i + 1);
+        if doc.go_to_step(done) {
             self.reset_pending();
             self.pull_selection();
         }
@@ -173,14 +189,20 @@ fn history_row(
             ui_kit::color::MUTED
         },
     );
-    let text = painter.with_clip_rect(rect.shrink2(vec2(6.0, 0.0)).intersect(painter.clip_rect()));
-    text.text(
+    // Too long, the name ends with "…" and shows whole on hover.
+    let elided = ui_kit::elided_text(
+        painter,
         pos2(rect.left() + 32.0, rect.center().y),
-        Align2::LEFT_CENTER,
         name,
         FontId::proportional(ui_kit::TEXT_SIZE),
         color,
+        rect.right() - 6.0 - (rect.left() + 32.0),
     );
+    let response = if elided {
+        response.on_hover_text(name)
+    } else {
+        response
+    };
     response
         .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, current, name));
     response

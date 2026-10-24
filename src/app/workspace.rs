@@ -26,22 +26,26 @@ pub(super) const SHORTCUT_SIDE_PANEL: KeyboardShortcut =
 
 const WEBSITE: &str = "https://shu-app.com/atelier/";
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+/// Where problems are reported (Help › Report a Problem, then Diagnostics'
+/// button, with the report copied).
+pub(super) const ISSUES_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/issues");
 
 /// What the user arranged, kept from one session to the next.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 #[serde(default)]
 pub(super) struct Layout {
     pub side_width: f32,
-    /// Height of the Layers part of the side panel, as dragged; `None`:
-    /// fitted to the list.
-    pub layers_height: Option<f32>,
+    /// Share of the side panel's height given to the Layers part, as
+    /// dragged (a share, so that it suits any window); `None`: fitted to
+    /// the list.
+    pub layers_share: Option<f32>,
 }
 
 impl Default for Layout {
     fn default() -> Self {
         Self {
             side_width: SIDE_WIDTH,
-            layers_height: None,
+            layers_share: None,
         }
     }
 }
@@ -56,7 +60,7 @@ impl Layout {
             .and_then(|json| serde_json::from_slice::<Self>(&json).ok())
             .map(|l| Self {
                 side_width: l.side_width.clamp(SIDE_MIN, SIDE_MAX),
-                ..l
+                layers_share: l.layers_share.map(|s| s.clamp(0.0, 1.0)),
             })
             .unwrap_or_default()
     }
@@ -83,7 +87,7 @@ pub(super) struct Workspace {
     /// Shift+Tab, Window › Layers or Properties: the side panel is hidden.
     pub hide_side: bool,
     /// Help › Keyboard Shortcuts open, and its filter.
-    shortcuts: Option<String>,
+    pub shortcuts: Option<String>,
     about: bool,
     /// A failed open or save, shown until dismissed.
     alert: Option<String>,
@@ -143,8 +147,10 @@ impl AtelierApp {
                     return;
                 };
                 self.open_path(&path);
-                if self.tab_of(&path).is_none() {
-                    self.recent.remove(&path);
+                // Gone: off both lists (a RAW file opens later, through
+                // Camera Raw).
+                if !path.exists() {
+                    self.recent.forget(&path);
                 }
             }
             Command::ClearRecent => self.recent.clear(),
@@ -169,9 +175,9 @@ impl AtelierApp {
             }
             Command::Shortcuts => self.workspace.shortcuts = Some(String::new()),
             Command::Website => self.ctx.open_url(egui::OpenUrl::new_tab(WEBSITE)),
-            Command::ReportProblem => self
-                .ctx
-                .open_url(egui::OpenUrl::new_tab(format!("{REPOSITORY}/issues"))),
+            // Diagnostics first: its button copies the report and opens
+            // the page.
+            Command::ReportProblem => self.open_diagnostics(),
             Command::Diagnostics => self.open_diagnostics(),
             Command::About => self.workspace.about = true,
         }
@@ -187,51 +193,63 @@ impl AtelierApp {
         !self.workspace.hide_all && !self.workspace.hide_side
     }
 
-    /// A painting or retouching tool over a locked layer (not in Quick
-    /// Mask Mode, where it paints the mask): its strokes would be refused.
+    /// Why a painting or retouching tool can't change the active layer
+    /// (not in Quick Mask Mode, where it paints the mask): its strokes
+    /// would be refused, said before the click.
+    pub(super) fn paint_block(&self) -> Option<PaintBlock> {
+        let paints = self.tool.sized_brush()
+            || matches!(
+                self.tool,
+                Tool::Gradient | Tool::Bucket | Tool::RedEye | Tool::Patch
+            );
+        let doc = self
+            .doc
+            .as_ref()
+            .filter(|d| paints && d.quick_mask().is_none())?;
+        if doc.active_layer().locked {
+            Some(PaintBlock::Locked)
+        } else if !doc.shown(doc.active) {
+            Some(PaintBlock::Hidden)
+        } else {
+            None
+        }
+    }
+
+    /// A painting tool over a locked layer.
     pub(super) fn paints_on_locked_layer(&self) -> bool {
-        let paints = matches!(
-            self.tool,
-            Tool::Brush
-                | Tool::Eraser
-                | Tool::CloneStamp
-                | Tool::SpotHealing
-                | Tool::HealingBrush
-                | Tool::Patch
-                | Tool::RedEye
-                | Tool::Gradient
-                | Tool::Bucket
-                | Tool::Blur
-                | Tool::Sharpen
-                | Tool::Smudge
-                | Tool::Dodge
-                | Tool::Burn
-                | Tool::Sponge
-        );
-        paints
-            && self
-                .doc
-                .as_ref()
-                .is_some_and(|d| d.quick_mask().is_none() && d.active_layer().locked)
+        self.paint_block() == Some(PaintBlock::Locked)
     }
 
     /// Reports a failed operation: in the status bar, in the warning color,
     /// and in a window that stays until dismissed (`alert`), so that it
     /// can't go unnoticed. Batch runs keep only the status.
-    pub(super) fn report_error(&mut self, message: String) {
-        crate::diag::error(&message);
+    pub(super) fn report_error(&mut self, message: impl Into<crate::i18n::Message>) {
+        let message = message.into();
+        crate::diag::error(message.clone());
+        let message = message.shown;
         self.status = message.clone();
         self.workspace.error_status = Some(message.clone());
         if !self.automate.running() {
-            self.workspace.alert = Some(message);
+            // Several at once (files dropped together): all of them.
+            match &mut self.workspace.alert {
+                Some(shown) if *shown != message => {
+                    shown.push('\n');
+                    shown.push_str(&message);
+                }
+                _ => self.workspace.alert = Some(message),
+            }
         }
     }
 
     /// Reports a failed operation in the status bar only (and the
-    /// diagnostics' log), for what can be tried again at once.
-    pub(super) fn status_failed(&mut self, message: String) {
-        crate::diag::error(&message);
-        self.status = message;
+    /// diagnostics' log), in the warning color, for what can be tried
+    /// again at once.
+    pub(super) fn status_failed(&mut self, message: impl Into<crate::i18n::Message>) {
+        let message = message.into();
+        crate::diag::error(message.clone());
+        let message = message.shown;
+        self.status = message.clone();
+        self.workspace.error_status = Some(message);
     }
 
     /// File › Open Recent: the recent files (by name, with their folder
@@ -296,11 +314,12 @@ impl AtelierApp {
                 None,
                 Action::History,
             ),
+            // One side panel holds both: one item, named for both.
             Check(
-                t!("panel-layers"),
+                t!("ui4-menu-layers-properties"),
                 true,
                 side,
-                None,
+                Some(&SHORTCUT_SIDE_PANEL),
                 Action::Workspace(Command::ToggleSidePanel),
             ),
             Check(
@@ -309,13 +328,6 @@ impl AtelierApp {
                 self.vector.panel.open,
                 None,
                 Action::Paths,
-            ),
-            Check(
-                t!("panel-properties"),
-                true,
-                side,
-                None,
-                Action::Workspace(Command::ToggleSidePanel),
             ),
             Check(
                 t!("uip-menu-swatches"),
@@ -524,10 +536,24 @@ impl AtelierApp {
         }
         let mut rows = Vec::new();
         let tools = t!("palette-tools");
+        // One row per key: the tools that share it, and Shift+key to go
+        // from one to the next.
+        let mut keyed: Vec<(Key, Vec<String>)> = Vec::new();
         for tool in Tool::ALL {
-            if let Some(k) = tool.shortcut() {
-                rows.push((tools.clone(), tool.name(), k.name().to_owned()));
+            let Some(k) = tool.shortcut() else { continue };
+            match keyed.iter_mut().find(|(key, _)| *key == k) {
+                Some((_, names)) => names.push(tool.name()),
+                None => keyed.push((k, vec![tool.name()])),
             }
+        }
+        for (k, names) in keyed {
+            let key = if names.len() > 1 {
+                let next = keys::shortcut(ctx, &KeyboardShortcut::new(Modifiers::SHIFT, k));
+                t!("ui4-shortcuts-tools-cycle", key = k.name(), next = next)
+            } else {
+                k.name().to_owned()
+            };
+            rows.push((tools.clone(), names.join(", "), key));
         }
         for (title, entries) in self.menus() {
             walk(ctx, &entries, &title, &title, &mut rows);
@@ -566,16 +592,37 @@ impl AtelierApp {
         let response = ui
             .interact(grip, egui::Id::new("side-panel-grip"), Sense::drag())
             .on_hover_cursor(CursorIcon::ResizeHorizontal);
+        // The width at the press, and where it was: the edge follows the
+        // pointer, past a limit and back again.
+        let start_id = egui::Id::new("side-panel-grip-start");
+        if response.drag_started()
+            && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+        {
+            ui.data_mut(|d| d.insert_temp(start_id, (panel.width(), origin.x)));
+        }
         if response.dragged() {
             ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+            // From the width shown (less than the saved one in a narrow
+            // window).
+            let (width, x) = ui
+                .data(|d| d.get_temp::<(f32, f32)>(start_id))
+                .unwrap_or((panel.width(), panel.left()));
+            let pointer = response.interact_pointer_pos().map_or(x, |p| p.x);
             let layout = &mut self.workspace.layout;
-            layout.side_width =
-                (layout.side_width - response.drag_delta().x).clamp(SIDE_MIN, SIDE_MAX);
+            layout.side_width = (width - (pointer - x)).clamp(SIDE_MIN, SIDE_MAX);
         }
         if response.drag_stopped() {
             self.workspace.save_layout();
         }
     }
+}
+
+/// Why the painting tools would refuse the active layer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum PaintBlock {
+    Locked,
+    /// Hidden, or in a hidden group.
+    Hidden,
 }
 
 /// Warning color: errors in the status bar and the alert.
@@ -633,6 +680,51 @@ mod tests {
         assert_eq!(toolbar::columns(600.0), 2);
     }
 
+    /// 1366 × 768 at 125 % (1093 × 614 points): the two columns are packed,
+    /// so the last tools (Hand, Zoom) are above the colors, not scrolled out.
+    #[test]
+    fn two_columns_pack_the_tools_on_a_scaled_laptop() {
+        let mut h = app([1093.0, 614.0], true);
+        h.run_steps(2);
+        // Above the colors (40) and the status bar (28).
+        let bottom = h.ctx.content_rect().bottom() - 28.0 - 40.0;
+        for tool in [Tool::Hand, Tool::Zoom] {
+            let slot = h
+                .get_all_by_label(&tool.name())
+                .map(|n| n.rect())
+                .find(|r| r.left() < 100.0)
+                .expect("in the toolbar");
+            assert!(slot.bottom() <= bottom, "{} at {slot:?}", tool.name());
+        }
+    }
+
+    /// The Move tool's bar during Free Transform keeps Auto-Select (greyed)
+    /// and never splits Apply from Cancel, whatever the width.
+    #[test]
+    fn the_move_bar_keeps_its_items_and_apply_next_to_cancel() {
+        for width in [1600.0, 1366.0, 1024.0, 820.0] {
+            let mut h = app([width, 768.0], true);
+            h.state_mut().set_tool(Tool::Transform);
+            h.state_mut()
+                .run(Action::Transform(transform::Command::Free));
+            h.run_steps(3);
+            assert!(h.query_by_label(&t!("input3-auto-select")).is_some());
+            let in_bar = |h: &Harness<'static, AtelierApp>, label: &str| {
+                h.get_all_by_label(label)
+                    .map(|n| n.rect())
+                    .find(|r| r.top() < 40.0 + 3.0 * 46.0)
+                    .unwrap_or_else(|| panic!("{label} in the options bar at {width}"))
+            };
+            let apply = in_bar(&h, &t!("options-apply"));
+            let cancel = in_bar(&h, &t!("dialog-cancel"));
+            assert!(
+                (apply.center().y - cancel.center().y).abs() < 4.0,
+                "{width}: {apply:?} {cancel:?}"
+            );
+            assert!(apply.left() > cancel.left(), "{width}");
+        }
+    }
+
     /// The Layer menu, taller than a small laptop's window, scrolls instead
     /// of covering the menu bar.
     #[test]
@@ -684,7 +776,7 @@ mod tests {
         assert!(h.query_by_label(&layers).is_none());
         assert!(h.query_by_label(&Tool::Brush.name()).is_some());
         assert!(h.ctx.memory(|m| m.focused()).is_none());
-        // Window › Layers brings it back.
+        // Window › Layers and Properties brings it back.
         h.state_mut()
             .run(Action::Workspace(Command::ToggleSidePanel));
         h.run_steps(2);
@@ -706,9 +798,8 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(labels.len(), 7);
-            assert!(labels.contains(&t!("panel-layers")));
-            assert!(labels.contains(&t!("panel-properties")));
+            assert_eq!(labels.len(), 6);
+            assert!(labels.contains(&t!("ui4-menu-layers-properties")));
             let mut sorted = labels.clone();
             sorted.sort_by_key(|l| super::super::palette::fold(l));
             assert_eq!(labels, sorted, "{}", lang.code());
@@ -734,6 +825,84 @@ mod tests {
         h.state_mut().run(Action::Workspace(Command::ClearRecent));
         assert!(h.state().recent.paths().is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A recent file that is gone leaves both lists (the menu's too); a
+    /// RAW file, which opens later through Camera Raw, stays.
+    #[test]
+    fn a_missing_recent_file_leaves_the_menu_and_a_raw_one_stays() {
+        let dir = std::env::temp_dir().join(format!("atelier-ui4-recent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gone = dir.join("gone.png");
+        let raw = dir.join("photo.dng");
+        std::fs::write(&raw, b"not really a raw file").unwrap();
+        let mut h = app([1280.0, 800.0], false);
+        h.state_mut().recent = crate::recent::Recent::with_paths(vec![gone, raw.clone()]);
+        h.state_mut().run(Action::Workspace(Command::OpenRecent(0)));
+        h.run_steps(2);
+        assert_eq!(h.state().recent.paths(), std::slice::from_ref(&raw));
+        h.state_mut().run(Action::Workspace(Command::OpenRecent(0)));
+        h.run_steps(2);
+        assert_eq!(h.state().recent.paths(), [raw]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An image dropped on the tab bar opens in a tab of its own; dropped
+    /// on the canvas, it is placed in the document.
+    #[test]
+    fn a_drop_on_the_tabs_opens_and_on_the_canvas_places() {
+        let dir = std::env::temp_dir().join(format!("atelier-ui4-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dropped.png");
+        image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]))
+            .save(&path)
+            .unwrap();
+        #[derive(Debug)]
+        struct Dropped(PathBuf);
+        impl egui::DroppedFile for Dropped {
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+            fn bytes(&self) -> Result<Vec<u8>, String> {
+                std::fs::read(&self.0).map_err(|e| e.to_string())
+            }
+        }
+        let mut h = app([1280.0, 800.0], true);
+        let drop = |h: &mut Harness<'static, AtelierApp>, at: Pos2| {
+            h.hover_at(at);
+            h.run_steps(1);
+            h.input_mut()
+                .dropped_files
+                .push(std::sync::Arc::new(Dropped(path.clone())));
+            h.run_steps(3);
+            // Placed through Free Transform: Enter places it.
+            if h.state().transform_pending() {
+                h.key_press(Key::Enter);
+                h.run_steps(2);
+            }
+        };
+        // The tab strip, under the title and options bars.
+        drop(&mut h, pos2(400.0, 40.0 + 46.0 + 17.0));
+        assert_eq!(h.state().tab_count(), 2);
+        let layers = h.state().doc.as_ref().map_or(0, |d| d.layers.len());
+        drop(&mut h, pos2(500.0, 400.0));
+        assert_eq!(h.state().tab_count(), 2);
+        let after = h.state().doc.as_ref().map_or(0, |d| d.layers.len());
+        assert_eq!(after, layers + 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Several files that fail together are all reported.
+    #[test]
+    fn failures_at_once_are_all_in_the_alert() {
+        let mut h = app([1280.0, 800.0], false);
+        h.state_mut().report_error("first");
+        h.state_mut().report_error("second");
+        let alert = h.state().workspace.alert.clone().unwrap_or_default();
+        assert!(
+            alert.contains("first") && alert.contains("second"),
+            "{alert}"
+        );
     }
 
     #[test]
@@ -815,10 +984,55 @@ mod tests {
         h.run_steps(1);
         h.drop_at(at - vec2(0.0, 120.0));
         h.run_steps(2);
-        let dragged = h.state().workspace.layout.layers_height;
+        let dragged = h.state().workspace.layout.layers_share;
         assert!(dragged.is_some(), "the split moved");
         let moved = h.get_by_label(&t!("panel-layers")).rect();
         assert!(moved.top() < heading.top() - 100.0, "{moved:?}");
+    }
+
+    /// A split dragged on a tall screen (most of the panel for the Layers)
+    /// still leaves the Properties readable in a small window.
+    #[test]
+    fn a_saved_split_keeps_room_for_the_properties() {
+        let mut h = app([1280.0, 720.0], true);
+        h.state_mut().workspace.layout.layers_share = Some(1.0);
+        h.run_steps(3);
+        let properties = h.get_by_label(&t!("panel-properties")).rect();
+        let layers = h.get_by_label(&t!("panel-layers")).rect();
+        assert!(
+            layers.top() - properties.top() >= 160.0,
+            "{properties:?} {layers:?}"
+        );
+    }
+
+    /// With many layers on a low panel, the default split shows 3 rows,
+    /// not 5, and leaves the Properties their room.
+    #[test]
+    fn many_layers_on_a_small_screen_leave_room_for_the_properties() {
+        let mut h = app([1093.0, 614.0], true);
+        for _ in 0..7 {
+            h.state_mut().run(Action::NewLayer);
+        }
+        h.run_steps(3);
+        let properties = h.get_by_label(&t!("panel-properties")).rect();
+        let layers = h.get_by_label(&t!("panel-layers")).rect();
+        assert!(
+            layers.top() - properties.top() >= 200.0,
+            "{properties:?} {layers:?}"
+        );
+    }
+
+    /// A wide side panel, saved on a large screen, leaves a narrow window's
+    /// canvas its room (and comes back when the window grows).
+    #[test]
+    fn a_saved_side_width_leaves_room_for_the_canvas() {
+        let mut h = app([800.0, 700.0], true);
+        h.state_mut().workspace.layout.side_width = SIDE_MAX;
+        h.run_steps(3);
+        let layers = h.get_by_label(&t!("panel-layers")).rect();
+        let toolbar = toolbar::width(toolbar::columns(700.0 - 40.0 - 46.0 - 28.0));
+        assert!(layers.left() >= toolbar + 360.0 - 1.0, "{layers:?}");
+        assert_eq!(h.state().workspace.layout.side_width, SIDE_MAX);
     }
 
     /// The side panel is wider when its edge is dragged, within limits.

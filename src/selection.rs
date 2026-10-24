@@ -65,6 +65,19 @@ impl Selection {
             }
     }
 
+    /// Selects exactly the same pixels as `other` (masks compared pixel by
+    /// pixel when they are not the same buffer): a recomputed selection
+    /// that changed nothing.
+    pub fn equal(&self, other: &Selection) -> bool {
+        self.rect == other.rect
+            && self.inverted == other.inverted
+            && match (&self.mask, &other.mask) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.as_raw() == b.as_raw(),
+                _ => false,
+            }
+    }
+
     /// Coverage of canvas pixel (x, y).
     pub fn coverage(&self, x: i64, y: i64) -> u8 {
         let r = self.rect;
@@ -406,6 +419,13 @@ impl Selection {
     /// Outline (canvas coordinates): segments between selected and unselected
     /// pixels, grouped into horizontal and vertical lines.
     pub fn outline(&self, canvas: PixelRect) -> Vec<[(i64, i64); 2]> {
+        self.outline_within(canvas, usize::MAX).expect("no limit")
+    }
+
+    /// The outline, unless it has more than `limit` segments (a speckled
+    /// selection: then drawn from the coverage instead).
+    pub fn outline_within(&self, canvas: PixelRect, limit: usize) -> Option<Vec<[(i64, i64); 2]>> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         if self.mask.is_none() {
             let rect_edges = |r: PixelRect| {
                 let (x0, y0, x1, y1) = (r.x, r.y, r.right(), r.bottom());
@@ -420,7 +440,7 @@ impl Selection {
             if self.inverted {
                 edges.extend(rect_edges(canvas));
             }
-            return edges;
+            return (edges.len() <= limit).then_some(edges);
         }
         // Area examined: the selection, plus a one-pixel border; what is
         // selected there first, in parallel.
@@ -435,10 +455,25 @@ impl Selection {
         let (row, raw) = (border.w as usize, coverage.as_raw());
         let inside =
             |x: i64, y: i64| raw[(y - border.y) as usize * row + (x - border.x) as usize] >= 128;
+        // Segments found so far, by all the bands: they stop past `limit`.
+        let (found, stopped) = (AtomicUsize::new(0), AtomicBool::new(false));
+        let over = |band: &Vec<[(i64, i64); 2]>, counted: &mut usize| {
+            let new = band.len() - *counted;
+            *counted = band.len();
+            let total = found.fetch_add(new, Ordering::Relaxed) + new;
+            if total > limit || stopped.load(Ordering::Relaxed) {
+                stopped.store(true, Ordering::Relaxed);
+                return true;
+            }
+            false
+        };
         // Horizontal edges: between (x, y-1) and (x, y), by bands of rows.
         let mut edges = par_collect(area.h as usize + 1, |rows| {
-            let mut edges = Vec::new();
+            let (mut edges, mut counted) = (Vec::new(), 0);
             for y in rows.map(|i| area.y + i as i64) {
+                if over(&edges, &mut counted) {
+                    return Vec::new();
+                }
                 let mut run: Option<i64> = None;
                 for x in area.x..=area.right() {
                     let edge = x < area.right() && inside(x, y - 1) != inside(x, y);
@@ -456,8 +491,11 @@ impl Selection {
         });
         // Vertical edges: between (x-1, y) and (x, y), by bands of columns.
         edges.extend(par_collect(area.w as usize + 1, |columns| {
-            let mut edges = Vec::new();
+            let (mut edges, mut counted) = (Vec::new(), 0);
             for x in columns.map(|i| area.x + i as i64) {
+                if over(&edges, &mut counted) {
+                    return Vec::new();
+                }
                 let mut run: Option<i64> = None;
                 for y in area.y..=area.bottom() {
                     let edge = y < area.bottom() && inside(x - 1, y) != inside(x, y);
@@ -473,7 +511,7 @@ impl Selection {
             }
             edges
         }));
-        edges
+        (!stopped.load(Ordering::Relaxed) && edges.len() <= limit).then_some(edges)
     }
 }
 
@@ -733,5 +771,18 @@ mod tests {
         assert_eq!(sel.outline(canvas).len(), 8);
         let within = sel.clone().translate(-1, 0).within(canvas).unwrap();
         assert_eq!(within.rect, rect(0, 0, 5, 2));
+    }
+
+    /// Past its limit, the outline gives up (a speckled selection is drawn
+    /// from its coverage); within it, it is the whole outline.
+    #[test]
+    fn outline_within_a_limit() {
+        let mask = GrayImage::from_fn(64, 64, |x, y| Luma([((x + y) % 2) as u8 * 255]));
+        let sel = Selection::from_mask(&mask, (0, 0)).unwrap();
+        let canvas = rect(0, 0, 64, 64);
+        let all = sel.outline(canvas);
+        assert!(all.len() > 100);
+        assert_eq!(sel.outline_within(canvas, all.len()), Some(all.clone()));
+        assert_eq!(sel.outline_within(canvas, 20), None);
     }
 }

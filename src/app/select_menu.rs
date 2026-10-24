@@ -13,7 +13,7 @@ use super::canvas::{draw_frame, pointer_angle, rotate_around, rotate_handle_pos}
 use super::color_range::ColorRange;
 use super::dialogs::{DialogSpec, block, floating_dialog, gap_between_blocks};
 use super::render::GpuImage;
-use super::select_mask::{Output, SelectMask};
+use super::select_mask::{OutputTo, SelectMask};
 use super::select_tools::{FreeLasso, ShapeOptions, combined};
 use super::*;
 use crate::i18n::t;
@@ -185,7 +185,7 @@ pub(super) enum Then {
     /// nothing, or nothing visible, is left.
     Modified,
     /// Select and Mask's output.
-    Output(Output),
+    Output(OutputTo),
 }
 
 /// A selection being computed in the background, for a document, from
@@ -195,6 +195,8 @@ struct SelectJob {
     doc: u64,
     then: Then,
     base: Option<Selection>,
+    /// The history position it started from (see `Document::history_step`).
+    step: u64,
     name: Option<String>,
 }
 
@@ -512,6 +514,7 @@ impl AtelierApp {
             doc: doc.uid(),
             then,
             base: self.selection.clone(),
+            step: doc.history_step(),
             name: self.sel.step_name.take(),
         });
         self.status = t!("sel-status-working");
@@ -546,7 +549,13 @@ impl AtelierApp {
             return;
         };
         self.status.clear();
-        if self.doc.as_ref().is_none_or(|d| d.uid() != job.doc) {
+        let Some(doc) = self.doc.as_ref().filter(|d| d.uid() == job.doc) else {
+            return;
+        };
+        // Undone, redone or changed meanwhile: it was computed from
+        // another state, and recording it would wipe the redo list.
+        if doc.history_step() != job.step {
+            self.status = t!("hist4-selection-history-changed");
             return;
         }
         let unchanged = match (&job.base, &self.selection) {
@@ -558,8 +567,10 @@ impl AtelierApp {
             self.status = t!("hist3-selection-changed");
             return;
         }
-        self.sel.step_name = job.name;
+        // The name already given to what comes next stays its own.
+        let next = std::mem::replace(&mut self.sel.step_name, job.name);
         self.finish_select(result, job.then);
+        self.sel.step_name = next;
     }
 
     /// A selection computed in the background is still to come.

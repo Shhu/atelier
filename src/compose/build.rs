@@ -111,6 +111,15 @@ pub(crate) fn siblings(
 }
 
 /// Fingerprint of anything (Debug for the settings holding floats).
+/// Versions of a layer's pixels and mask as its reductions know them (see
+/// [`super::Hint`]).
+pub fn source_versions(l: &Layer) -> [u64; 2] {
+    let mask = l
+        .active_mask()
+        .map_or(0, |m| hash_of((m.rev(), m.feather.to_bits())));
+    [l.rev(), mask]
+}
+
 fn hash_of(value: impl Hash) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut h);
@@ -364,9 +373,14 @@ impl Builder<'_, '_> {
                 at: p.at,
             },
             (_, Some(p)) if p.layer == l.id => self.sources.gray(key, p.version, p.image, p.origin),
+            // The display: a feather radius being changed shows once ready.
+            _ if self.opts.later_styles => {
+                let (image, origin, shown) = m.shaped_later(l.offset);
+                self.sources.gray(key, hash_of(shown), &image, origin)
+            }
             _ => {
                 let (image, origin) = m.shaped(l.offset);
-                let version = hash_of((m.rev(), m.feather.to_bits()));
+                let version = source_versions(l)[1];
                 self.sources.gray(key, version, &image, origin)
             }
         };
@@ -526,10 +540,14 @@ pub fn signatures(layers: &[Layer], opts: &Options) -> Vec<Sig> {
         let (mask_rev, mask) = match (placed_mask, opts.mask, l.active_mask()) {
             (Some(p), _, Some(_)) => (p.version, hash_of(p.rect)),
             (_, Some(p), _) if p.layer == l.id => (p.version, hash_of(p.origin)),
-            (_, _, Some(m)) => (
-                m.rev(),
-                debug_hash(&(m.origin(l.offset), m.default, m.density, m.feather)),
-            ),
+            (_, _, Some(m)) => {
+                // The feathered image shown (see `Mask::shaped_later`).
+                let shown = opts.later_styles.then(|| m.shaped_later(l.offset).2);
+                (
+                    m.rev(),
+                    debug_hash(&(m.origin(l.offset), m.default, m.density, m.feather, shown)),
+                )
+            }
             _ => (0, 0),
         };
         let placed = opts.placed.iter().find(|p| p.layer == i);

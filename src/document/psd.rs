@@ -13,8 +13,9 @@
 //! Writing (8-bit RGB, or CMYK converted through a profile; RLE
 //! compressed) keeps the layers with all of the
 //! above, the saved selections as alpha channels, the guides, the color
-//! profile, and the flattened image for the applications that only read
-//! that.
+//! profile, the opened file's resources that describe the document
+//! (resolution, XMP, IPTC, EXIF, print settings) as they were, and the
+//! flattened image for the applications that only read that.
 
 use std::path::Path;
 
@@ -556,7 +557,7 @@ mod tests {
         }
         // Large, but without any data: an empty layer, at once.
         let start = std::time::Instant::now();
-        let doc = read::document(&one_layer([0, 0, 40_000, 40_000]))
+        let doc = read::document(&one_layer([0, 0, 30_000, 30_000]))
             .unwrap()
             .doc;
         assert!(start.elapsed().as_secs() < 2);
@@ -674,5 +675,139 @@ mod tests {
         // Saved as an Atelier document: nothing is lost any more.
         doc.save(&dir.join("gray16.atelier")).unwrap();
         assert!(doc.psd_losses().is_empty() && !doc.modified);
+    }
+
+    /// A PSD of a 4 × 4 canvas with one `side`² layer whose one channel
+    /// holds only its PackBits row counts (no rows).
+    fn rle_counts_only(side: u32) -> Vec<u8> {
+        use bytes::Writer;
+        let count = (side as usize).div_ceil(64) as u16;
+        let mut chan = Writer::default();
+        chan.u16(1);
+        for _ in 0..side {
+            chan.u16(count);
+        }
+        let mut rec = Writer::default();
+        for v in [0, 0, side as i32, side as i32] {
+            rec.i32(v);
+        }
+        rec.u16(1);
+        rec.i16(0);
+        rec.u32(chan.data.len() as u32);
+        rec.bytes(b"8BIMnorm");
+        rec.bytes(&[255, 0, 0, 0]);
+        rec.u32(12);
+        rec.zeros(8);
+        rec.bytes(&[0, 0, 0, 0]);
+        let mut info = Writer::default();
+        info.u16(1);
+        info.bytes(&rec.data);
+        info.bytes(&chan.data);
+        let mut w = Writer::default();
+        w.bytes(b"8BPS");
+        w.u16(1);
+        w.zeros(6);
+        w.u16(3);
+        w.u32(4);
+        w.u32(4);
+        w.u16(8);
+        w.u16(3);
+        w.zeros(8);
+        w.u32(info.data.len() as u32 + 4);
+        w.u32(info.data.len() as u32);
+        w.bytes(&info.data);
+        w.u16(0);
+        w.zeros(48);
+        w.data
+    }
+
+    /// Row counts without their rows are damage, found before the
+    /// channel is allocated; a PSD's layer is at most 30000 a side.
+    #[test]
+    fn layers_hold_what_their_data_can() {
+        for side in [30_000, 30_001, 120_000] {
+            let started = std::time::Instant::now();
+            let read = read::document(&rle_counts_only(side));
+            assert!(matches!(read, Err(FileError::Damaged)), "{side}");
+            assert!(started.elapsed().as_secs_f32() < 1.0, "{side}");
+        }
+    }
+
+    /// The image resources that describe the document (resolution, XMP,
+    /// IPTC…) are written back as they were; layer comps, which name
+    /// layers by identifiers, are said to be left out.
+    #[test]
+    fn document_resources_survive_a_save() {
+        use crate::i18n::t;
+        let resource = |id: u16, data: &[u8]| crate::document::PsdResource {
+            id,
+            name: Vec::new(),
+            data: data.to_vec(),
+        };
+        let mut ppi300 = Vec::new();
+        for _ in 0..2 {
+            ppi300.extend((300u32 << 16).to_be_bytes());
+            ppi300.extend([0, 1, 0, 2]);
+        }
+        let kept = vec![
+            resource(1005, &ppi300),
+            resource(
+                1060,
+                b"<x:xmpmeta><dc:rights>QA Copyright</dc:rights></x:xmpmeta>",
+            ),
+            resource(1028, b"\x1c\x02\x74\x00\x02(c)"),
+        ];
+        let mut doc = sample();
+        doc.file_metadata.psd_resources = Arc::new(kept.clone());
+        let (back, notes) = write_read(&doc);
+        assert!(
+            notes.is_empty() && back.notes.is_empty(),
+            "{:?}",
+            back.notes
+        );
+        assert_eq!(*back.doc.file_metadata.psd_resources, kept);
+        // Without any: 72 pixels per inch, as before.
+        let (back, _) = write_read(&sample());
+        assert_eq!(
+            back.doc.file_metadata.psd_resources[0].data[..4],
+            (72u32 << 16).to_be_bytes()
+        );
+        // Layer comps.
+        let mut doc = sample();
+        doc.file_metadata.psd_resources = Arc::new(vec![resource(1065, b"comps")]);
+        let (back, _) = write_read(&doc);
+        assert_eq!(back.notes, [t!("files4-psd-note-comps")]);
+        assert!(
+            back.doc
+                .file_metadata
+                .psd_resources
+                .iter()
+                .all(|r| r.id != 1065)
+        );
+    }
+
+    /// Saving over a PSD keeps as many alpha channels as the file writes:
+    /// an opaque document has room for one more.
+    #[test]
+    fn alpha_channels_lost_as_the_file_writes_them() {
+        let channels = |doc: &mut Document, n: usize| {
+            doc.channels = (0..n)
+                .map(|i| Channel {
+                    name: format!("A{i}"),
+                    mask: Arc::new(GrayImage::new(4, 4)),
+                })
+                .collect();
+        };
+        let mut opaque = Document::new(RgbaImage::from_pixel(4, 4, Rgba([1, 2, 3, 255])), None);
+        channels(&mut opaque, 53);
+        assert!(losses(&opaque).is_empty());
+        assert!(write::document(&opaque, None).unwrap().1.is_empty());
+        channels(&mut opaque, 54);
+        assert!(!losses(&opaque).is_empty());
+        let mut clear = Document::new(RgbaImage::from_pixel(4, 4, Rgba([1, 2, 3, 0])), None);
+        channels(&mut clear, 52);
+        assert!(losses(&clear).is_empty());
+        channels(&mut clear, 53);
+        assert_eq!(losses(&clear), write::document(&clear, None).unwrap().1);
     }
 }

@@ -737,59 +737,100 @@ pub struct EmbeddedIn {
     pub name: String,
 }
 
-/// A linked file to read again, and its smart object rendered with it
-/// (see [`Document::stale_links`]).
+/// A linked file to look at again, and the instances of its smart object
+/// rendered with it (see [`Document::stale_links`]).
 pub struct LinkRead {
+    path: PathBuf,
+    /// The modification time of the copy shown, and whether the file was
+    /// missing: read again if it changed or came back.
+    known: Option<SystemTime>,
+    missing: bool,
+    /// The contents' id, kept.
+    id: u64,
+    instances: Vec<LinkInstance>,
+    limit: PixelRect,
+}
+
+/// A smart object showing a linked file, as it was when looked at.
+struct LinkInstance {
     layer: u64,
     /// The layer's revision: rendered for it as it was.
     rev: u64,
     name: String,
-    path: PathBuf,
-    /// The file's modification time before it is read.
-    stamp: Option<SystemTime>,
     smart: SmartObject,
     offset: (i64, i64),
-    limit: PixelRect,
 }
 
-/// A linked file read again (`read`: `None` if it could not be).
+/// What became of a linked file (see [`LinkRead::run`]).
+enum LinkState {
+    Unchanged,
+    Missing,
+    /// It exists but could not be read (being written, damaged).
+    Unreadable,
+    /// Read: the contents shared by the instances, each one's rendering.
+    Read(Box<(Contents, Vec<SmartRender>)>),
+}
+
+/// A linked file looked at again.
 pub struct LinkFresh {
-    layer: u64,
-    rev: u64,
-    name: String,
     path: PathBuf,
+    /// The file's modification time before it was read.
     stamp: Option<SystemTime>,
-    read: Option<(Contents, SmartRender)>,
+    /// The instances' layers, revisions and names.
+    instances: Vec<(u64, u64, String)>,
+    state: LinkState,
 }
 
 impl LinkRead {
-    /// Reads the file and renders the smart object with it (slow: any
-    /// thread).
+    /// Looks at the file, reads it once if it changed and renders each
+    /// instance with it (slow, also on a network path: any thread).
     pub fn run(self) -> LinkFresh {
-        let mut smart = self.smart;
-        let read = Document::open(&self.path).ok().map(|o| {
-            smart.contents = o.doc.to_contents(smart.contents.id, file_name(&self.path));
-            let job = smart.job(smart.transform(self.offset), self.offset, self.limit);
-            (smart.contents, job.run())
-        });
-        LinkFresh {
-            layer: self.layer,
-            rev: self.rev,
-            name: self.name,
-            path: self.path,
-            stamp: self.stamp,
-            read,
+        let instances = self
+            .instances
+            .iter()
+            .map(|i| (i.layer, i.rev, i.name.clone()))
+            .collect();
+        let fresh = |stamp, state| LinkFresh {
+            path: self.path.clone(),
+            stamp,
+            instances,
+            state,
+        };
+        let Ok(meta) = std::fs::metadata(&self.path) else {
+            return fresh(None, LinkState::Missing);
+        };
+        let stamp = meta.modified().ok();
+        if stamp == self.known && !self.missing {
+            return fresh(stamp, LinkState::Unchanged);
         }
+        let Ok(opened) = Document::open(&self.path) else {
+            return fresh(stamp, LinkState::Unreadable);
+        };
+        let contents = opened.doc.to_contents(self.id, file_name(&self.path));
+        let renders = self
+            .instances
+            .into_iter()
+            .map(|i| {
+                let mut smart = i.smart;
+                smart.contents = contents.clone();
+                smart
+                    .job(smart.transform(i.offset), i.offset, self.limit)
+                    .run()
+            })
+            .collect();
+        fresh(stamp, LinkState::Read(Box::new((contents, renders))))
     }
 }
 
-/// What became of the linked files (see [`Document::update_links`]).
+/// What became of the linked files (see [`Document::put_links`]).
 #[derive(Default, Debug, PartialEq)]
 pub struct LinkReport {
     /// Names of the layers whose file changed, shown again.
     pub updated: Vec<String>,
     /// Names of the layers whose file is missing.
     pub missing: Vec<String>,
+    /// Names of the layers whose file exists but could not be read.
+    pub unreadable: Vec<String>,
 }
 
 impl Document {
@@ -994,38 +1035,41 @@ impl Document {
         Ok(opened.animated)
     }
 
-    /// Replace Contents: smart object `active` shows the file at `path`
-    /// instead, centered where its contents were, with the same transform.
+    /// Replace Contents: smart object `active` and the other instances of
+    /// its contents show the file at `path` instead, each centered where
+    /// its contents were, with the same transform, as one step.
     pub fn replace_contents(&mut self, path: &Path) -> Result<(), FileError> {
         let Some(old) = self.active_layer().smart.as_deref() else {
             return Ok(());
         };
+        let id = old.contents.id;
         let opened = Self::open(path)?;
-        let contents = opened.doc.to_contents(next_rev(), file_name(path));
+        let contents = opened.doc.to_contents(id, file_name(path));
         let (ow, oh) = old.contents.size();
         let (nw, nh) = contents.size();
         let d = [(ow as f64 - nw as f64) / 2.0, (oh as f64 - nh as f64) / 2.0];
-        let map = match old.map {
-            Map::Projective(h) => {
-                Map::Projective(Homography::affine([1.0, 0.0, d[0], 0.0, 1.0, d[1]]).then(&h))
-            }
-            warp => warp,
-        };
-        let linked = old.link.is_some();
+        let shift = Homography::affine([1.0, 0.0, d[0], 0.0, 1.0, d[1]]);
         self.checkpoint(t!("smart-hist-replace"));
         let limit = self.shape_limit();
-        let layer = self.active_layer_mut();
-        if let Some(s) = layer.smart.as_deref_mut() {
-            s.contents = contents;
-            s.map = map;
-            s.link = linked.then(|| Link::new(path));
+        let instance = |l: &Layer| l.smart.as_ref().is_some_and(|s| s.contents.id == id);
+        for layer in self.layers.iter_mut().filter(|l| instance(l)) {
+            if let Some(s) = layer.smart.as_deref_mut() {
+                s.contents = contents.clone();
+                if let Map::Projective(h) = s.map {
+                    s.map = Map::Projective(shift.then(&h));
+                }
+                if s.link.is_some() {
+                    s.link = Some(Link::new(path));
+                }
+            }
+            layer.render_smart(limit);
         }
-        layer.render_smart(limit);
         Ok(())
     }
 
     /// The contents `id` edited (Edit Contents, saved): every instance of
-    /// it shows them, as one undo step. Returns whether one was found.
+    /// it shows them, embedded if it was linked, as one undo step. Returns
+    /// whether one was found.
     pub fn update_contents(&mut self, id: u64, mut contents: Contents) -> bool {
         let found = |l: &Layer| l.smart.as_ref().is_some_and(|s| s.contents.id == id);
         if !self.layers.iter().any(found) {
@@ -1038,6 +1082,8 @@ impl Document {
             if let Some(s) = layer.smart.as_deref_mut() {
                 contents.name = s.contents.name.clone();
                 s.contents = contents.clone();
+                // Its file (missing) would replace these edits: embedded.
+                s.link = None;
             }
             layer.render_smart(limit);
         }
@@ -1049,91 +1095,119 @@ impl Document {
     /// thread: see [`Self::stale_links`]).
     #[cfg(test)]
     pub fn update_links(&mut self) -> LinkReport {
-        let (reads, missing) = self.stale_links();
-        let mut report = self.put_links(reads.into_iter().map(LinkRead::run).collect());
-        report.missing.splice(0..0, missing);
-        report
+        let reads = self.stale_links(true);
+        self.put_links(reads.into_iter().map(LinkRead::run).collect())
     }
 
-    /// The linked files that changed, to read again ([`LinkRead::run`], on
-    /// any thread, then [`Self::put_links`]); and the names of the layers
-    /// whose file is missing (marked so, their last copy kept: the
-    /// document doesn't change).
-    pub fn stale_links(&mut self) -> (Vec<LinkRead>, Vec<String>) {
+    /// The linked files to look at again ([`LinkRead::run`], on any thread,
+    /// then [`Self::put_links`]): one per file and contents, whatever the
+    /// number of instances. Without `network`, files on another machine are
+    /// left alone (looking would connect to it).
+    pub fn stale_links(&self, network: bool) -> Vec<LinkRead> {
         let limit = self.shape_limit();
-        let (mut reads, mut missing) = (Vec::new(), Vec::new());
-        for l in &mut self.layers {
-            let Some(s) = l.smart.as_deref_mut() else {
+        let mut reads: Vec<LinkRead> = Vec::new();
+        for l in &self.layers {
+            let Some(s) = l.smart.as_deref() else {
                 continue;
             };
-            let Some(link) = &mut s.link else {
+            let Some(link) = &s.link else {
                 continue;
             };
-            let Some(stamp) = std::fs::metadata(&link.path)
-                .ok()
-                .map(|m| m.modified().ok())
-            else {
-                link.missing = true;
-                missing.push(l.name.clone());
-                continue;
-            };
-            if stamp == link.modified && !link.missing {
+            if !network && super::native::remote(&link.path) {
                 continue;
             }
-            reads.push(LinkRead {
+            let instance = LinkInstance {
                 layer: l.id,
                 rev: l.rev,
                 name: l.name.clone(),
-                path: link.path.clone(),
-                stamp,
                 smart: s.clone(),
                 offset: l.offset,
-                limit,
-            });
+            };
+            let id = s.contents.id;
+            match reads.iter_mut().find(|r| r.id == id && r.path == link.path) {
+                Some(r) => {
+                    r.missing |= link.missing;
+                    r.instances.push(instance);
+                }
+                None => reads.push(LinkRead {
+                    path: link.path.clone(),
+                    known: link.modified,
+                    missing: link.missing,
+                    id,
+                    instances: vec![instance],
+                    limit,
+                }),
+            }
         }
-        (reads, missing)
+        reads
     }
 
-    /// The linked files read again shown, as one undo step (rendered
-    /// again here when the smart object changed meanwhile).
+    /// The linked files looked at again: those read shown, as one undo
+    /// step (rendered again here when a smart object changed meanwhile);
+    /// the missing ones marked so, their last copy kept (the document
+    /// doesn't change).
     pub fn put_links(&mut self, fresh: Vec<LinkFresh>) -> LinkReport {
         let mut report = LinkReport::default();
         let limit = self.shape_limit();
         let mut stepped = false;
         for f in fresh {
-            let Some(i) = self.layer_index(f.layer) else {
-                continue;
-            };
-            let Some((contents, render)) = f.read else {
-                report.missing.push(f.name);
-                continue;
-            };
-            let same_link = |s: &SmartObject| s.link.as_ref().is_some_and(|l| l.path == f.path);
-            if !self.layers[i].smart.as_deref().is_some_and(same_link) {
-                continue;
-            }
-            if !stepped {
-                self.checkpoint(t!("smart-hist-update-links"));
-                stepped = true;
-            }
-            let layer = &mut self.layers[i];
-            let unchanged = layer.rev == f.rev;
-            if let Some(s) = layer.smart.as_deref_mut() {
-                s.contents = contents;
-                if let Some(link) = &mut s.link {
-                    link.missing = false;
-                    link.modified = f.stamp;
+            let renders = match f.state {
+                LinkState::Unchanged => continue,
+                LinkState::Missing => {
+                    for (layer, _, name) in f.instances {
+                        let link = self
+                            .layer_index(layer)
+                            .and_then(|i| self.layers[i].smart.as_deref_mut())
+                            .and_then(|s| s.link.as_mut())
+                            .filter(|l| l.path == f.path);
+                        if let Some(link) = link {
+                            link.missing = true;
+                            report.missing.push(name);
+                        }
+                    }
+                    continue;
                 }
+                LinkState::Unreadable => {
+                    report
+                        .unreadable
+                        .extend(f.instances.into_iter().map(|(_, _, name)| name));
+                    continue;
+                }
+                LinkState::Read(read) => *read,
+            };
+            let (contents, renders) = renders;
+            for ((layer, rev, name), render) in f.instances.into_iter().zip(renders) {
+                let Some(i) = self.layer_index(layer) else {
+                    continue;
+                };
+                let same_link = |s: &SmartObject| s.link.as_ref().is_some_and(|l| l.path == f.path);
+                if !self.layers[i].smart.as_deref().is_some_and(same_link) {
+                    continue;
+                }
+                if !stepped {
+                    self.checkpoint(t!("smart-hist-update-links"));
+                    stepped = true;
+                }
+                let layer = &mut self.layers[i];
+                let unchanged = layer.rev == rev;
+                if let Some(s) = layer.smart.as_deref_mut() {
+                    // Shared by the instances (their layers too), read once.
+                    s.contents = contents.clone();
+                    if let Some(link) = &mut s.link {
+                        link.missing = false;
+                        link.modified = f.stamp;
+                    }
+                }
+                if unchanged {
+                    let old = layer.offset;
+                    layer.put_smart(render);
+                    layer.keep_masks(old);
+                } else {
+                    layer.render_smart(limit);
+                }
+                self.modified = true;
+                report.updated.push(name);
             }
-            if unchanged {
-                let old = layer.offset;
-                layer.put_smart(render);
-                layer.keep_masks(old);
-            } else {
-                layer.render_smart(limit);
-            }
-            self.modified = true;
-            report.updated.push(f.name);
         }
         report
     }
@@ -1721,8 +1795,8 @@ mod tests {
         RgbaImage::from_pixel(20, 20, Rgba([0, 255, 0, 255]))
             .save(&path)
             .unwrap();
-        let (reads, missing) = doc.stale_links();
-        assert_eq!((reads.len(), missing.len()), (1, 0));
+        let reads = doc.stale_links(false);
+        assert_eq!(reads.len(), 1);
         let fresh: Vec<LinkFresh> = reads.into_iter().map(LinkRead::run).collect();
         let i = doc.active;
         let before = doc.active_layer().rect();
@@ -1734,12 +1808,89 @@ mod tests {
         assert_eq!(doc.active_layer().rect(), moved, "the move kept");
         let (x, y) = (moved.x + 5, moved.y + 5);
         assert_eq!(doc.active_layer().pixel_at(x, y), Some([0, 255, 0, 255]));
-        assert!(doc.stale_links().0.is_empty(), "up to date");
+        let report = doc.put_links(
+            doc.stale_links(false)
+                .into_iter()
+                .map(LinkRead::run)
+                .collect(),
+        );
+        assert_eq!(report, LinkReport::default(), "up to date");
         // Missing: reported, nothing to save.
         doc.modified = false;
         std::fs::remove_file(&path).unwrap();
         assert_eq!(doc.update_links().missing.len(), 1);
         assert!(!doc.modified);
+        // Being written (not an image yet): could not be read, not missing.
+        std::fs::write(&path, b"half").unwrap();
+        let report = doc.update_links();
+        assert_eq!((report.missing.len(), report.unreadable.len()), (0, 1));
+    }
+
+    /// Instances of a linked file: read once, their contents still
+    /// shared (one copy in memory), each rendered with its own transform.
+    #[test]
+    fn instances_of_a_link_read_once() {
+        let dir = std::env::temp_dir().join("atelier-smart-links-instances");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("logo.png");
+        RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255]))
+            .save(&path)
+            .unwrap();
+        let mut doc = Document::new(RgbaImage::from_pixel(100, 100, Rgba([255; 4])), None);
+        doc.place_file(&path, true).unwrap();
+        doc.duplicate_active();
+        let i = doc.active;
+        doc.edit_smart(i, "move".into(), |s| s.map = shift_map(s.map, [30.0, 0.0]));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        RgbaImage::from_pixel(20, 20, Rgba([0, 255, 0, 255]))
+            .save(&path)
+            .unwrap();
+        for l in &mut doc.layers {
+            if let Some(link) = l.smart.as_deref_mut().and_then(|s| s.link.as_mut()) {
+                link.modified = None;
+            }
+        }
+        let reads = doc.stale_links(false);
+        assert_eq!(reads.len(), 1, "one read");
+        assert_eq!(reads[0].instances.len(), 2);
+        let report = doc.put_links(reads.into_iter().map(LinkRead::run).collect());
+        assert_eq!(report.updated.len(), 2);
+        let flats: Vec<&Arc<RgbaImage>> = doc
+            .layers
+            .iter()
+            .filter_map(|l| l.smart.as_deref().map(|s| &s.contents.flat))
+            .collect();
+        assert!(Arc::ptr_eq(flats[0], flats[1]), "shared");
+        for l in doc.layers.iter().filter(|l| l.is_smart()) {
+            let r = l.rect();
+            assert_eq!(l.pixel_at(r.x + 5, r.y + 5), Some([0, 255, 0, 255]));
+        }
+    }
+
+    /// A link to another machine isn't looked at by itself (that would
+    /// connect to it, maybe for long), only when asked.
+    #[test]
+    fn network_links_looked_at_only_when_asked() {
+        let mut doc = Document::new(RgbaImage::from_pixel(100, 100, Rgba([255; 4])), None);
+        let dir = std::env::temp_dir().join("atelier-smart-links-network");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("logo.png");
+        RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255]))
+            .save(&path)
+            .unwrap();
+        doc.place_file(&path, true).unwrap();
+        if let Some(link) = doc
+            .active_layer_mut()
+            .smart
+            .as_deref_mut()
+            .and_then(|s| s.link.as_mut())
+        {
+            link.path = PathBuf::from(r"\\host\share\logo.png");
+        }
+        assert!(doc.stale_links(false).is_empty());
+        assert_eq!(doc.stale_links(true).len(), 1);
     }
 
     #[test]

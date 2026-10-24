@@ -38,11 +38,12 @@ mod transform;
 mod vectors;
 pub use artboards::{
     ARTBOARD_GAP, Artboard, ArtboardBackground, ArtboardExport, ArtboardFiles, Side,
-    artboard_file_stem, unused_artboard_path,
+    artboard_file_stem, artboard_path, existing_artboard_files, windows_device,
 };
 pub use color::{ProofSetup, to_cmyk};
 pub use file_io::{
-    ExportFormat, FileError, MAX_DIMENSION, Opened, check_size, file_size, file_thumbnail,
+    ExportFormat, FileError, FileMetadata, MAX_DIMENSION, Opened, PsdResource, check_size,
+    file_size, file_thumbnail,
 };
 pub use file_io::{encode_cmyk, has_cmyk};
 pub use file_io::{encode_image, write_atomic};
@@ -152,6 +153,9 @@ struct StylesCache {
     mask: u64,
     effects: Effects,
     styles: Arc<Styles>,
+    /// The layer's place when they were last shown for its pixels (they
+    /// stay there for other pixels, see `Layer::placed_styles`).
+    offset: std::cell::Cell<(i64, i64)>,
 }
 
 /// An element of the composition. Its pixels may extend beyond the canvas:
@@ -249,7 +253,7 @@ impl Layer {
             && c.effects == self.effects
             && (held || (c.rev, c.mask) == (self.rev, mask))
         {
-            return Some(Arc::clone(&c.styles));
+            return Some(self.placed_styles(c));
         }
         let shape = match self.active_mask() {
             Some(m) => Cow::Owned(m.apply_to(&self.image, self.offset)),
@@ -264,6 +268,7 @@ impl Layer {
             mask,
             effects: self.effects.clone(),
             styles: Arc::clone(&styles),
+            offset: self.offset.into(),
         });
         Some(styles)
     }
@@ -679,6 +684,9 @@ pub struct Document {
     /// What opening its file (a Photoshop document) had to simplify or
     /// leave out: saving over that file would lose it.
     pub file_notes: Vec<String>,
+    /// What its file holds beside the layers (metadata, resolution),
+    /// written back when it is saved in that format.
+    pub file_metadata: FileMetadata,
 }
 
 impl Document {
@@ -716,6 +724,7 @@ impl Document {
             filter_mask_target: false,
             embedded_in: None,
             file_notes: Vec::new(),
+            file_metadata: FileMetadata::default(),
         };
         let layer = doc.make_layer(t!("doc-background-layer-name"), image, (0, 0));
         doc.layers.push(layer);
@@ -755,6 +764,10 @@ impl Document {
         let decoded = file_io::read_image(path)?;
         let mut doc = Self::new(decoded.image, Some(path.to_path_buf()));
         doc.icc_profile = decoded.icc_profile.map(Arc::new);
+        doc.file_metadata.exif = decoded.exif.map(Arc::new);
+        // Not said on opening (the first frame is): kept for saving over
+        // the file in its format.
+        doc.file_notes = decoded.losses;
         Ok(Opened {
             doc,
             animated: decoded.animated,
@@ -875,6 +888,7 @@ impl Document {
             // Never gives contents back to a smart object.
             embedded_in: None,
             file_notes: self.file_notes.clone(),
+            file_metadata: self.file_metadata.clone(),
         }
     }
 
@@ -1001,6 +1015,15 @@ impl Document {
         if let Some(real) = self.swapped.take() {
             self.layers[self.active] = *real;
         }
+        // Folding a group is not a step: the groups stay as they are shown.
+        let folds: Vec<(u64, bool)> = self
+            .layers
+            .iter()
+            .filter_map(|l| match l.kind {
+                LayerKind::Group { expanded } => Some((l.id, expanded)),
+                _ => None,
+            })
+            .collect();
         let previous = State {
             layers: std::mem::replace(&mut self.layers, s.layers),
             active: self.active,
@@ -1019,6 +1042,13 @@ impl Document {
             ),
             id: std::mem::replace(&mut self.state_id, s.id),
         };
+        for l in &mut self.layers {
+            if let LayerKind::Group { expanded } = &mut l.kind
+                && let Some(&(_, fold)) = folds.iter().find(|(id, _)| *id == l.id)
+            {
+                *expanded = fold;
+            }
+        }
         self.active = s.active.min(self.layers.len() - 1);
         self.canvas = s.canvas;
         self.quick_mask_rev = next_rev();
@@ -1053,6 +1083,12 @@ impl Document {
             Some(_) if redo.is_empty() => {}
             _ => self.dropped_redo = Some((self.seq, redo)),
         }
+        // The step that dropped them was forgotten: nothing can give them back.
+        if let Some((seq, _)) = &self.dropped_redo
+            && self.undo.front().is_none_or(|s| s.seq > *seq)
+        {
+            self.dropped_redo = None;
+        }
         self.trim_history(HISTORY_BUDGET);
         self.step += 1;
         self.state_id = next_rev();
@@ -1062,12 +1098,14 @@ impl Document {
     /// Memory the history keeps beyond the current state, in bytes: each
     /// buffer (pixels, masks, smart objects' contents and renderings,
     /// channels, quick mask) counts once, however many states share it.
+    /// The redo list a step dropped (kept in case it is discarded) counts too.
     pub fn history_bytes(&self) -> usize {
         let mut seen = std::collections::HashSet::new();
         self.state_buffers(&mut seen, None);
         let mut total = 0;
-        for state in self.redo.iter().chain(&self.undo).map(|s| &s.state) {
-            total += self.state_buffers(&mut seen, Some(state));
+        let dropped = self.dropped_redo.iter().flat_map(|(_, steps)| steps);
+        for state in self.redo.iter().chain(&self.undo).chain(dropped) {
+            total += self.state_buffers(&mut seen, Some(&state.state));
         }
         total
     }
@@ -1108,8 +1146,12 @@ impl Document {
     }
 
     /// Forgets the oldest steps beyond `budget` bytes of history (see
-    /// [`Self::history_bytes`]). The last step is always kept.
+    /// [`Self::history_bytes`]). The last step is always kept. A dropped
+    /// redo list goes first: it only comes back if a step changes nothing.
     pub fn trim_history(&mut self, budget: usize) {
+        if self.dropped_redo.is_some() && self.history_bytes() > budget {
+            self.dropped_redo = None;
+        }
         let mut seen = std::collections::HashSet::new();
         self.state_buffers(&mut seen, None);
         let mut total = 0;
@@ -1183,6 +1225,15 @@ impl Document {
         }
     }
 
+    /// How many steps were recorded since `mark` (and are still there).
+    pub fn steps_since(&self, mark: HistoryMark) -> usize {
+        self.undo
+            .iter()
+            .rev()
+            .take_while(|s| s.seq > mark.seq)
+            .count()
+    }
+
     /// Discards the steps recorded since `mark` (as [`Self::discard_step`]),
     /// even if the oldest ones were forgotten meanwhile (a full history).
     /// Returns whether the state at the mark is back.
@@ -1231,6 +1282,13 @@ impl Document {
         (done.chain(undone).collect(), self.undo.len())
     }
 
+    /// Numbers of the steps of [`Self::history`], in the same order: they
+    /// identify a step even when steps before it are added or forgotten.
+    pub fn history_numbers(&self) -> Vec<u64> {
+        let done = self.undo.iter().map(|s| s.seq);
+        done.chain(self.redo.iter().rev().map(|s| s.seq)).collect()
+    }
+
     /// Undoes or redoes steps until `done` of them are done (a click in the
     /// History panel). Returns whether the state changed.
     pub fn go_to_step(&mut self, done: usize) -> bool {
@@ -1254,7 +1312,13 @@ impl Document {
     /// Records the selection `new` as a step named `name`, if it differs
     /// from the one known. Returns whether a step was recorded.
     pub fn record_selection(&mut self, new: Option<Selection>, name: String) -> bool {
-        if same_selection(self.selection.as_ref(), new.as_ref()) {
+        let equal = match (self.selection.as_ref(), new.as_ref()) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.equal(b),
+            _ => false,
+        };
+        if equal {
+            self.selection = new;
             return false;
         }
         self.checkpoint(name);
@@ -1877,7 +1941,9 @@ impl Document {
         }
         let offset = layer.offset;
         let mut image = mask.clone();
-        if let Some(old) = &layer.mask {
+        // A disabled mask hides nothing: a new one replaces it.
+        let old = layer.mask.as_ref().filter(|m| m.enabled);
+        if let Some(old) = old {
             let (ox, oy) = old.origin(offset);
             let before = old.image();
             for (x, y, p) in image.enumerate_pixels_mut() {
@@ -1895,11 +1961,11 @@ impl Document {
         self.checkpoint(t!("menu-layer-remove-background"));
         let layer = &mut self.layers[self.active];
         match &mut layer.mask {
-            Some(m) => {
+            Some(m) if m.enabled => {
                 m.replace(image, offset, offset);
                 m.default = 0;
             }
-            None => layer.mask = Some(Mask::new(image, offset, 0, offset)),
+            _ => layer.mask = Some(Mask::new(image, offset, 0, offset)),
         }
         self.mask_target = Some(layer.id);
         self.filter_mask_target = false;
@@ -3215,6 +3281,22 @@ mod tests {
     }
 
     #[test]
+    fn remove_background_replaces_a_disabled_mask() {
+        let mut doc = Document::new(RgbaImage::from_pixel(8, 8, Rgba([9, 9, 9, 255])), None);
+        doc.add_mask(NewMask::HideAll, None);
+        let m = doc.active_layer_mut().mask.as_mut().unwrap();
+        m.enabled = false;
+        m.density = 0.5;
+        let cut = GrayImage::from_fn(8, 8, |x, _| image::Luma([if x < 4 { 255 } else { 0 }]));
+        assert!(doc.mask_active(&cut));
+        let m = doc.active_layer().mask.as_ref().unwrap();
+        // The cut-out shows, whole (the hidden-all mask was off).
+        assert!(m.enabled && m.density == 1.0);
+        assert_eq!(m.image().get_pixel(1, 1).0, [255]);
+        assert_eq!(m.image().get_pixel(6, 1).0, [0]);
+    }
+
+    #[test]
     fn history_step_changes_even_when_the_history_is_full() {
         let mut doc = logo();
         for _ in 0..MAX_UNDO + 2 {
@@ -3228,6 +3310,99 @@ mod tests {
         doc.undo();
         doc.checkpoint("step".into());
         assert_ne!(doc.history_step(), step);
+    }
+
+    #[test]
+    fn a_new_adjustment_layer_is_one_step_with_a_full_history() {
+        let mut doc = Document::new(RgbaImage::new(16, 16), None);
+        for i in 0..MAX_UNDO + 10 {
+            doc.checkpoint(format!("s{i}"));
+        }
+        let oldest = doc.history_numbers()[0];
+        doc.add_adjustment_layer(crate::pixel_ops::Adjustment::Invert, None);
+        // One step: only one more of the oldest is forgotten.
+        assert_eq!(doc.history_numbers()[0], oldest + 1);
+        assert!(doc.layers.last().unwrap().mask.is_some());
+        doc.undo();
+        assert_eq!(doc.layers.len(), 1);
+        let (names, done) = doc.history();
+        assert!(names[done - 1].starts_with('s'));
+    }
+
+    #[test]
+    fn a_dropped_redo_list_counts_in_the_budget() {
+        let mut doc = Document::new(RgbaImage::new(256, 256), None);
+        for _ in 0..4 {
+            doc.checkpoint("paint".into());
+            doc.active_layer_mut()
+                .replace_pixels(RgbaImage::new(256, 256));
+        }
+        doc.undo();
+        doc.undo();
+        // A new step: the undone ones stay (in case it changes nothing),
+        // counted.
+        doc.checkpoint("paint".into());
+        doc.active_layer_mut()
+            .replace_pixels(RgbaImage::new(256, 256));
+        doc.checkpoint("paint".into());
+        assert!(doc.dropped_redo.is_some());
+        let with = doc.history_bytes();
+        // Over the budget, they are forgotten first.
+        let kept = doc.undo.len();
+        doc.trim_history(with - 1);
+        assert!(doc.dropped_redo.is_none());
+        assert!(doc.history_bytes() < with);
+        assert_eq!(doc.undo.len(), kept);
+        // The step that dropped them forgotten: they go too.
+        let mut doc = Document::new(RgbaImage::new(8, 8), None);
+        doc.checkpoint("a".into());
+        doc.undo();
+        doc.checkpoint("b".into());
+        assert!(doc.dropped_redo.is_some());
+        for _ in 0..MAX_UNDO {
+            doc.checkpoint("c".into());
+        }
+        assert!(doc.dropped_redo.is_none());
+    }
+
+    #[test]
+    fn a_recomputed_identical_selection_is_no_step() {
+        let mut doc = Document::new(RgbaImage::new(16, 16), None);
+        let rect = PixelRect {
+            x: 2,
+            y: 2,
+            w: 4,
+            h: 4,
+        };
+        let mask = || Arc::new(GrayImage::from_pixel(4, 4, image::Luma([200])));
+        let sel = |mask| Selection {
+            rect,
+            mask: Some(mask),
+            inverted: false,
+        };
+        assert!(doc.record_selection(Some(sel(mask())), "Grow".into()));
+        assert!(!doc.record_selection(Some(sel(mask())), "Grow".into()));
+        assert_eq!(doc.history().0.len(), 1);
+    }
+
+    #[test]
+    fn undo_keeps_groups_folded_as_shown() {
+        let mut doc = Document::new(RgbaImage::new(8, 8), None);
+        doc.add_group();
+        let group = doc.active;
+        doc.checkpoint("other".into());
+        doc.mark_saved();
+        let fold =
+            |doc: &Document| matches!(doc.layers[group].kind, LayerKind::Group { expanded: false });
+        if let LayerKind::Group { expanded } = &mut doc.layers[group].kind {
+            *expanded = false;
+        }
+        doc.mark_modified();
+        doc.undo();
+        assert!(fold(&doc), "undo leaves the fold");
+        doc.redo();
+        assert!(fold(&doc));
+        assert!(doc.modified, "folded since the save");
     }
 
     #[test]

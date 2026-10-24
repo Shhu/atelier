@@ -166,6 +166,8 @@ pub(super) struct ActionsState {
     saving: bool,
     /// For the status bar: a problem with the actions file.
     notice: Option<String>,
+    /// Told once that changes can't be saved (`saving` false).
+    reminded: bool,
 }
 
 impl Default for ActionsState {
@@ -176,6 +178,7 @@ impl Default for ActionsState {
             library: load.library,
             saving: load.saving,
             notice: load.notice,
+            reminded: false,
             selected: None,
             recording: None,
             insert_at: 0,
@@ -216,9 +219,11 @@ impl ActionsState {
         if self.recording.is_some_and(|r| self.action(r).is_none()) {
             self.recording = None;
         }
-        if self.saving
-            && let Err(e) = self.library.save()
-        {
+        if !self.saving {
+            if !std::mem::replace(&mut self.reminded, true) {
+                self.notice = Some(t!("smart4-actions-change-not-saved"));
+            }
+        } else if let Err(e) = self.library.save() {
             self.notice = Some(t!("smart3-actions-not-saved", error = e.to_string()));
         }
     }
@@ -985,6 +990,8 @@ impl AtelierApp {
         let can_paint = doc.can_paint();
         let filterable = can_paint || self.smart_filters_apply();
         let canvas = doc.full_rect();
+        // A hidden target stops the action (its result could not be seen).
+        let (hidden_filter, hidden) = (self.hidden_target(true), self.hidden_target(false));
         let lock_error = || {
             t!(
                 "status-layer-is-locked",
@@ -1073,6 +1080,9 @@ impl AtelierApp {
                 if locked {
                     return Err(lock_error());
                 }
+                if let Some(text) = hidden {
+                    return Err(text);
+                }
                 if !can_paint && self.smart_filters_apply() {
                     return Err(t!("smart-status-no-adjustments"));
                 }
@@ -1100,6 +1110,9 @@ impl AtelierApp {
                 if locked {
                     return Err(lock_error());
                 }
+                if let Some(text) = hidden_filter {
+                    return Err(text);
+                }
                 if !filterable {
                     return Err(t!("filter-no-pixels"));
                 }
@@ -1115,6 +1128,9 @@ impl AtelierApp {
                 if locked {
                     return Err(lock_error());
                 }
+                if let Some(text) = hidden_filter {
+                    return Err(text);
+                }
                 if dialog {
                     self.camera_raw_filter(Some(settings.clone()));
                 } else {
@@ -1129,6 +1145,9 @@ impl AtelierApp {
             } => {
                 if locked {
                     return Err(lock_error());
+                }
+                if let Some(text) = hidden {
+                    return Err(text);
                 }
                 if *contents == Contents::ContentAware && !has_selection {
                     return Err(t!("retouch-needs-selection"));
@@ -1232,6 +1251,9 @@ impl AtelierApp {
                 if locked {
                     return Err(lock_error());
                 }
+                if let Some(text) = hidden_filter {
+                    return Err(text);
+                }
                 if !filterable {
                     return Err(t!("filter-no-pixels"));
                 }
@@ -1306,6 +1328,7 @@ impl AtelierApp {
         let has_doc = self.doc.is_some();
         let button_mode = self.actions.button_mode;
         let selected = self.actions.selected;
+        let saving = self.actions.saving;
         let out = floating_dialog(
             ctx,
             DialogSpec {
@@ -1317,6 +1340,19 @@ impl AtelierApp {
             },
             |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
+                // The actions file couldn't be read: nothing is saved in it.
+                if !saving {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(t!("smart4-actions-banner"))
+                                .color(ui.visuals().warn_fg_color),
+                        );
+                        if ui.button(t!("smart4-actions-save-all")).clicked() {
+                            click = Some(PanelClick::SaveAll);
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
                 if button_mode {
                     action_buttons(ui, &self.actions.library, has_doc && !playing, &mut click);
                 } else {
@@ -1493,7 +1529,8 @@ impl AtelierApp {
             PanelClick::ClearAll => a.dialog = Some(PanelDialog::ClearAll),
             PanelClick::Reset => a.dialog = Some(PanelDialog::Reset),
             PanelClick::Load(replace) => self.load_actions(replace),
-            PanelClick::Save => self.save_actions(),
+            PanelClick::Save => self.save_actions(false),
+            PanelClick::SaveAll => self.save_actions(true),
         }
     }
 
@@ -1595,32 +1632,42 @@ impl AtelierApp {
                 a.changed();
                 self.status = t!("actions-status-loaded", path = path.display().to_string());
             }
-            Err(e) => self.status_failed(t!("actions-status-load-failed", error = e.to_string())),
+            Err(e) => self.report_error(tm!("actions-status-load-failed", error = e.to_string())),
         }
     }
 
-    /// Save Actions: the selected set, in a file of its own.
-    fn save_actions(&mut self) {
-        let Some(set) = self
-            .actions
-            .selected
-            .and_then(|r| self.actions.library.sets.get(r.set()))
-            .cloned()
-        else {
-            return;
+    /// Save Actions: the selected set (or every set: `all`), in a file of
+    /// its own.
+    fn save_actions(&mut self, all: bool) {
+        let sets = if all {
+            self.actions.library.sets.clone()
+        } else {
+            let Some(set) = self
+                .actions
+                .selected
+                .and_then(|r| self.actions.library.sets.get(r.set()))
+                .cloned()
+            else {
+                return;
+            };
+            vec![set]
+        };
+        let name = match &sets[..] {
+            [set] => set.name.clone(),
+            _ => t!("actions-title"),
         };
         let filter = t!("actions-file-filter");
         let Some(path) = rfd::FileDialog::new()
             .set_title(t!("actions-menu-save"))
             .add_filter(filter, &["json"])
-            .set_file_name(format!("{}.json", set.name))
+            .set_file_name(format!("{name}.json"))
             .save_file()
         else {
             return;
         };
-        match act::write(&path, &[set]) {
+        match act::write(&path, &sets) {
             Ok(()) => self.status = t!("actions-status-saved", path = path.display().to_string()),
-            Err(e) => self.status_failed(t!("actions-status-save-failed", error = e.to_string())),
+            Err(e) => self.report_error(tm!("actions-status-save-failed", error = e.to_string())),
         }
     }
 
@@ -2016,6 +2063,8 @@ enum PanelClick {
     /// Load Actions, or Replace Actions (`true`).
     Load(bool),
     Save,
+    /// Every set, in one file (the actions file can't be written).
+    SaveAll,
 }
 
 /// The panel menu.
@@ -2383,11 +2432,10 @@ fn tree_row(ui: &mut egui::Ui, r: TreeRow) -> TreeResponse {
     let right = key
         .as_ref()
         .map_or(rect.right() - 6.0, |(_, at)| at.x - 8.0);
-    let clip = Rect::from_min_max(pos2(text_x, rect.top()), pos2(right, rect.bottom()));
-    let text = painter.with_clip_rect(clip.intersect(painter.clip_rect()));
-    text.text(
+    // Too long, the name ends with "…" and shows whole on hover.
+    let elided = ui_kit::elided_text(
+        &painter,
         pos2(text_x, rect.center().y),
-        Align2::LEFT_CENTER,
         r.name,
         FontId::proportional(ui_kit::TEXT_SIZE),
         if r.on == Some(false) {
@@ -2395,10 +2443,16 @@ fn tree_row(ui: &mut egui::Ui, r: TreeRow) -> TreeResponse {
         } else {
             color::TEXT
         },
+        right - text_x,
     );
     if let Some((galley, at)) = key {
         painter.galley(at, galley, color::MUTED);
     }
+    let row = if elided {
+        row.on_hover_text(r.name)
+    } else {
+        row
+    };
     let name = r.name.to_owned();
     row.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Button, true, r.selected, &name)
@@ -2902,6 +2956,57 @@ mod tests {
 
     fn idle(app: &AtelierApp) -> bool {
         !app.actions.playing() && !app.actions_wait()
+    }
+
+    #[test]
+    fn steps_on_a_hidden_layer_stop_the_action() {
+        let mut h = app();
+        h.state_mut()
+            .doc
+            .as_mut()
+            .unwrap()
+            .active_layer_mut()
+            .visible = false;
+        let before = h
+            .state()
+            .doc
+            .as_ref()
+            .unwrap()
+            .active_layer()
+            .image()
+            .clone();
+        let mesh = crate::liquify::Mesh::new(120, 80).to_bytes();
+        for command in [
+            Recorded::Filter {
+                filter: FilterKind::GaussianBlur.initial(),
+            },
+            Recorded::CameraRaw {
+                settings: Default::default(),
+            },
+            Recorded::Liquify { mesh },
+            Recorded::Adjust {
+                adjustment: crate::pixel_ops::Adjustment::Invert,
+            },
+            Recorded::Fill {
+                contents: Contents::Black,
+                color: [0; 3],
+                opacity: 1.0,
+                preserve_transparency: false,
+            },
+        ] {
+            let app = h.state_mut();
+            assert!(app.play_step(&command, false).is_err(), "{command:?}");
+            assert!(!app.liquify.busy() && !app.filters.busy());
+        }
+        let after = h
+            .state()
+            .doc
+            .as_ref()
+            .unwrap()
+            .active_layer()
+            .image()
+            .clone();
+        assert_eq!(*after, *before);
     }
 
     /// One set with one action of `steps`, selected.
@@ -3456,5 +3561,44 @@ mod tests {
         assert_eq!(doc.layers.len(), 2);
         assert!(doc.active_layer().is_smart());
         assert_eq!(doc.active_layer().rect().w, 40);
+    }
+
+    /// Flatten Image with a hidden layer asks first: confirmed, it is
+    /// recorded (the question only opened while `run` ran).
+    #[test]
+    fn flatten_with_hidden_layers_is_recorded_once_confirmed() {
+        let mut h = app();
+        with_action(&mut h, Vec::new());
+        let app = h.state_mut();
+        app.run(Action::NewLayer);
+        app.doc.as_mut().unwrap().active_layer_mut().visible = false;
+        app.actions.start_recording((0, 0));
+        app.run(Action::FlattenImage);
+        h.run_steps(2);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert_eq!(h.state().doc.as_ref().unwrap().layers.len(), 1, "flattened");
+        let steps = &h.state().actions.library.sets[0].actions[0].steps;
+        assert_eq!(steps.len(), 1, "recorded");
+        assert_eq!(
+            steps[0].command,
+            Recorded::Menu {
+                item: MenuItem::FlattenImage
+            }
+        );
+    }
+
+    /// The actions file can't be read: the panel says changes aren't
+    /// saved, and the first change says so once.
+    #[test]
+    fn unsaved_actions_file_told() {
+        let mut a = ActionsState {
+            saving: false,
+            ..ActionsState::default()
+        };
+        a.changed();
+        assert_eq!(a.notice.take(), Some(t!("smart4-actions-change-not-saved")));
+        a.changed();
+        assert!(a.notice.is_none(), "once");
     }
 }

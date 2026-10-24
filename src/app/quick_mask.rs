@@ -27,15 +27,70 @@ impl AtelierApp {
         self.pull_selection();
     }
 
-    /// The mask in red over the canvas, in Quick Mask Mode.
+    /// The mask in red over the canvas, in Quick Mask Mode; a dialog's
+    /// preview (a filter, an adjustment) shows there.
     pub(super) fn quick_mask_overlay(&self) -> Option<OverlaySource> {
         let doc = self.doc.as_ref()?;
         let mask = doc.quick_mask()?;
+        let previewed = self.preview_shown.as_ref().and_then(|p| match &p.mask {
+            Some((gray, _)) if p.quick_mask && gray.dimensions() == mask.dimensions() => {
+                Some((gray, p.fingerprint))
+            }
+            _ => None,
+        });
+        let (mask, key) = match previewed {
+            Some((gray, version)) => (gray, hash_of((doc.uid(), "preview", version))),
+            None => (mask, hash_of((doc.uid(), doc.quick_mask_key()))),
+        };
         Some(OverlaySource {
             mask: OverlayMask::Gray(Arc::clone(mask)),
             scale: 1.0,
             style: OverlayStyle::Tint([255, 0, 0], 0.5),
-            key: hash_of((doc.uid(), doc.quick_mask_key())),
+            key,
         })
+    }
+
+    /// In Quick Mask Mode, moving and transforming are refused: they would
+    /// act on the layer under the mask. Says so and returns `true`.
+    pub(super) fn refuse_in_quick_mask(&mut self) -> bool {
+        let on = self.doc.as_ref().is_some_and(|d| d.quick_mask().is_some());
+        if on {
+            self.status = t!("sel4-quick-mask-no-move", key = keys::key(Key::Q));
+        }
+        on
+    }
+
+    /// The Quick Mask button under the colors, like Photoshop's: on while
+    /// in Quick Mask Mode.
+    pub(super) fn quick_mask_button(&mut self, ui: &mut egui::Ui) {
+        let on = self.doc.as_ref().is_some_and(|d| d.quick_mask().is_some());
+        let (rect, response) = ui.allocate_exact_size(vec2(28.0, 22.0), Sense::click());
+        let enabled = self.doc.is_some();
+        let painter = ui.painter();
+        let hovered = enabled && response.hovered();
+        let fill = match (on, hovered) {
+            (true, _) => ui_kit::color::ACCENT_SOFT,
+            (false, true) => ui_kit::color::BUTTON_HOVER,
+            (false, false) => Color32::TRANSPARENT,
+        };
+        painter.rect_filled(rect, 5.0, fill);
+        // A frame with a circle in it: filled when the outside is masked.
+        let ink = match (on, enabled) {
+            (true, _) => ui_kit::color::ACCENT_TEXT,
+            (false, true) if hovered => ui_kit::color::TEXT,
+            (false, true) => ui_kit::color::MUTED,
+            (false, false) => ui_kit::color::DISABLED,
+        };
+        let frame = Rect::from_center_size(rect.center(), vec2(16.0, 12.0));
+        painter.rect_stroke(frame, 2.0, UiStroke::new(1.0, ink), StrokeKind::Inside);
+        if on {
+            painter.circle_filled(frame.center(), 3.5, ink);
+        } else {
+            painter.circle_stroke(frame.center(), 3.5, UiStroke::new(1.0, ink));
+        }
+        let tip = t!("sel-menu-quick-mask");
+        if enabled && ui_kit::tip_with_key(response, &tip, &keys::key(Key::Q)).clicked() {
+            self.run(Action::Select(super::select_menu::Command::QuickMask));
+        }
     }
 }

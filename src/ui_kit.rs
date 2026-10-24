@@ -329,6 +329,38 @@ pub fn tip_with_key(response: Response, name: &str, key: &str) -> Response {
     })
 }
 
+/// One line of text from `left_center`, ending with "…" past `max_width`.
+/// Returns whether it was cut: the caller then shows it whole on hover.
+pub fn elided_text(
+    painter: &Painter,
+    left_center: Pos2,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) -> bool {
+    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat::simple(font, color));
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_width.max(0.0));
+    let galley = painter.layout_job(job);
+    let elided = galley.elided;
+    let at = pos2(left_center.x, left_center.y - galley.size().y / 2.0);
+    painter.galley(at, galley, color);
+    elided
+}
+
+/// A row's tooltip: `tip`, below its name in bold when the row shows the
+/// name cut (see `elided_text`).
+pub fn row_tip(response: Response, name: &str, elided: bool, tip: &str) -> Response {
+    if elided {
+        response.on_hover_ui(|ui| {
+            ui.label(egui::RichText::new(name).strong());
+            ui.label(tip);
+        })
+    } else {
+        response.on_hover_text(tip)
+    }
+}
+
 /// Frameless icon button, 28 × 28 (hover: discreet background).
 pub fn icon_button(ui: &mut Ui, glyph: &str, tip: &str, enabled: bool) -> Response {
     let response = icon_cell(ui, glyph, tip, enabled, false, 28.0, 16.0);
@@ -638,6 +670,9 @@ pub fn text_field(
         .desired_width(edit_rect.width())
         .font(FontId::proportional(TEXT_SIZE))
         .show(&mut child);
+    // The painted label names the field for screen readers.
+    ui.ctx()
+        .accesskit_node_builder(output.response.id, |node| node.set_label(label));
     painter.set(
         frame,
         field_shape(rect, hovered, output.response.has_focus()),
@@ -832,11 +867,20 @@ pub fn combo<R>(
             ..Default::default()
         },
     );
-    egui::ComboBox::from_id_salt(id_salt)
+    let shown = egui::ComboBox::from_id_salt(id_salt)
         .selected_text(text)
         .width(width)
         .height(320.0)
-        .show_ui(ui, add_contents)
+        .show_ui(ui, add_contents);
+    // Named by its label, its value apart ("Scale" and "100%", not
+    // "Scale100%").
+    if let Some(label) = label {
+        ui.ctx().accesskit_node_builder(shown.response.id, |node| {
+            node.set_label(label);
+            node.set_value(selected);
+        });
+    }
+    shown
 }
 
 /// Compact segmented control: `(value, label or glyph, tooltip)`.
@@ -1228,6 +1272,9 @@ mod tests {
                     (&mut i, "I", medium(13.0), "Italic"),
                 ],
             );
+            let mut name = "Layer 1".to_owned();
+            text_field(ui, "Name", &mut name, egui::Id::new("name"));
+            combo(ui, "scale", Some("Scale"), "100%", 120.0, |_| {});
         });
         h.run();
         for name in [
@@ -1237,6 +1284,7 @@ mod tests {
             "Width",
             "Shadow color",
             "Percent",
+            "Name",
         ] {
             h.get_by_label(name);
         }
@@ -1252,6 +1300,9 @@ mod tests {
             pixels.accesskit_node().description().as_deref(),
             Some("In pixels")
         );
+        // A combo's label and value stay apart.
+        let scale = h.get_by_label("Scale");
+        assert_eq!(scale.accesskit_node().value().as_deref(), Some("100%"));
     }
 
     #[test]

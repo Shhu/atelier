@@ -16,7 +16,9 @@ use image::{Luma, Rgba, RgbaImage};
 
 pub use blend::BlendMode;
 use blend::{Px, atop, blend_color, dissolve, over};
-pub use build::{Dirty, Options, Placed, PlacedMask, Preview, Sig, dirty_area, plan, signatures};
+pub use build::{
+    Dirty, Options, Placed, PlacedMask, Preview, Sig, dirty_area, plan, signatures, source_versions,
+};
 use gradient::Ramp;
 pub use levels::{FullSize, Hint, LevelCache, SourceKey, Sources, Src};
 

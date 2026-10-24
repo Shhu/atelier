@@ -175,19 +175,23 @@ pub fn flood_fill(
 }
 
 /// How the Paint Bucket paints, beyond its color.
+#[derive(Clone, Copy)]
 pub struct BucketStyle<'a> {
     /// All Layers: the pixels compared (what is seen, the image's size);
     /// `None`: the image's own.
     pub sample: Option<&'a RgbaImage>,
-    /// The edge of the fill softened over a pixel.
+    /// The edge of the fill softened outward over a pixel.
     pub anti_alias: bool,
     pub opacity: f32,
     /// Lays the paint (its alpha scaled) over a pixel at (x, y).
-    pub blend: &'a dyn Fn([u8; 4], [u8; 4], i64, i64) -> [u8; 4],
+    pub blend: &'a (dyn Fn([u8; 4], [u8; 4], i64, i64) -> [u8; 4] + Sync),
 }
 
 /// [`flood_fill`] with an opacity, a blending mode, anti-aliasing, and the
-/// colors compared taken from `style.sample`.
+/// colors compared taken from `style.sample`. Every pixel of the region is
+/// painted whole; anti-aliased, the pixels just outside it (in the image
+/// and the selection) are painted by the share of their neighbours in it,
+/// like Photoshop: the image's and the selection's edges stay crisp.
 #[allow(clippy::too_many_arguments)]
 pub fn flood_fill_with(
     image: &mut RgbaImage,
@@ -201,116 +205,144 @@ pub fn flood_fill_with(
 ) -> Option<[u32; 4]> {
     let (w, h) = image.dimensions();
     let clip = clip.unwrap_or_else(|| Clip::all(image));
-    let inside = |x: u32, y: u32| x < w && y < h && clip.coverage(x, y) > 0;
-    if !inside(x, y) {
+    if x >= w || y >= h || clip.coverage(x, y) == 0 {
         return None;
     }
+    let (wu, n) = (w as usize, w as usize * h as usize);
     let sample: &RgbaImage = style
         .sample
         .filter(|s| s.dimensions() == (w, h))
         .unwrap_or(image);
     let seed = sample.get_pixel(x, y).0;
-    let close = |x: u32, y: u32| distance(sample.get_pixel(x, y).0, seed) <= tolerance;
-    // The pixels filled, and their box.
-    let mut member = vec![false; (w * h) as usize];
-    let mut bounds = [x, y, x, y];
-    let mut grow = |px: u32, py: u32| {
-        bounds = [
-            bounds[0].min(px),
-            bounds[1].min(py),
-            bounds[2].max(px),
-            bounds[3].max(py),
-        ];
-    };
-    if contiguous {
-        let mut stack = vec![(x, y)];
-        member[(y * w + x) as usize] = true;
-        while let Some((px, py)) = stack.pop() {
-            let neighbours = [
-                (px.wrapping_sub(1), py),
-                (px + 1, py),
-                (px, py.wrapping_sub(1)),
-                (px, py + 1),
-            ];
-            for (nx, ny) in neighbours {
-                if !inside(nx, ny) {
+    // The pixels that may be filled (close enough, in the selection), on
+    // all the cores.
+    let mut ok = vec![0u8; n];
+    {
+        let (raw, clip) = (sample.as_raw(), &clip);
+        crate::mask_ops::par_rows(&mut ok, wu, |first, band| {
+            for (j, row) in band.chunks_exact_mut(wu).enumerate() {
+                let py = (first + j) as u32;
+                let src = raw[(first + j) * wu * 4..][..wu * 4].chunks_exact(4);
+                for ((o, px), x) in row.iter_mut().zip(src).zip(0u32..) {
+                    let p = [px[0], px[1], px[2], px[3]];
+                    *o = u8::from(distance(p, seed) <= tolerance && clip.coverage(x, py) > 0);
+                }
+            }
+        });
+    }
+    // The pixels filled: the span-wise connected area (4-connectivity),
+    // or all of them.
+    let member = if contiguous {
+        let mut member = vec![0u8; n];
+        let mut stack = vec![(x as usize, y as usize)];
+        while let Some((sx, sy)) = stack.pop() {
+            let row = sy * wu;
+            if member[row + sx] != 0 || ok[row + sx] == 0 {
+                continue;
+            }
+            let free = |i: usize, member: &[u8]| ok[i] != 0 && member[i] == 0;
+            let (mut l, mut r) = (sx, sx);
+            while l > 0 && free(row + l - 1, &member) {
+                l -= 1;
+            }
+            while r + 1 < wu && free(row + r + 1, &member) {
+                r += 1;
+            }
+            member[row + l..=row + r].fill(1);
+            for ny in [sy.wrapping_sub(1), sy + 1] {
+                if ny >= h as usize {
                     continue;
                 }
-                let i = (ny * w + nx) as usize;
-                if !member[i] && close(nx, ny) {
-                    member[i] = true;
-                    grow(nx, ny);
-                    stack.push((nx, ny));
+                let nrow = ny * wu;
+                let mut i = l;
+                while i <= r {
+                    if free(nrow + i, &member) {
+                        stack.push((i, ny));
+                        while i <= r && free(nrow + i, &member) {
+                            i += 1;
+                        }
+                    } else {
+                        i += 1;
+                    }
                 }
             }
         }
+        member
     } else {
-        for py in 0..h {
-            for px in 0..w {
-                let m = inside(px, py) && close(px, py);
-                member[(py * w + px) as usize] = m;
-                if m {
-                    grow(px, py);
-                }
-            }
-        }
-    }
+        ok
+    };
+    // Rows with a pixel filled.
+    let rows: Vec<usize> = (0..h as usize)
+        .filter(|&r| member[r * wu..(r + 1) * wu].contains(&1))
+        .collect();
+    let (&first, &last) = (rows.first()?, rows.last()?);
     // Anti-aliased, the edge reaches a pixel beyond.
-    let margin = u32::from(style.anti_alias);
-    let (bx0, by0) = (
-        bounds[0].saturating_sub(margin),
-        bounds[1].saturating_sub(margin),
+    let margin = usize::from(style.anti_alias);
+    let (by0, by1) = (
+        first.saturating_sub(margin),
+        (last + margin).min(h as usize - 1),
     );
-    let (bx1, by1) = (
-        (bounds[2] + margin).min(w - 1),
-        (bounds[3] + margin).min(h - 1),
-    );
-    // Coverage of a pixel: whole inside; anti-aliased, the share of its
-    // 3 × 3 neighbourhood filled (the edge, on both sides, partly).
-    let at = |x: i64, y: i64| {
+    let filled = |x: i64, y: i64| {
         x >= 0
             && y >= 0
             && x < w as i64
             && y < h as i64
-            && member[(y as u32 * w + x as u32) as usize]
+            && member[y as usize * wu + x as usize] != 0
     };
     let coverage = |x: u32, y: u32| -> f32 {
+        if member[y as usize * wu + x as usize] != 0 {
+            return 1.0;
+        }
         if !style.anti_alias {
-            return if member[(y * w + x) as usize] {
-                1.0
-            } else {
-                0.0
-            };
+            return 0.0;
         }
         let (xi, yi) = (x as i64, y as i64);
         let n = (-1..=1)
             .flat_map(|dy| (-1..=1).map(move |dx| (dx, dy)))
-            .filter(|&(dx, dy)| at(xi + dx, yi + dy))
+            .filter(|&(dx, dy)| filled(xi + dx, yi + dy))
             .count();
         n as f32 / 9.0
     };
-    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
-    for py in by0..=by1 {
-        for px in bx0..=bx1 {
-            if !inside(px, py) {
-                continue;
-            }
-            let c = coverage(px, py);
-            if c <= 0.0 {
-                continue;
-            }
-            let [r, g, b, a] = color;
-            let k = c * style.opacity.clamp(0.0, 1.0) * clip.coverage(px, py) as f32 / 255.0;
-            let a = (a as f32 * k).round() as u8;
-            let p = image.get_pixel_mut(px, py);
-            let new = (style.blend)(p.0, [r, g, b, a], px as i64, py as i64);
-            if new != p.0 {
-                p.0 = new;
-                (x0, y0, x1, y1) = (x0.min(px), y0.min(py), x1.max(px), y1.max(py));
+    let changed = std::sync::Mutex::new((u32::MAX, u32::MAX, 0u32, 0u32));
+    let opacity = style.opacity.clamp(0.0, 1.0);
+    let raw: &mut [u8] = image;
+    let rows_data = &mut raw[by0 * wu * 4..(by1 + 1) * wu * 4];
+    crate::mask_ops::par_rows(rows_data, wu * 4, |band_first, band| {
+        let mut b = (u32::MAX, u32::MAX, 0u32, 0u32);
+        for (j, row) in band.chunks_exact_mut(wu * 4).enumerate() {
+            let py = (by0 + band_first + j) as u32;
+            for (px, p) in (0..w).zip(row.chunks_exact_mut(4)) {
+                let c = coverage(px, py);
+                if c <= 0.0 {
+                    continue;
+                }
+                let cover = clip.coverage(px, py);
+                if cover == 0 {
+                    continue;
+                }
+                let [r, g, bl, a] = color;
+                let k = c * opacity * cover as f32 / 255.0;
+                let a = (a as f32 * k).round() as u8;
+                let old = [p[0], p[1], p[2], p[3]];
+                let new = (style.blend)(old, [r, g, bl, a], px as i64, py as i64);
+                if new != old {
+                    p.copy_from_slice(&new);
+                    b = (b.0.min(px), b.1.min(py), b.2.max(px), b.3.max(py));
+                }
             }
         }
-    }
-    (x1 >= x0 && x0 != u32::MAX).then(|| [x0, y0, x1 - x0 + 1, y1 - y0 + 1])
+        if b.0 != u32::MAX {
+            let mut all = changed.lock().unwrap_or_else(|e| e.into_inner());
+            *all = (
+                all.0.min(b.0),
+                all.1.min(b.1),
+                all.2.max(b.2),
+                all.3.max(b.3),
+            );
+        }
+    });
+    let (x0, y0, x1, y1) = changed.into_inner().unwrap_or_else(|e| e.into_inner());
+    (x0 != u32::MAX).then(|| [x0, y0, x1 - x0 + 1, y1 - y0 + 1])
 }
 
 /// Magic Wand: pixels close (within `tolerance`, 0..=255) to the one at
@@ -656,16 +688,17 @@ pub type Histograms = [[u32; 256]; 4];
 
 /// Histograms of the visible pixels.
 pub fn histogram(image: &RgbaImage) -> Histograms {
-    let mut h = [[0u32; 256]; 4];
-    for p in image.pixels().filter(|p| p.0[3] > 0) {
-        let [r, g, b, _] = p.0;
-        let luma = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32).round() as usize;
-        h[0][luma.min(255)] += 1;
-        h[1][r as usize] += 1;
-        h[2][g as usize] += 1;
-        h[3][b as usize] += 1;
-    }
-    h
+    let (w, h) = image.dimensions();
+    let sums = par_histograms(h, |rows| {
+        let mut sums = [[0u64; 256]; 4];
+        let raw = &image.as_raw()[rows.start as usize * w as usize * 4..];
+        let n = (rows.end - rows.start) as usize * w as usize;
+        for p in raw.chunks_exact(4).take(n).filter(|p| p[3] > 0) {
+            count(&mut sums, [p[0], p[1], p[2]], 1);
+        }
+        sums
+    });
+    sums.map(|channel| channel.map(|v| v as u32))
 }
 
 /// Histograms of the visible pixels inside `clip` (a selection), each one
@@ -674,23 +707,63 @@ pub fn histogram_within(image: &RgbaImage, clip: Option<&Clip>) -> Histograms {
     let Some(clip) = clip else {
         return histogram(image);
     };
-    let mut sums = [[0u64; 256]; 4];
     let [x0, y0, x1, y1] = clip.rect;
-    for y in y0..y1.min(image.height()) {
-        for x in x0..x1.min(image.width()) {
-            let [r, g, b, a] = image.get_pixel(x, y).0;
-            let weight = clip.coverage(x, y) as u64;
-            if a == 0 || weight == 0 {
-                continue;
+    let (y1, x1) = (y1.min(image.height()), x1.min(image.width()));
+    let sums = par_histograms(y1.saturating_sub(y0), |rows| {
+        let mut sums = [[0u64; 256]; 4];
+        for y in y0 + rows.start..y0 + rows.end {
+            for x in x0..x1 {
+                let [r, g, b, a] = image.get_pixel(x, y).0;
+                let weight = clip.coverage(x, y) as u64;
+                if a > 0 && weight > 0 {
+                    count(&mut sums, [r, g, b], weight);
+                }
             }
-            let luma = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32).round() as usize;
-            sums[0][luma.min(255)] += weight;
-            sums[1][r as usize] += weight;
-            sums[2][g as usize] += weight;
-            sums[3][b as usize] += weight;
+        }
+        sums
+    });
+    sums.map(|channel| channel.map(|v| v.div_ceil(255) as u32))
+}
+
+fn count(sums: &mut [[u64; 256]; 4], [r, g, b]: [u8; 3], weight: u64) {
+    let luma = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32).round() as usize;
+    sums[0][luma.min(255)] += weight;
+    sums[1][r as usize] += weight;
+    sums[2][g as usize] += weight;
+    sums[3][b as usize] += weight;
+}
+
+/// Histograms of `rows` rows, counted by bands of rows on all the cores
+/// (`band` counts one) and added up.
+fn par_histograms(
+    rows: u32,
+    band: impl Fn(std::ops::Range<u32>) -> [[u64; 256]; 4] + Sync,
+) -> [[u64; 256]; 4] {
+    let n = (threads() as u32).min(rows.div_ceil(64)).max(1);
+    if n == 1 || SERIAL.with(Cell::get) {
+        return band(0..rows);
+    }
+    let per = rows.div_ceil(n);
+    let band = &band;
+    let parts: Vec<[[u64; 256]; 4]> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..rows)
+            .step_by(per as usize)
+            .map(|y| s.spawn(move || band(y..(y + per).min(rows))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("histogram band"))
+            .collect()
+    });
+    let mut sums = [[0u64; 256]; 4];
+    for part in parts {
+        for (s, p) in sums.iter_mut().zip(part) {
+            for (a, b) in s.iter_mut().zip(p) {
+                *a += b;
+            }
         }
     }
-    sums.map(|channel| channel.map(|v| v.div_ceil(255) as u32))
+    sums
 }
 
 /// Maximum number of points of a curve (like Photoshop).
@@ -1636,6 +1709,24 @@ mod tests {
     }
 
     #[test]
+    fn histograms_by_bands_count_every_row() {
+        // Large enough for several bands of rows.
+        let img = RgbaImage::from_fn(300, 701, |x, y| {
+            Rgba([
+                (x % 256) as u8,
+                (y % 256) as u8,
+                7,
+                if x == 0 { 0 } else { 255 },
+            ])
+        });
+        let h = histogram(&img);
+        assert_eq!(h[0].iter().sum::<u32>(), 299 * 701);
+        let red = (1..300).filter(|x| x % 256 == 3).count() as u32 * 701;
+        assert_eq!(h[1][3], red);
+        assert_eq!(h[3][7], 299 * 701);
+    }
+
+    #[test]
     fn hue_saturation_behaves() {
         let px = |rgb: [u8; 3], hs: HueSaturation| {
             let mut img = RgbaImage::from_pixel(1, 1, Rgba([rgb[0], rgb[1], rgb[2], 90]));
@@ -1849,10 +1940,57 @@ mod tests {
         assert_eq!(hard.get_pixel(10, 2), &BLACK);
         let soft = fill(true);
         assert_eq!(soft.get_pixel(5, 2).0, [255, 0, 0, 255]);
+        // The region filled whole, the edge softened outward only.
         let (inner, outer) = (soft.get_pixel(9, 2).0, soft.get_pixel(10, 2).0);
-        assert!(inner[1] > 0 && inner[0] == 255, "{inner:?}");
+        assert_eq!(inner, [255, 0, 0, 255]);
         assert!(outer[0] > 0 && outer[0] < 255, "{outer:?}");
         assert_eq!(soft.get_pixel(12, 2), &BLACK);
+    }
+
+    #[test]
+    fn anti_aliased_bucket_keeps_the_image_and_selection_edges_crisp() {
+        let style = BucketStyle {
+            sample: None,
+            anti_alias: true,
+            opacity: 1.0,
+            blend: &|d, s, _, _| over(d, s),
+        };
+        let red = [255, 0, 0, 255];
+        // An empty image filled whole: its border and corners too.
+        let mut empty = RgbaImage::new(30, 20);
+        assert!(flood_fill_with(&mut empty, 5, 5, red, 0, None, true, &style).is_some());
+        assert!(empty.pixels().all(|p| p.0 == red));
+        // In a rectangular selection: its inner edge whole, nothing outside.
+        let mut img = RgbaImage::from_pixel(30, 20, WHITE);
+        let clip: Clip = [5, 5, 20, 15].into();
+        flood_fill_with(&mut img, 10, 10, red, 0, Some(clip), true, &style);
+        assert_eq!(img.get_pixel(5, 5).0, red);
+        assert_eq!(img.get_pixel(19, 10).0, red);
+        assert_eq!(img.get_pixel(4, 10), &WHITE);
+        assert_eq!(img.get_pixel(20, 10), &WHITE);
+    }
+
+    #[test]
+    fn non_contiguous_and_contiguous_bucket_agree_on_one_region() {
+        // A ring of black splits white into an inside and an outside.
+        let img = RgbaImage::from_fn(40, 40, |x, y| {
+            let d = ((x as f32 - 20.0).powi(2) + (y as f32 - 20.0).powi(2)).sqrt();
+            if (9.0..11.0).contains(&d) {
+                BLACK
+            } else {
+                WHITE
+            }
+        });
+        let red = [255, 0, 0, 255];
+        let mut inside = img.clone();
+        let b = flood_fill(&mut inside, 20, 20, red, 0, None, true).expect("filled");
+        assert!(b[2] < 20 && b[3] < 20, "{b:?}");
+        assert_eq!(inside.get_pixel(0, 0), &WHITE);
+        assert_eq!(inside.get_pixel(20, 20).0, red);
+        let mut all = img.clone();
+        flood_fill(&mut all, 20, 20, red, 0, None, false);
+        assert_eq!(all.get_pixel(0, 0).0, red);
+        assert_eq!(all.get_pixel(20, 10), &BLACK);
     }
 
     #[test]

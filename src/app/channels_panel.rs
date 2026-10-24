@@ -44,9 +44,17 @@ pub(super) struct ChannelsPanel {
     /// were made: RGB, R, G, B, then the alphas.
     thumbs: Option<(u64, f64, Vec<TextureHandle>)>,
     /// The layers reduced for the thumbnails, kept between them (only
-    /// what changed is reduced again): document (uid), and them.
-    reduced: Option<(u64, crate::compose::LevelCache)>,
+    /// what changed is reduced again): document (uid), and them. The
+    /// canvas gives them its brush hints (see `draw_document`).
+    pub(super) reduced: Option<(u64, crate::compose::LevelCache)>,
+    /// The first reductions of a document, made on a worker thread (the
+    /// panel opened, another tab): its uid, and the job.
+    making: Option<(u64, std::thread::JoinHandle<crate::compose::LevelCache>)>,
 }
+
+/// While reductions are made on a worker thread, the panel looks again
+/// this often.
+const MAKING_POLL: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// Thumbnails are made again at most this often (seconds) while the image
 /// keeps changing (brush stroke, slider).
@@ -368,6 +376,7 @@ impl AtelierApp {
         let Some(doc) = &self.doc else { return };
         let layers = doc.render_layers();
         let opts = crate::compose::Options {
+            held: doc.effects_held(),
             later_styles: true,
             ..Default::default()
         };
@@ -390,11 +399,53 @@ impl AtelierApp {
             }
         }
         let uid = doc.uid();
-        let reduced = &mut self.channels.reduced;
-        if reduced.as_ref().is_none_or(|(d, _)| *d != uid) {
-            *reduced = Some((uid, crate::compose::LevelCache::new(thumb_level(doc))));
+        let level = thumb_level(doc);
+        let panel = &mut self.channels;
+        if let Some((made_for, job)) = panel.making.take_if(|(_, j)| j.is_finished())
+            && let Ok(mut made) = job.join()
+            && made_for == uid
+        {
+            // With what was painted meanwhile.
+            if let Some((_, meanwhile)) = panel.reduced.as_mut().filter(|(d, _)| *d == uid) {
+                made.hints_from(meanwhile);
+            }
+            panel.reduced = Some((uid, made));
         }
-        let cache = &mut reduced.as_mut().expect("set above").1;
+        if panel.making.is_some() {
+            ctx.request_repaint_after(MAKING_POLL);
+            return;
+        }
+        let reduced = &mut panel.reduced;
+        let fits = |(d, c): &(u64, crate::compose::LevelCache)| {
+            *d == uid && crate::compose::Sources::level(c) == level
+        };
+        if !reduced.as_ref().is_some_and(fits) {
+            // Every layer to reduce: on a worker thread, the rows shown
+            // without thumbnails meanwhile; the hints of strokes made
+            // meanwhile kept here.
+            *reduced = Some((uid, crate::compose::LevelCache::new(level)));
+            let (layers, canvas, held) = (layers.to_vec(), doc.full_rect(), doc.effects_held());
+            let job = std::thread::Builder::new()
+                .name("channels".into())
+                .spawn(move || {
+                    let mut cache = crate::compose::LevelCache::new(level);
+                    let options = crate::compose::Options {
+                        held,
+                        later_styles: true,
+                        ..Default::default()
+                    };
+                    crate::compose::plan(&layers, canvas, &mut cache, &options);
+                    cache.retain_used();
+                    cache
+                });
+            if let Ok(job) = job {
+                panel.making = Some((uid, job));
+                panel.thumbs = None;
+                ctx.request_repaint_after(MAKING_POLL);
+                return;
+            }
+        }
+        let cache = &mut panel.reduced.as_mut().expect("set above").1;
         let small = small_composite(doc, cache);
         let (w, h) = small.dimensions();
         let mut images: Vec<ColorImage> = vec![to_color_image(&small)];
@@ -444,6 +495,7 @@ fn small_composite(doc: &Document, cache: &mut crate::compose::LevelCache) -> Rg
     let level = crate::compose::Sources::level(cache);
     let layers = doc.render_layers();
     let options = crate::compose::Options {
+        held: doc.effects_held(),
         later_styles: true,
         ..Default::default()
     };
@@ -498,8 +550,10 @@ fn channel_key(ctx: &egui::Context, n: usize) -> String {
 }
 
 /// The `n`-th channel shortcut pressed this frame (exactly Ctrl+2…9, the
-/// digit row by its place: see `shortcut_key`), if any.
-pub(super) fn channel_shortcut(input: &mut egui::InputState) -> Option<usize> {
+/// digit row by its place: see `shortcut_key`), among the `rows` channels
+/// shown, if any. The others are left to the shortcuts of what the key types
+/// (Ctrl+6 on an AZERTY keyboard, without alpha channels: Ctrl+−).
+pub(super) fn channel_shortcut(input: &mut egui::InputState, rows: usize) -> Option<usize> {
     const DIGITS: [Key; 8] = [
         Key::Num2,
         Key::Num3,
@@ -512,6 +566,7 @@ pub(super) fn channel_shortcut(input: &mut egui::InputState) -> Option<usize> {
     ];
     DIGITS
         .iter()
+        .take(rows)
         .position(|&k| consume_exact(input, KeyboardShortcut::new(Modifiers::COMMAND, k)))
 }
 
@@ -574,24 +629,36 @@ fn channel_row(
     );
     let name_area =
         Rect::from_x_y_ranges(frame.right() + 10.0..=shortcut.left() - 6.0, rect.y_range());
-    painter
-        .with_clip_rect(name_area.intersect(painter.clip_rect()))
-        .text(
-            pos2(name_area.left(), rect.center().y),
-            Align2::LEFT_CENTER,
-            name,
-            FontId::proportional(ui_kit::TEXT_SIZE),
-            ui_kit::color::TEXT,
-        );
+    // Too long, the name ends with "…" and shows whole on hover.
+    let elided = ui_kit::elided_text(
+        &painter,
+        pos2(name_area.left(), rect.center().y),
+        name,
+        FontId::proportional(ui_kit::TEXT_SIZE),
+        ui_kit::color::TEXT,
+        name_area.width(),
+    );
     let eye_clicked = eye_response.clicked();
     let tip = t!(
         "input3-channel-row-tip",
         ctrl_click = keys::click(ui.ctx(), Modifiers::COMMAND)
     );
-    let row = row.on_hover_text(tip);
+    let row = ui_kit::row_tip(row, name, elided, &tip);
     row.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, name));
     RowResponse {
         row,
         eye: eye_clicked,
+    }
+}
+
+#[cfg(test)]
+impl AtelierApp {
+    /// Whether the Channels thumbnails are shown, and whether their first
+    /// reductions are being made.
+    pub(super) fn channel_thumbs_state(&self) -> (bool, bool) {
+        (
+            self.channels.thumbs.is_some(),
+            self.channels.making.is_some(),
+        )
     }
 }

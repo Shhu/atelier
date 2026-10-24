@@ -421,3 +421,145 @@ fn linked_edit_contents_opens_the_file_and_links_follow() {
     assert_eq!(doc(&h).flatten().get_pixel(x, y).0, [255, 0, 0, 255]);
     assert_eq!(doc(&h).history().1, steps + 1);
 }
+
+/// Edit Contents of a linked PNG opens the PNG; Ctrl+S writes the PNG
+/// (no Save As), and the smart object follows once back in its document.
+#[test]
+fn linked_png_edit_contents_saves_the_png() {
+    let dir = folder("linked-png");
+    let path = dir.join("logo.png");
+    RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255]))
+        .save(&path)
+        .unwrap();
+    let mut h = app();
+    h.state_mut().place_path(&path, true);
+    h.key_press(egui::Key::Enter);
+    let applied = |app: &AtelierApp| !app.transform_pending() && !app.transform_busy();
+    settle(&mut h, applied);
+    h.state_mut().run(Action::Smart(Command::EditContents));
+    h.run_steps(2);
+    assert_eq!(doc(&h).path.as_deref(), Some(path.as_path()));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    h.state_mut().primary = Color32::from_rgb(255, 0, 0);
+    h.state_mut().run(Action::FillPrimary);
+    super::files::SAVE_DIALOG.with_borrow_mut(|d| d.asked.clear());
+    h.state_mut().run(Action::Save);
+    h.run_steps(2);
+    let asked = super::files::SAVE_DIALOG.with_borrow_mut(|d| std::mem::take(&mut d.asked));
+    assert!(asked.is_empty(), "no Save As: {asked:?}");
+    assert!(!doc(&h).modified);
+    let on_disk = image::open(&path).unwrap().to_rgba8().get_pixel(5, 5).0;
+    assert_eq!(on_disk, [255, 0, 0, 255]);
+    h.state_mut().switch_tab(0);
+    settle(&mut h, |app| !app.links_reading());
+    h.run_steps(2);
+    let r = doc(&h).active_layer().rect();
+    let (x, y) = ((r.x + 10) as u32, (r.y + 10) as u32);
+    assert_eq!(doc(&h).flatten().get_pixel(x, y).0, [255, 0, 0, 255]);
+}
+
+/// A linked smart object whose file is missing: Edit Contents edits the
+/// embedded copy, and saving it embeds the smart object, so the file
+/// coming back doesn't replace the edits.
+#[test]
+fn missing_link_edit_contents_kept_when_file_returns() {
+    let dir = folder("missing-link");
+    let path = dir.join("logo.png");
+    let away = dir.join("away.png");
+    RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255]))
+        .save(&path)
+        .unwrap();
+    let mut h = app();
+    h.state_mut().place_path(&path, true);
+    h.key_press(egui::Key::Enter);
+    let applied = |app: &AtelierApp| !app.transform_pending() && !app.transform_busy();
+    settle(&mut h, applied);
+    std::fs::rename(&path, &away).unwrap();
+    // Focus away and back: the link is found missing.
+    h.state_mut().smart.focused = false;
+    h.run_steps(1);
+    settle(&mut h, |app| !app.links_reading());
+    h.run_steps(2);
+    h.state_mut().run(Action::Smart(Command::EditContents));
+    h.run_steps(2);
+    assert!(doc(&h).embedded_in.is_some(), "the embedded copy is edited");
+    h.state_mut().primary = Color32::from_rgb(255, 0, 0);
+    h.state_mut().run(Action::FillPrimary);
+    h.state_mut().run(Action::Save);
+    h.run_steps(2);
+    h.state_mut().switch_tab(0);
+    h.run_steps(2);
+    assert!(smart(&h).link.is_none(), "embedded");
+    let r = doc(&h).active_layer().rect();
+    let (x, y) = ((r.x + 10) as u32, (r.y + 10) as u32);
+    let edited = doc(&h).flatten().get_pixel(x, y).0;
+    assert_eq!(edited, [255, 0, 0, 255]);
+    // The file comes back (drive reconnected): focus regained.
+    std::fs::rename(&away, &path).unwrap();
+    h.state_mut().smart.focused = false;
+    h.run_steps(2);
+    settle(&mut h, |app| !app.links_reading());
+    h.run_steps(2);
+    assert_eq!(
+        doc(&h).flatten().get_pixel(x, y).0,
+        edited,
+        "the edits kept"
+    );
+}
+
+/// Replace Contents on one instance (a Duplicate Layer copy): every
+/// instance shows the file, still sharing their contents, as one step.
+#[test]
+fn replace_contents_updates_every_instance() {
+    let dir = folder("replace-instances");
+    let path = dir.join("other.png");
+    RgbaImage::from_pixel(40, 30, Rgba([0, 255, 0, 255]))
+        .save(&path)
+        .unwrap();
+    let mut h = app();
+    h.state_mut().run(Action::Smart(Command::Convert));
+    h.run_steps(2);
+    h.state_mut().run(Action::Duplicate);
+    h.run_steps(2);
+    let d = h.state_mut().doc.as_mut().unwrap();
+    let ids = |d: &Document| -> Vec<u64> {
+        d.layers
+            .iter()
+            .filter_map(|l| l.smart.as_ref().map(|s| s.contents.id))
+            .collect()
+    };
+    let before = ids(d);
+    let steps = d.history().1;
+    d.replace_contents(&path).unwrap();
+    assert_eq!(ids(d), before, "still shared");
+    assert_eq!(d.history().1, steps + 1);
+    for l in d.layers.iter().filter(|l| l.is_smart()) {
+        assert_eq!(l.pixel_at(30, 20), Some([0, 255, 0, 255]), "{}", l.name);
+    }
+}
+
+#[test]
+fn a_long_smart_object_rendering_is_cancelled_and_undone() {
+    let mut h = app();
+    // Large enough to be rendered on another thread, slow to filter.
+    let mut d = Document::new(
+        RgbaImage::from_fn(2100, 2100, |x, y| {
+            Rgba([(x % 251) as u8, (y % 241) as u8, 90, 255])
+        }),
+        None,
+    );
+    assert!(d.convert_to_smart(&[0]));
+    let mut median = crate::document::SmartFilter::new(Filter::Median { radius: 80.0 });
+    median.visible = false;
+    let i = d.active;
+    d.edit_smart(i, "Add".into(), |s| s.filters.push(median));
+    let before = d.active_layer().image().clone();
+    h.state_mut().doc = Some(d);
+    h.state_mut().run(Action::Smart(Command::ToggleFilter(0)));
+    assert!(h.state().smart.busy(), "rendering in the background");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().smart.busy());
+    assert!(!smart(&h).filters[0].visible, "the change undone");
+    assert_eq!(*doc(&h).active_layer().image(), before);
+}

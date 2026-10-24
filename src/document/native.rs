@@ -62,6 +62,8 @@ use crate::text::{self, AntiAlias, CharStyle, Kerning, ParagraphStyle, TextAlign
 mod smart;
 mod vectors;
 
+pub(super) use smart::remote;
+
 /// File extension of Atelier documents.
 pub const EXTENSION: &str = "atelier";
 
@@ -73,6 +75,8 @@ const MANIFEST: &str = "document.json";
 const THUMBNAIL: &str = "thumbnail.png";
 const PROFILE: &str = "color-profile.icc";
 const PROOF_PROFILE: &str = "proof-profile.icc";
+const EXIF: &str = "metadata/exif.bin";
+const PSD_RESOURCES: &str = "metadata/photoshop-resources.bin";
 const THUMBNAIL_SIZE: u32 = 256;
 /// Read limit of the manifest and color profile (damaged files).
 const MAX_SMALL_ENTRY: u64 = 64 << 20;
@@ -118,6 +122,13 @@ struct Manifest {
     /// session, not saved).
     #[serde(default)]
     proof: Option<ProofEntry>,
+    /// What the document's first file held beside its layers, given back
+    /// when saved in that format: archive paths of the EXIF and of the
+    /// Photoshop image resources (see [`resources_bytes`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exif: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    photoshop_resources: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -938,6 +949,9 @@ pub(super) fn write(
             paper_color: doc.proof.paper,
             black_ink: doc.proof.ink,
         }),
+        exif: doc.file_metadata.exif.is_some().then(|| EXIF.into()),
+        photoshop_resources: (!doc.file_metadata.psd_resources.is_empty())
+            .then(|| PSD_RESOURCES.into()),
     };
 
     let mut zip = ZipWriter::new(out);
@@ -953,6 +967,13 @@ pub(super) fn write(
     }
     if let Some(proof) = &doc.proof.custom {
         files.push((PROOF_PROFILE.into(), proof.icc().to_vec()));
+    }
+    if let Some(exif) = &doc.file_metadata.exif {
+        files.push((EXIF.into(), exif.to_vec()));
+    }
+    if !doc.file_metadata.psd_resources.is_empty() {
+        let data = resources_bytes(&doc.file_metadata.psd_resources);
+        files.push((PSD_RESOURCES.into(), data));
     }
     for (name, data) in files {
         let large = data.len() as u64 >= u32::MAX as u64;
@@ -1396,11 +1417,7 @@ fn read_archive(
             return Err(FileError::Damaged);
         }
         let blob = match image {
-            Some(name) => {
-                // A PNG is never much larger than its raw pixels.
-                let limit = 2 * (w as u64 * h as u64 * 4) + (1 << 20);
-                Some(read_entry(zip, name, limit)?)
-            }
+            Some(name) => Some(read_pixels(zip, name, (w, h), if gray { 1 } else { 4 })?),
             None if w == 0 || h == 0 => None,
             None => return Err(FileError::Damaged),
         };
@@ -1428,6 +1445,14 @@ fn read_archive(
         Some(_) => Some(Arc::new(read_entry(zip, PROOF_PROFILE, MAX_SMALL_ENTRY)?)),
         None => None,
     };
+    let mut file_metadata = super::FileMetadata::default();
+    if let Some(name) = &manifest.exif {
+        file_metadata.exif = Some(Arc::new(read_entry(zip, name, MAX_SMALL_ENTRY)?));
+    }
+    if let Some(name) = &manifest.photoshop_resources {
+        let data = read_entry(zip, name, MAX_SMALL_ENTRY)?;
+        file_metadata.psd_resources = Arc::new(resources_of(&data).ok_or(FileError::Damaged)?);
+    }
 
     let mut doc = Document::new(RgbaImage::new(0, 0), path.map(Path::to_path_buf));
     let folder = path.and_then(Path::parent);
@@ -1520,8 +1545,7 @@ fn read_archive(
         .collect();
     let canvas = (manifest.width, manifest.height);
     for c in &manifest.channels {
-        let limit = 2 * (canvas.0 as u64 * canvas.1 as u64) + (1 << 20);
-        let png = read_entry(zip, &c.image, limit)?;
+        let png = read_pixels(zip, &c.image, canvas, 1)?;
         doc.channels.push(Channel {
             name: c.name.clone(),
             mask: Arc::new(decode_gray(&png, canvas)?),
@@ -1531,6 +1555,7 @@ fn read_archive(
     doc.work_path = manifest.work_path.as_ref().map(vectors::path_of);
     doc.active = manifest.active.min(doc.layers.len() - 1);
     doc.icc_profile = icc_profile;
+    doc.file_metadata = file_metadata;
     if let Some(p) = &manifest.proof {
         doc.proof = super::ProofSetup {
             custom: proof_profile.and_then(crate::cms::Profile::from_icc),
@@ -1677,16 +1702,79 @@ fn read_entry(
     name: &str,
     limit: u64,
 ) -> Result<Vec<u8>, FileError> {
+    let end = zip.central_directory_start();
     let entry = zip.by_name(name).map_err(zip_error)?;
-    if entry.size() > limit {
+    if entry.size() > limit || entry.compressed_size() > end {
         return Err(FileError::Damaged);
     }
-    let mut data = Vec::with_capacity(entry.size() as usize);
+    // The declared size only bounds the reservation: the real growth is
+    // bounded by `take`.
+    let mut data = Vec::with_capacity(entry.size().min(MAX_SMALL_ENTRY) as usize);
     entry.take(limit + 1).read_to_end(&mut data)?;
     if data.len() as u64 > limit {
         return Err(FileError::Damaged);
     }
     Ok(data)
+}
+
+/// Deflate shrinks data at most about 1032 times.
+const DEFLATE_RATIO: u64 = 1100;
+
+/// The PNG of a layer, mask or channel of `size` pixels of `bpp` bytes.
+/// Refused when it is larger than any layer, or when its bytes in the
+/// archive are too few to hold that many pixels (a few kilobytes would
+/// otherwise make the decoder reserve gigabytes).
+pub(super) fn read_pixels(
+    zip: &mut ZipArchive<impl Read + Seek>,
+    name: &str,
+    size: (u32, u32),
+    bpp: u64,
+) -> Result<Vec<u8>, FileError> {
+    let (w, h) = (u64::from(size.0), u64::from(size.1));
+    if w * h > u64::from(MAX_DIMENSION).pow(2) {
+        return Err(FileError::Damaged);
+    }
+    let raw = h * (1 + w * bpp);
+    let stored = zip.by_name(name).map_err(zip_error)?.compressed_size();
+    if stored.saturating_mul(DEFLATE_RATIO) + (1 << 16) < raw {
+        return Err(FileError::Damaged);
+    }
+    // A PNG is never much larger than its raw pixels.
+    read_entry(zip, name, 2 * w * h * bpp + (1 << 20))
+}
+
+/// Photoshop image resources: each its id (u16), name (a length byte,
+/// then it) and data (a u32 length, then it), big-endian.
+fn resources_bytes(resources: &[super::PsdResource]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for r in resources {
+        let name = &r.name[..r.name.len().min(255)];
+        out.extend(r.id.to_be_bytes());
+        out.push(name.len() as u8);
+        out.extend(name);
+        out.extend((r.data.len() as u32).to_be_bytes());
+        out.extend(&r.data);
+    }
+    out
+}
+
+/// What [`resources_bytes`] wrote; `None` if damaged.
+fn resources_of(mut data: &[u8]) -> Option<Vec<super::PsdResource>> {
+    let mut take = |n: usize| {
+        let (head, rest) = data.split_at_checked(n)?;
+        data = rest;
+        Some(head)
+    };
+    let mut out = Vec::new();
+    while let Some(id) = take(2) {
+        let id = u16::from_be_bytes([id[0], id[1]]);
+        let n = take(1)?[0] as usize;
+        let name = take(n)?.to_vec();
+        let len = u32::from_be_bytes(take(4)?.try_into().ok()?) as usize;
+        let data = take(len)?.to_vec();
+        out.push(super::PsdResource { id, name, data });
+    }
+    Some(out)
 }
 
 fn zip_error(e: ZipError) -> FileError {
@@ -2210,5 +2298,148 @@ mod tests {
         assert_eq!(boards, expected);
         assert_eq!(back.artboards().len(), 2);
         assert_eq!(back.flatten(), doc.flatten());
+    }
+
+    /// `path` rewritten with its manifest changed by `edit` (entries
+    /// stored, as Atelier writes them), then the sizes the archive
+    /// declares for `entry` set to `declared`.
+    fn crafted(
+        path: &Path,
+        edit: impl FnOnce(&mut serde_json::Value),
+        entry: &str,
+        declared: Option<u32>,
+    ) -> std::path::PathBuf {
+        let mut zip = ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let mut out = ZipWriter::new(Cursor::new(Vec::new()));
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let mut edit = Some(edit);
+        for i in 0..zip.len() {
+            let mut e = zip.by_index(i).unwrap();
+            let name = e.name().to_string();
+            let mut data = Vec::new();
+            e.read_to_end(&mut data).unwrap();
+            if name == MANIFEST {
+                let mut json: serde_json::Value = serde_json::from_slice(&data).unwrap();
+                (edit.take().unwrap())(&mut json);
+                data = json.to_string().into_bytes();
+            }
+            out.start_file(name, stored).unwrap();
+            out.write_all(&data).unwrap();
+        }
+        let mut bytes = out.finish().unwrap().into_inner();
+        if let Some(size) = declared {
+            let u16_at = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]) as usize;
+            // Central directory: size at 24, name length at 28, name at 46;
+            // local headers: 22, 26, 30.
+            for (magic, size_at, len_at, name_at) in
+                [(b"PK\x01\x02", 24, 28, 46), (b"PK\x03\x04", 22, 26, 30)]
+            {
+                let mut at = 0;
+                while let Some(i) = bytes[at..].windows(4).position(|w| w == magic) {
+                    let h = at + i;
+                    let n = u16_at(&bytes, h + len_at);
+                    if bytes.get(h + name_at..h + name_at + n) == Some(entry.as_bytes()) {
+                        bytes[h + size_at..h + size_at + 4].copy_from_slice(&size.to_le_bytes());
+                    }
+                    at = h + 4;
+                }
+            }
+        }
+        let crafted = path.with_file_name("crafted.atelier");
+        std::fs::write(&crafted, bytes).unwrap();
+        crafted
+    }
+
+    /// A few kilobytes never make the reader reserve gigabytes: neither
+    /// the sizes the archive declares nor a layer's declared dimensions
+    /// are trusted beyond what its bytes can hold.
+    #[test]
+    fn declared_sizes_never_reserve_memory() {
+        let path = temp("declared-sizes");
+        let mut doc = Document::new(RgbaImage::from_pixel(8, 8, Rgba([9, 9, 9, 255])), None);
+        doc.add_layer(
+            "A".into(),
+            RgbaImage::from_pixel(4, 4, Rgba([1, 2, 3, 255])),
+            (0, 0),
+        );
+        doc.save(&path).unwrap();
+        let png = "layers/1.png";
+        let side = |v: u32| {
+            move |json: &mut serde_json::Value| {
+                json["layers"][1]["width"] = v.into();
+                json["layers"][1]["height"] = v.into();
+            }
+        };
+        let cases = [
+            // 4 GB declared for the layer's few bytes.
+            (
+                crafted(&path, side(30_000), png, Some(0xFFFF_FFF0)),
+                "declared size",
+            ),
+            // 30000² pixels in a few bytes.
+            (crafted(&path, side(30_000), png, None), "dimensions"),
+            // Larger than any document.
+            (
+                crafted(&path, side(100_000), png, Some(0xFFFF_FFF0)),
+                "area",
+            ),
+        ];
+        for (file, what) in cases {
+            let started = std::time::Instant::now();
+            let opened = Document::open(&file);
+            assert!(matches!(opened, Err(FileError::Damaged)), "{what}");
+            assert!(started.elapsed().as_secs_f32() < 1.0, "{what}");
+        }
+        // Untouched, it opens.
+        let same = crafted(&path, |_| {}, png, None);
+        assert_eq!(Document::open(&same).unwrap().doc.flatten(), doc.flatten());
+    }
+
+    /// The pixels a PNG entry may declare: what deflate can make of its
+    /// bytes, and no more than a document holds.
+    #[test]
+    fn pixel_entries_hold_what_their_bytes_can() {
+        let mut out = ZipWriter::new(Cursor::new(Vec::new()));
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        out.start_file("small", stored).unwrap();
+        out.write_all(&[0; 1000]).unwrap();
+        let mut zip = ZipArchive::new(Cursor::new(out.finish().unwrap().into_inner())).unwrap();
+        assert!(read_pixels(&mut zip, "small", (100, 100), 4).is_ok());
+        let refused = |zip: &mut ZipArchive<_>, size| {
+            matches!(read_pixels(zip, "small", size, 4), Err(FileError::Damaged))
+        };
+        assert!(refused(&mut zip, (2000, 2000)));
+        assert!(refused(&mut zip, (MAX_DIMENSION + 1, MAX_DIMENSION)));
+    }
+
+    /// What a document's first file held beside its layers (EXIF, a
+    /// Photoshop document's resolution and metadata) stays with it in an
+    /// Atelier document.
+    #[test]
+    fn file_metadata_round_trip() {
+        let path = temp("file-metadata");
+        let mut doc = Document::new(RgbaImage::from_pixel(4, 4, Rgba([9, 9, 9, 255])), None);
+        doc.file_metadata.exif = Some(Arc::new(b"II*\0exif".to_vec()));
+        doc.file_metadata.psd_resources = Arc::new(vec![
+            crate::document::PsdResource {
+                id: 1005,
+                name: Vec::new(),
+                data: vec![1, 44, 0, 0, 0, 1, 0, 2],
+            },
+            crate::document::PsdResource {
+                id: 1060,
+                name: b"x".to_vec(),
+                data: b"<x:xmpmeta/>".to_vec(),
+            },
+        ]);
+        doc.save(&path).unwrap();
+        let back = Document::open(&path).unwrap().doc;
+        assert_eq!(back.file_metadata, doc.file_metadata);
+        // None: nothing written.
+        let plain = temp("file-metadata-none");
+        let mut doc = Document::new(RgbaImage::from_pixel(4, 4, Rgba([9, 9, 9, 255])), None);
+        doc.save(&plain).unwrap();
+        let mut zip = ZipArchive::new(File::open(&plain).unwrap()).unwrap();
+        assert!(zip.by_name(EXIF).is_err() && zip.by_name(PSD_RESOURCES).is_err());
     }
 }

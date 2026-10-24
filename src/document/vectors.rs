@@ -167,6 +167,7 @@ impl Document {
     /// history step.
     pub fn set_shape(&mut self, i: usize, shape: Shape) {
         let limit = self.shape_limit();
+        self.layers[i].anchor_styles();
         self.layers[i].set_shape(shape, limit);
         self.mark_modified();
     }
@@ -221,6 +222,19 @@ impl Document {
             let Some(mut shape) = self.layers[i].shape.as_deref().cloned() else {
                 return;
             };
+            // By whole pixels, a shape rendered whole: the same image
+            // elsewhere (its styles stay drawn).
+            let whole = d.x.fract() == 0.0 && d.y.fract() == 0.0;
+            let fits = shape
+                .extent()
+                .map(pixel_box)
+                .is_some_and(|b| u64::from(b.w) * u64::from(b.h) <= MAX_LAYER_PIXELS);
+            if whole && fits {
+                let l = &mut self.layers[i];
+                l.offset = (l.offset.0 + d.x as i64, l.offset.1 + d.y as i64);
+                self.mark_modified();
+                return;
+            }
             shape.translate(d);
             self.set_shape(i, shape);
         } else if let Some(mut path) = self.path(r) {
@@ -262,6 +276,57 @@ mod tests {
     fn rect_shape(x0: f32, y0: f32, x1: f32, y1: f32) -> Shape {
         let live = Live::new(ShapeKind::Rectangle, Bounds::of(pt(x0, y0), pt(x1, y1)));
         Shape::live(live, Paint::Color([255, 0, 0]), ShapeStroke::default())
+    }
+
+    /// A shape moved whole by whole pixels keeps its image (and the
+    /// styles drawn for it), only its place changes; otherwise it is
+    /// rendered again, the former styles staying where they were in the
+    /// canvas until the new ones are drawn.
+    #[test]
+    fn a_shape_moved_by_whole_pixels_keeps_its_image() {
+        let mut doc = Document::new(RgbaImage::from_pixel(80, 60, Rgba([255; 4])), None);
+        doc.add_shape_layer(
+            "Rectangle".into(),
+            "Rectangle",
+            rect_shape(10.0, 5.0, 30.0, 25.0),
+        );
+        let fx = &mut doc.active_layer_mut().effects;
+        fx.stroke.enabled = true;
+        fx.stroke.width = 3.0;
+        let id = doc.active_layer().id;
+        let drawn = doc.active_layer().styles(false).expect("styles");
+        let (rev, offset) = (doc.active_layer().rev(), doc.active_layer().offset);
+        doc.move_path(PathRef::Layer(id), pt(7.0, -3.0));
+        let layer = doc.active_layer();
+        assert_eq!(
+            (layer.rev(), layer.offset),
+            (rev, (offset.0 + 7, offset.1 - 3))
+        );
+        let kept = layer.styles_cached().expect("styles");
+        assert_eq!(kept.version, drawn.version);
+        assert_eq!(
+            kept.exterior[0].offset, drawn.exterior[0].offset,
+            "with the layer"
+        );
+        let path = doc.path(PathRef::Layer(id)).unwrap();
+        let b = path.bounds().unwrap();
+        assert_eq!((b.min.x, b.min.y), (17.0, 2.0));
+
+        // Moved by a fraction: rendered again; the former styles stay put.
+        let before = doc.active_layer().offset;
+        let canvas = |l: &Layer, s: &crate::compose::styles::Styles| {
+            (
+                l.offset.0 + s.exterior[0].offset.0,
+                l.offset.1 + s.exterior[0].offset.1,
+            )
+        };
+        let at = canvas(doc.active_layer(), &kept);
+        doc.move_path(PathRef::Layer(id), pt(-20.5, 0.0));
+        let layer = doc.active_layer();
+        assert_ne!(layer.rev(), rev);
+        assert_ne!(layer.offset, before);
+        let former = layer.styles_cached().expect("styles");
+        assert_eq!(canvas(layer, &former), at);
     }
 
     #[test]

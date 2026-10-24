@@ -67,12 +67,35 @@ thread_local! {
     static CURRENT: AtomicUsize = const { AtomicUsize::new(0) };
 }
 
+// A language for this thread only, for a while (see `in_lang`).
+thread_local! {
+    static OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 fn current() -> usize {
+    if let Some(index) = OVERRIDE.with(std::cell::Cell::get) {
+        return index;
+    }
     #[cfg(not(test))]
     let index = CURRENT.load(Ordering::Relaxed);
     #[cfg(test)]
     let index = CURRENT.with(|c| c.load(Ordering::Relaxed));
     index
+}
+
+/// `f`'s texts in `lang`, whatever the interface's language (the English
+/// diagnostics report). Only this thread is affected.
+pub fn in_lang<R>(lang: Lang, f: impl FnOnce() -> R) -> R {
+    let before = OVERRIDE.with(|o| o.replace(Some(lang.index())));
+    // Restored even if `f` panics.
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OVERRIDE.with(|o| o.set(self.0));
+        }
+    }
+    let _restore = Restore(before);
+    f()
 }
 
 static BUNDLES: LazyLock<Vec<FluentBundle<FluentResource>>> =
@@ -148,6 +171,48 @@ pub fn tr(id: &str, args: Option<&FluentArgs>) -> String {
     id.to_owned()
 }
 
+/// A message shown in the interface's language, with its English text for
+/// the diagnostics' log and report (see `tm!`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Message {
+    pub shown: String,
+    pub english: String,
+}
+
+impl Message {
+    pub fn new(shown: String, english: String) -> Self {
+        Self { shown, english }
+    }
+}
+
+/// A text with no English of its own (already English, or not known):
+/// the same in both.
+impl From<String> for Message {
+    fn from(shown: String) -> Self {
+        Self {
+            english: shown.clone(),
+            shown,
+        }
+    }
+}
+
+impl From<&String> for Message {
+    fn from(shown: &String) -> Self {
+        shown.clone().into()
+    }
+}
+
+impl From<&str> for Message {
+    fn from(shown: &str) -> Self {
+        shown.to_owned().into()
+    }
+}
+
+/// Text of key `id` in English (the arguments as given).
+pub fn tr_en(id: &str, args: Option<&FluentArgs>) -> String {
+    in_lang(Lang::En, || tr(id, args))
+}
+
 /// `value` with `decimals` digits, written with the language's decimal
 /// separator ("1.5" in English, "1,5" in French).
 pub fn decimal(value: f64, decimals: usize) -> String {
@@ -193,6 +258,23 @@ macro_rules! t {
     }};
 }
 pub(crate) use t;
+
+/// `tm!("key", name = value, …)`: like `t!`, a `Message` with the English
+/// text too (the arguments are evaluated once).
+macro_rules! tm {
+    ($id:literal) => {
+        $crate::i18n::Message::new($crate::i18n::tr($id, None), $crate::i18n::tr_en($id, None))
+    };
+    ($id:literal, $($name:ident = $value:expr),+ $(,)?) => {{
+        let mut args = fluent_bundle::FluentArgs::new();
+        $(args.set(stringify!($name), $value);)+
+        $crate::i18n::Message::new(
+            $crate::i18n::tr($id, Some(&args)),
+            $crate::i18n::tr_en($id, Some(&args)),
+        )
+    }};
+}
+pub(crate) use tm;
 
 #[cfg(test)]
 mod tests {
@@ -273,14 +355,18 @@ mod tests {
                     .filter(|l| !l.trim_start().starts_with("//"))
                     .collect::<Vec<_>>()
                     .join("\n");
-                // `t!(` but not `format!(`; rustfmt may put the key on the next line.
-                for (start, _) in code.match_indices("t!(") {
-                    let before = code[..start].chars().next_back();
-                    if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
-                        continue;
-                    }
-                    if let Some(rest) = code[start + 3..].trim_start().strip_prefix('"') {
-                        keys.insert(rest.split('"').next().unwrap_or_default().to_owned());
+                // `t!(` (or `tm!(`) but not `format!(`; rustfmt may put the
+                // key on the next line.
+                for macro_call in ["t!(", "tm!("] {
+                    for (start, _) in code.match_indices(macro_call) {
+                        let before = code[..start].chars().next_back();
+                        if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                            continue;
+                        }
+                        let rest = code[start + macro_call.len()..].trim_start();
+                        if let Some(rest) = rest.strip_prefix('"') {
+                            keys.insert(rest.split('"').next().unwrap_or_default().to_owned());
+                        }
                     }
                 }
             }
@@ -304,6 +390,18 @@ mod tests {
             from = at + 1;
         }
         source
+    }
+
+    /// A message keeps its English (the report's), and `in_lang` changes
+    /// the language for a while only.
+    #[test]
+    fn messages_carry_their_english() {
+        set_lang(Lang::Fr);
+        let m = tm!("menu-file");
+        assert_eq!((m.shown.as_str(), m.english.as_str()), ("Fichier", "File"));
+        assert_eq!(in_lang(Lang::En, || t!("menu-file")), "File");
+        assert_eq!(t!("menu-file"), "Fichier");
+        set_lang(Lang::En);
     }
 
     #[test]
@@ -358,6 +456,16 @@ mod tests {
         }
         for line in lines(Lang::En) {
             assert!(!line.contains(" %"), "en: space before %: {line}");
+        }
+        // Straight apostrophes and quotes everywhere (French quotes with « »).
+        for lang in Lang::ALL {
+            for line in lines(lang) {
+                assert!(
+                    !line.contains(['’', '“', '”']),
+                    "{}: curly quote in {line}",
+                    lang.code()
+                );
+            }
         }
     }
 

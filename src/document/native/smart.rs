@@ -212,7 +212,7 @@ fn relative(path: &Path, folder: &Path) -> Option<PathBuf> {
 
 /// A path on another machine: UNC (`\\host\share`, also `//host/share`
 /// on Windows), as written on any system.
-fn remote(path: &Path) -> bool {
+pub(in crate::document) fn remote(path: &Path) -> bool {
     let text = path.to_string_lossy();
     let local = ["\\\\?\\", "\\\\.\\"];
     if text.starts_with("\\\\") && !local.iter().any(|l| text.starts_with(l)) {
@@ -322,8 +322,8 @@ pub(super) fn smart_of(
     if let Some(m) = e.filter_mask {
         let image = match &m.image {
             Some(name) => {
-                let limit = 2 * (m.width as u64 * m.height as u64) + (1 << 20);
-                decode_gray(&read_entry(zip, name, limit)?, (m.width, m.height))?
+                let size = (m.width, m.height);
+                decode_gray(&read_pixels(zip, name, size, 1)?, size)?
             }
             None => GrayImage::new(0, 0),
         };

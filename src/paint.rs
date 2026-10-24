@@ -393,37 +393,35 @@ impl Stroke {
         let inner = (radius - 0.5).max(0.0) * s.hardness.clamp(0.0, 1.0);
         // The pixel under the center is always covered (a 1 px brush paints).
         let center = (cx.floor(), cy.floor());
-        self.scratch.clear();
-        for py in r.y..r.y + r.h {
-            let dy = py as f32 + 0.5 - cy;
-            for px in r.x..r.x + r.w {
-                let dx = px as f32 + 0.5 - cx;
-                // In the tip's frame: u along its long axis.
-                let u = dx * cos - dy * sin;
-                let v = dx * sin + dy * cos;
-                let a = match &s.tip {
-                    Tip::Round => {
-                        let d = (u * u + (v / minor).powi(2)).sqrt();
-                        if d <= inner || (px as f32, py as f32) == center {
-                            1.0
-                        } else {
-                            let t = ((d - inner) / (outer - inner)).clamp(0.0, 1.0);
-                            1.0 - t * t * (3.0 - 2.0 * t)
+        let tip = &s.tip;
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        scratch.resize((r.w * r.h) as usize, 0.0);
+        dab_rows(&mut scratch, r.w as usize, |first, band| {
+            for (j, row) in band.chunks_exact_mut(r.w as usize).enumerate() {
+                let py = r.y + (first + j) as u32;
+                let dy = py as f32 + 0.5 - cy;
+                for (px, out) in (r.x..r.x + r.w).zip(row) {
+                    let dx = px as f32 + 0.5 - cx;
+                    // In the tip's frame: u along its long axis.
+                    let u = dx * cos - dy * sin;
+                    let v = dx * sin + dy * cos;
+                    *out = match tip {
+                        Tip::Round => {
+                            let d = (u * u + (v / minor).powi(2)).sqrt();
+                            if d <= inner || (px as f32, py as f32) == center {
+                                1.0
+                            } else {
+                                let t = ((d - inner) / (outer - inner)).clamp(0.0, 1.0);
+                                1.0 - t * t * (3.0 - 2.0 * t)
+                            }
                         }
-                    }
-                    Tip::Sampled(tip) => tip.sample(u / radius, v / (radius * minor), diameter),
-                };
-                self.scratch.push(a);
+                        Tip::Sampled(tip) => tip.sample(u / radius, v / (radius * minor), diameter),
+                    };
+                }
             }
-        }
-    }
-
-    /// Selection coverage of pixel (x, y), 0..1.
-    fn limit(&self, x: u32, y: u32, shaped: bool) -> f32 {
-        match &self.clip {
-            Some(c) if shaped => c.coverage(x, y) as f32 / 255.0,
-            _ => 1.0,
-        }
+        });
+        self.scratch = scratch;
     }
 
     fn dab(
@@ -464,26 +462,37 @@ impl Stroke {
         let cap = s.opacity.clamp(0.0, 1.0) * s.pressure_scale(p) * 65535.0;
         let flow = s.flow.clamp(0.0, 1.0);
         let w = self.base.width() as usize;
-        let mut i = 0;
-        for py in r.y..r.y + r.h {
-            for px in r.x..r.x + r.w {
-                let a = self.scratch[i] * flow;
-                i += 1;
-                if a <= 0.0 {
-                    continue;
-                }
-                let target = cap * self.limit(px, py, shaped);
-                let m = &mut self.mask[py as usize * w + px as usize];
-                let now = *m as f32;
-                if now < target {
-                    let next = (now + (target - now) * a).round() as u16;
-                    if next > *m {
-                        *m = next;
-                        self.painted = true;
+        let (scratch, clip) = (&self.scratch, &self.clip);
+        let painted = std::sync::atomic::AtomicBool::new(false);
+        let rows = &mut self.mask[r.y as usize * w..(r.y + r.h) as usize * w];
+        let rw = r.w as usize;
+        dab_rows_work(rows, w, rw * r.h as usize, |first, band| {
+            let mut any = false;
+            for (j, row) in band.chunks_exact_mut(w).enumerate() {
+                let py = r.y + (first + j) as u32;
+                let tips = &scratch[(first + j) * rw..][..rw];
+                for (px, &tip) in (r.x..r.x + r.w).zip(tips) {
+                    let a = tip * flow;
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    let target = cap * limit(clip, px, py, shaped);
+                    let m = &mut row[px as usize];
+                    let now = *m as f32;
+                    if now < target {
+                        let next = (now + (target - now) * a).round() as u16;
+                        if next > *m {
+                            *m = next;
+                            any = true;
+                        }
                     }
                 }
             }
-        }
+            if any {
+                painted.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        self.painted |= painted.into_inner();
     }
 
     /// Recomposites area `r` from the original pixels and the mask.
@@ -491,49 +500,54 @@ impl Stroke {
         let w = self.base.width() as usize;
         let [cr, cg, cb, _] = self.settings.color;
         let ca = self.settings.color[3] as f32 / 255.0;
-        let (base, out) = (self.base.as_raw(), image.as_mut());
-        for y in r.y as usize..(r.y + r.h) as usize {
-            let (from, to) = (y * w + r.x as usize, y * w + (r.x + r.w) as usize);
-            let mask = &self.mask[from..to];
-            let src = &base[from * 4..to * 4];
-            let dst = &mut out[from * 4..to * 4];
-            for (x, ((&m, b), d)) in (r.x as i64..).zip(
-                mask.iter()
-                    .zip(src.chunks_exact(4))
-                    .zip(dst.chunks_exact_mut(4)),
-            ) {
-                let b = [b[0], b[1], b[2], b[3]];
-                let px = if m == 0 {
-                    b
-                } else {
-                    let k = m as f32 / 65535.0;
-                    let rgb = || [b[0], b[1], b[2]].map(|v| v as f32 / 255.0);
-                    let toned = |c: [f32; 3]| [to_u8(c[0]), to_u8(c[1]), to_u8(c[2]), b[3]];
-                    match self.mode {
-                        StrokeMode::Erase => match to_u8(b[3] as f32 / 255.0 * (1.0 - k)) {
-                            0 => [0, 0, 0, 0],
-                            a => [b[0], b[1], b[2], a],
-                        },
-                        StrokeMode::Tone {
-                            burn,
-                            range,
-                            protect,
-                        } => toned(tone::dodge_burn(rgb(), k, burn, range, protect)),
-                        StrokeMode::Sponge { saturate, vibrance } => {
-                            toned(tone::sponge(rgb(), k, saturate, vibrance))
-                        }
-                        StrokeMode::Clone => match self.cloned(x, y as i64) {
-                            Some([sr, sg, sb, sa]) => {
-                                over(b, [sr, sg, sb, to_u8(sa as f32 / 255.0 * k)])
+        let base = self.base.as_raw();
+        let out: &mut [u8] = image.as_mut();
+        let rows = &mut out[r.y as usize * w * 4..(r.y + r.h) as usize * w * 4];
+        dab_rows_work(rows, w * 4, (r.w * r.h) as usize, |first, band| {
+            for (j, line) in band.chunks_exact_mut(w * 4).enumerate() {
+                let y = r.y as usize + first + j;
+                let (from, to) = (y * w + r.x as usize, y * w + (r.x + r.w) as usize);
+                let mask = &self.mask[from..to];
+                let src = &base[from * 4..to * 4];
+                let dst = &mut line[r.x as usize * 4..(r.x + r.w) as usize * 4];
+                for (x, ((&m, b), d)) in (r.x as i64..).zip(
+                    mask.iter()
+                        .zip(src.chunks_exact(4))
+                        .zip(dst.chunks_exact_mut(4)),
+                ) {
+                    let b = [b[0], b[1], b[2], b[3]];
+                    let px = if m == 0 {
+                        b
+                    } else {
+                        let k = m as f32 / 65535.0;
+                        let rgb = || [b[0], b[1], b[2]].map(|v| v as f32 / 255.0);
+                        let toned = |c: [f32; 3]| [to_u8(c[0]), to_u8(c[1]), to_u8(c[2]), b[3]];
+                        match self.mode {
+                            StrokeMode::Erase => match to_u8(b[3] as f32 / 255.0 * (1.0 - k)) {
+                                0 => [0, 0, 0, 0],
+                                a => [b[0], b[1], b[2], a],
+                            },
+                            StrokeMode::Tone {
+                                burn,
+                                range,
+                                protect,
+                            } => toned(tone::dodge_burn(rgb(), k, burn, range, protect)),
+                            StrokeMode::Sponge { saturate, vibrance } => {
+                                toned(tone::sponge(rgb(), k, saturate, vibrance))
                             }
-                            None => b,
-                        },
-                        _ => over(b, [cr, cg, cb, to_u8(ca * k)]),
-                    }
-                };
-                d.copy_from_slice(&px);
+                            StrokeMode::Clone => match self.cloned(x, y as i64) {
+                                Some([sr, sg, sb, sa]) => {
+                                    over(b, [sr, sg, sb, to_u8(sa as f32 / 255.0 * k)])
+                                }
+                                None => b,
+                            },
+                            _ => over(b, [cr, cg, cb, to_u8(ca * k)]),
+                        }
+                    };
+                    d.copy_from_slice(&px);
+                }
             }
-        }
+        });
     }
 
     /// Clone Stamp: the source pixel for layer pixel (x, y), if any.
@@ -560,50 +574,100 @@ impl Stroke {
         let (x1, y1) = ((r.x + r.w + 1).min(w), (r.y + r.h + 1).min(h));
         let rw = (x1 - x0) as usize;
         let read: &RgbaImage = self.source.as_ref().unwrap_or(&*image);
-        let mut region = Vec::with_capacity(rw * (y1 - y0) as usize);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                region.push(premultiply(read.get_pixel(x, y).0));
+        let mut region = vec![[0.0f32; 4]; rw * (y1 - y0) as usize];
+        dab_rows(&mut region, rw, |first, band| {
+            for (j, row) in band.chunks_exact_mut(rw).enumerate() {
+                let y = y0 + (first + j) as u32;
+                for (x, out) in (x0..x1).zip(row) {
+                    *out = premultiply(read.get_pixel(x, y).0);
+                }
             }
-        }
+        });
         let at = |x: u32, y: u32| region[(y - y0) as usize * rw + (x - x0) as usize];
         let strength = self.settings.flow.clamp(0.0, 1.0) * self.settings.pressure_scale(p);
-        let mut i = 0;
-        for py in r.y..r.y + r.h {
-            for px in r.x..r.x + r.w {
-                let amount = self.scratch[i] * strength * self.limit(px, py, shaped);
-                i += 1;
-                if amount <= 0.0 {
-                    continue;
-                }
-                let mut mean = [0.0f32; 4];
-                let mut n = 0.0;
-                for ny in py.saturating_sub(1).max(y0)..(py + 2).min(y1) {
-                    for nx in px.saturating_sub(1).max(x0)..(px + 2).min(x1) {
-                        let q = at(nx, ny);
-                        for c in 0..4 {
-                            mean[c] += q[c];
+        // Computed on all the cores, then written.
+        let (scratch, clip) = (&self.scratch, &self.clip);
+        let mut results = vec![([0.0f32; 4], 0.0f32); (r.w * r.h) as usize];
+        dab_rows(&mut results, r.w as usize, |first, band| {
+            for (j, row) in band.chunks_exact_mut(r.w as usize).enumerate() {
+                let py = r.y + (first + j) as u32;
+                for (i, px) in (r.x..r.x + r.w).enumerate() {
+                    let amount = scratch[(first + j) * r.w as usize + i]
+                        * strength
+                        * limit(clip, px, py, shaped);
+                    if amount <= 0.0 {
+                        continue;
+                    }
+                    let mut mean = [0.0f32; 4];
+                    let mut n = 0.0;
+                    for ny in py.saturating_sub(1).max(y0)..(py + 2).min(y1) {
+                        for nx in px.saturating_sub(1).max(x0)..(px + 2).min(x1) {
+                            let q = at(nx, ny);
+                            for c in 0..4 {
+                                mean[c] += q[c];
+                            }
+                            n += 1.0;
                         }
-                        n += 1.0;
+                    }
+                    let cur = at(px, py);
+                    let mut out = [0.0f32; 4];
+                    for c in 0..4 {
+                        let m = mean[c] / n;
+                        out[c] = if sharpen {
+                            cur[c] + (cur[c] - m) * amount
+                        } else {
+                            cur[c] + (m - cur[c]) * amount
+                        };
+                    }
+                    out[3] = out[3].clamp(0.0, 1.0);
+                    for c in 0..3 {
+                        out[c] = out[c].clamp(0.0, out[3]);
+                    }
+                    row[i] = (out, amount);
+                }
+            }
+        });
+        self.put_all(image, r, &results);
+    }
+
+    /// [`Self::put`] of `results` (row by row over `r`; an amount of 0:
+    /// nothing), on all the cores when only the layer is written.
+    fn put_all(&mut self, image: &mut RgbaImage, r: DirtyRect, results: &[([f32; 4], f32)]) {
+        if self.source.is_some() {
+            let mut k = 0;
+            for py in r.y..r.y + r.h {
+                for px in r.x..r.x + r.w {
+                    let (out, amount) = results[k];
+                    k += 1;
+                    if amount > 0.0 {
+                        self.put(image, px, py, out, amount);
                     }
                 }
-                let cur = at(px, py);
-                let mut out = [0.0f32; 4];
-                for c in 0..4 {
-                    let m = mean[c] / n;
-                    out[c] = if sharpen {
-                        cur[c] + (cur[c] - m) * amount
-                    } else {
-                        cur[c] + (m - cur[c]) * amount
-                    };
-                }
-                out[3] = out[3].clamp(0.0, 1.0);
-                for c in 0..3 {
-                    out[c] = out[c].clamp(0.0, out[3]);
-                }
-                self.put(image, px, py, out, amount);
             }
+            return;
         }
+        let (w, rw) = (image.width() as usize, r.w as usize);
+        let painted = std::sync::atomic::AtomicBool::new(false);
+        let raw: &mut [u8] = image.as_mut();
+        let rows = &mut raw[r.y as usize * w * 4..(r.y + r.h) as usize * w * 4];
+        dab_rows_work(rows, w * 4, rw * r.h as usize, |first, band| {
+            let mut any = false;
+            for (j, line) in band.chunks_exact_mut(w * 4).enumerate() {
+                let done = &results[(first + j) * rw..][..rw];
+                let pixels = line[r.x as usize * 4..(r.x as usize + rw) * 4].chunks_exact_mut(4);
+                for (&(out, amount), p) in done.iter().zip(pixels) {
+                    if amount > 0.0 {
+                        let px = unpremultiply(out);
+                        any |= p != px;
+                        p.copy_from_slice(&px);
+                    }
+                }
+            }
+            if any {
+                painted.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        self.painted |= painted.into_inner();
     }
 
     /// Writes the result `out` (premultiplied) of an effect of `amount` at
@@ -668,29 +732,81 @@ impl Stroke {
         }
         self.tip_coverage(r, cx, cy, diameter);
         let strength = self.settings.flow.clamp(0.0, 1.0) * self.settings.pressure_scale(p);
+        // What each pixel becomes, on all the cores: the new slot, and the
+        // amount laid down (0: none).
+        let rw = r.w as usize;
+        let mut results = vec![([0.0f32; 4], 0.0f32); rw * r.h as usize];
+        {
+            let read: &RgbaImage = self.source.as_ref().unwrap_or(&*image);
+            let carried = self.carried.as_ref().expect("carried paint");
+            let (scratch, clip) = (&self.scratch, &self.clip);
+            dab_rows(&mut results, rw, |first, band| {
+                for (jj, row) in band.chunks_exact_mut(rw).enumerate() {
+                    let y = r.y + (first + jj) as u32;
+                    let j = (y as i64 - iy + half) as usize;
+                    for (k, x) in (r.x..r.x + r.w).enumerate() {
+                        let amount =
+                            scratch[(first + jj) * rw + k] * strength * limit(clip, x, y, shaped);
+                        let cur = premultiply(read.get_pixel(x, y).0);
+                        let i = (x as i64 - ix + half) as usize;
+                        let slot = carried.pixels[j * carried.size + i];
+                        row[k] = if amount <= 0.0 || slot[3].is_nan() {
+                            (cur, 0.0)
+                        } else {
+                            (
+                                std::array::from_fn(|c| cur[c] + (slot[c] - cur[c]) * amount),
+                                amount,
+                            )
+                        };
+                    }
+                }
+            });
+        }
+        let carried = self.carried.as_mut().expect("carried paint");
         let mut k = 0;
         for y in r.y..r.y + r.h {
+            let j = (y as i64 - iy + half) as usize;
             for x in r.x..r.x + r.w {
-                let amount = self.scratch[k] * strength * self.limit(x, y, shaped);
+                let i = (x as i64 - ix + half) as usize;
+                carried.pixels[j * carried.size + i] = results[k].0;
                 k += 1;
-                let read: &RgbaImage = self.source.as_ref().unwrap_or(&*image);
-                let cur = premultiply(read.get_pixel(x, y).0);
-                let carried = self.carried.as_mut().expect("carried paint");
-                let (i, j) = (
-                    (x as i64 - ix + half) as usize,
-                    (y as i64 - iy + half) as usize,
-                );
-                let slot = &mut carried.pixels[j * carried.size + i];
-                if amount <= 0.0 || slot[3].is_nan() {
-                    *slot = cur;
-                    continue;
-                }
-                let out: [f32; 4] = std::array::from_fn(|c| cur[c] + (slot[c] - cur[c]) * amount);
-                *slot = out;
-                self.put(image, x, y, out, amount);
             }
         }
+        self.put_all(image, r, &results);
         Some(r)
+    }
+}
+
+/// Selection coverage of pixel (x, y), 0..1.
+fn limit(clip: &Option<Clip>, x: u32, y: u32, shaped: bool) -> f32 {
+    match clip {
+        Some(c) if shaped => c.coverage(x, y) as f32 / 255.0,
+        _ => 1.0,
+    }
+}
+
+/// Below this many pixels, a dab is worked on here, in one go (threads
+/// would cost more than they save).
+const DAB_PARALLEL: usize = 1 << 16;
+
+/// `f(first_row, band)` over the rows (`row` long) of a dab's buffer, on
+/// all the cores when large.
+fn dab_rows<T: Send>(data: &mut [T], row: usize, f: impl Fn(usize, &mut [T]) + Sync) {
+    let work = data.len();
+    dab_rows_work(data, row, work, f);
+}
+
+/// [`dab_rows`] for rows wider than the dab: `work` pixels in all.
+fn dab_rows_work<T: Send>(
+    data: &mut [T],
+    row: usize,
+    work: usize,
+    f: impl Fn(usize, &mut [T]) + Sync,
+) {
+    if work < DAB_PARALLEL {
+        f(0, data);
+    } else {
+        crate::mask_ops::par_rows(data, row, f);
     }
 }
 

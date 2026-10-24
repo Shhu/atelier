@@ -67,9 +67,10 @@ struct Shown {
 
 /// A click or a rectangle: on the image `fingerprint`, with Shift and Alt.
 struct Pick {
-    /// The document clicked, and its image then.
+    /// The document clicked, its image then and its history step.
     doc: u64,
     fingerprint: u64,
+    step: u64,
     prompt: Prompt,
     shift: bool,
     alt: bool,
@@ -195,8 +196,9 @@ fn preview(mask: &GrayImage) -> Option<Preview> {
 }
 
 /// What the analysis depends on: the canvas and the displayed layers,
-/// with their masks, effects and settings. Pixel revisions are unique
-/// across documents.
+/// with their masks, effects, settings and artboards (not what only the
+/// Layers panel shows: a group folded). Pixel revisions are unique across
+/// documents.
 pub(super) fn fingerprint(doc: &Document) -> u64 {
     hash_of((
         doc.width(),
@@ -215,7 +217,11 @@ pub(super) fn fingerprint(doc: &Document) -> u64 {
                     l.effects.any().then(|| format!("{:?}", l.effects)),
                     l.mask.as_ref().map(|m| m.key(l.offset)),
                     // Adjustment and fill layers: their settings.
-                    format!("{:?}", l.kind),
+                    match &l.kind {
+                        LayerKind::Pixels | LayerKind::Group { .. } => None,
+                        kind => Some(format!("{kind:?}")),
+                    },
+                    l.artboard,
                 )
             })
             .collect::<Vec<_>>(),
@@ -405,12 +411,13 @@ impl AtelierApp {
         if !self.request_model(AfterDownload::ObjectSelection) {
             return;
         }
-        let Some(doc) = self.doc.as_ref().map(Document::uid) else {
+        let Some((doc, step)) = self.doc.as_ref().map(|d| (d.uid(), d.history_step())) else {
             return;
         };
         let pick = Pick {
             doc,
             fingerprint: current,
+            step,
             prompt,
             shift,
             alt,
@@ -436,6 +443,19 @@ impl AtelierApp {
     /// Results of the analysis and of the masks computed in the background
     /// (every frame, whatever the tool).
     pub(super) fn poll_object_select(&mut self) {
+        let tool = self.tool == Tool::ObjectSelect;
+        // Nothing asked for: the fingerprint (a hash of every layer) is not
+        // paid every frame.
+        if !tool && !self.object_select.busy() {
+            return;
+        }
+        // Clicks waiting for an analysis that only the tool starts: the
+        // tool was left, they are dropped rather than applied later.
+        let os = &mut self.object_select;
+        if !tool && os.analysing.is_none() && !os.queued.is_empty() {
+            os.queued.clear();
+            self.status = t!("sel4-objsel-dropped");
+        }
         let current = self.doc.as_ref().map(fingerprint);
         let uid = self.doc.as_ref().map(Document::uid);
         let os = &mut self.object_select;
@@ -458,8 +478,9 @@ impl AtelierApp {
                         Ok(Err(e)) => e,
                         _ => t!("ai-error-internal"),
                     };
-                    self.status = t!("objsel-failed", error = error);
-                    crate::diag::error(&self.status);
+                    let failed = tm!("objsel-failed", error = error);
+                    self.status = failed.shown.clone();
+                    crate::diag::error(failed);
                 }
             }
         }
@@ -468,7 +489,11 @@ impl AtelierApp {
             && !os.queued.is_empty()
         {
             let mut queued = std::mem::take(&mut os.queued);
+            let before = queued.len();
             queued.retain(|pick| Some(pick.fingerprint) == current);
+            if queued.len() < before {
+                self.status = t!("sel4-objsel-dropped");
+            }
             os.picking += queued.len();
             let ctx = self.ctx.clone();
             os.worker(&ctx).push(|q| {
@@ -513,18 +538,25 @@ impl AtelierApp {
                 }
                 Done::Pick(pick, mask) => {
                     self.object_select.picking -= 1;
-                    if Some(pick.fingerprint) == current {
+                    let step = self.doc.as_ref().map(Document::history_step);
+                    if uid == Some(pick.doc) && step != Some(pick.step) {
+                        // Undone, redone or edited meanwhile: the click was
+                        // about another state (never recorded over it).
+                        self.status = t!("hist4-selection-history-changed");
+                    } else if Some(pick.fingerprint) == current {
                         self.apply_object(mask, pick.shift, pick.alt);
                     } else if let Some(now) = current
                         && uid == Some(pick.doc)
+                        && self.tool == Tool::ObjectSelect
                     {
                         // The image changed meanwhile (an undo): the click
                         // is made again on what shows now, rather than lost
-                        // (never on another tab).
-                        crate::diag::warn(
-                            "Object Selection: image changed during a pick, picked again",
-                        );
+                        // (never on another tab, nor once the tool is left:
+                        // it would land later, unexpected).
+                        crate::diag::warn(tm!("ui4-log-objsel-picked-again"));
                         self.pick_object(pick.prompt, pick.shift, pick.alt, now);
+                    } else if uid == Some(pick.doc) {
+                        self.status = t!("sel4-objsel-dropped");
                     }
                 }
             }
@@ -536,7 +568,7 @@ impl AtelierApp {
             os.worker = None;
             os.picking = 0;
             os.reset_hover();
-            self.status_failed(t!("objsel-failed", error = t!("ai-error-internal")));
+            self.status_failed(tm!("objsel-failed", error = t!("ai-error-internal")));
         }
     }
 
@@ -548,7 +580,7 @@ impl AtelierApp {
         let found = match mask {
             Ok(mask) => mask.and_then(|m| Selection::from_mask(&m.coverage, m.offset)),
             Err(error) => {
-                self.status_failed(t!("objsel-failed", error = error));
+                self.status_failed(tm!("objsel-failed", error = error));
                 return;
             }
         };
@@ -820,5 +852,58 @@ mod tests {
         });
         let mask = Selection::from_mask(&selected, (0, 0));
         assert_near(mask.expect("box").rect, [561, 166, 198, 308]);
+    }
+
+    /// Folding a group changes nothing in the image: no new analysis. An
+    /// artboard's background does.
+    #[test]
+    fn fingerprint_ignores_group_folding_and_follows_artboards() {
+        let mut doc = Document::new(image::RgbaImage::new(64, 64), None);
+        doc.add_group();
+        let before = fingerprint(&doc);
+        for l in &mut doc.layers {
+            if let crate::document::LayerKind::Group { expanded } = &mut l.kind {
+                *expanded = !*expanded;
+            }
+        }
+        assert_eq!(fingerprint(&doc), before, "folded");
+        let i = doc.active;
+        doc.layers[i].artboard = Some(crate::document::Artboard {
+            size: (32, 32),
+            background: crate::document::ArtboardBackground::White,
+        });
+        let board = fingerprint(&doc);
+        assert_ne!(board, before, "artboard");
+        doc.layers[i].artboard.as_mut().unwrap().background =
+            crate::document::ArtboardBackground::Black;
+        assert_ne!(fingerprint(&doc), board, "its background");
+    }
+
+    /// A click waiting for an analysis that only the tool starts is
+    /// dropped when the tool is left, never applied later.
+    #[test]
+    fn a_waiting_click_is_dropped_when_the_tool_is_left() {
+        let mut harness = app_with(image::RgbaImage::new(64, 64));
+        let app = harness.state_mut();
+        let doc = app.doc.as_ref().unwrap();
+        let pick = Pick {
+            doc: doc.uid(),
+            fingerprint: fingerprint(doc),
+            step: doc.history_step(),
+            prompt: Prompt {
+                points: vec![(10.0, 10.0, true)],
+                rect: None,
+            },
+            shift: false,
+            alt: false,
+        };
+        app.object_select.queued.push(pick);
+        app.tool = Tool::Brush;
+        harness.run_steps(2);
+        let app = harness.state();
+        assert!(app.object_select.queued.is_empty());
+        assert!(!app.object_select.busy());
+        assert_eq!(app.status, t!("sel4-objsel-dropped"));
+        assert!(app.selection.is_none());
     }
 }

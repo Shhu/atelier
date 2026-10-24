@@ -9,8 +9,10 @@ use crate::i18n::t;
 const SLOT: f32 = 36.0;
 const SLOT_GAP: f32 = 2.0;
 const SECTION_LINE: f32 = 11.0;
+/// The colors, then the Quick Mask button under them.
+const COLORS: f32 = 40.0 + 6.0 + 22.0;
 /// The panel's margins (top 8, bottom 12), the colors and the gap above them.
-const CHROME: f32 = 8.0 + 12.0 + 40.0 + 8.0;
+const CHROME: f32 = 8.0 + 12.0 + COLORS + 8.0;
 
 /// A line before each section: selection, painting, paths and text, view.
 fn starts_section(group: &[Tool]) -> bool {
@@ -20,14 +22,17 @@ fn starts_section(group: &[Tool]) -> bool {
     )
 }
 
-/// The groups by rows of `columns` slots, a section starting a new row;
-/// `true` when a section's line goes before the row.
+/// The groups by rows of `columns` slots; `true` when a section's line goes
+/// before the row. In one column each section starts a new row; in more,
+/// the groups are packed (no half-empty rows) and a line is drawn where a
+/// section happens to start a row.
 fn rows(columns: usize) -> Vec<(bool, Vec<usize>)> {
     let mut rows: Vec<(bool, Vec<usize>)> = Vec::new();
     for (index, group) in Tool::GROUPS.iter().enumerate() {
         let section = starts_section(group);
+        let breaks = section && columns == 1;
         match rows.last_mut() {
-            Some((_, row)) if !section && row.len() < columns => row.push(index),
+            Some((_, row)) if !breaks && row.len() < columns => row.push(index),
             _ => rows.push((section, vec![index])),
         }
     }
@@ -59,14 +64,18 @@ pub(super) fn width(columns: usize) -> f32 {
 
 impl AtelierApp {
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui, columns: usize) {
-        // The colors stay at the bottom; the tools scroll above them when
-        // even two columns don't fit.
+        // The colors and the Quick Mask button stay at the bottom; the
+        // tools scroll above them when even two columns don't fit.
         let full = ui.max_rect();
-        let (tools, colors) = full.split_top_bottom_at_y(full.bottom() - 40.0);
+        let (tools, colors) = full.split_top_bottom_at_y(full.bottom() - COLORS);
         let centered = egui::Layout::top_down(egui::Align::Center);
         ui.scope_builder(
             egui::UiBuilder::new().max_rect(colors).layout(centered),
-            |ui| self.colors(ui),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                self.colors(ui);
+                self.quick_mask_button(ui);
+            },
         );
         let mut tools =
             ui.new_child(egui::UiBuilder::new().max_rect(tools.with_max_y(tools.bottom() - 8.0)));

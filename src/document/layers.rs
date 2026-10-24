@@ -134,11 +134,7 @@ impl Document {
         } else {
             NewMask::RevealAll
         };
-        let step = self.undo.len();
-        self.add_mask(kind, selection);
-        if self.undo.len() > step {
-            self.undo.pop_back();
-        }
+        self.put_mask(kind, selection);
     }
 
     /// New empty group above the active layer.
@@ -468,6 +464,31 @@ impl Document {
         let start = r.start;
         self.layers.drain(r);
         self.active = start.min(self.layers.len() - 1);
+        self.fix_depths();
+        true
+    }
+
+    /// Deletes layers `indices` (a group with its layers) in one step.
+    /// Refused (`false`) when that would leave no layer.
+    pub fn delete_layers(&mut self, indices: &[usize]) -> bool {
+        let mut gone = vec![false; self.layers.len()];
+        for &i in indices.iter().filter(|&&i| i < self.layers.len()) {
+            for j in self.block(i) {
+                gone[j] = true;
+            }
+        }
+        let count = gone.iter().filter(|&&g| g).count();
+        if count == 0 || count >= self.layers.len() {
+            return false;
+        }
+        self.checkpoint(t!("menu-layer-delete"));
+        let lowest = gone.iter().position(|&g| g).unwrap_or(0);
+        let mut k = 0;
+        self.layers.retain(|_| {
+            k += 1;
+            !gone[k - 1]
+        });
+        self.active = lowest.min(self.layers.len() - 1);
         self.fix_depths();
         true
     }

@@ -142,15 +142,6 @@ impl AtelierApp {
         for (title, entries) in self.menus() {
             flatten(ctx, &entries, &title, &mut commands);
         }
-        if query.is_empty() {
-            // With no image: what starts one.
-            let no_doc = self.doc.is_none();
-            let suggested = commands
-                .into_iter()
-                .filter(|e| e.enabled && suggested(e.action, no_doc))
-                .collect();
-            return vec![(t!("palette-suggested"), suggested, 0)];
-        }
         let tools = Tool::ALL.into_iter().map(|tool| Entry {
             label: tool.name(),
             path: t!("palette-tool"),
@@ -159,20 +150,36 @@ impl AtelierApp {
             checked: None,
             action: Action::Tool(tool),
         });
+        if query.is_empty() {
+            // With no image: what starts one (tools included: Crop).
+            let no_doc = self.doc.is_none();
+            let suggested = commands
+                .into_iter()
+                .chain(tools.filter(|_| !no_doc))
+                .filter(|e| e.enabled && suggested(e.action, no_doc))
+                .collect();
+            return vec![(t!("palette-suggested"), suggested, 0)];
+        }
         let tools = ranked(tools.collect(), query, MAX_TOOLS);
         let commands = ranked(commands, query, MAX_COMMANDS);
-        [
+        // The group with the better match first (Enter runs it).
+        let commands_first = commands.2 > tools.2;
+        let mut groups = vec![
             (t!("palette-tools"), tools.0, tools.1),
             (t!("palette-commands"), commands.0, commands.1),
-        ]
-        .into_iter()
-        .filter(|(_, entries, _)| !entries.is_empty())
-        .collect()
+        ];
+        if commands_first {
+            groups.reverse();
+        }
+        groups
+            .into_iter()
+            .filter(|(_, entries, _)| !entries.is_empty())
+            .collect()
     }
 
     /// Why a greyed command can't run now, in a few words.
     pub(super) fn why_unavailable(&self, action: Action) -> String {
-        unavailable_reason(self.doc.is_some(), self.selection.is_some(), action)
+        unavailable_reason(&self.greyed_facts(), action)
     }
 
     /// Search field row: icon, query (focused), Esc.
@@ -330,9 +337,89 @@ fn flatten(ctx: &egui::Context, entries: &[MenuEntry], path: &str, out: &mut Vec
     }
 }
 
-/// Why a greyed command can't run, knowing whether there is an image and
-/// a selection.
-pub(super) fn unavailable_reason(has_doc: bool, has_selection: bool, action: Action) -> String {
+/// What the reason a command is greyed depends on, gathered once per menu
+/// draw (the menus can't borrow the app while they run).
+#[derive(Clone, Copy, Default)]
+pub(super) struct Facts {
+    doc: bool,
+    selection: bool,
+    last_selection: bool,
+    layer_below: bool,
+    mask: bool,
+    pixels: bool,
+    smart: bool,
+    smart_pixels: bool,
+    linked: bool,
+    live: bool,
+    group: bool,
+    artboard: bool,
+    artboards: bool,
+    styled: bool,
+    guides: bool,
+    saved_selections: bool,
+    last_filter: bool,
+    last_transform: bool,
+    busy: bool,
+}
+
+impl AtelierApp {
+    /// What `unavailable_reason` needs to know now.
+    pub(super) fn greyed_facts(&self) -> Facts {
+        let doc = self.doc.as_ref();
+        let layer = doc.map(Document::active_layer);
+        Facts {
+            doc: doc.is_some(),
+            selection: self.selection.is_some(),
+            last_selection: self.last_selection.is_some(),
+            layer_below: doc.is_some_and(|d| d.active > 0 || d.active_layer().is_group()),
+            mask: layer.is_some_and(|l| l.mask.is_some()),
+            pixels: layer.is_some_and(Layer::has_pixels),
+            smart: layer.is_some_and(Layer::is_smart),
+            smart_pixels: self.smart_filters_apply(),
+            linked: layer
+                .and_then(|l| l.smart.as_deref())
+                .is_some_and(|s| s.link.is_some()),
+            live: layer.is_some_and(Layer::is_live),
+            group: layer.is_some_and(Layer::is_group),
+            artboard: layer.is_some_and(|l| l.artboard.is_some()),
+            artboards: doc.is_some_and(Document::has_artboards),
+            styled: layer.is_some_and(|l| l.effects.any()),
+            guides: doc.is_some_and(|d| !d.guides.is_empty()),
+            saved_selections: doc.is_some_and(|d| !d.channels.is_empty()),
+            last_filter: self.has_last_filter(),
+            last_transform: self.has_last_transform(),
+            busy: self.subject_job.is_some(),
+        }
+    }
+}
+
+impl AtelierApp {
+    /// Every menu command and tool with its name, without "…" ("Image
+    /// Size", "Brush"): what Diagnostics shows of what it measured.
+    pub(super) fn command_names(&self, ctx: &egui::Context) -> Vec<(Action, String)> {
+        let mut commands = Vec::new();
+        for (title, entries) in self.menus() {
+            flatten(ctx, &entries, &title, &mut commands);
+        }
+        let tools = Tool::ALL.into_iter().map(|t| (Action::Tool(t), t.name()));
+        commands
+            .into_iter()
+            .map(|e| (e.action, e.label.trim_end_matches('…').to_owned()))
+            .chain(tools)
+            .collect()
+    }
+}
+
+/// Why a greyed command can't run, in a few words that say what to do.
+pub(super) fn unavailable_reason(f: &Facts, action: Action) -> String {
+    use select_menu::Command as Select;
+    use smart_ui::Command as Smart;
+    if matches!(action, Action::Workspace(workspace::Command::ClearRecent)) {
+        return t!("ui4-why-no-recent");
+    }
+    if !f.doc {
+        return t!("ui3-why-no-image");
+    }
     let needs_selection = matches!(
         action,
         Action::Cut
@@ -341,16 +428,83 @@ pub(super) fn unavailable_reason(has_doc: bool, has_selection: bool, action: Act
             | Action::Deselect
             | Action::InvertSelection
             | Action::CropToSelection
+            | Action::PasteInto
             | Action::AddMask(NewMask::RevealSelection | NewMask::HideSelection)
+            | Action::Select(
+                Select::Modify(_)
+                    | Select::Grow
+                    | Select::Similar
+                    | Select::Transform
+                    | Select::Save
+                    | Select::SelectAndMask
+            )
     );
-    if !has_doc {
-        t!("ui3-why-no-image")
-    } else if needs_selection && !has_selection {
+    let mask_action = matches!(
+        action,
+        Action::DeleteMask | Action::ApplyMask | Action::ToggleMaskEnabled | Action::ToggleMaskLink
+    );
+    let smart_action = matches!(
+        action,
+        Action::Smart(
+            Smart::NewViaCopy
+                | Smart::ResetTransform
+                | Smart::EditContents
+                | Smart::ExportContents
+                | Smart::ReplaceContents
+        )
+    );
+    if matches!(action, Action::AddMask(_)) && f.mask {
+        t!("ui4-why-has-mask")
+    } else if needs_selection && !f.selection {
         t!("ui3-why-no-selection")
     } else if matches!(action, Action::Undo) {
         t!("ui3-why-nothing-to-undo")
     } else if matches!(action, Action::Redo) {
         t!("ui3-why-nothing-to-redo")
+    } else if mask_action && !f.mask {
+        t!("ui4-why-no-mask")
+    } else if matches!(action, Action::ApplyMask) && !f.pixels {
+        t!("ui4-why-no-pixels")
+    } else if smart_action && !f.smart {
+        t!("ui4-why-not-smart")
+    } else if matches!(
+        action,
+        Action::Smart(Smart::UpdateModified | Smart::EmbedLinked)
+    ) && !f.linked
+    {
+        t!("ui4-why-not-linked")
+    } else if matches!(action, Action::Rasterize) && !f.live {
+        t!("ui4-why-not-live")
+    } else if matches!(action, Action::Adjust(_)) && f.smart_pixels {
+        t!("ui4-why-smart-adjust")
+    } else if matches!(action, Action::MergeDown) && !f.layer_below {
+        t!("ui4-why-no-layer-below")
+    } else if matches!(action, Action::Ungroup) && !f.group {
+        t!("ui4-why-not-group")
+    } else if matches!(action, Action::Artboard(artboard_tool::Command::Ungroup)) && !f.artboard {
+        t!("ui4-why-not-artboard")
+    } else if matches!(action, Action::Artboard(artboard_tool::Command::FromGroup)) {
+        t!("ui4-why-not-top-group")
+    } else if matches!(action, Action::Artboard(artboard_tool::Command::FromLayers)) && f.artboard {
+        t!("ui4-why-in-artboard")
+    } else if matches!(action, Action::Artboard(artboard_tool::Command::ToFiles)) && !f.artboards {
+        t!("ui4-why-no-artboards")
+    } else if matches!(action, Action::ClearLayerStyle) && !f.styled {
+        t!("ui4-why-no-style")
+    } else if matches!(action, Action::LayerStyle(_)) && !f.pixels {
+        t!("ui4-why-no-pixels")
+    } else if matches!(action, Action::View(rulers::Command::ClearGuides)) && !f.guides {
+        t!("ui4-why-no-guides")
+    } else if matches!(action, Action::Select(Select::Load)) && !f.saved_selections {
+        t!("ui4-why-no-saved-selection")
+    } else if matches!(action, Action::Reselect) && !f.last_selection {
+        t!("ui4-why-no-last-selection")
+    } else if matches!(action, Action::LastFilter) && !f.last_filter {
+        t!("ui4-why-no-filter-yet")
+    } else if matches!(action, Action::Transform(transform::Command::Again)) && !f.last_transform {
+        t!("ui4-why-no-transform-yet")
+    } else if matches!(action, Action::RemoveBackground | Action::SelectSubject) && f.busy {
+        t!("ui4-why-busy")
     } else {
         t!("ui3-why-not-now")
     }
@@ -397,10 +551,17 @@ fn keywords(action: Action) -> String {
         | Action::NewAdjustmentLayer(AdjustKind::BlackWhite) => {
             t!("ui3-palette-keywords-black-white")
         }
-        Action::ExportAs | Action::Automate(actions_panel::Command::QuickExport) => {
-            t!("ui3-palette-keywords-export")
+        Action::ExportAs => t!("ui3-palette-keywords-export"),
+        Action::Automate(actions_panel::Command::QuickExport) => {
+            t!("ui4-palette-keywords-quick-export")
         }
         Action::Save | Action::SaveAs => t!("ui3-palette-keywords-save"),
+        Action::Import | Action::Smart(smart_ui::Command::PlaceLinked) => {
+            t!("ui4-palette-keywords-place")
+        }
+        Action::Quit => t!("ui4-palette-keywords-quit"),
+        Action::Select(select_menu::Command::QuickMask) => t!("ui4-palette-keywords-quick-mask"),
+        Action::Tool(Tool::RedEye) => t!("ui4-palette-keywords-red-eye"),
         Action::RemoveBackground | Action::SelectSubject => {
             t!("ui3-palette-keywords-cut-out")
         }
@@ -412,20 +573,28 @@ fn keywords(action: Action) -> String {
     }
 }
 
-/// The entries matching `query`, the available ones first, then the best
-/// matches, at most `max`; and how many more match.
-fn ranked(entries: Vec<Entry>, query: &str, max: usize) -> (Vec<Entry>, usize) {
-    let mut scored: Vec<(u32, Entry)> = entries
+/// The entries matching `query`, the best matches first (among equal ones,
+/// the available, then the shallower in the menus), at most `max`; how many
+/// more match; the best score.
+/// How an entry ranks: its score, whether it is available, its depth in the
+/// menus (shallower first).
+type Rank = (u32, bool, std::cmp::Reverse<usize>);
+
+fn ranked(entries: Vec<Entry>, query: &str, max: usize) -> (Vec<Entry>, usize, u32) {
+    let mut scored: Vec<(Rank, Entry)> = entries
         .into_iter()
         .filter_map(|e| {
             let score = score(&e.label, &e.path, &keywords(e.action), query)?;
-            Some((score + if e.enabled { 1000 } else { 0 }, e))
+            let depth = e.path.matches('›').count();
+            Some(((score, e.enabled, std::cmp::Reverse(depth)), e))
         })
         .collect();
     // Stable: equal matches keep the menus' order.
-    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    scored.sort_by_key(|(key, _)| std::cmp::Reverse(*key));
+    let best = scored.first().map_or(0, |((score, ..), _)| *score);
     let more = scored.len().saturating_sub(max);
-    (scored.into_iter().take(max).map(|(_, e)| e).collect(), more)
+    let entries = scored.into_iter().take(max).map(|(_, e)| e).collect();
+    (entries, more, best)
 }
 
 /// Small words a query may hold that commands don't ("black and white").
@@ -435,17 +604,29 @@ const FILLERS: [&str; 12] = [
 
 /// How well a command matches `query` (higher is better), or `None`: its
 /// label starts with it; each word of it starts a word of the label; the
-/// label holds it; each word starts a word of the menu path and label, or
-/// of the keywords. Case and accents don't count.
+/// label holds it from the start of a word; each word starts a word of the
+/// menu path and label, or of the keywords. Case and accents don't count.
+/// Within a level, a few points more: the label's words it covers, the
+/// query as a phrase in the menu path and label, an earlier keyword.
 fn score(label: &str, path: &str, keywords: &str, query: &str) -> Option<u32> {
-    let query = fold(query);
+    // The British spelling finds the commands too.
+    let query = fold(query).replace("colour", "color");
     let label = fold(label);
-    if label.starts_with(&query) {
-        return Some(100);
-    }
     let wanted: Vec<&str> = words(&query).filter(|w| !FILLERS.contains(w)).collect();
+    // The share of the label's words the query starts (0 to 4).
+    let covered = || {
+        let own: Vec<&str> = words(&label).filter(|w| !FILLERS.contains(w)).collect();
+        let hit = own
+            .iter()
+            .filter(|w| wanted.iter().any(|q| starts_like(w, q)))
+            .count();
+        (4 * hit / own.len().max(1)) as u32
+    };
+    if label.starts_with(&query) {
+        return Some(100 + covered());
+    }
     if wanted.is_empty() {
-        return label.contains(&query).then_some(60);
+        return at_word_start(&label, &query).then_some(60);
     }
     let all_found = |text: &str| {
         let have: Vec<&str> = words(text).collect();
@@ -453,17 +634,35 @@ fn score(label: &str, path: &str, keywords: &str, query: &str) -> Option<u32> {
             .iter()
             .all(|q| have.iter().any(|w| starts_like(w, q)))
     };
+    let full = format!("{} {label}", fold(path));
+    let phrase = if at_word_start(&full, &query) { 5 } else { 0 };
     if all_found(&label) {
-        Some(80)
-    } else if label.contains(&query) {
+        Some(80 + covered())
+    } else if at_word_start(&label, &query) {
         Some(60)
-    } else if all_found(&format!("{} {label}", fold(path))) {
-        Some(40)
-    } else if all_found(&format!("{} {label} {}", fold(path), fold(keywords))) {
-        Some(30)
+    } else if all_found(&full) {
+        Some(40 + phrase)
     } else {
-        None
+        let keywords = fold(keywords);
+        if !all_found(&format!("{full} {keywords}")) {
+            return None;
+        }
+        // The earlier the keyword, the closer the command.
+        let first = words(&keywords)
+            .position(|k| wanted.iter().any(|q| starts_like(k, q)))
+            .unwrap_or(usize::MAX);
+        Some(30 + phrase + 4u32.saturating_sub(first.min(4) as u32))
     }
+}
+
+/// `text` holds `part` at the start of one of its words.
+fn at_word_start(text: &str, part: &str) -> bool {
+    text.match_indices(part).any(|(i, _)| {
+        text[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric())
+    })
 }
 
 /// The words of folded text.
@@ -834,19 +1033,100 @@ mod tests {
         );
     }
 
-    /// Available commands come first; a greyed one says why.
+    /// The best match comes first, greyed or not (among equal matches, the
+    /// available one); a greyed one says why.
     #[test]
-    fn available_results_come_first() {
+    fn the_best_match_comes_first() {
         let h = app(true, Lang::En);
-        let results = h.state().palette_groups(&h.ctx, "crop");
-        let commands = &results.last().expect("commands").1;
-        let first_greyed = commands.iter().position(|e| !e.enabled);
-        if let Some(i) = first_greyed {
-            assert!(commands[i..].iter().all(|e| !e.enabled));
-        }
+        let first = |q: &str| found(&h, q).first().map(|(_, a)| *a);
+        // Not Edit in Quick Mask Mode (found by its path), though greyed.
+        assert!(matches!(
+            first("select and mask"),
+            Some(Action::Select(select_menu::Command::SelectAndMask))
+        ));
         assert_eq!(
             h.state().why_unavailable(Action::CropToSelection),
             t!("ui3-why-no-selection")
+        );
+        // Mid-word letters don't match: "lock" isn't in "Clockwise".
+        assert!(
+            found(&h, "lock")
+                .iter()
+                .all(|(_, a)| !matches!(a, Action::RotateCanvas(_)))
+        );
+        // Black & White before Fill with Background Color with…
+        assert!(matches!(
+            first("b&w"),
+            Some(Action::Adjust(AdjustKind::BlackWhite))
+        ));
+        // The keyword of Export As, not Quick Export as PNG.
+        assert!(matches!(first("jpg"), Some(Action::ExportAs)));
+        // The Layer Mask items before Create Clipping Mask.
+        let mask = found(&h, "layer mask");
+        let at = |want: fn(&Action) -> bool| mask.iter().position(|(_, a)| want(a));
+        let reveal = at(|a| matches!(a, Action::AddMask(NewMask::RevealAll)));
+        let clipping = at(|a| matches!(a, Action::ToggleClipping));
+        assert!(reveal < clipping.or(Some(usize::MAX)), "{mask:?}");
+        // "text" finds the Type tool.
+        assert!(matches!(first("text"), Some(Action::Tool(Tool::Text))));
+        assert!(matches!(first("resolution"), Some(Action::ImageSize)));
+        assert!(matches!(first("import"), Some(Action::Import)));
+        assert!(matches!(first("quit"), Some(Action::Quit)));
+        assert!(
+            found(&h, "colour range")
+                .iter()
+                .any(|(_, a)| matches!(a, Action::Select(select_menu::Command::ColorRange)))
+        );
+    }
+
+    /// In French: commands before a tool that only holds the word inside
+    /// another; Quick Mask and Red Eye by their usual names.
+    #[test]
+    fn french_queries_find_the_command() {
+        let h = app(true, Lang::Fr);
+        let first = |q: &str| found(&h, q).first().map(|(_, a)| *a);
+        let version = first("version");
+        let quick_mask = first("masque rapide");
+        let red_eye = first("yeux rouges");
+        i18n::set_lang(Lang::En);
+        assert!(matches!(
+            version,
+            Some(Action::Workspace(workspace::Command::About))
+        ));
+        assert!(matches!(
+            quick_mask,
+            Some(Action::Select(select_menu::Command::QuickMask))
+        ));
+        assert!(matches!(red_eye, Some(Action::Tool(Tool::RedEye))));
+    }
+
+    /// A greyed command says what it needs, not a generic reason.
+    #[test]
+    fn greyed_commands_say_why() {
+        let h = app(true, Lang::En);
+        let why = |a: Action| h.state().why_unavailable(a);
+        let feather = Action::Select(select_menu::Command::Modify(
+            select_menu::ModifyKind::Feather,
+        ));
+        assert_eq!(why(feather), t!("ui3-why-no-selection"));
+        assert_eq!(why(Action::PasteInto), t!("ui3-why-no-selection"));
+        assert_eq!(why(Action::MergeDown), t!("ui4-why-no-layer-below"));
+        assert_eq!(why(Action::DeleteMask), t!("ui4-why-no-mask"));
+        assert_eq!(
+            why(Action::Smart(smart_ui::Command::EditContents)),
+            t!("ui4-why-not-smart")
+        );
+        assert_eq!(why(Action::LastFilter), t!("ui4-why-no-filter-yet"));
+        assert_eq!(
+            why(Action::View(rulers::Command::ClearGuides)),
+            t!("ui4-why-no-guides")
+        );
+        let empty = app(false, Lang::En);
+        assert_eq!(
+            empty
+                .state()
+                .why_unavailable(Action::Workspace(workspace::Command::ClearRecent)),
+            t!("ui4-why-no-recent")
         );
     }
 

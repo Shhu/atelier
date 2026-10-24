@@ -33,18 +33,29 @@ impl AtelierApp {
                     t!("file-status-opened-first-frame", path = shown)
                 } else if !opened.notes.is_empty() {
                     let notes = opened.notes.join(" · ");
-                    crate::diag::warn(format!("Opened {} simplified: {notes}", file_name(path)));
+                    crate::diag::warn(tm!(
+                        "xchg-status-opened-simplified",
+                        path = file_name(path),
+                        notes = notes.clone()
+                    ));
                     t!("xchg-status-opened-simplified", path = shown, notes = notes)
                 } else {
                     t!("status-opened", path = shown)
                 };
-                self.recent.add(path);
+                // Batch's files don't push the user's out of Open Recent.
+                if !self.automate.running() {
+                    self.recent.add(path);
+                }
                 self.add_tab(opened.doc);
             }
             Err(e) => {
                 // The name only, so that the cause stays in view.
                 let name = file_name(path);
-                self.report_error(t!("status-open-failed", path = name, error = e.to_string()));
+                self.report_error(tm!(
+                    "status-open-failed",
+                    path = name,
+                    error = e.to_string()
+                ));
             }
         }
     }
@@ -73,7 +84,7 @@ impl AtelierApp {
     /// proposes an Atelier document, and says why.
     pub(super) fn save(&mut self) {
         // A smart object's contents (Edit Contents) go back to it.
-        if self.save_embedded() {
+        if self.save_embedded() || self.save_linked_file() {
             return;
         }
         let Some(doc) = &self.doc else { return };
@@ -143,7 +154,10 @@ impl AtelierApp {
         // Photoshop refuses too: the other tab would show a file that is
         // no longer its own, and its Save would overwrite this one.
         if self.tab_of(path).is_some_and(|i| i != self.active_tab) {
-            self.status = t!("file-status-open-in-another-tab", name = file_name(path));
+            self.report_error(tm!(
+                "file-status-open-in-another-tab",
+                name = file_name(path)
+            ));
             return;
         }
         let Some(doc) = &mut self.doc else { return };
@@ -162,7 +176,11 @@ impl AtelierApp {
                     t!("status-saved", path = shown)
                 } else {
                     let what = notes.join(" · ");
-                    crate::diag::warn(format!("Saved {} simplified: {what}", file_name(path)));
+                    crate::diag::warn(tm!(
+                        "xchg-status-saved-simplified",
+                        path = file_name(path),
+                        notes = what
+                    ));
                     t!(
                         "xchg-status-saved-simplified",
                         path = shown,
@@ -244,7 +262,7 @@ impl AtelierApp {
                 true
             }
             Err(e) => {
-                self.status_failed(t!("status-copy-failed", error = e.to_string()));
+                self.status_failed(tm!("status-copy-failed", error = e.to_string()));
                 false
             }
         }
@@ -282,7 +300,7 @@ impl AtelierApp {
     fn paste_image(&mut self, image: image::RgbaImage, mode: PasteMode) {
         let (w, h) = image.dimensions();
         if let Err(e) = crate::document::check_size(w, h) {
-            self.status_failed(t!("file-status-paste-failed", error = e.to_string()));
+            self.status_failed(tm!("file-status-paste-failed", error = e.to_string()));
             return;
         }
         if mode == PasteMode::Into && self.selection.is_none() {
@@ -290,11 +308,17 @@ impl AtelierApp {
             return;
         }
         self.commit_pending();
-        // Paste in Place: where the same pixels were copied from (the
-        // center otherwise, as Paste).
+        // Paste in Place: where the same pixels were copied from (as
+        // Paste otherwise): centered on the selection, else on the part
+        // of the canvas in view.
         let origin = (self.last_copy.as_ref())
             .filter(|c| mode == PasteMode::InPlace && c.matches(&image))
-            .map(|c| c.origin);
+            .map(|c| c.origin)
+            .or_else(|| {
+                let (cx, cy) = self.paste_center()?;
+                let x = (cx - w as f32 / 2.0).round() as i64;
+                Some((x, (cy - h as f32 / 2.0).round() as i64))
+            });
         let step = match mode {
             PasteMode::Centered => t!("menu-edit-paste"),
             PasteMode::InPlace => t!("files3-menu-paste-in-place"),
@@ -321,21 +345,49 @@ impl AtelierApp {
         self.reset_pending();
     }
 
+    /// Where Paste centers an image (canvas coordinates): on the
+    /// selection, else on the part of the canvas in view. `None` before
+    /// the canvas is shown (then the canvas center).
+    fn paste_center(&self) -> Option<(f32, f32)> {
+        let doc = self.doc.as_ref()?;
+        let canvas = doc.full_rect();
+        if let Some(r) = self.selection.as_ref().and_then(|s| s.bounds(canvas)) {
+            return Some((r.x as f32 + r.w as f32 / 2.0, r.y as f32 + r.h as f32 / 2.0));
+        }
+        let view = self.last_view?;
+        let area = (self.ctx).data(|d| d.get_temp::<Rect>(egui::Id::new(DROP_AREA)))?;
+        let seen = Rect::from_min_max(view.to_image(area.min), view.to_image(area.max));
+        let visible = seen.intersect(to_rect(canvas));
+        (visible.is_positive()).then(|| (visible.center().x, visible.center().y))
+    }
+
     /// Files dropped on the window: placed as smart objects (Place
     /// Embedded), or each opened in its own tab when no document is open
     /// (Atelier documents always open). They wait while a modal window is
     /// open.
     pub(super) fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        // On the canvas, an image is placed in the document; on the tabs
+        // or the panels, it opens in a tab of its own.
+        let canvas = ctx.data(|d| d.get_temp::<Rect>(egui::Id::new(DROP_AREA)));
         ctx.input(|i| {
-            let paths = i.raw.dropped_files.iter().map(|f| f.path().to_path_buf());
+            let at = i.pointer.latest_pos();
+            let on_canvas = match (at, canvas) {
+                (Some(p), Some(area)) => area.contains(p),
+                _ => true,
+            };
+            let paths = i
+                .raw
+                .dropped_files
+                .iter()
+                .map(|f| (f.path().to_path_buf(), on_canvas));
             self.dropped.extend(paths);
         });
         if self.dropped.is_empty() || self.modal_open() {
             return;
         }
         let open = self.doc.is_none();
-        for path in std::mem::take(&mut self.dropped) {
-            if open || is_native(&path) {
+        for (path, on_canvas) in std::mem::take(&mut self.dropped) {
+            if open || !on_canvas || is_native(&path) {
                 self.open_path(&path);
             } else {
                 self.place_path(&path, false);
@@ -343,6 +395,10 @@ impl AtelierApp {
         }
     }
 }
+
+/// Where the canvas was last drawn (below the tabs): files dropped there
+/// are placed.
+pub(super) const DROP_AREA: &str = "canvas-drop-area";
 
 /// Where a pasted image goes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -378,14 +434,19 @@ impl CopiedFrom {
     }
 }
 
-/// Fingerprint of an image's alpha, from a few thousand samples (fast on
-/// any size).
+/// Fingerprint of an image's alpha, and of the colors of its opaque
+/// pixels (the others may come back premultiplied), from a few thousand
+/// samples (fast on any size).
 fn print(image: &image::RgbaImage) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    let alpha = image.as_raw().iter().skip(3).step_by(4);
     let n = (image.width() as usize * image.height() as usize).max(1);
-    alpha.step_by(n.div_ceil(4096)).for_each(|a| a.hash(&mut h));
+    for p in image.as_raw().chunks_exact(4).step_by(n.div_ceil(4096)) {
+        match p[3] {
+            255 => p.hash(&mut h),
+            a => a.hash(&mut h),
+        }
+    }
     h.finish()
 }
 
@@ -471,7 +532,7 @@ pub(super) fn file_name(path: &Path) -> String {
 }
 
 /// `path` with the first of `extensions` added, if it has none of them.
-fn has_extension(path: &Path, ext: &str) -> bool {
+pub(super) fn has_extension(path: &Path, ext: &str) -> bool {
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
@@ -747,5 +808,56 @@ mod tests {
         // One step.
         app.doc.as_mut().unwrap().undo();
         assert_eq!(app.doc.as_ref().unwrap().layers.len(), layers);
+    }
+
+    /// Paste in Place knows its copy by its colors too: another opaque
+    /// image of the same size is not it.
+    #[test]
+    fn paste_in_place_knows_its_copy_by_its_colors() {
+        let copy =
+            image::RgbaImage::from_fn(40, 30, |x, y| image::Rgba([x as u8, y as u8, 7, 255]));
+        let from = CopiedFrom::new(&copy, (5, 6));
+        assert!(from.matches(&copy));
+        let shot = image::RgbaImage::from_pixel(40, 30, image::Rgba([1, 2, 3, 255]));
+        assert!(!from.matches(&shot));
+    }
+
+    /// Paste centers the image on the selection, else on the part of the
+    /// canvas in view (zoomed into a corner, it lands there).
+    #[test]
+    fn paste_lands_on_the_selection_or_in_view() {
+        let canvas = image::RgbaImage::from_pixel(1000, 800, image::Rgba([9, 9, 9, 255]));
+        let mut harness = harness(vec![Document::new(canvas, None)]);
+        let pasted = image::RgbaImage::from_pixel(10, 10, image::Rgba([1, 2, 3, 255]));
+        let app = harness.state_mut();
+        app.selection = Some(
+            PixelRect {
+                x: 100,
+                y: 100,
+                w: 20,
+                h: 20,
+            }
+            .into(),
+        );
+        app.paste_image(pasted.clone(), PasteMode::Centered);
+        assert_eq!(app.doc.as_ref().unwrap().active_layer().offset, (105, 105));
+        app.selection = None;
+        // Zoomed into the top left corner.
+        app.zoom = 8.0;
+        app.pan = Vec2::splat(2000.0);
+        harness.run_steps(2);
+        let app = harness.state_mut();
+        app.paste_image(pasted, PasteMode::Centered);
+        let (x, y) = app.doc.as_ref().unwrap().active_layer().offset;
+        let view = app.last_view.unwrap();
+        let area = (app.ctx)
+            .data(|d| d.get_temp::<Rect>(egui::Id::new(DROP_AREA)))
+            .unwrap();
+        let seen = Rect::from_min_max(view.to_image(area.min), view.to_image(area.max));
+        let center = egui::pos2(x as f32 + 5.0, y as f32 + 5.0);
+        assert!(
+            seen.contains(center) && x < 300 && y < 300,
+            "{x}, {y} in {seen:?}"
+        );
     }
 }

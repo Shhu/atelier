@@ -32,9 +32,9 @@ fn click(h: &mut Harness<'static, AtelierApp>, at: Pos2) {
 
 /// The foreground and background squares at the bottom of the tool bar.
 fn color_square(h: &Harness<'static, AtelierApp>, foreground: bool) -> Pos2 {
-    // Tool bar: 8 px margin, colors in its last 40 px above a 12 px margin
-    // and the 28 px status bar.
-    let bottom = h.ctx.content_rect().bottom() - 28.0 - 12.0 - 40.0;
+    // Tool bar: 8 px margin, colors (40 px) then the Quick Mask button
+    // (6 + 22 px) above a 12 px margin and the 28 px status bar.
+    let bottom = h.ctx.content_rect().bottom() - 28.0 - 12.0 - 68.0;
     if foreground {
         pos2(8.0 + 11.0, bottom + 11.0)
     } else {

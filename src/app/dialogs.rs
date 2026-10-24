@@ -376,6 +376,9 @@ impl AtelierApp {
 
     /// Fill… confirmed (or played by an action) with the settings `d`.
     pub(super) fn apply_fill(&mut self, d: FillDialog) {
+        if self.refuse_hidden_layer() {
+            return;
+        }
         self.record(crate::actions::Recorded::Fill {
             contents: actions_panel::contents(d.content),
             color: actions_panel::rgb(d.color),
@@ -695,7 +698,12 @@ impl AtelierApp {
             self.flatten_confirm = false;
         }
         if out.ok {
+            // `run` only opened this question: the recording is made here.
+            let before = self.doc.as_ref().map(|d| (d.uid(), d.history_step()));
             self.merge_layers(Action::FlattenImage);
+            if let Some(command) = self.recorded_action(Action::FlattenImage) {
+                self.record_done(command, before);
+            }
         }
     }
 
@@ -902,7 +910,8 @@ fn free_place(ctx: &egui::Context, others: &[Rect], height: f32) -> Pos2 {
     const WIDTH: f32 = 300.0;
     let start = tool_dialog_pos(ctx);
     let bottom = dialog_bounds(ctx).bottom();
-    let left = dialog_bounds(ctx).left();
+    // New columns stay over the canvas, not over the tool bar.
+    let left = canvas_area(ctx).left() + DIALOG_MARGIN;
     let mut pos = start;
     for _ in 0..16 {
         let probe = Rect::from_min_max(pos2(pos.x - WIDTH, pos.y), pos2(pos.x, pos.y + height));
@@ -915,6 +924,31 @@ fn free_place(ctx: &egui::Context, others: &[Rect], height: f32) -> Pos2 {
         }
     }
     pos
+}
+
+/// Dialogs that open with their first field focused (the others keep
+/// their keys: tools, points, sliders).
+const FOCUS_FIRST_FIELD: [&str; 7] = [
+    "image_size",
+    "canvas_size",
+    "new_document",
+    "rotate_canvas",
+    "sel_modify",
+    "new_guide",
+    "fit_image",
+];
+
+/// The floating panels that Tab hides with the bars and the side panel.
+const HIDDEN_WITH_PANELS: [&str; 5] = ["history", "channels", "actions", "paths", "swatches"];
+
+fn panels_hidden_id() -> egui::Id {
+    egui::Id::new("panels-hidden")
+}
+
+/// Tab (hide the panels) is on for this frame: the floating panels stay
+/// open but aren't shown, and come back with the others.
+pub(super) fn set_panels_hidden(ctx: &egui::Context, hidden: bool) {
+    ctx.data_mut(|d| d.insert_temp(panels_hidden_id(), hidden));
 }
 
 /// Window › Reset Workspace: the floating panels go back to their first
@@ -1028,6 +1062,13 @@ pub(super) fn floating_dialog(
         footer,
         resize,
     } = spec;
+    let spec_id = id;
+    if !modal
+        && HIDDEN_WITH_PANELS.contains(&id)
+        && ctx.data(|d| d.get_temp::<bool>(panels_hidden_id()).unwrap_or(false))
+    {
+        return DialogOutcome::default();
+    }
     let id = egui::Id::new(id);
     let offset_id = id.with("offset");
     let offset = ctx.data(|d| d.get_temp::<Vec2>(offset_id).unwrap_or_default());
@@ -1152,6 +1193,8 @@ pub(super) fn floating_dialog(
                 grip_drag = Some((height, response.drag_delta()));
             }
         } else {
+            // A body that scrolls shows it (its last lines aren't just cut).
+            ui.spacing_mut().scroll.dormant_handle_opacity = 0.6;
             egui::ScrollArea::vertical()
                 .max_height(body_max)
                 .auto_shrink([false, true])
@@ -1225,6 +1268,10 @@ pub(super) fn floating_dialog(
             }
         });
     };
+    let opening = !ctx.memory(|m| {
+        m.areas()
+            .visible_last_frame(&egui::LayerId::new(egui::Order::Foreground, id))
+    });
     let rect = if modal {
         let shown = egui::Modal::new(id)
             .area(area)
@@ -1233,7 +1280,12 @@ pub(super) fn floating_dialog(
             .show(ctx, content);
         // Not while a drop-down is open (Esc only closes it), nor under
         // another modal (a Color Picker opened from this one).
-        if !shown.any_popup_open && shown.is_top_modal {
+        // Its first field takes the keyboard, so that "1920 Tab 1080
+        // Enter" needs no mouse.
+        if opening && FOCUS_FIRST_FIELD.contains(&spec_id) {
+            super::focus_first_field(ctx);
+        }
+        if !shown.any_popup_open && !popup_open_at_frame_start(ctx) && shown.is_top_modal {
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 out.cancel = true;
             }
@@ -2564,4 +2616,20 @@ pub(super) fn adjustment_editor(
             ui_kit::checkbox(ui, &mut g.reverse, &t!("core-gradient-reverse"));
         }
     }
+}
+
+/// Whether a menu or drop-down was open when this frame began: the Esc or
+/// Enter that closed it is not also the dialog's.
+fn popup_open_at_frame_start(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(popup_start_id()).unwrap_or(false))
+}
+
+/// Notes, at the start of each frame, whether a menu or drop-down is open.
+pub(super) fn note_popups_at_frame_start(ctx: &egui::Context) {
+    let open = egui::Popup::is_any_open(ctx);
+    ctx.data_mut(|d| d.insert_temp(popup_start_id(), open));
+}
+
+fn popup_start_id() -> egui::Id {
+    egui::Id::new("popup-open-at-frame-start")
 }

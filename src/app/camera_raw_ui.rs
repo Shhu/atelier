@@ -648,8 +648,12 @@ impl AtelierApp {
                 self.open_camera_raw(purpose, loaded.source, loaded.analysis, settings)
             }
             (Err(e), Purpose::Open { path, .. }) => {
-                let path = path.display().to_string();
-                self.status_failed(t!("status-open-failed", path = path, error = e.to_string()));
+                let path = files::file_name(&path);
+                self.report_error(tm!(
+                    "status-open-failed",
+                    path = path,
+                    error = e.to_string()
+                ));
             }
             (Err(_), _) => {}
         }
@@ -799,6 +803,7 @@ impl AtelierApp {
                     doc.end_paint();
                     doc.discard_step();
                 }
+                self.shrink_after_preview();
                 self.end_layer_preview();
                 self.reset_pending();
                 t!("raw-filter-title")
@@ -845,7 +850,8 @@ impl AtelierApp {
                         None => {
                             doc.end_paint();
                             doc.discard_step();
-                            self.status_failed(t!("fx3-filter-failed", name = name.as_str()));
+                            self.status_failed(tm!("fx3-filter-failed", name = name.as_str()));
+                            self.shrink_after_preview();
                         }
                     }
                 }
@@ -853,7 +859,11 @@ impl AtelierApp {
                 self.reset_pending();
             }
             Destination::Document { path, preview_only } => {
-                let Some(image) = result else { return };
+                let Some(image) = result else {
+                    let name = file_label(&path);
+                    self.status_failed(tm!("fx4-raw-open-failed", name = name.as_str()));
+                    return;
+                };
                 let shown = path.display().to_string();
                 self.status = if preview_only {
                     let notes = t!("raw-note-preview-only");
@@ -861,7 +871,9 @@ impl AtelierApp {
                 } else {
                     t!("status-opened", path = shown)
                 };
-                self.recent.add(&path);
+                if !self.automate.running() {
+                    self.recent.add(&path);
+                }
                 self.add_tab(Document::new(image, Some(path)));
             }
         }

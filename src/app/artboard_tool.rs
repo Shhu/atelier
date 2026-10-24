@@ -16,7 +16,7 @@ use super::dialogs::{
 use super::*;
 use crate::document::{
     ARTBOARD_GAP, ArtboardBackground, ArtboardExport, ArtboardFiles, ExportFormat, Side,
-    artboard_file_stem, unused_artboard_path,
+    artboard_file_stem, artboard_path, existing_artboard_files,
 };
 use crate::export::ExportOptions;
 
@@ -243,11 +243,23 @@ pub(super) struct Artboards {
     job: Option<Receiver<Result<Vec<PathBuf>, String>>>,
     /// Artboards left out by Export As (ids).
     pub export_skip: Vec<u64>,
+    /// Files of the names an export writes exist: asked whether to replace.
+    replace_ask: Option<ReplaceAsk>,
+}
+
+/// An export to start once asked, replacing existing files or not.
+type StartExport = Box<dyn FnOnce(&mut AtelierApp, bool)>;
+
+/// An artboard export whose files exist: their number, and the export
+/// (replacing them or not).
+struct ReplaceAsk {
+    count: usize,
+    start: StartExport,
 }
 
 impl Artboards {
     pub(super) fn modal(&self) -> bool {
-        self.dialog.is_some() || self.files.is_some()
+        self.dialog.is_some() || self.files.is_some() || self.replace_ask.is_some()
     }
 
     pub(super) fn dragging(&self) -> bool {
@@ -681,6 +693,7 @@ impl AtelierApp {
     pub(super) fn artboard_windows(&mut self, ctx: &egui::Context) {
         self.board_dialog(ctx);
         self.files_dialog(ctx);
+        self.replace_dialog(ctx);
         let Some(job) = &self.artboards.job else {
             return;
         };
@@ -702,7 +715,7 @@ impl AtelierApp {
                 );
             }
             Ok(Err(error)) => {
-                self.status_failed(t!("artboard-status-export-failed", error = error))
+                self.report_error(tm!("artboard-status-export-failed", error = error))
             }
             Err(TryRecvError::Disconnected) => {}
         }
@@ -881,9 +894,63 @@ impl AtelierApp {
                 background: s.background,
                 overlapping: s.overlapping,
             },
+            replace: false,
         };
-        let job = doc.export_artboards_later(&which, files);
-        self.run_artboards_job(which.len(), move || job().map_err(|e| e.to_string()));
+        let names: Vec<String> = which.iter().map(|&i| doc.layers[i].name.clone()).collect();
+        let ext = files.format.extensions()[0];
+        let count = existing_artboard_files(&files.folder, &files.prefix, &names, ext);
+        let uid = doc.uid();
+        self.ask_replace(
+            count,
+            Box::new(move |app: &mut AtelierApp, replace| {
+                let Some(doc) = app.doc.as_ref().filter(|d| d.uid() == uid) else {
+                    return;
+                };
+                let job = doc.export_artboards_later(&which, ArtboardFiles { replace, ..files });
+                app.run_artboards_job(which.len(), move || job().map_err(|e| e.to_string()));
+            }),
+        );
+    }
+
+    /// `start`s an export, once asked whether to replace the `count`
+    /// files of its names that exist (none: started at once, keeping all).
+    fn ask_replace(&mut self, count: usize, start: StartExport) {
+        if count == 0 {
+            start(self, false);
+        } else {
+            self.artboards.replace_ask = Some(ReplaceAsk { count, start });
+        }
+    }
+
+    /// "N files exist": Replace, Keep Both (the new ones numbered), Cancel.
+    fn replace_dialog(&mut self, ctx: &egui::Context) {
+        let Some(ask) = &self.artboards.replace_ask else {
+            return;
+        };
+        let count = ask.count;
+        let center = ctx.content_rect().center();
+        let out = floating_dialog(
+            ctx,
+            DialogSpec {
+                pivot: egui::Align2::CENTER_CENTER,
+                width: 380.0,
+                ok: t!("smart4-artboards-replace"),
+                other: Some(t!("smart4-artboards-keep-both")),
+                ..DialogSpec::new("artboards_replace", t!("file-export-title"), center)
+            },
+            |ui| {
+                ui.label(t!("smart4-artboards-exist", count = count));
+            },
+        );
+        if !(out.ok || out.other || out.cancel) {
+            return;
+        }
+        let Some(ask) = self.artboards.replace_ask.take() else {
+            return;
+        };
+        if out.ok || out.other {
+            (ask.start)(self, out.ok);
+        }
     }
 
     /// Writes artboard files on another thread (see `artboard_windows`).
@@ -953,15 +1020,39 @@ impl AtelierApp {
         let Some(folder) = dialog.pick_folder() else {
             return true;
         };
+        let names: Vec<String> = which.iter().map(|&i| doc.layers[i].name.clone()).collect();
+        let ext = options.format.extensions()[0];
+        let count = existing_artboard_files(&folder, "", &names, ext);
+        let uid = doc.uid();
+        let options = options.clone();
+        self.ask_replace(
+            count,
+            Box::new(move |app: &mut AtelierApp, replace| {
+                if app.doc.as_ref().is_some_and(|d| d.uid() == uid) {
+                    app.export_artboards_files(which, folder, options, replace);
+                }
+            }),
+        );
+        true
+    }
+
+    /// [`Self::export_as_artboards_files`] into `folder`, files of the same
+    /// names replaced or not.
+    fn export_artboards_files(
+        &mut self,
+        which: Vec<usize>,
+        folder: PathBuf,
+        options: ExportOptions,
+        replace: bool,
+    ) {
         self.commit_pending();
-        let Some(doc) = &self.doc else { return true };
+        let Some(doc) = &self.doc else { return };
         let content = ArtboardExport {
             background: true,
             overlapping: false,
         };
         let render = doc.artboard_images_later(&which, content);
         let icc = doc.icc_profile.clone();
-        let options = options.clone();
         // Converted as a single export is (sRGB, Use Proof Setup).
         let (proof, srgb) = (self.proof_converter(), self.srgb_source(&options));
         self.run_artboards_job(which.len(), move || {
@@ -970,7 +1061,7 @@ impl AtelierApp {
             for (name, image) in render() {
                 let stem = artboard_file_stem(&name, &mut used);
                 let ext = options.format.extensions()[0];
-                let path = unused_artboard_path(&folder, &stem, ext, &mut used);
+                let path = artboard_path(&folder, &stem, ext, &mut used, replace);
                 let icc = icc.as_deref().map(Vec::as_slice);
                 let bytes = super::export_as::export_bytes(
                     image,
@@ -986,7 +1077,6 @@ impl AtelierApp {
             }
             Ok(written)
         });
-        true
     }
 }
 

@@ -212,6 +212,9 @@ pub(super) struct VectorTools {
     /// Pen: the open component being drawn.
     pub drawing: Option<(PathRef, usize)>,
     gesture: Option<Gesture>,
+    /// The document's effects held for the gesture (see
+    /// `AtelierApp::hold_for_gesture`).
+    holding: bool,
     /// Active layer at the last frame (a shape layer selected in the Layers
     /// panel takes the place of the selected path, as in Photoshop).
     last_active: Option<u64>,
@@ -239,6 +242,7 @@ impl Default for VectorTools {
             components: Vec::new(),
             drawing: None,
             gesture: None,
+            holding: false,
             last_active: None,
             panel: Default::default(),
         }
@@ -508,7 +512,21 @@ impl AtelierApp {
         if self.vector.gesture.is_some() {
             self.ctx.request_repaint();
         }
+        self.hold_for_gesture();
         cursor
+    }
+
+    /// While a gesture edits a shape, its layer styles keep their images
+    /// (drawn again once, at the end) instead of being drawn again and
+    /// again on worker threads that slow the edit down.
+    fn hold_for_gesture(&mut self) {
+        let editing = self.vector.gesture.is_some();
+        if self.vector.holding != editing
+            && let Some(doc) = &mut self.doc
+        {
+            doc.hold_effects(editing);
+            self.vector.holding = editing;
+        }
     }
 
     fn vector_press(&mut self, p: Pt, tol: f32, m: Modifiers) {
@@ -1123,8 +1141,15 @@ impl AtelierApp {
                     let all = (0..base.subpaths.len()).all(|k| self.vector.components.contains(&k));
                     if let Some(doc) = &mut self.doc {
                         if all {
-                            // Moved whole: a live shape stays one.
-                            doc.move_path(*r, to - *last);
+                            // Moved whole: a live shape stays one. By
+                            // whole pixels unless zoomed in (its image
+                            // then just moves).
+                            let mut step = to - *last;
+                            if self.zoom <= 1.0 {
+                                step = pt(step.x.round(), step.y.round());
+                            }
+                            doc.move_path(*r, step);
+                            *last = *last + step;
                         } else {
                             let mut path = base.clone();
                             for &k in &self.vector.components {
@@ -1133,9 +1158,9 @@ impl AtelierApp {
                                 }
                             }
                             doc.set_path(*r, path);
+                            *last = to;
                         }
                     }
-                    *last = to;
                 }
             }
             Gesture::Marquee { to, .. } => *to = p,
@@ -1276,6 +1301,7 @@ impl AtelierApp {
             self.vector.drawing = None;
             self.vector.gesture = None;
         }
+        self.hold_for_gesture();
         let path = self.target_path().map(|(_, p)| p);
         let Some(path) = path else {
             self.vector.clear_selection();

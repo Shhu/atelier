@@ -118,8 +118,13 @@ fn escape_closing_a_drop_down_keeps_the_dialog() {
     let mut h = app();
     h.state_mut().run(Action::ImageSize);
     h.run_steps(3);
-    let r = h.get_by_label("Resample").rect();
-    let pos = pos2(r.left() + 40.0, r.bottom() + 20.0);
+    // The drop-down itself (its label text carries the same name).
+    let r = h
+        .query_all_by_label("Resample")
+        .max_by(|a, b| a.rect().width().total_cmp(&b.rect().width()))
+        .expect("Resample drop-down")
+        .rect();
+    let pos = r.center();
     h.hover_at(pos);
     h.run_steps(1);
     h.drag_at(pos);
@@ -243,14 +248,14 @@ fn windows_shift_delete_is_not_a_cut() {
     let mut input = egui::InputState::default();
     input.modifiers = Modifiers::SHIFT;
     input.events = vec![egui::Event::Cut];
-    let fill = clipboard_action(&input, false);
+    let fill = clipboard_action(&input, None);
     if cfg!(windows) {
         assert!(matches!(fill, Some(Action::FillDialog)));
     } else {
         assert!(fill.is_none(), "Ctrl+Shift+X");
     }
     input.modifiers = Modifiers::COMMAND;
-    assert!(matches!(clipboard_action(&input, false), Some(Action::Cut)));
+    assert!(matches!(clipboard_action(&input, None), Some(Action::Cut)));
 }
 
 #[test]
@@ -443,9 +448,20 @@ fn azerty_ctrl_digits_show_the_channels() {
     let app = h.state();
     assert_eq!(app.channels.color_shown(doc(&h)), Some(1), "green");
     assert_eq!(app.rulers.settings.grid, grid);
+    // The 6 key: the first alpha channel; without one, Zoom Out (a French
+    // laptop has no other key for it).
+    let zoom = h.state().zoom;
+    type_key(&mut h, Key::Minus, Key::Num6, Modifiers::COMMAND);
+    assert!(h.state().zoom < zoom, "zoomed out");
+    h.state_mut().doc.as_mut().unwrap().new_channel();
     let zoom = h.state().zoom;
     type_key(&mut h, Key::Minus, Key::Num6, Modifiers::COMMAND);
     assert_eq!(h.state().zoom, zoom);
+    assert_eq!(
+        h.state().channels.color_shown(doc(&h)),
+        None,
+        "the alpha channel"
+    );
     // Ctrl+3: red; Ctrl+Alt+3 is not a channel shortcut.
     type_key(&mut h, Key::Num3, Key::Num3, Modifiers::COMMAND);
     assert_eq!(h.state().channels.color_shown(doc(&h)), Some(0));
@@ -807,7 +823,7 @@ fn copy_variants_are_not_a_plain_copy() {
         ctrl.plus(Modifiers::SHIFT).plus(Modifiers::ALT),
     ] {
         input.modifiers = m;
-        let action = clipboard_action(&input, false);
+        let action = clipboard_action(&input, None);
         assert!(
             !matches!(action, Some(Action::Copy | Action::CanvasSize)),
             "{m:?}"
@@ -815,14 +831,11 @@ fn copy_variants_are_not_a_plain_copy() {
     }
     input.modifiers = ctrl.plus(Modifiers::ALT);
     assert!(matches!(
-        clipboard_action(&input, false),
+        clipboard_action(&input, None),
         Some(Action::CanvasSize)
     ));
     input.modifiers = ctrl;
-    assert!(matches!(
-        clipboard_action(&input, false),
-        Some(Action::Copy)
-    ));
+    assert!(matches!(clipboard_action(&input, None), Some(Action::Copy)));
 }
 
 #[test]
@@ -861,4 +874,408 @@ fn space_during_a_shape_drag_moves_its_box() {
             h: 30
         }
     );
+}
+
+// ------------------------------------------------- QA4 regressions
+
+/// A secondary click (press and release) at `pos`.
+fn right_click(h: &mut Harness<'_, AtelierApp>, pos: Pos2) {
+    h.hover_at(pos);
+    h.run_steps(1);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        });
+        h.run_steps(1);
+    }
+    h.run_steps(1);
+}
+
+/// A left click at `pos`, one frame pressed.
+fn click_at(h: &mut Harness<'_, AtelierApp>, pos: Pos2) {
+    h.hover_at(pos);
+    h.run_steps(1);
+    press(h, pos, true, Modifiers::NONE);
+    h.run_steps(1);
+    press(h, pos, false, Modifiers::NONE);
+    h.run_steps(3);
+}
+
+fn steps(h: &Harness<'static, AtelierApp>) -> usize {
+    doc(h).history().0.len()
+}
+
+#[test]
+fn a_click_closing_a_menu_does_not_reach_the_canvas() {
+    let mut h = with_logo();
+    h.state_mut().set_tool(Tool::Brush);
+    h.run_steps(2);
+    // The Edit menu.
+    h.get_by_label("Edit").click();
+    h.run_steps(3);
+    assert!(egui::Popup::is_any_open(&h.ctx), "menu open");
+    let before = steps(&h);
+    let p = screen(&h, 300.0, 250.0);
+    click_at(&mut h, p);
+    assert!(!egui::Popup::is_any_open(&h.ctx), "menu closed");
+    assert_eq!(steps(&h), before, "nothing painted");
+    // The canvas's own menu.
+    right_click(&mut h, p);
+    assert!(egui::Popup::is_any_open(&h.ctx), "context menu open");
+    let p = screen(&h, 50.0, 250.0);
+    click_at(&mut h, p);
+    assert!(!egui::Popup::is_any_open(&h.ctx), "context menu closed");
+    assert_eq!(steps(&h), before, "nothing painted");
+    // The next click paints.
+    click_at(&mut h, p);
+    assert_eq!(steps(&h), before + 1, "painted");
+}
+
+#[test]
+fn a_click_closing_a_tool_flyout_does_not_paint() {
+    let mut h = with_logo();
+    h.state_mut().set_tool(Tool::Brush);
+    h.run_steps(2);
+    let slot = h.get_by_label(&Tool::Select.name()).rect().center();
+    right_click(&mut h, slot);
+    assert!(egui::Popup::is_any_open(&h.ctx), "flyout open");
+    let before = steps(&h);
+    let p = screen(&h, 50.0, 50.0);
+    click_at(&mut h, p);
+    assert!(!egui::Popup::is_any_open(&h.ctx), "flyout closed");
+    assert_eq!(steps(&h), before);
+}
+
+#[test]
+fn a_click_closing_a_menu_keeps_the_marquee_selection() {
+    let mut h = with_logo();
+    h.state_mut().set_tool(Tool::Select);
+    h.state_mut().selection = Some(some_selection());
+    h.run_steps(2);
+    h.get_by_label("Select").click();
+    h.run_steps(3);
+    assert!(egui::Popup::is_any_open(&h.ctx), "menu open");
+    let p = screen(&h, 300.0, 250.0);
+    click_at(&mut h, p);
+    assert!(!egui::Popup::is_any_open(&h.ctx), "menu closed");
+    assert!(h.state().selection.is_some(), "not deselected");
+}
+
+#[test]
+fn delete_in_quick_mask_keeps_the_layer() {
+    let mut h = with_logo();
+    h.state_mut().set_tool(Tool::Brush);
+    h.run_steps(1);
+    h.key_press(Key::Q);
+    h.run_steps(2);
+    assert!(doc(&h).quick_mask().is_some(), "in Quick Mask");
+    assert!(h.state().selection.is_none());
+    h.key_press(Key::Delete);
+    h.run_steps(2);
+    assert_eq!(doc(&h).layers.len(), 2, "layer kept");
+    assert!(!h.state().status.is_empty(), "says why");
+}
+
+#[test]
+fn ctrl_drag_with_a_painting_tool_moves_the_selected_pixels() {
+    let mut h = with_logo();
+    h.state_mut().set_tool(Tool::Brush);
+    h.state_mut().selection = Some(Selection {
+        rect: PixelRect {
+            x: 110,
+            y: 110,
+            w: 20,
+            h: 20,
+        },
+        mask: None,
+        inverted: false,
+    });
+    h.run_steps(2);
+    let (a, b) = (screen(&h, 120.0, 120.0), screen(&h, 220.0, 220.0));
+    drag(&mut h, a, b, Modifiers::COMMAND);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    // As with the Move tool: the 20 × 20 pixels went, the layer stayed.
+    let d = doc(&h);
+    let logo = d.layers.iter().find(|l| l.name == "Logo").expect("Logo");
+    let bounds = logo.content_bounds().expect("pixels");
+    assert_eq!((bounds.x, bounds.y), (100, 100), "the layer stayed");
+    assert_eq!((bounds.w, bounds.h), (130, 130), "its pixels moved");
+    assert!(h.state().tool == Tool::Brush);
+}
+
+#[test]
+fn ctrl_drag_with_the_marquee_and_no_selection_moves_the_layer() {
+    let mut h = with_logo();
+    h.state_mut().set_tool(Tool::Select);
+    h.run_steps(2);
+    let (a, b) = (screen(&h, 120.0, 120.0), screen(&h, 150.0, 130.0));
+    drag(&mut h, a, b, Modifiers::COMMAND);
+    h.run_steps(2);
+    assert_eq!(doc(&h).layers[1].offset, (130, 110), "moved");
+    assert!(h.state().selection.is_none(), "no marquee");
+}
+
+#[test]
+fn paste_keeps_the_modifiers_let_go_before_v() {
+    let ctrl = Modifiers::COMMAND;
+    let shift_ctrl = ctrl.plus(Modifiers::SHIFT);
+    let all = shift_ctrl.plus(Modifiers::ALT);
+    let release = |modifiers| egui::Event::Key {
+        key: Key::V,
+        physical_key: Some(Key::V),
+        pressed: false,
+        repeat: false,
+        modifiers,
+    };
+    // Frames: the modifiers held, then the events of each.
+    let run = |frames: &[(Modifiers, Vec<egui::Event>)]| {
+        let mut chord = PasteChord {
+            idle: true,
+            ..Default::default()
+        };
+        let mut paste = None;
+        for (modifiers, events) in frames {
+            let mut input = egui::InputState::default();
+            input.modifiers = *modifiers;
+            input.events = events.clone();
+            paste = chord.update(&input).or(paste);
+        }
+        let mut input = egui::InputState::default();
+        input.events = vec![];
+        clipboard_action(&input, paste).map(|a| format!("{a:?}"))
+    };
+    let some = |s: &str| Some(s.to_owned());
+    // Shift let go a few ms before V.
+    let frames = [
+        (shift_ctrl, vec![]),
+        (ctrl, vec![]),
+        (ctrl, vec![release(ctrl)]),
+    ];
+    assert_eq!(run(&frames), some("PasteInPlace"));
+    // Alt, then Shift, then Ctrl let go before V.
+    let frames = [
+        (all, vec![]),
+        (shift_ctrl, vec![]),
+        (ctrl, vec![]),
+        (Modifiers::NONE, vec![release(Modifiers::NONE)]),
+    ];
+    assert_eq!(run(&frames), some("PasteInto"));
+    // A plain Ctrl+V after an earlier Shift+B.
+    let b = egui::Event::Key {
+        key: Key::B,
+        physical_key: Some(Key::B),
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::SHIFT,
+    };
+    let frames = [
+        (Modifiers::SHIFT, vec![b]),
+        (Modifiers::NONE, vec![]),
+        (ctrl, vec![]),
+        (ctrl, vec![release(ctrl)]),
+    ];
+    assert_eq!(run(&frames), some("Paste"));
+}
+
+#[test]
+fn held_toggles_do_not_repeat() {
+    let mut h = with_logo();
+    for repeat in [false, true, true, true] {
+        h.event(egui::Event::Key {
+            key: Key::Tab,
+            physical_key: Some(Key::Tab),
+            pressed: true,
+            repeat,
+            modifiers: Modifiers::NONE,
+        });
+        h.run_steps(1);
+        assert!(h.state().workspace.hide_all, "repeat {repeat}");
+    }
+    assert!(h.ctx.memory(|m| m.focused()).is_none(), "focus untouched");
+    let rulers = h.state().rulers.settings.rulers;
+    for repeat in [false, true, true] {
+        h.event(egui::Event::Key {
+            key: Key::R,
+            physical_key: Some(Key::R),
+            pressed: true,
+            repeat,
+            modifiers: Modifiers::COMMAND,
+        });
+        h.run_steps(1);
+    }
+    assert_ne!(h.state().rulers.settings.rulers, rulers, "toggled once");
+    // Undo repeats.
+    for _ in 0..2 {
+        h.state_mut().run(Action::NewLayer);
+    }
+    h.run_steps(1);
+    let layers = doc(&h).layers.len();
+    for repeat in [false, true] {
+        h.event(egui::Event::Key {
+            key: Key::Z,
+            physical_key: Some(Key::Z),
+            pressed: true,
+            repeat,
+            modifiers: Modifiers::COMMAND,
+        });
+        h.run_steps(1);
+    }
+    assert_eq!(doc(&h).layers.len(), layers - 2, "undone twice");
+}
+
+#[test]
+fn tab_hides_the_floating_panels_too() {
+    let mut h = with_logo();
+    h.state_mut().run(Action::History);
+    h.run_steps(3);
+    let history = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("history"));
+    let shown =
+        |h: &Harness<'_, AtelierApp>| h.ctx.memory(|m| m.areas().visible_last_frame(&history));
+    assert!(shown(&h), "History shown");
+    h.key_press(Key::Tab);
+    h.run_steps(3);
+    assert!(h.state().workspace.hide_all);
+    assert!(!shown(&h), "History hidden");
+    assert!(h.state().history.open, "and still open");
+    h.key_press(Key::Tab);
+    h.run_steps(3);
+    assert!(shown(&h), "History back");
+}
+
+#[test]
+fn the_side_panel_edge_follows_the_pointer_back() {
+    let mut h = with_logo();
+    let start = h.state().workspace.layout.side_width;
+    let edge = h.ctx.content_rect().right() - start + 2.0;
+    let at = pos2(edge, 400.0);
+    h.hover_at(at);
+    h.run_steps(1);
+    h.drag_at(at);
+    h.run_steps(1);
+    for i in 1..=4 {
+        h.hover_at(at - vec2(100.0 * i as f32, 0.0));
+        h.run_steps(1);
+    }
+    assert_eq!(h.state().workspace.layout.side_width, workspace::SIDE_MAX);
+    for i in (0..4).rev() {
+        h.hover_at(at - vec2(100.0 * i as f32, 0.0));
+        h.run_steps(1);
+    }
+    h.drop_at(at);
+    h.run_steps(2);
+    assert_eq!(h.state().workspace.layout.side_width, start);
+}
+
+#[test]
+fn escape_closes_keyboard_shortcuts_and_diagnostics() {
+    let mut h = with_logo();
+    for command in [
+        workspace::Command::Shortcuts,
+        workspace::Command::Diagnostics,
+    ] {
+        h.state_mut().run(Action::Workspace(command));
+        h.run_steps(3);
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        let open = |h: &Harness<'_, AtelierApp>| {
+            h.state().workspace.shortcuts.is_some() || h.state().diagnostics.open
+        };
+        assert!(open(&h), "{command:?}: Enter isn't theirs");
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(!open(&h), "{command:?} closed");
+    }
+}
+
+#[test]
+fn tab_goes_from_field_to_field_in_a_dialog() {
+    let mut h = with_logo();
+    h.state_mut().run(Action::ImageSize);
+    h.run_steps(8);
+    // Open, its first field has the keyboard.
+    assert!(h.ctx.text_edit_focused(), "first field focused");
+    let first = h.ctx.memory(|m| m.focused());
+    let mut seen = vec![first];
+    // Tab goes on to the other fields, past the checkboxes and drop-downs,
+    // and comes back round.
+    for _ in 0..6 {
+        h.key_press(Key::Tab);
+        h.run_steps(FOCUS_HUNT_TRIES as usize);
+        assert!(h.ctx.text_edit_focused(), "a field has the keyboard");
+        seen.push(h.ctx.memory(|m| m.focused()));
+    }
+    assert_ne!(seen[1], first, "moved on");
+    assert!(seen[1..].contains(&first), "came back round: {seen:?}");
+    // Shift+Tab goes back.
+    let now = h.ctx.memory(|m| m.focused());
+    h.key_press_modifiers(Modifiers::SHIFT, Key::Tab);
+    h.run_steps(FOCUS_HUNT_TRIES as usize);
+    assert!(h.ctx.text_edit_focused());
+    assert_ne!(h.ctx.memory(|m| m.focused()), now);
+}
+
+#[test]
+fn shift_pressed_again_constrains_an_added_marquee() {
+    let mut h = with_logo();
+    h.state_mut().set_tool(Tool::Select);
+    h.state_mut().selection = Some(some_selection());
+    h.run_steps(2);
+    let (a, b) = (screen(&h, 200.0, 50.0), screen(&h, 300.0, 90.0));
+    // Shift at the press: Add. Let go, then pressed again: a square.
+    h.event(egui::Event::ModifiersChanged(Modifiers::SHIFT));
+    h.hover_at(a);
+    h.run_steps(1);
+    press(&h, a, true, Modifiers::SHIFT);
+    h.run_steps(1);
+    h.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+    h.hover_at(a.lerp(b, 0.5));
+    h.run_steps(1);
+    h.event(egui::Event::ModifiersChanged(Modifiers::SHIFT));
+    h.hover_at(b);
+    h.run_steps(1);
+    press(&h, b, false, Modifiers::SHIFT);
+    h.run_steps(1);
+    h.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+    h.run_steps(2);
+    let sel = h.state().selection.clone().expect("a selection");
+    assert!(sel.contains(290.0, 140.0), "a 100 × 100 square added");
+    assert!(sel.contains(20.0, 20.0), "the first one kept");
+}
+
+#[test]
+fn ime_composition_is_shown_until_committed() {
+    let mut h = with_logo();
+    h.state_mut().set_tool(Tool::Text);
+    h.run_steps(1);
+    let p = screen(&h, 50.0, 50.0);
+    click_at(&mut h, p);
+    assert!(h.state().type_tool.edit.is_some(), "typing");
+    h.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+        text: "かん".into(),
+        active_range_chars: None,
+    }));
+    h.run_steps(1);
+    let edit = h.state().type_tool.edit.as_ref().unwrap();
+    assert_eq!(edit.preedit, "かん");
+    h.event(egui::Event::Ime(egui::ImeEvent::Commit("漢".into())));
+    h.run_steps(1);
+    let edit = h.state().type_tool.edit.as_ref().unwrap();
+    assert!(edit.preedit.is_empty());
+    let text = doc(&h).active_layer().text.as_ref().expect("a text");
+    assert_eq!(text.text, "漢");
+}
+
+#[test]
+fn alt_click_clips_only_on_the_line_between_two_rows() {
+    let mut h = with_logo();
+    h.state_mut()
+        .click_row(1, right_panel::RowPart::Name, Modifiers::ALT);
+    assert!(!doc(&h).layers[1].clipped, "not on the name");
+    h.state_mut()
+        .click_row(0, right_panel::RowPart::ClipLine(1), Modifiers::ALT);
+    assert!(doc(&h).layers[1].clipped, "on the line");
 }

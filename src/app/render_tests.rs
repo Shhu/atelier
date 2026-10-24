@@ -577,6 +577,49 @@ fn huge_selection_outline() {
     );
 }
 
+/// A speckled selection on a large image: its outline is found on another
+/// thread and, far too detailed, drawn from the coverage (dashes on its
+/// edges), without keeping its millions of segments.
+#[test]
+fn speckled_selection_outline_is_drawn_from_its_coverage() {
+    let mut h = app_with(
+        Document::new(solid(2400, 1800, [90, 90, 90, 255]), None),
+        Tool::Select,
+        2048,
+    );
+    h.state_mut().selection = Some(noisy_selection(2400, 1800));
+    let start = std::time::Instant::now();
+    loop {
+        h.run_steps(1);
+        let o = h.state().selection_outline.as_ref();
+        if o.is_some_and(|o| o.dense) {
+            break;
+        }
+        assert!(start.elapsed().as_secs() < 30, "outline never found");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    h.run_steps(1);
+    assert!(
+        h.state()
+            .selection_outline
+            .as_ref()
+            .unwrap()
+            .edges
+            .is_empty()
+    );
+    let shot = h.render().unwrap();
+    let view = h.state().last_view.unwrap();
+    let p = view.to_screen(pos2(1200.0, 900.0));
+    let around: Vec<[u8; 4]> = (0..16)
+        .map(|d| shot.get_pixel(p.x as u32 + d, p.y as u32).0)
+        .collect();
+    assert!(around.iter().any(|c| c[..3] == [0, 0, 0]), "{around:?}");
+    assert!(
+        around.iter().any(|c| c[..3] == [255, 255, 255]),
+        "{around:?}"
+    );
+}
+
 /// Groups, a clipped layer, a mask, an adjustment, a fill layer and styles:
 /// the display shows what the export gives, zoomed in or out, and follows
 /// a change of the adjustment.
@@ -746,4 +789,240 @@ fn zooming_across_levels_never_shows_an_empty_canvas() {
         assert!(start.elapsed().as_secs() < 60, "the new level never came");
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+}
+
+/// Paints `color` over 30 × 30 pixels at (x, y) of the active layer, as a
+/// brush stroke tells the view, then draws a frame.
+fn dab(h: &mut Harness<'static, AtelierApp>, (x, y): (u32, u32), color: [u8; 4]) {
+    let app = h.state_mut();
+    let layer = app.doc.as_mut().unwrap().active_layer_mut();
+    let pixels = layer.pixels_mut();
+    for py in y..y + 30 {
+        for px in x..x + 30 {
+            pixels.put_pixel(px, py, Rgba(color));
+        }
+    }
+    let r = crate::paint::DirtyRect { x, y, w: 30, h: 30 };
+    app.stroke_dirty = Some(app.stroke_dirty.map_or(r, |d| d.union(r)));
+    h.run_steps(1);
+}
+
+/// Runs frames until the view's reductions are made.
+fn until_reduced(h: &mut Harness<'static, AtelierApp>) {
+    let start = std::time::Instant::now();
+    while h.state().level_pending() {
+        assert!(start.elapsed().as_secs() < 60, "the level never came");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.run_steps(1);
+    }
+    h.run_steps(1);
+}
+
+fn same_reductions(h: &mut Harness<'static, AtelierApp>, what: &str) {
+    let (kept, fresh) = h.state_mut().reductions_against_fresh().expect("made");
+    let differ = kept
+        .pixels()
+        .zip(fresh.pixels())
+        .filter(|(a, b)| a.0.iter().zip(b.0).any(|(a, b)| a.abs_diff(b) > 2))
+        .count();
+    assert_eq!(differ, 0, "{what}: pixels differ from fresh reductions");
+}
+
+/// Paint where the view composited nothing (out of view) still reaches
+/// its reduced copies of the layers: a stroke never keeps a gap there,
+/// even once in view.
+#[test]
+fn paint_out_of_view_reaches_the_reduced_copies() {
+    let mut h = app_with(
+        Document::new(solid(4000, 1600, [255, 255, 255, 255]), None),
+        Tool::Brush,
+        2048,
+    );
+    h.state_mut().zoom = 0.5;
+    h.run_steps(1);
+    until_reduced(&mut h);
+    let view = h.state().last_view.unwrap();
+    let window = h.ctx.content_rect();
+    let out = [(100, 800), (3870, 800)]
+        .into_iter()
+        .find(|&(x, y)| !window.contains(view.to_screen(pos2(x as f32, y as f32))))
+        .expect("part of the canvas out of view");
+    dab(&mut h, out, [200, 0, 0, 255]);
+    // Then in view: the reductions are redone in part.
+    dab(&mut h, (2000, 800), [0, 0, 200, 255]);
+    same_reductions(&mut h, "after paint out of view");
+}
+
+/// Paint while a new level's reductions are made on a worker thread also
+/// reaches them.
+#[test]
+fn paint_during_a_level_change_reaches_the_new_reductions() {
+    let mut doc = Document::new(solid(4000, 3000, [255, 255, 255, 255]), None);
+    for k in 0..3 {
+        doc.add_layer(format!("l{k}"), solid(4000, 3000, [0, 90, 0, 40]), (0, 0));
+    }
+    let mut h = app_with(doc, Tool::Brush, 2048);
+    h.state_mut().zoom = 0.4;
+    h.run_steps(1);
+    until_reduced(&mut h);
+    h.state_mut().zoom = 0.2;
+    h.run_steps(1);
+    let meanwhile = h.state().level_pending();
+    dab(&mut h, (2000, 1500), [200, 0, 0, 255]);
+    dab(&mut h, (2100, 1500), [200, 0, 0, 255]);
+    until_reduced(&mut h);
+    dab(&mut h, (1000, 1000), [0, 0, 200, 255]);
+    same_reductions(&mut h, "after paint during a level change");
+    assert!(meanwhile, "the level was made on a worker thread");
+}
+
+/// A change of the whole view (a layer's opacity) is never shown as a
+/// patchwork of tiles from before and after it.
+#[test]
+fn a_change_of_the_whole_view_shows_at_once() {
+    let mut doc = Document::new(solid(3000, 2000, [255, 255, 255, 255]), None);
+    doc.add_layer("red".into(), solid(3000, 2000, [255, 0, 0, 255]), (0, 0));
+    for k in 0..12 {
+        doc.add_layer(format!("l{k}"), solid(3000, 2000, [0, 0, 255, 8]), (0, 0));
+    }
+    let mut h = app_with(doc, Tool::Hand, 2048);
+    h.state_mut().zoom = 0.5;
+    h.run_steps(1);
+    until_reduced(&mut h);
+    for _ in 0..20 {
+        h.run_steps(1);
+    }
+    let view = h.state().last_view.unwrap();
+    let window = h.ctx.content_rect().shrink(80.0);
+    // A point in each tile shown.
+    let points: Vec<(u32, u32)> = (0..3000)
+        .step_by(512)
+        .flat_map(|x| (0..2000).step_by(512).map(move |y| (x + 256, y + 256)))
+        .filter(|&(x, y)| window.contains(view.to_screen(pos2(x as f32, y as f32))))
+        .collect();
+    let shot = h.render().unwrap();
+    // Those where the canvas shows (not under a panel).
+    let flat = h.state().doc.as_ref().unwrap().flatten();
+    let points: Vec<(u32, u32)> = points
+        .into_iter()
+        .filter(|&(x, y)| {
+            let [r, g, b, _] = flat.get_pixel(x, y).0;
+            near(shown(&shot, &h, x, y), [r, g, b])
+        })
+        .collect();
+    assert!(points.len() >= 4, "{points:?}");
+    let before: Vec<[u8; 3]> = points
+        .iter()
+        .map(|&(x, y)| shown(&shot, &h, x, y))
+        .collect();
+    h.state_mut().doc.as_mut().unwrap().layers[1].opacity = 0.0;
+    // A frame composites a few tiles only (a slow computer).
+    super::render::TEST_TILE_BUDGET.set(Some(std::time::Duration::ZERO));
+    let mut seen_generation = false;
+    let start = std::time::Instant::now();
+    loop {
+        assert!(start.elapsed().as_secs() < 60, "the change never showed");
+        h.run_steps(1);
+        let shot = h.render().unwrap();
+        let now: Vec<bool> = points
+            .iter()
+            .zip(&before)
+            .map(|(&(x, y), b)| near(shown(&shot, &h, x, y), *b))
+            .collect();
+        assert!(
+            now.iter().all(|&same| same) || now.iter().all(|&same| !same),
+            "a patchwork: {now:?}"
+        );
+        seen_generation |= h.state().generation_pending();
+        if !now[0] && !h.state().generation_pending() {
+            break;
+        }
+    }
+    super::render::TEST_TILE_BUDGET.set(None);
+    assert!(seen_generation, "composited over several frames");
+}
+
+/// The histogram of what a Levels layer adjusts is made on a worker
+/// thread, and not again when only the Levels layer itself changes.
+#[test]
+fn a_levels_layer_histogram_is_made_once_off_the_ui_thread() {
+    use crate::pixel_ops::Adjustment;
+    let mut doc = Document::new(solid(400, 300, [200, 50, 50, 255]), None);
+    doc.add_adjustment_layer(Adjustment::Levels(Default::default()), None);
+    let mut h = app_with(doc, Tool::Hand, 2048);
+    let ctx = h.ctx.clone();
+    let levels = Adjustment::Levels(Default::default());
+    let ready = |h: &mut Harness<'static, AtelierApp>| {
+        let start = std::time::Instant::now();
+        loop {
+            let found = h.state_mut().below_histogram(&ctx, &levels);
+            if let Some(found) = found
+                && !h.state().below_histogram.busy()
+            {
+                return found;
+            }
+            assert!(start.elapsed().as_secs() < 60, "no histogram");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    let first = ready(&mut h);
+    assert_eq!(first[1][200], 400 * 300, "red of the layer below");
+    // The Levels layer's own settings: the same histogram, at once.
+    if let LayerKind::Adjustment(Adjustment::Levels(l)) =
+        &mut h.state_mut().doc.as_mut().unwrap().active_layer_mut().kind
+    {
+        l.rgb.gamma = 1.6;
+    }
+    assert_eq!(h.state_mut().below_histogram(&ctx, &levels), Some(first));
+    assert!(!h.state().below_histogram.busy());
+    // The layer below changed: made again.
+    let doc = h.state_mut().doc.as_mut().unwrap();
+    doc.layers[0]
+        .pixels_mut()
+        .put_pixel(0, 0, Rgba([10, 10, 10, 255]));
+    let _ = h.state_mut().below_histogram(&ctx, &levels);
+    let next = ready(&mut h);
+    assert_eq!(next[1][200], 400 * 300 - 1);
+}
+
+/// Opening the Channels panel on a large image makes its first
+/// reductions on a worker thread; the thumbnails come once they are made.
+#[test]
+fn channels_thumbnails_are_first_reduced_off_the_ui_thread() {
+    let mut doc = Document::new(solid(4000, 3000, [255, 255, 255, 255]), None);
+    doc.add_layer("a".into(), solid(4000, 3000, [0, 90, 0, 120]), (0, 0));
+    let mut h = app_with(doc, Tool::Hand, 2048);
+    h.state_mut().channels.open = true;
+    h.run_steps(1);
+    assert_eq!(h.state().channel_thumbs_state(), (false, true));
+    let start = std::time::Instant::now();
+    while h.state().channel_thumbs_state() != (true, false) {
+        assert!(start.elapsed().as_secs() < 60, "no thumbnails");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.run_steps(1);
+    }
+}
+
+/// A new document's view (opened, or a tab whose view wasn't kept) makes
+/// its reductions on a worker thread rather than freezing the window.
+#[test]
+fn a_new_documents_view_is_reduced_off_the_ui_thread() {
+    let mut h = app_with(
+        Document::new(solid(400, 300, [255, 255, 255, 255]), None),
+        Tool::Hand,
+        2048,
+    );
+    let mut big = Document::new(solid(5000, 4000, [20, 200, 20, 255]), None);
+    big.add_layer("a".into(), solid(5000, 4000, [0, 0, 90, 60]), (0, 0));
+    h.state_mut().add_tab(big);
+    h.state_mut().zoom = 0.1;
+    h.state_mut().fit_pending = None;
+    h.run_steps(1);
+    assert!(h.state().level_pending(), "made on a worker thread");
+    until_reduced(&mut h);
+    let shot = h.render().unwrap();
+    let view = h.state().last_view.unwrap();
+    let middle = view.to_image(h.ctx.content_rect().center());
+    let at = shown(&shot, &h, middle.x as u32, middle.y as u32);
+    assert!(at[1] > 100 && at[0] < 60, "the image shows: {at:?}");
 }

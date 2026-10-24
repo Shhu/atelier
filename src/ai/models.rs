@@ -333,7 +333,12 @@ fn remove_orphans(path: &Path) {
         if !file.starts_with(&prefix) || !file.ends_with(".part") || file.starts_with(&own) {
             continue;
         }
-        let age = entry.metadata().and_then(|m| m.modified()).ok();
+        // A real stat: on Windows, the directory entry's time only changes
+        // once the writer closes the file, so a download in progress of
+        // another run would look untouched.
+        let age = std::fs::metadata(entry.path())
+            .and_then(|m| m.modified())
+            .ok();
         if age
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age >= ORPHAN_AGE)
@@ -341,6 +346,63 @@ fn remove_orphans(path: &Path) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// A new partial download. On Windows, others can't delete it while it is
+/// written (another run of the program cleaning its orphans).
+fn create_partial(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, not FILE_SHARE_DELETE.
+        options.share_mode(0x1 | 0x2);
+    }
+    options.open(path)
+}
+
+/// A model file that could not be loaded: if it isn't what was downloaded
+/// (damaged on the disk), it is removed so that the model is offered for
+/// download again. Returns `true` then.
+/// Its other files (external data) are checked too.
+pub fn remove_if_damaged(path: &Path) -> bool {
+    let Some(model) = Model::ALL
+        .into_iter()
+        .find(|m| m.files().iter().any(|f| m.path(f.name) == path))
+    else {
+        return false;
+    };
+    let mut removed = false;
+    for f in model.files() {
+        let path = model.path(f.name);
+        if digest_of(&path).is_some_and(|d| d != f.sha256) {
+            crate::diag::warn(crate::i18n::tm!("ui4-log-model-damaged", name = f.name));
+            removed |= std::fs::remove_file(&path).is_ok();
+        }
+    }
+    removed
+}
+
+/// The SHA-256 of a file, in hexadecimal.
+fn digest_of(path: &Path) -> Option<String> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 16];
+    loop {
+        let n = f.read(&mut buffer).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
 }
 
 /// Network error, in words: a timeout says that the connection stopped
@@ -378,7 +440,7 @@ fn download_file(
     let (windowed, whole) = (agent(Some(window)), agent(None));
     remove_orphans(path);
     let partial = Partial::new(path);
-    let mut out = std::fs::File::create(&partial.0).map_err(failed)?;
+    let mut out = create_partial(&partial.0).map_err(failed)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 16];
     let mut total = 0u64;
@@ -674,6 +736,20 @@ mod tests {
         let files = [file("", 2, "")];
         let found = files_in(&dir, &files);
         assert_eq!(found.iter().map(|(_, len)| len).sum::<u64>(), 42);
+    }
+
+    #[test]
+    fn digest_of_a_file() {
+        let dir = temp_dir("digest");
+        let path = dir.join("model.onnx");
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            digest_of(&path).as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        // Not a model file: never removed.
+        assert!(!remove_if_damaged(&path));
+        assert!(path.exists());
     }
 
     #[test]

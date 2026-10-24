@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::i18n::Message;
+
 /// A frame longer than this is a freeze.
 pub const FREEZE: Duration = Duration::from_millis(100);
 /// Frame time statistics are kept per second, for this many seconds.
@@ -68,7 +70,23 @@ pub struct OpStats {
 pub struct Freeze {
     pub at: Instant,
     pub took: Duration,
-    pub context: String,
+    pub context: Doing,
+}
+
+/// What the window was doing during a freeze, as names the window's code
+/// shows in the interface's language (and the report in English).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Doing {
+    /// The active tool (its `Debug` name).
+    pub tool: String,
+    /// The open dialog: the key of its name.
+    pub dialog: Option<&'static str>,
+    pub stroke: bool,
+    pub pointer_down: bool,
+    /// The frame's longest operations (their recorded names).
+    pub ran: Vec<(String, Duration)>,
+    /// Background jobs running (their recorded names).
+    pub jobs: Vec<String>,
 }
 
 /// Frame times over a period.
@@ -213,7 +231,7 @@ impl Measures {
     }
 
     /// A freeze, and what was going on.
-    pub fn freeze(&mut self, at: Instant, took: Duration, context: String) {
+    pub fn freeze(&mut self, at: Instant, took: Duration, context: Doing) {
         if self.freezes.len() >= MAX_FREEZES {
             self.freezes.pop_front();
         }
@@ -331,7 +349,7 @@ pub fn frame(start: Instant, took: Duration) -> bool {
     lock(&MEASURES).frame(start, took)
 }
 
-pub fn freeze(took: Duration, context: String) {
+pub fn freeze(took: Duration, context: Doing) {
     lock(&MEASURES).freeze(Instant::now(), took, context);
 }
 
@@ -419,7 +437,10 @@ pub struct LogEntry {
     pub at: Instant,
     pub wall: SystemTime,
     pub level: Level,
+    /// In the interface's language (the window's).
     pub message: String,
+    /// In English (the log file's and the report's).
+    pub english: String,
 }
 
 #[derive(Default)]
@@ -432,17 +453,18 @@ struct Log {
     file_started: bool,
 }
 
-/// Something that went wrong without stopping anything.
-pub fn warn(message: impl AsRef<str>) {
-    log(Level::Warning, message.as_ref());
+/// Something that went wrong without stopping anything (a text of the
+/// interface, or a `tm!` message with its English).
+pub fn warn(message: impl Into<Message>) {
+    log(Level::Warning, &message.into());
 }
 
 /// A failed operation (shown to the user as one).
-pub fn error(message: impl AsRef<str>) {
-    log(Level::Error, message.as_ref());
+pub fn error(message: impl Into<Message>) {
+    log(Level::Error, &message.into());
 }
 
-fn log(level: Level, message: &str) {
+fn log(level: Level, message: &Message) {
     use std::sync::TryLockError;
     // A panic while this very thread holds the log (writing it) would wait
     // forever: a panicking thread tries for a moment, then gives up.
@@ -462,12 +484,13 @@ fn log(level: Level, message: &str) {
     add(&mut log, level, message);
 }
 
-fn add(log: &mut Log, level: Level, message: &str) {
+fn add(log: &mut Log, level: Level, message: &Message) {
     let entry = LogEntry {
         at: Instant::now(),
         wall: SystemTime::now(),
         level,
-        message: scrub(message.trim()),
+        message: scrub(message.shown.trim()),
+        english: scrub(message.english.trim()),
     };
     match level {
         Level::Warning => log.warnings += 1,
@@ -534,7 +557,7 @@ fn write_file(log: &mut Log, entry: &LogEntry) {
         "{} {} {}",
         timestamp(entry.wall),
         entry.level.code(),
-        entry.message
+        entry.english
     );
 }
 
@@ -558,7 +581,7 @@ pub fn timestamp(at: SystemTime) -> String {
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        log(Level::Panic, &panic_message(info));
+        log(Level::Panic, &panic_message(info).into());
         previous(info);
     }));
 }
@@ -823,7 +846,11 @@ mod tests {
         m.record("Open".into(), Duration::from_millis(40), at, false);
         m.record("Open".into(), Duration::from_millis(60), at, false);
         assert!(m.frame(at, Duration::from_millis(150)));
-        m.freeze(at, Duration::from_millis(150), "tool Brush".into());
+        let brush = Doing {
+            tool: "Brush".into(),
+            ..Doing::default()
+        };
+        m.freeze(at, Duration::from_millis(150), brush);
         m.tiles(at, 12, true, 1);
         let ops = m.operations();
         assert_eq!(ops.len(), 1);
@@ -857,8 +884,8 @@ mod tests {
         assert_eq!(five.frames, 3);
         assert_eq!(five.average, ms(80));
         // Old freezes leave the last minute but stay for five.
-        m.freeze(origin, ms(150), String::new());
-        m.freeze(later, ms(200), String::new());
+        m.freeze(origin, ms(150), Doing::default());
+        m.freeze(later, ms(200), Doing::default());
         assert_eq!(m.freezes(later, Duration::from_secs(60)).len(), 1);
         assert_eq!(m.freezes(later, Duration::from_secs(300)).len(), 2);
     }

@@ -69,7 +69,7 @@ menu-image-rotation = Rotation de l'image
 menu-image-rotate-180 = 180°
 menu-image-rotate-cw = 90° horaire
 menu-image-rotate-ccw = 90° antihoraire
-menu-image-rotate-arbitrary = Paramétrable…
+menu-image-rotate-arbitrary = Paramétrée…
 menu-image-flip-horizontal = Symétrie horizontale de la zone de travail
 menu-image-flip-vertical = Symétrie verticale de la zone de travail
 menu-image-crop = Recadrer
@@ -504,7 +504,7 @@ zoombar-actual-pixels = 100 %
 
 ## Start screen (no image open)
 
-welcome-title = Ouvrir une image
+welcome-title = Créer ou ouvrir une image
 welcome-subtitle = Déposez un fichier n'importe où dans la fenêtre, ou choisissez-en un.
 welcome-recent = Récents
 welcome-forget-recent = Retirer de la liste
@@ -2294,7 +2294,7 @@ hist3-reselect = Resélectionner
 hist3-inverse = Intervertir
 hist3-move-selection = Déplacer la sélection
 hist3-select-subject = Sélectionner le sujet
-hist3-make-selection = Créer une sélection
+hist3-make-selection = Définir une sélection
 hist3-selection = Modification de la sélection
 hist3-quick-mask = Mode Masque
 
@@ -2302,7 +2302,7 @@ hist3-quick-mask = Mode Masque
 hist3-oldest-state = Plus ancien état conservé
 
 ## Selection computed in the background
-hist3-selection-changed = La sélection a changé pendant le calcul de la précédente : ce résultat est abandonné.
+hist3-selection-changed = La sélection a changé pendant le calcul de la précédente : le résultat précédent n'a pas été appliqué.
 
 ## Move tool options
 input3-auto-select = Sélection automatique
@@ -2312,7 +2312,6 @@ input3-auto-select-tip = Un clic sélectionne le calque sous le pointeur. Mainte
 input3-eyedropper-hint = Clic : premier plan · { $alt_click } : arrière-plan
 input3-visibility-tip = Afficher / masquer ({ $alt_click } : lui seul)
 input3-curves-hint = Cliquez pour ajouter un point ; glissez-le hors du graphique (ou { $ctrl_click }, { $delete }) pour le retirer. Flèches : déplacer le point, { $next } : point suivant.
-input3-layer-row-tip = Glissez pour réorganiser, ou dans un groupe · double-clic sur le nom : renommer, à côté : style de calque · { $alt_click } : écrêter sur le calque du dessous · { $ctrl_click } sur une vignette : ses pixels ou son masque en sélection · sur le masque : { $shift_click } le désactive ou l'active, { $alt_click } l'affiche seul
 input3-clone-hint = { $alt_click } pour définir la source, puis peignez pour la copier
 input3-healing-hint = { $alt_click } pour définir la source, puis peignez : sa texture se fond dans les couleurs alentour
 input3-channel-row-tip = Clic : afficher seule · { $ctrl_click } : récupérer comme sélection · Double-clic : renommer
@@ -2349,17 +2348,17 @@ files3-status-paste-into-no-selection = Coller dedans demande une sélection.
 ## Export
 
 files3-export-no-metadata = Les fichiers { $format } ne contiennent pas de métadonnées.
-files3-status-artboards-busy = Des plans de travail sont encore en cours d’exportation.
+files3-status-artboards-busy = Des plans de travail sont encore en cours d'exportation.
 
 ## Painting and retouching (fix3 tools)
 
 tools3-status-source-empty = Rien de copié : la zone source est vide (Échantillon : { $sample }).
-tools3-status-layer-hidden = Impossible de peindre : « { $name } » est masqué.
+tools3-status-layer-hidden = Impossible de peindre : « { $name } » est masqué. Affichez-le avec son œil dans le panneau Calques.
 tools3-rasterize-text = Le calque de texte « { $name } » doit être pixellisé pour peindre dessus. Son texte ne sera plus modifiable.
 tools3-rasterize-shape = Le calque de forme « { $name } » doit être pixellisé pour peindre dessus. Sa forme ne sera plus modifiable.
 tools3-rasterize-ok = Pixelliser
 tools3-bucket-all-layers = Tous les calques
-tools3-bucket-all-layers-tip = Remplit selon les couleurs que montrent tous les calques visibles, sur le calque actif
+tools3-bucket-all-layers-tip = Prend la zone d'après tous les calques visibles, remplit le calque actif
 
 ## Layer › Remove Background (fix3 tools)
 
@@ -2368,7 +2367,6 @@ tools3-status-remove-background-pixels = Supprimer l'arrière-plan s'applique à
 ## Actions panel: Clear All Actions, the actions file
 smart3-actions-clear-all-question = Supprimer tous les scripts ?
 smart3-actions-damaged = Les scripts enregistrés n'ont pas pu être lus ({ $error }) : les scripts par défaut sont affichés et le fichier a été conservé sous le nom { $backup }.
-smart3-actions-unreadable = Les scripts enregistrés n'ont pas pu être lus ({ $error }) : les scripts par défaut sont affichés, et les modifications des scripts ne seront pas enregistrées avant le redémarrage d'Atelier.
 smart3-actions-not-recorded = Non enregistré : cette commande ne peut pas faire partie d'un script.
 smart3-actions-not-saved = Les scripts n'ont pas pu être enregistrés : { $error }
 
@@ -2396,7 +2394,7 @@ fx3-ai-error-write = le fichier n'a pas pu être écrit ({ $error })
 fx3-model-ready-run-again = { $name } est prêt : relancez la commande (la sélection ou le calque a changé entre-temps).
 
 ## Content-Aware Fill, Spot Healing Brush
-fx3-ai-skipped-transparency = Modèle d'IA non utilisé : la zone a des pixels transparents, remplie avec des motifs à la place.
+fx3-ai-skipped-transparency = La zone a des pixels transparents : remplie par des motifs, sans le modèle d'IA.
 
 ## Start screen
 ui3-status-welcome = Créez une image ({ $new }), ouvrez-en une ({ $open }) ou glissez-la dans la fenêtre.
@@ -2446,7 +2444,7 @@ ui3-why-nothing-to-undo = Rien à annuler
 ui3-why-nothing-to-redo = Rien à rétablir
 ui3-why-not-now = Indisponible pour le calque actif ou dans l'état actuel
 # Other words a command is found by (space-separated, never shown)
-ui3-palette-keywords-image-size = redimensionner agrandir réduire rééchantillonner échelle dimensions
+ui3-palette-keywords-image-size = redimensionner agrandir réduire rééchantillonner échelle dimensions résolution dpi ppp
 ui3-palette-keywords-canvas-size = agrandir étendre bordure marge
 ui3-palette-keywords-rotate = pivoter tourner rotation retourner miroir symétrie
 ui3-palette-keywords-crop = recadrer recadrage rogner
@@ -2478,10 +2476,10 @@ diag-copy = Copier les diagnostics
 diag-open-logs = Ouvrir le dossier des journaux
 diag-open-logs-failed = Impossible d'ouvrir le dossier des journaux ({ $error }).
 diag-clear = Effacer les mesures
-diag-note = La copie contient les versions, le système, les mesures et les messages récents : les dossiers deviennent des noms de fichiers, sans contenu d'image.
+diag-note = La copie contient les versions, le système, les mesures et les messages récents. Les chemins sont réduits aux noms de fichiers ; aucun contenu d'image.
 diag-status-copied = Diagnostics copiés : collez-les dans un message ou un ticket.
 diag-tab-overview = Vue d'ensemble
-diag-tab-operations = Opérations lentes
+diag-tab-operations = Opérations
 diag-tab-log = Journal
 diag-tab-documents = Documents
 diag-tab-system = Système
@@ -2491,15 +2489,14 @@ diag-min = { $value } min
 diag-hours = { $hours } h { $minutes } min
 diag-ago = il y a { $duration }
 diag-unknown = Indisponible sur ce système
-diag-card-frame = Temps par image
+diag-card-frame = Temps d'affichage
 diag-card-frame-detail = max { $max } sur la dernière minute · { $frames ->
-    [one] { $frames } image
-   *[other] { $frames } images
+    [one] { $frames } rafraîchissement
+   *[other] { $frames } rafraîchissements
 }
 diag-card-freezes = Blocages (1 min)
-diag-card-freezes-detail = { $total } au total · max { $max } · { $five } sur 5 min
+diag-card-freezes-detail = { $total } au total · max { $max } · { $five } ces 5 dernières minutes
 diag-card-memory = Mémoire du programme
-diag-card-memory-detail = privée { $private }
 diag-card-history = Mémoire de l'historique
 diag-card-history-detail = sur { $budget } pour tous les onglets · { $steps ->
     [one] { $steps } étape
@@ -2511,15 +2508,15 @@ diag-card-documents-detail = le plus grand { $width } × { $height } · { $layer
    *[other] { $layers } calques
 } en tout
 diag-card-documents-none = Aucun document ouvert
-diag-card-rendering = Affichage du canevas
+diag-card-rendering = Affichage de la zone de travail
 diag-card-rendering-value = { $tiles ->
     [one] { $tiles } tuile
    *[other] { $tiles } tuiles
 }
-diag-card-rendering-detail = max { $max } par image · niveau { $level } · { $over } hors budget (1 min)
+diag-card-rendering-detail = max { $max } par rafraîchissement · niveau de taille { $level } · { $over } à court de temps (1 min)
 diag-card-jobs = Calculs en arrière-plan
 diag-card-jobs-none = Aucun en cours
-diag-card-ai = Moteur d'IA
+diag-card-ai = Calcul de l'IA
 diag-ai-unused = Pas encore utilisé
 diag-card-ai-detail = { $installed ->
     [one] { $installed } modèle installé
@@ -2573,8 +2570,8 @@ diag-kind-pixels = { $count ->
    *[other] { $count } calques de pixels
 }
 diag-kind-text = { $count ->
-    [one] { $count } texte
-   *[other] { $count } textes
+    [one] { $count } calque de texte
+   *[other] { $count } calques de texte
 }
 diag-kind-shape = { $count ->
     [one] { $count } forme
@@ -2602,9 +2599,9 @@ diag-sys-debug = { $version } (version de débogage)
 diag-sys-os = Système
 diag-sys-gpu = Carte graphique
 diag-sys-gpu-unknown = Pas encore connue
-diag-sys-max-texture = Plus grande texture
-diag-sys-cores = Threads du processeur
-diag-sys-threads = Threads du programme
+diag-sys-max-texture = Plus grande image sur la carte graphique
+diag-sys-cores = Cœurs logiques du processeur
+diag-sys-threads = Fils d'exécution du programme
 diag-sys-scale = Échelle d'affichage
 diag-sys-window = Fenêtre
 diag-sys-language = Langue
@@ -2616,3 +2613,202 @@ diag-sys-monitor-assumed = { $name } (supposé)
 diag-sys-history-budget = Budget de l'historique
 diag-sys-history-budget-value = { $active } par document, { $total } en tout
 diag-sys-since = Mesures depuis
+
+## History: background results dropped after a history change
+hist4-selection-history-changed = Le document a changé pendant le calcul de la sélection : ce résultat est abandonné.
+hist4-subject-history-changed = Le document a changé pendant la recherche : relancez la commande.
+
+## Enregistrer un fichier dans son propre format
+
+files4-note-frames = les autres images de l'animation
+files4-note-pages = les autres pages
+files4-note-metadata = des métadonnées (copyright, EXIF, XMP ou IPTC)
+files4-psd-note-comps = compositions de calques ignorées
+files4-status-would-lose = « { $name } » perdrait : { $notes }. Enregistrez-le comme document Atelier pour tout garder.
+
+## Layers: delete
+tools4-status-last-layer = Suppression impossible : un document garde au moins un calque.
+
+## Move tool
+tools4-show-transform-controls = Afficher les options de transformation
+tools4-show-transform-controls-tip = Affiche le cadre et les poignées du calque sélectionné : faire glisser une poignée le met à l'échelle ou le fait pivoter. Sinon, un glissement ne fait que déplacer.
+
+## Retouching
+tools4-status-heal-unchanged = Aucun changement : le remplissage redonne les pixels qui étaient là.
+
+## Free Transform
+tools4-status-path-transform = La transformation manuelle s'applique aux calques : faites glisser le tracé avec l'outil Sélection de tracé, ou transformez tout son calque de forme.
+
+## Keys in Quick Mask mode
+input4-quick-mask-delete = En mode Masque, { $delete } efface la zone sélectionnée du masque : faites d'abord une sélection.
+
+## Layers panel
+input4-layer-row-tip = Glissez pour réorganiser, ou dans un groupe · double-clic sur le nom : renommer, à côté : style de calque · { $alt_click } sur la ligne entre deux calques : écrêter celui du dessus sur celui du dessous · { $ctrl_click } sur une vignette : ses pixels ou son masque en sélection · sur le masque : { $shift_click } le désactive ou l'active, { $alt_click } l'affiche seul, double-clic : ses propriétés
+
+## Select and Mask
+
+sel4-mask-needs-selection = Sélectionner et masquer a besoin d'une sélection ou d'un masque de fusion ciblé.
+sel4-mask-target-changed = Sélectionner et masquer s'est fermé : le calque, son masque ou l'historique a changé entre-temps.
+
+## Quick Mask
+
+sel4-quick-mask-no-move = Mode Masque : déplacer et transformer ne sont pas disponibles. Appuyez d'abord sur { $key } pour terminer.
+sel4-tab-quick-mask = { $zoom } (Masque)
+
+## Object Selection
+
+sel4-objsel-dropped = Sélection d'objet : l'image a changé avant que l'objet soit trouvé. Cliquez à nouveau.
+
+## Hidden layer: Fill, adjustments, Make Transparent, Content-Aware Fill (and their action steps)
+fx4-layer-hidden = « { $name } » est masqué : affichez-le pour le modifier.
+
+## A dialog's preview on the canvas failed
+fx4-preview-failed = L'aperçu de « { $name } » n'a pas pu être calculé.
+fx4-preview-failed-any = L'aperçu n'a pas pu être calculé.
+
+## Camera Raw: opening a raw file failed
+fx4-raw-open-failed = Impossible de développer { $name } : rien n'a été ouvert.
+
+## AI models: a downloaded file that does not load
+fx4-ai-model-damaged = fichier du modèle endommagé : il a été supprimé et sera téléchargé à nouveau à la prochaine utilisation
+
+## Linked smart objects: Edit Contents, files read again
+smart4-status-link-unreadable = Le fichier lié n'a pas pu être lu, sa dernière copie est affichée : { $names }
+smart4-status-link-saved = Enregistré dans { $name } : les objets dynamiques liés à ce fichier suivent.
+smart4-status-link-saved-flat = Enregistré dans { $name }, calques fusionnés : les objets dynamiques liés à ce fichier suivent. Cet onglet garde les calques jusqu'à sa fermeture.
+smart4-status-updated-embedded = Objet dynamique mis à jour et incorporé (son fichier lié est introuvable) : { $name }
+
+## Actions panel: the actions file
+smart4-actions-unreadable = Les scripts enregistrés n'ont pas pu être lus ({ $error }) : les scripts par défaut sont affichés, et les modifications des scripts ne sont pas enregistrées.
+smart4-actions-change-not-saved = Cette modification n'est pas enregistrée : le fichier des scripts n'a pas pu être lu. Utilisez Enregistrer tous les scripts… dans le panneau Scripts pour garder vos scripts.
+smart4-actions-banner = Les modifications des scripts ne sont pas enregistrées : le fichier des scripts n'a pas pu être lu.
+smart4-actions-save-all = Enregistrer tous les scripts…
+
+## Batch
+smart4-batch-open-modified = { $name } est ouvert avec des modifications non enregistrées : laissé tel quel. Enregistrez-le ou fermez-le, puis relancez le traitement.
+
+## Artboards to files
+smart4-artboards-exist = { $count ->
+    [one] { $count } fichier portant le nom d'un plan de travail existe déjà dans ce dossier.
+   *[other] { $count } fichiers portant les noms des plans de travail existent déjà dans ce dossier.
+}
+smart4-artboards-replace = Remplacer
+smart4-artboards-keep-both = Conserver les deux
+
+## Aide > Diagnostic : carte mémoire
+
+perf4-diag-memory-detail = privée { $private }, copies d'affichage { $display }
+perf4-diag-memory-display = copies d'affichage { $display }
+
+## Window menu: the side panel
+ui4-menu-layers-properties = Calques et propriétés
+
+## Command palette: other words commands are found by
+ui4-palette-keywords-quick-export = png exporter enregistrer web
+ui4-palette-keywords-place = importer insérer ajouter image fichier
+ui4-palette-keywords-quit = fermer sortir
+ui4-palette-keywords-quick-mask = masque rapide
+ui4-palette-keywords-red-eye = yeux rouges pupille
+
+## Why a greyed command can't run (menus and palette)
+ui4-why-no-recent = La liste des fichiers récents est vide
+ui4-why-has-mask = Le calque actif a déjà un masque de fusion
+ui4-why-no-mask = Le calque actif n'a pas de masque de fusion
+ui4-why-no-pixels = Le calque actif n'a pas de pixels à lui
+ui4-why-not-smart = Le calque actif n'est pas un objet dynamique
+ui4-why-not-linked = L'objet dynamique n'est pas lié à un fichier
+ui4-why-not-live = Seuls les calques de texte, de forme et les objets dynamiques se pixellisent
+ui4-why-smart-adjust = Les réglages ne modifient pas un objet dynamique : ajoutez un calque de réglage au-dessus
+ui4-why-no-layer-below = Il n'y a pas de calque en dessous avec lequel fusionner
+ui4-why-not-group = Le calque actif n'est pas un groupe
+ui4-why-not-artboard = Le calque actif n'est pas un plan de travail
+ui4-why-not-top-group = Sélectionnez un groupe en haut de la liste, hors de tout plan de travail
+ui4-why-in-artboard = Les calques sont déjà dans un plan de travail
+ui4-why-no-artboards = L'image n'a pas de plan de travail
+ui4-why-no-style = Le calque actif n'a pas de style de calque
+ui4-why-no-guides = Il n'y a pas de repères
+ui4-why-no-saved-selection = Aucune sélection n'a été mémorisée dans cette image
+ui4-why-no-last-selection = Il n'y a pas de sélection précédente à rétablir
+ui4-why-no-filter-yet = Aucun filtre appliqué pour l'instant
+ui4-why-no-transform-yet = Aucune transformation appliquée pour l'instant
+ui4-why-busy = Déjà en cours : attendez qu'il se termine
+
+## Options bar: a hidden layer the tools would refuse
+ui4-options-layer-hidden = Calque masqué
+ui4-options-layer-hidden-tip = Les outils ne peignent pas sur un calque masqué : affichez-le avec son œil dans le panneau Calques
+
+## Diagnostics' log: messages written for it
+ui4-log-ai-gpu-failed = { $name } : la carte graphique a échoué ({ $error }), calcul sur le processeur à la place
+ui4-log-ai-gpu-not-loaded = { $name } : impossible de le charger sur la carte graphique ({ $error }), calcul sur le processeur à la place
+ui4-log-model-damaged = { $name } : fichier endommagé, supprimé
+ui4-log-objsel-picked-again = Sélection d'objet : l'image a changé pendant un clic, l'objet a été choisi de nouveau
+
+## Diagnostics: what was measured, as named in the window
+ui4-op-ai = { $name } (IA)
+ui4-op-stroke = Fin d'un tracé : { $tool }
+ui4-op-open = Ouverture ({ $format })
+ui4-op-save = Enregistrement ({ $format })
+ui4-op-export = Exportation ({ $format })
+ui4-op-filter = Filtre : { $name }
+ui4-op-filter-preview = Aperçu du filtre : { $name }
+ui4-op-history-record = Historique : enregistrement d'une étape
+ui4-op-history-go = Historique : retour à une étape
+ui4-op-transform-commit = Application d'une transformation
+ui4-op-transform = Transformation
+ui4-op-selection = Sélection
+ui4-op-color-range = Plage de couleurs : image réduite
+ui4-op-export-flatten = Exporter sous : aplatissement
+ui4-op-export-preview = Exporter sous : aperçu
+ui4-op-magnetic = Lasso magnétique : contours
+ui4-op-raw-read = Camera Raw : lecture du fichier
+ui4-op-raw-develop = Camera Raw : développement
+ui4-op-raw-preview = Camera Raw : aperçu
+ui4-op-linked-read = Fichiers liés : lecture
+ui4-op-objsel-hover = Sélection d'objet : aperçu sous le pointeur
+ui4-op-objsel-pick = Sélection d'objet : choix
+ui4-op-objsel-analysis = Sélection d'objet : analyse de l'image
+
+## Diagnostics: what the window was doing during a freeze
+ui4-diag-doing-tool = Outil : { $tool }
+ui4-diag-doing-dialog = Fenêtre : { $name }
+ui4-diag-doing-stroke = tracé en cours
+ui4-diag-doing-pointer = bouton de la souris enfoncé
+ui4-diag-doing-ran = a exécuté { $operations }
+ui4-diag-doing-jobs = en arrière-plan : { $jobs }
+ui4-diag-dialog-new = Nouveau document
+ui4-diag-dialog-palette = Palette de commandes
+
+## Diagnostics window: the verdict, what to send, tooltips
+ui4-diag-verdict-fine = Tout semble normal.
+ui4-diag-verdict-froze = { $count ->
+    [one] Atelier s'est bloqué { $count } fois dans la dernière minute.
+   *[other] Atelier s'est bloqué { $count } fois dans la dernière minute.
+}
+ui4-diag-verdict-errors = { $count ->
+    [one] { $count } erreur s'est produite pendant cette session : voyez l'onglet Journal.
+   *[other] { $count } erreurs se sont produites pendant cette session : voyez l'onglet Journal.
+}
+ui4-diag-verdict-slow = L'affichage est lent en ce moment.
+ui4-diag-what-to-send = Pour signaler un problème, utilisez Signaler un problème : le rapport est copié, à coller dans votre message.
+ui4-diag-report = Signaler un problème…
+ui4-diag-report-tip = Copie le rapport, puis ouvre la page où signaler les problèmes
+ui4-diag-status-report = Rapport copié : collez-le dans votre message, sur la page qui s'est ouverte.
+ui4-diag-just-now = à l'instant
+ui4-diag-tip-frame = Temps pour dessiner la fenêtre une fois. Sous { $smooth }, c'est fluide ; au-delà de { $sluggish }, ça rame.
+ui4-diag-tip-freezes = Moments où la fenêtre a cessé de répondre pendant plus de { $freeze }.
+ui4-diag-tip-memory = Mémoire qu'utilise le programme, y compris celle qu'il partage avec d'autres programmes.
+ui4-diag-tip-history = Mémoire gardée pour annuler, pour tous les documents ouverts ; les étapes les plus anciennes partent au-delà du budget.
+ui4-diag-tip-documents = Documents ouverts, le plus grand et les calques qu'ils contiennent.
+ui4-diag-tip-rendering = Morceaux de l'image dessinés par rafraîchissement. Un niveau de taille au-dessus de 0 montre une copie réduite quand vous dézoomez.
+ui4-diag-tip-jobs = Travail fait sans bloquer la fenêtre (filtres, IA, enregistrement…).
+ui4-diag-tip-ai = Où les modèles d'IA ont tourné : sur la carte graphique ou sur le processeur.
+ui4-diag-tip-color = Le profil de couleur du document et celui de l'écran.
+ui4-diag-tip-log = Avertissements et erreurs depuis le lancement ; l'onglet Journal les liste.
+ui4-diag-gpu-integrated = intégrée
+ui4-diag-gpu-discrete = dédiée
+ui4-diag-gpu-virtual = virtuelle
+ui4-diag-gpu-cpu = logicielle (sur le processeur)
+ui4-diag-gpu-other = autre
+
+## Keyboard Shortcuts: tools that share a key
+ui4-shortcuts-tools-cycle = { $key }, puis { $next } pour le suivant

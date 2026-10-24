@@ -304,18 +304,19 @@ impl Document {
     pub fn apply_transformed(
         &mut self,
         target: Target,
-        layers: &[usize],
         t: &Transform,
         mut done: Vec<Transformed>,
         name: String,
     ) {
         self.checkpoint(name);
         let limit = self.shape_limit();
-        let indices: Vec<usize> = match target {
-            Target::Mask => vec![self.active],
-            Target::Layer => layers.to_vec(),
-        };
-        for i in indices {
+        // By id: the layers may have moved since the job started (a layer
+        // deleted meanwhile is skipped).
+        let ids: Vec<u64> = done.iter().map(|d| d.id).collect();
+        for id in ids {
+            let Some(i) = self.layer_index(id) else {
+                continue;
+            };
             let shape = target == Target::Layer && self.follows_as_shape(i, t);
             let layer = &mut self.layers[i];
             let Some(result) = done.iter_mut().find(|d| d.id == layer.id) else {
@@ -378,7 +379,7 @@ impl Document {
         name: String,
     ) {
         let done = self.transform_job(target, layers, t, filter).run();
-        self.apply_transformed(target, layers, t, done, name);
+        self.apply_transformed(target, t, done, name);
     }
 
     /// Names the last undo step `name` (History panel).

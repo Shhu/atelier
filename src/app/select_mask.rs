@@ -89,11 +89,21 @@ impl Output {
     }
 }
 
+/// Where Select and Mask's output goes: Output To, the layer it was
+/// opened on (its id), and whether it refines that layer's own mask.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) struct OutputTo {
+    output: Output,
+    layer: u64,
+    own_mask: bool,
+}
+
 /// Select and Mask open.
 pub(super) struct SelectMask {
-    /// The selection refined, and its coverage reduced for the preview
-    /// (`scale`: its pixels per canvas pixel).
-    source: Selection,
+    /// The selection refined (`None`: nothing, e.g. a Hide All mask), and
+    /// its coverage reduced for the preview (`scale`: its pixels per canvas
+    /// pixel).
+    source: Option<Selection>,
     reduced: Arc<GrayImage>,
     scale: f32,
     pub(super) refine: Refine,
@@ -103,9 +113,24 @@ pub(super) struct SelectMask {
     pub(super) output: Output,
     /// Preview for the settings it was refined with.
     shown: Option<(Refine, Arc<GrayImage>)>,
+    /// What it was opened on: the document, its history position, the
+    /// active layer (its id), and whether its mask is the source.
+    doc: u64,
+    step: u64,
+    layer: u64,
+    own_mask: bool,
 }
 
 impl SelectMask {
+    /// `doc` is still as it was opened on: same history position, active
+    /// layer and target.
+    fn opened_on(&self, doc: &Document) -> bool {
+        doc.uid() == self.doc
+            && doc.history_step() == self.step
+            && doc.active_layer().id == self.layer
+            && (!self.own_mask || refines_layer_mask(doc))
+    }
+
     /// The refined preview, computed again when the settings changed.
     fn preview(&mut self) -> Arc<GrayImage> {
         if self.shown.as_ref().is_none_or(|(r, _)| *r != self.refine) {
@@ -119,8 +144,11 @@ impl SelectMask {
 
 /// A selection's coverage over `canvas`, reduced to at most
 /// [`PREVIEW_SIDE`], and its scale.
-fn reduced_coverage(sel: &Selection, canvas: PixelRect) -> (GrayImage, f32) {
-    let full = sel.to_mask(canvas);
+fn reduced_coverage(sel: Option<&Selection>, canvas: PixelRect) -> (GrayImage, f32) {
+    let full = match sel {
+        Some(sel) => sel.to_mask(canvas),
+        None => GrayImage::new(canvas.w, canvas.h),
+    };
     let scale = (PREVIEW_SIDE as f32 / canvas.w.max(canvas.h).max(1) as f32).min(1.0);
     if scale >= 1.0 {
         return (full, 1.0);
@@ -156,21 +184,35 @@ impl AtelierApp {
     }
 
     pub(super) fn open_select_mask(&mut self) {
+        self.wait_select_job();
         let Some(doc) = &self.doc else { return };
-        // A targeted layer mask is refined, and replaced by the result.
-        let layer_mask = refines_layer_mask(doc);
-        let source = match layer_mask {
-            true => doc.mask_selection(doc.active),
-            false => self.selection.clone(),
+        // A targeted layer mask is refined as it is stored (its density,
+        // feather and what lies outside the canvas stay), and gets the
+        // result. An empty one (Hide All) is a start too.
+        let own_mask = refines_layer_mask(doc);
+        let source = match own_mask {
+            true => {
+                let layer = doc.active_layer();
+                let canvas = doc.full_rect();
+                let mask = layer.mask.as_ref().expect("checked");
+                let raw = mask.raw_over(canvas, layer.offset);
+                Selection::from_mask(&raw, (canvas.x, canvas.y))
+            }
+            false => match self.selection.clone() {
+                Some(sel) => Some(sel),
+                None => {
+                    self.status = t!("sel4-mask-needs-selection");
+                    return;
+                }
+            },
         };
-        let Some(sel) = source else { return };
-        let (reduced, scale) = reduced_coverage(&sel, doc.full_rect());
-        let output = match layer_mask {
+        let (reduced, scale) = reduced_coverage(source.as_ref(), doc.full_rect());
+        let output = match own_mask {
             true => Output::LayerMask,
             false => Output::Selection,
         };
         self.sel.select_mask = Some(SelectMask {
-            source: sel,
+            source,
             reduced: Arc::new(reduced),
             scale,
             refine: Refine::default(),
@@ -178,6 +220,10 @@ impl AtelierApp {
             opacity: [50.0, 100.0, 100.0, 50.0, 100.0],
             output,
             shown: None,
+            doc: doc.uid(),
+            step: doc.history_step(),
+            layer: doc.active_layer().id,
+            own_mask,
         });
     }
 
@@ -202,14 +248,23 @@ impl AtelierApp {
         let Some(mut sm) = self.sel.select_mask.take() else {
             return;
         };
-        let has_mask = self
-            .doc
-            .as_ref()
-            .is_some_and(|d| d.active_layer().mask.is_some());
+        // Another layer, an undo, a change behind the window: what it
+        // refines is no longer what it shows; it closes.
+        if !self.doc.as_ref().is_some_and(|d| sm.opened_on(d)) {
+            self.status = t!("sel4-mask-target-changed");
+            return;
+        }
+        // Its own mask is refined, not replaced.
+        let replaced = !sm.own_mask
+            && self
+                .doc
+                .as_ref()
+                .is_some_and(|d| d.active_layer().mask.is_some());
         let neutral = sm.refine == Refine::default();
         let out = floating_dialog(
             ctx,
             DialogSpec {
+                // The view can be zoomed and moved meanwhile.
                 modal: false,
                 reset: Some(!neutral),
                 ..DialogSpec::new("select_mask", t!("sel-mask-title"), tool_dialog_pos(ctx))
@@ -316,7 +371,7 @@ impl AtelierApp {
                             }
                         },
                     );
-                    if sm.output == Output::LayerMask && has_mask {
+                    if sm.output == Output::LayerMask && replaced {
                         ui_kit::hint(ui, t!("sel-mask-replaces-mask"));
                     }
                 });
@@ -334,24 +389,37 @@ impl AtelierApp {
     /// Closes Select and Mask: OK (`apply`) refines the selection at full
     /// size and outputs it.
     pub(super) fn close_select_mask(&mut self, apply: bool) {
-        let (Some(sm), Some(canvas)) = (
-            self.sel.select_mask.take(),
-            self.doc.as_ref().map(Document::full_rect),
-        ) else {
+        let (Some(sm), Some(doc)) = (self.sel.select_mask.take(), self.doc.as_ref()) else {
             return;
         };
         if !apply {
             return;
         }
+        let canvas = doc.full_rect();
+        // What it was opened on is no longer there: its result would land
+        // on something else.
+        if !sm.opened_on(doc) {
+            self.status = t!("sel4-mask-target-changed");
+            return;
+        }
         let (source, r) = (sm.source, sm.refine);
+        // Its own mask, untouched: nothing to do.
+        if sm.own_mask && sm.output == Output::LayerMask && r == Refine::default() {
+            return;
+        }
+        let to = OutputTo {
+            output: sm.output,
+            layer: sm.layer,
+            own_mask: sm.own_mask,
+        };
         let pixels = canvas.w as u64 * canvas.h as u64;
         let name = t!("sel-menu-select-and-mask");
         self.sel.step_name = Some(super::select_menu::step_label(name));
-        self.select_later(Then::Output(sm.output), pixels, move || {
+        self.select_later(Then::Output(to), pixels, move || {
             if r == Refine::default() {
-                Some(source)
+                source
             } else {
-                source.refined(&r, canvas)
+                source?.refined(&r, canvas)
             }
         });
     }
@@ -359,20 +427,35 @@ impl AtelierApp {
     /// Select and Mask's result, where Output To says. Except as the
     /// selection, the selection is then dropped, like Photoshop; one undo
     /// step.
-    pub(super) fn output_refined(&mut self, refined: Option<Selection>, output: Output) {
+    pub(super) fn output_refined(&mut self, refined: Option<Selection>, to: OutputTo) {
+        let output = to.output;
         if output == Output::Selection {
             self.apply_selection(refined, SelectMode::Replace);
             return;
         }
         let Some(doc) = &mut self.doc else { return };
+        // Only on the layer it was opened on.
+        let source = doc.active;
+        if doc.active_layer().id != to.layer {
+            self.status = t!("sel4-mask-target-changed");
+            return;
+        }
         let canvas = doc.full_rect();
         // Nothing selected: everything hidden.
         let sel = refined.unwrap_or_else(|| Selection {
             inverted: true,
             ..canvas.into()
         });
-        let source = doc.active;
         match output {
+            Output::LayerMask if to.own_mask && doc.active_layer().mask.is_some() => {
+                // Refined in place: its settings, link and what lies outside
+                // the canvas stay.
+                doc.checkpoint(t!("xchg-hist-select-and-mask"));
+                let layer = doc.active_layer_mut();
+                let offset = layer.offset;
+                let mask = layer.mask.as_mut().expect("checked");
+                mask.put_over(&sel.to_mask(canvas), canvas, offset);
+            }
             Output::LayerMask => {
                 if doc.active_layer().mask.is_some() {
                     doc.checkpoint(t!("xchg-hist-select-and-mask"));

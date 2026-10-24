@@ -270,6 +270,14 @@ impl AtelierApp {
     /// Exports the document to `path` and says so; recorded with its folder.
     pub(super) fn export_to(&mut self, options: &ExportOptions, path: &Path) {
         self.commit_pending();
+        // As Save As: the other tab's file would no longer be its own.
+        if self.tab_of(path).is_some_and(|i| i != self.active_tab) {
+            self.status = t!(
+                "file-status-open-in-another-tab",
+                name = files::file_name(path)
+            );
+            return;
+        }
         let started = std::time::Instant::now();
         let written = self.write_export(options, path);
         crate::diag::record(format!("Export: {:?}", options.format), started.elapsed());
@@ -280,7 +288,11 @@ impl AtelierApp {
                     t!("file-status-exported", path = shown)
                 } else {
                     let notes = notes.join(" · ");
-                    crate::diag::warn(format!("Exported {}: {notes}", files::file_name(path)));
+                    crate::diag::warn(tm!(
+                        "xchg-status-exported-simplified",
+                        path = files::file_name(path),
+                        notes = notes.clone()
+                    ));
                     t!(
                         "xchg-status-exported-simplified",
                         path = shown,
@@ -292,7 +304,7 @@ impl AtelierApp {
                     folder: path.parent().map(Path::to_path_buf),
                 });
             }
-            Err(e) => self.status_failed(e),
+            Err(e) => self.report_error(e),
         }
     }
 
@@ -575,7 +587,9 @@ fn image_settings(ui: &mut egui::Ui, o: &mut ExportOptions, canvas: (u32, u32), 
             let (cw, ch) = canvas;
             let (mut w, mut h) = o.size(canvas);
             let half = (width - 8.0) / 2.0;
-            let size = 1..=MAX_DIMENSION;
+            // No side beyond what the format holds (Atelier opens).
+            let max = o.format.max_side().min(MAX_DIMENSION);
+            let size = 1..=max;
             ui.horizontal(|ui| {
                 let (wl, hl) = (t!("optbar-width-short"), t!("optbar-height-short"));
                 if ui_kit::number_field(ui, &wl, &mut w, size.clone(), " px", half).changed() {
@@ -587,8 +601,7 @@ fn image_settings(ui: &mut egui::Ui, o: &mut ExportOptions, canvas: (u32, u32), 
             });
             let mut scale = o.scale;
             let label = t!("actions-scale");
-            // No side beyond what Atelier opens.
-            let most = (MAX_DIMENSION as f32 * 100.0 / cw.max(ch).max(1) as f32).min(1000.0);
+            let most = (max as f32 * 100.0 / cw.max(ch).max(1) as f32).min(1000.0);
             let suffix = crate::i18n::percent("");
             if ui_kit::number_field(ui, &label, &mut scale, 1.0..=most, &suffix, width).changed() {
                 o.scale = scale;
@@ -637,6 +650,31 @@ mod tests {
             });
         h.run_steps(2);
         (h, dir)
+    }
+
+    /// Export As over the file of another tab is refused, as Save As is.
+    #[test]
+    fn export_never_replaces_the_file_of_another_tab() {
+        let (mut h, dir) = app("other-tab");
+        let other = dir.join("other.png");
+        RgbaImage::from_pixel(4, 4, Rgba([1, 2, 3, 255]))
+            .save(&other)
+            .unwrap();
+        let before = std::fs::read(&other).unwrap();
+        let app = h.state_mut();
+        app.open_path(&other);
+        app.switch_tab(0);
+        app.export_to(&ExportOptions::default(), &other);
+        assert_eq!(std::fs::read(&other).unwrap(), before);
+        let refused = t!("file-status-open-in-another-tab", name = "other.png");
+        assert_eq!(app.status, refused);
+        // Over a file of its own tab: as asked.
+        let own = dir.join("photo.png");
+        app.export_to(&ExportOptions::default(), &own);
+        assert_ne!(
+            app.status,
+            t!("file-status-open-in-another-tab", name = "photo.png")
+        );
     }
 
     #[test]

@@ -122,8 +122,10 @@ impl Slot {
             Err(e) if device == Device::Gpu => {
                 let model = (self.path)();
                 let name = model.file_name().unwrap_or_default().to_string_lossy();
-                crate::diag::warn(format!(
-                    "{name}: the graphics card failed ({e}), running on the CPU"
+                crate::diag::warn(crate::i18n::tm!(
+                    "ui4-log-ai-gpu-failed",
+                    name = name.to_string(),
+                    error = e.to_string()
                 ));
                 state.cpu_only = true;
                 state.session = None;
@@ -135,7 +137,15 @@ impl Slot {
     }
 
     fn load(&self, cpu_only: bool) -> Result<(Session, Device), String> {
-        let loaded = session(&(self.path)(), cpu_only)?;
+        let path = (self.path)();
+        let loaded = session(&path, cpu_only).map_err(|e| {
+            // Of the right size but damaged: removed, to download again.
+            if super::models::remove_if_damaged(&path) {
+                crate::i18n::t!("fx4-ai-model-damaged")
+            } else {
+                e
+            }
+        })?;
         let code = match loaded.1 {
             Device::Gpu => 1,
             Device::Cpu => 2,
@@ -185,9 +195,14 @@ fn session(model: &Path, cpu_only: bool) -> Result<(Session, Device), String> {
     if !cpu_only {
         match gpu_session(model) {
             Ok(session) => return Ok((session, Device::Gpu)),
-            Err(e) => crate::diag::warn(format!(
-                "{}: not loaded on the graphics card ({e}), on the CPU instead",
-                model.file_name().unwrap_or_default().to_string_lossy()
+            Err(e) => crate::diag::warn(crate::i18n::tm!(
+                "ui4-log-ai-gpu-not-loaded",
+                name = model
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                error = e.to_string()
             )),
         }
     }
