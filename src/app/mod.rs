@@ -43,6 +43,8 @@ mod paths_panel;
 #[cfg(test)]
 mod picker_tests;
 mod quick_mask;
+#[cfg(test)]
+mod quick_mask_tests;
 mod render;
 #[cfg(test)]
 mod render_tests;
@@ -1251,6 +1253,7 @@ impl Action {
                 | Action::LastFilter
                 | Action::CameraRawFilter
                 | Action::Liquify
+                | Action::Transform(_)
         )
     }
 
@@ -1668,6 +1671,7 @@ impl AtelierApp {
         self.sel.transform = None;
         self.reset_transform();
         self.layer_drag = None;
+        self.xform.quick.clear(true);
     }
 
     /// Drops the transform being prepared by the Move tool.
@@ -1796,7 +1800,11 @@ impl AtelierApp {
             self.transform_edited(before, Some("nudge"));
             return;
         }
-        if self.doc.is_none() || self.refuse_in_quick_mask() || self.refuse_if_locked() {
+        // The quick mask moves, whatever the layer's lock.
+        if self.in_quick_mask() {
+            return self.nudge_quick_mask((dx, dy));
+        }
+        if self.doc.is_none() || self.refuse_if_locked() {
             return;
         }
         // Nothing seen moves (several layers selected: the others do).
@@ -2018,6 +2026,13 @@ impl AtelierApp {
 
     fn active_locked(&self) -> bool {
         self.doc.as_ref().is_some_and(|d| d.active_layer().locked)
+    }
+
+    /// The Move tool and Free Transform can't move the active layer, which
+    /// is locked; in Quick Mask Mode they move the mask, which the lock
+    /// doesn't protect.
+    fn transform_locked(&self) -> bool {
+        self.active_locked() && !self.in_quick_mask()
     }
 
     /// Before an edit of the target (see `Document::target_layer`): in

@@ -60,13 +60,61 @@ impl Document {
 
     /// The quick mask at the size of the canvas (it always is; a mask of
     /// another size is put on the canvas as it is, cut or completed).
-    fn fitted_quick_mask(&self) -> Option<Arc<GrayImage>> {
+    pub(super) fn fitted_quick_mask(&self) -> Option<Arc<GrayImage>> {
         let mask = self.quick_mask.as_ref()?;
         let (w, h) = self.canvas;
         if mask.dimensions() == (w, h) {
             return Some(Arc::clone(mask));
         }
         Some(Arc::new(crate::mask_ops::recanvas(mask, 0, 0, w, h)))
+    }
+
+    /// Puts `mask` (the canvas) in place of the quick mask, within the
+    /// current step.
+    pub(super) fn put_quick_mask(&mut self, mask: GrayImage) {
+        if let Some(m) = &mut self.quick_mask {
+            *m = Arc::new(mask);
+            self.quick_mask_rev = next_rev();
+        }
+    }
+
+    /// Box (canvas) of what the quick mask selects (pixels not 0), of the
+    /// part of it `selection` selects if given: what a transform takes.
+    pub fn quick_mask_bounds(&self, selection: Option<&Selection>) -> Option<PixelRect> {
+        let mask = self.fitted_quick_mask()?;
+        let canvas = self.full_rect();
+        let area = match selection {
+            Some(s) => s.bounds(canvas)?,
+            None => canvas,
+        };
+        let cov = selection.map(|s| s.to_mask(area));
+        let (w, aw) = (canvas.w as usize, area.w as usize);
+        let raw = mask.as_raw();
+        // The first and last pixel of each row, on all the cores.
+        let rows = crate::mask_ops::par_collect(area.h as usize, |range| {
+            range
+                .map(|j| {
+                    let start = (area.y as usize + j) * w + area.x as usize;
+                    let row = &raw[start..start + aw];
+                    let c = cov.as_ref().map(|c| &c.as_raw()[j * aw..(j + 1) * aw]);
+                    let on = |i: &usize| row[*i] > 0 && c.is_none_or(|c| c[*i] > 0);
+                    let first = (0..aw).find(on)?;
+                    Some((j, first, (0..aw).rev().find(on)?))
+                })
+                .collect()
+        });
+        let mut found = rows.into_iter().flatten();
+        let (j, a, b) = found.next()?;
+        let (mut x0, mut x1, y0, mut y1) = (a, b, j, j);
+        for (j, a, b) in found {
+            (x0, x1, y1) = (x0.min(a), x1.max(b), j);
+        }
+        Some(PixelRect {
+            x: area.x + x0 as i64,
+            y: area.y + y0 as i64,
+            w: (x1 - x0 + 1) as u32,
+            h: (y1 - y0 + 1) as u32,
+        })
     }
 
     /// After a change of the canvas: the saved channels and the quick mask

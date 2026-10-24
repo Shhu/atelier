@@ -1,6 +1,7 @@
 //! Edit › Transform through [`xform`] maps (skew, distort, perspective,
 //! warp, flips): of the active layer (a group: of its layers, the masks of
-//! its adjustment and fill layers included), or of its mask alone.
+//! its adjustment and fill layers included), of its mask alone, or of the
+//! quick mask.
 
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use image::imageops::FilterType;
 use image::{GrayImage, RgbaImage};
 
 use super::{Document, Layer, Mask, PixelRect, Selection, intersect, smart};
+use crate::mask_ops::par_rows;
 use crate::xform::{self, Bounds, Filter, Grid, Source, Transform};
 
 /// What a transform changes.
@@ -17,6 +19,8 @@ pub enum Target {
     Layer,
     /// The active layer's mask alone.
     Mask,
+    /// The quick mask, in Quick Mask Mode.
+    QuickMask,
 }
 
 fn bounds(r: PixelRect) -> Bounds {
@@ -84,6 +88,116 @@ fn transform_mask(
     )
 }
 
+/// Integer offset of a transform that only moves by whole pixels.
+fn whole_shift(t: &Transform) -> Option<(i64, i64)> {
+    let xform::Map::Projective(h) = t.map else {
+        return None;
+    };
+    let [a, b, c, d, e, f, g, k, _] = h.0.map(|v| v / h.0[8]);
+    let near = |v: f64, to: f64| (v - to).abs() < 1e-9;
+    let plain = near(a, 1.0) && near(b, 0.0) && near(d, 0.0) && near(e, 1.0);
+    (plain && near(g, 0.0) && near(k, 0.0) && near(c, c.round()) && near(f, f.round()))
+        .then(|| (c.round() as i64, f.round() as i64))
+}
+
+/// `image` (covering `area`, nothing beyond it) as `t` moves it, cut to
+/// `canvas`: the new image and the box it covers; `None` if nothing is
+/// left there.
+fn moved_gray(
+    image: &GrayImage,
+    area: PixelRect,
+    t: &Transform,
+    filter: Filter,
+    canvas: PixelRect,
+) -> Option<(GrayImage, PixelRect)> {
+    if let Some((dx, dy)) = whole_shift(t) {
+        let r = intersect(area.translate(dx, dy), canvas)?;
+        let (x, y) = ((r.x - dx - area.x) as u32, (r.y - dy - area.y) as u32);
+        return Some((
+            image::imageops::crop_imm(image, x, y, r.w, r.h).to_image(),
+            r,
+        ));
+    }
+    let (moved, (x, y)) = transform_mask(image, (area.x, area.y), 0, t, filter, canvas);
+    let (w, h) = moved.dimensions();
+    (w > 0 && h > 0).then_some((moved, PixelRect { x, y, w, h }))
+}
+
+/// The quick mask `mask` (the canvas) as `t` moves what `selection`
+/// selects of it (all of it without one), cut to the canvas: the place it
+/// leaves is unselected, unless `copy`.
+fn moved_quick_mask(
+    mask: &GrayImage,
+    selection: Option<&Selection>,
+    copy: bool,
+    t: &Transform,
+    filter: Filter,
+) -> GrayImage {
+    let (w, h) = mask.dimensions();
+    let canvas = PixelRect { x: 0, y: 0, w, h };
+    let Some(area) = selection.map_or(Some(canvas), |s| s.bounds(canvas)) else {
+        return mask.clone();
+    };
+    let row = w as usize;
+    let (x0, aw) = (area.x as usize, area.w as usize);
+    let rows = area.y as usize * row..area.bottom() as usize * row;
+    // What moves (the mask's values times the selection's coverage), and
+    // what stays.
+    let (part, cov, mut out) = match selection {
+        None => (std::borrow::Cow::Borrowed(mask), None, GrayImage::new(w, h)),
+        Some(sel) => {
+            let cov = sel.to_mask(area);
+            let mut part =
+                image::imageops::crop_imm(mask, area.x as u32, area.y as u32, aw as u32, area.h)
+                    .to_image();
+            let mut out = mask.clone();
+            let c = cov.as_raw();
+            par_rows(part.as_mut(), aw, |first, band| {
+                let c = &c[first * aw..];
+                for (p, &s) in band.iter_mut().zip(c) {
+                    *p = ((*p as u32 * s as u32 + 127) / 255) as u8;
+                }
+            });
+            if !copy {
+                let p = part.as_raw();
+                par_rows(&mut out.as_mut()[rows], row, |first, band| {
+                    for (j, line) in band.chunks_exact_mut(row).enumerate() {
+                        let from = &p[(first + j) * aw..][..aw];
+                        for (v, &q) in line[x0..x0 + aw].iter_mut().zip(from) {
+                            *v -= q;
+                        }
+                    }
+                });
+            }
+            (std::borrow::Cow::Owned(part), Some(cov), out)
+        }
+    };
+    let Some((moved, r)) = moved_gray(&part, area, t, filter, canvas) else {
+        return out;
+    };
+    let moved_cov = cov.and_then(|c| moved_gray(&c, area, t, filter, canvas));
+    // Laid over what stays, as far as it covers it.
+    let (mx, mw) = (r.x as usize, r.w as usize);
+    let (m, c) = (moved.as_raw(), moved_cov.as_ref().map(|(c, _)| c.as_raw()));
+    let rows = r.y as usize * row..r.bottom() as usize * row;
+    par_rows(&mut out.as_mut()[rows], row, |first, band| {
+        for (j, line) in band.chunks_exact_mut(row).enumerate() {
+            let k = (first + j) * mw;
+            let (dst, src) = (&mut line[mx..mx + mw], &m[k..k + mw]);
+            match c {
+                None => dst.copy_from_slice(src),
+                Some(c) => {
+                    for ((v, &p), &s) in dst.iter_mut().zip(src).zip(&c[k..k + mw]) {
+                        let under = (*v as u32 * (255 - s as u32) + 127) / 255;
+                        *v = (p as u32 + under).min(255) as u8;
+                    }
+                }
+            }
+        }
+    });
+    out
+}
+
 /// What a transform computes for a layer: its new pixels and its mask's
 /// new image, with their canvas positions.
 pub struct Transformed {
@@ -105,12 +219,20 @@ struct Sources {
     smart: Option<smart::RenderJob>,
 }
 
+/// The quick mask to transform: what of it (see [`moved_quick_mask`]).
+struct QuickSources {
+    mask: Arc<GrayImage>,
+    selection: Option<Selection>,
+    copy: bool,
+}
+
 /// The pixel work of a transform, to run on any thread.
 pub struct TransformJob {
     t: Transform,
     filter: Filter,
     limit: PixelRect,
     layers: Vec<Sources>,
+    quick: Option<QuickSources>,
 }
 
 impl TransformJob {
@@ -124,7 +246,8 @@ impl TransformJob {
             let m = l.mask.as_ref().map_or(0, |(m, ..)| m.len() as u64);
             p + m + l.smart.as_ref().map_or(0, smart::RenderJob::size)
         };
-        self.layers.iter().map(r).sum()
+        let quick = self.quick.as_ref().map_or(0, |q| q.mask.len() as u64);
+        self.layers.iter().map(r).sum::<u64>() + quick
     }
 
     /// A smart object it renders runs smart filters (whose cost its size
@@ -141,7 +264,17 @@ impl TransformJob {
             filter,
             limit,
             layers,
+            quick,
         } = self;
+        if let Some(q) = quick {
+            let moved = moved_quick_mask(&q.mask, q.selection.as_ref(), q.copy, &t, filter);
+            return vec![Transformed {
+                id: 0,
+                pixels: None,
+                mask: Some((moved, (0, 0))),
+                smart: None,
+            }];
+        }
         layers
             .into_iter()
             .map(|l| Transformed {
@@ -270,6 +403,7 @@ impl Document {
                 .then(|| (image.clone(), m.origin(l.offset), m.default))
         };
         let sources = match target {
+            Target::QuickMask => return self.quick_mask_job(t, None, false, filter),
             Target::Mask => {
                 let l = &self.layers[self.active];
                 vec![Sources {
@@ -303,7 +437,48 @@ impl Document {
             filter: Filter::from(filter),
             limit,
             layers: sources,
+            quick: None,
         }
+    }
+
+    /// The pixel work of `t` on the quick mask: of what `selection`
+    /// selects of it (a `copy`, the rest left as it is), or of all of it.
+    pub fn quick_mask_job(
+        &self,
+        t: &Transform,
+        selection: Option<&Selection>,
+        copy: bool,
+        filter: FilterType,
+    ) -> TransformJob {
+        let canvas = self.full_rect();
+        let mask = self
+            .fitted_quick_mask()
+            .unwrap_or_else(|| Arc::new(GrayImage::new(canvas.w, canvas.h)));
+        TransformJob {
+            t: *t,
+            filter: Filter::from(filter),
+            limit: canvas,
+            layers: Vec::new(),
+            quick: Some(QuickSources {
+                mask,
+                selection: selection.cloned(),
+                copy,
+            }),
+        }
+    }
+
+    /// Moves what `selection` selects of the quick mask (all of it without
+    /// one) by `d`, within the current step (arrow keys).
+    pub fn move_quick_mask(&mut self, (dx, dy): (i64, i64), selection: Option<&Selection>) {
+        let Some(mask) = self.fitted_quick_mask() else {
+            return;
+        };
+        let t = Transform::projective(
+            bounds(self.full_rect()),
+            xform::Homography::affine([1.0, 0.0, dx as f64, 0.0, 1.0, dy as f64]),
+        );
+        let moved = moved_quick_mask(&mask, selection, false, &t, Filter::Nearest);
+        self.put_quick_mask(moved);
     }
 
     /// Puts the result of [`Self::transform_job`] in place, as the undo
@@ -316,7 +491,17 @@ impl Document {
         mut done: Vec<Transformed>,
         name: String,
     ) {
+        // Quick Mask Mode left meanwhile: nothing to put it in.
+        if target == Target::QuickMask && self.quick_mask.is_none() {
+            return;
+        }
         self.checkpoint(name);
+        if target == Target::QuickMask {
+            if let Some((image, _)) = done.pop().and_then(|d| d.mask) {
+                self.put_quick_mask(image);
+            }
+            return;
+        }
         let limit = self.shape_limit();
         // By id: the layers may have moved since the job started (a layer
         // deleted meanwhile is skipped).
@@ -594,6 +779,42 @@ mod tests {
         assert_eq!(l.rect().x, 4, "the pixels stay");
         assert_eq!(mask_at(l, 4, 3), 1.0);
         assert_eq!(mask_at(l, 9, 3), 0.0);
+    }
+
+    /// The quick mask is cut to the canvas: what a move takes beyond it
+    /// doesn't come back, and what it uncovers is unselected.
+    #[test]
+    fn the_quick_mask_moves_within_the_canvas() {
+        let mut doc = Document::new(RgbaImage::new(40, 30), None);
+        doc.selection = Some(
+            PixelRect {
+                x: 10,
+                y: 10,
+                w: 20,
+                h: 10,
+            }
+            .into(),
+        );
+        doc.enter_quick_mask("Quick Mask".into());
+        doc.move_quick_mask((25, 0), None);
+        doc.move_quick_mask((-25, 0), None);
+        let mask = doc.quick_mask().unwrap();
+        assert_eq!(mask.get_pixel(14, 15).0[0], 255);
+        assert_eq!(mask.get_pixel(15, 15).0[0], 0, "cut beyond the canvas");
+        // A part selected moves, with a hole where it was.
+        doc.move_quick_mask((5, 0), None);
+        let left: Selection = PixelRect {
+            x: 0,
+            y: 0,
+            w: 18,
+            h: 30,
+        }
+        .into();
+        doc.move_quick_mask((20, 0), Some(&left));
+        let mask = doc.quick_mask().unwrap();
+        let at = |x| mask.get_pixel(x, 15).0[0];
+        assert_eq!((at(16), at(18), at(19)), (0, 255, 255));
+        assert_eq!((at(35), at(37), at(38)), (255, 255, 0));
     }
 
     #[test]

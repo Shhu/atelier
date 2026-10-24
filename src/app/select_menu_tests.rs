@@ -674,32 +674,6 @@ fn quick_mask_previews_show_on_its_overlay() {
     );
 }
 
-/// In Quick Mask Mode, the Move tool and Free Transform are refused: they
-/// would move the layer under the mask.
-#[test]
-fn quick_mask_refuses_moving_and_transforming() {
-    let mut h = app_with(halves());
-    h.state_mut().selection = Some(rect(20, 20, 60, 60).into());
-    key(&mut h, Key::Q, Modifiers::NONE);
-    h.state_mut().tool = Tool::Transform;
-    h.run_steps(1);
-    let (from, to) = (screen(&h, 50.0, 50.0), screen(&h, 150.0, 150.0));
-    drag(&mut h, from, to, Modifiers::NONE);
-    let d = h.state().doc.as_ref().unwrap();
-    assert_eq!(d.layers[0].offset, (0, 0));
-    assert_eq!(d.quick_mask().unwrap().get_pixel(50, 50).0[0], 255);
-    assert_eq!(
-        h.state().status,
-        t!("sel4-quick-mask-no-move", key = keys::key(Key::Q))
-    );
-    h.state_mut().status.clear();
-    h.state_mut()
-        .run(Action::Transform(transform::Command::Free));
-    h.run_steps(1);
-    assert!(h.state().transform_rect.is_none());
-    assert!(!h.state().status.is_empty());
-}
-
 /// A background Magic Wand click is named after the wand, even when
 /// another tool is chosen before it lands.
 #[test]

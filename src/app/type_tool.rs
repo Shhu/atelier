@@ -765,7 +765,8 @@ impl AtelierApp {
         self.sync_type_edit();
         let (ctrl, shift) = self.ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
         // Ctrl: the Move tool, for texts.
-        if self.layer_drag.is_some() || (ctrl && self.type_tool.drag.is_none()) {
+        let dragging = self.layer_drag.is_some() || self.xform.quick.dragging();
+        if dragging || (ctrl && self.type_tool.drag.is_none()) {
             if let Some(cursor) = self.drag_layer_input(view, pointer, start, down, true) {
                 return cursor;
             }

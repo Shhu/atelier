@@ -395,7 +395,7 @@ impl AtelierApp {
             }
         };
         // A distorted frame has no X, Y, W, H and angle to edit.
-        let locked = self.active_locked() || self.transform_distorted();
+        let locked = self.transform_locked() || self.transform_distorted();
         let pending = self.tool == Tool::Transform
             && (self.transform_rect.is_some() || self.transform_angle != 0.0);
         let (r, angle) = if pending {

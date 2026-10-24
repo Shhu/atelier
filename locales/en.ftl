@@ -2635,7 +2635,6 @@ sel4-mask-target-changed = Select and Mask closed: the layer, its mask or the hi
 
 ## Quick Mask
 
-sel4-quick-mask-no-move = Quick Mask Mode: moving and transforming are not available. Press { $key } to finish first.
 sel4-tab-quick-mask = { $zoom } (Quick Mask)
 
 ## Object Selection
@@ -2886,3 +2885,7 @@ ui5-shortcuts-cycle-note = Shift with a tool's key picks the next tool of its gr
 
 ## Files dragged over an open document
 ui5-drop-place-hint = Drop to place in this image. To open in a tab of its own: File › Open ({ $key }).
+
+## Quick Mask: moving the mask
+qm6-status-moved = Quick Mask moved by { $x }, { $y }
+qm6-quick-mask-name = Quick Mask

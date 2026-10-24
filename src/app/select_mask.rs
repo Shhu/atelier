@@ -240,6 +240,7 @@ impl AtelierApp {
             )),
             mask: OverlayMask::Gray(mask),
             scale: sm.scale,
+            origin: Pos2::ZERO,
             style: sm.view.style(opacity),
         })
     }

@@ -219,6 +219,8 @@ struct Commit {
     layer: String,
     rasterized: bool,
     lift: Option<Lift>,
+    /// The quick mask: the selection whose part of it is transformed.
+    selection: Option<Selection>,
     fit: bool,
     /// The canvas before.
     canvas: PixelRect,
@@ -319,6 +321,8 @@ pub(super) struct Transforming {
     applied: Option<Applied>,
     /// The mode to go on in once the warp being applied is done.
     reenter: Option<Mode>,
+    /// Moves and transforms of the quick mask.
+    pub(super) quick: super::quick_mask::QuickEdit,
     /// The Ctrl+Z points from before that warp, and the state then.
     reenter_undo: Option<(Vec<Snapshot>, Snapshot)>,
 }
@@ -362,6 +366,7 @@ impl Default for Transforming {
             applied: None,
             reenter: None,
             reenter_undo: None,
+            quick: Default::default(),
         }
     }
 }
@@ -614,9 +619,6 @@ fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 impl AtelierApp {
     /// Runs an Edit › Transform command.
     pub(super) fn transform_command(&mut self, cmd: Command) {
-        if self.refuse_in_quick_mask() {
-            return;
-        }
         match cmd {
             // Every command but Again (which repeats a layer's transform).
             _ if !matches!(cmd, Command::Again) && self.path_transform_wanted() => {
@@ -686,7 +688,9 @@ impl AtelierApp {
     /// lifted from the layer first. Returns `false` if there is nothing to
     /// transform.
     fn enter_transform(&mut self) -> bool {
-        if self.doc.is_none() || self.refuse_if_locked() {
+        // The quick mask: the layer's lock doesn't protect it.
+        let quick = self.in_quick_mask();
+        if self.doc.is_none() || (!quick && self.refuse_if_locked()) {
             return false;
         }
         self.set_tool(Tool::Transform);
@@ -698,10 +702,19 @@ impl AtelierApp {
             self.free_transform = true;
             return true;
         }
-        if !self.lift_selection() {
+        if quick {
+            // What the selection selects of the mask: its outline comes
+            // back where that goes.
+            self.xform.quick.selection = self.selection.take();
+        } else if !self.lift_selection() {
             return false;
         }
         let Some(src) = self.transform_source() else {
+            if quick {
+                self.selection = self.xform.quick.selection.take();
+                self.status = t!("xform-status-nothing", name = t!("qm6-quick-mask-name"));
+                return false;
+            }
             let name = self.doc.as_ref().map(|d| d.active_layer().name.clone());
             self.status = t!("xform-status-nothing", name = name.unwrap_or_default());
             return false;
@@ -761,6 +774,10 @@ impl AtelierApp {
             }
             self.selection = applied.selection;
         }
+        if let Some(selection) = self.xform.quick.selection.take() {
+            self.selection = Some(selection);
+        }
+        self.xform.quick.clear(false);
         let x = &mut self.xform;
         x.mode = Mode::Free;
         (x.quad, x.warp, x.reference, x.drag, x.step) = (None, None, None, None, None);
@@ -992,6 +1009,9 @@ impl AtelierApp {
     /// several layers' (`None` without any), or the mask's pixels when it
     /// is transformed alone (see `Document::transforms_mask`).
     pub(super) fn transform_source_override(&self) -> Option<Option<Rect>> {
+        if let Some(source) = self.quick_mask_source() {
+            return Some(source);
+        }
         let doc = self.doc.as_ref()?;
         let targets = self.transform_targets();
         if targets.len() > 1 {
@@ -1391,7 +1411,9 @@ impl AtelierApp {
     pub(super) fn apply_transform_extras(&mut self) -> bool {
         let targets = self.transform_targets();
         let Some(doc) = &self.doc else { return false };
-        let mask = targets.len() == 1 && doc.transforms_mask();
+        // The quick mask: the gray image alone, whatever the layers.
+        let quick = doc.quick_mask().is_some();
+        let mask = !quick && targets.len() == 1 && doc.transforms_mask();
         let plain = !self.transform_distorted() && self.xform.lift.is_none();
         // A smart object is rendered again from its contents, on another
         // thread when large.
@@ -1422,8 +1444,8 @@ impl AtelierApp {
             let (w, h) = l.image().dimensions();
             l.text.is_none() && !l.is_group() && u64::from(w) * u64::from(h) >= ASYNC_PIXELS
         };
-        if plain && !mask && !smart && !grouped_text && !after_warp && !large && targets.len() == 1
-        {
+        let alone = targets.len() == 1 && !quick;
+        if plain && !mask && !smart && !grouped_text && !after_warp && !large && alone {
             return false;
         }
         let Some(t) = self
@@ -1434,13 +1456,15 @@ impl AtelierApp {
             return true;
         };
         let Some(doc) = &self.doc else { return true };
-        let target = if mask {
+        let target = if quick {
+            TransformTarget::QuickMask
+        } else if mask {
             TransformTarget::Mask
         } else {
             TransformTarget::Layer
         };
         let mut layers: Vec<usize> = match target {
-            TransformTarget::Mask => Vec::new(),
+            TransformTarget::Mask | TransformTarget::QuickMask => Vec::new(),
             TransformTarget::Layer => targets.iter().flat_map(|&i| doc.block(i)).collect(),
         };
         layers.sort_unstable();
@@ -1471,7 +1495,20 @@ impl AtelierApp {
             .step
             .take()
             .unwrap_or_else(|| self.xform.mode.label());
-        let layer = doc.active_layer().name.clone();
+        let layer = if quick {
+            t!("qm6-quick-mask-name")
+        } else {
+            doc.active_layer().name.clone()
+        };
+        let selection = match quick {
+            true => self
+                .xform
+                .quick
+                .selection
+                .take()
+                .or_else(|| self.selection.clone()),
+            false => None,
+        };
         let canvas = doc.full_rect();
         let fit = self.fit_canvas && result.is_some();
         let commit = Commit {
@@ -1485,6 +1522,7 @@ impl AtelierApp {
             layer,
             rasterized,
             lift,
+            selection,
             fit,
             canvas,
         };
@@ -1494,7 +1532,12 @@ impl AtelierApp {
         }
         let filter = self.resize_filter.filter();
         let Some(doc) = &self.doc else { return true };
-        let job = doc.transform_job(target, &commit.pixels, &t, filter);
+        let job = match target {
+            TransformTarget::QuickMask => {
+                doc.quick_mask_job(&t, commit.selection.as_ref(), false, filter)
+            }
+            _ => doc.transform_job(target, &commit.pixels, &t, filter),
+        };
         // Small and quick: at once (smart filters never are, said).
         if job.size() < ASYNC_PIXELS && !job.has_filters() {
             self.finish_transform(commit, Some(job.run()));
@@ -1579,8 +1622,23 @@ impl AtelierApp {
         let applied = self.xform.applied.take();
         let Some(doc) = &mut self.doc else { return };
         let changed = done.is_some();
+        let quick = c.target == TransformTarget::QuickMask;
+        if quick {
+            // The step keeps the selection as it was before.
+            doc.sync_selection(c.selection.clone());
+            self.selection = match changed {
+                true => c
+                    .selection
+                    .as_ref()
+                    .and_then(|s| transformed_selection(s, &c.t, c.canvas)),
+                false => c.selection.clone(),
+            };
+        }
         if let Some(done) = done {
             doc.apply_transformed(c.target, &c.t, done, c.name.clone());
+        }
+        if quick {
+            self.sync_selection();
         }
         if let Some(map) = c.text_map.filter(|_| changed) {
             for &i in &c.texts {
@@ -1720,7 +1778,7 @@ impl AtelierApp {
         down: bool,
         shift: bool,
     ) -> Option<CursorIcon> {
-        if self.active_locked() {
+        if self.transform_locked() {
             return None;
         }
         // Every press may start an edit of the pending transform.
@@ -2111,6 +2169,12 @@ impl AtelierApp {
         frame: Option<Rect>,
         visible: Rect,
     ) -> Vec<(usize, render::PlacedImage)> {
+        if self.in_quick_mask() {
+            self.xform.mask_preview = None;
+            self.xform.lifted.clear();
+            self.preview_quick_mask(frame, visible);
+            return Vec::new();
+        }
         let t = frame.and_then(|src| self.pending_transform(src, false));
         let targets = self.transform_targets();
         let Some((t, doc)) = t.zip(self.doc.as_ref()) else {

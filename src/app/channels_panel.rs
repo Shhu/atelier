@@ -141,6 +141,7 @@ impl AtelierApp {
             key: hash_of((Arc::as_ptr(&mask) as usize, i)),
             mask: OverlayMask::Gray(mask),
             scale: 1.0,
+            origin: Pos2::ZERO,
             style,
         })
     }

@@ -277,10 +277,11 @@ impl AtelierApp {
             && self.selection.is_none()
             && self.marquee.is_none();
         let ctrl = self.snap_off;
-        let temp_move = (paints_or_selects || marquee)
+        let temp_move = ((paints_or_selects || marquee)
             && (self.layer_drag.is_some()
                 || (paints_or_selects && self.select_move.is_some())
-                || (start && ctrl));
+                || (start && ctrl)))
+            || (paints_or_selects && self.xform.quick.dragging());
         if temp_move {
             // Its Ctrl is the Move tool's, not "no snapping".
             self.snap_off = false;
@@ -290,17 +291,6 @@ impl AtelierApp {
         // Said before the press.
         let temp_move_hover = !temp_move && (paints_or_selects || marquee) && ctrl && !down;
         let down = down && !temp_move;
-        // Quick Mask Mode: the Move tool would move the layer under the
-        // mask; refused.
-        let quick_mask_move = self.tool == Tool::Transform
-            && self.layer_drag.is_none()
-            && self.doc.as_ref().is_some_and(|d| d.quick_mask().is_some());
-        if quick_mask_move {
-            if start {
-                self.refuse_in_quick_mask();
-            }
-            start = false;
-        }
         match self.tool {
             Tool::Brush
             | Tool::Eraser
@@ -387,10 +377,16 @@ impl AtelierApp {
                 cursor = Some(self.vector_input(view, tool_pointer, start, down));
             }
             Tool::Canvas | Tool::Transform => {
-                // The Move tool drags an artboard by its name.
-                let label = (self.tool == Tool::Transform)
-                    .then(|| self.artboard_label_input(view, tool_pointer, start, down))
+                // In Quick Mask Mode, the Move tool moves the mask.
+                let quick = (self.tool == Tool::Transform)
+                    .then(|| self.quick_mask_tool_input(view, tool_pointer, start, down))
                     .flatten();
+                // The Move tool drags an artboard by its name.
+                let label = quick.or_else(|| {
+                    (self.tool == Tool::Transform)
+                        .then(|| self.artboard_label_input(view, tool_pointer, start, down))
+                        .flatten()
+                });
                 // With a selection, the Move tool moves its pixels.
                 let label = label.or_else(|| {
                     (self.tool == Tool::Transform)
@@ -408,9 +404,6 @@ impl AtelierApp {
                     self.commit_artboard_move(drag_end);
                 }
             }
-        }
-        if quick_mask_move {
-            cursor = Some(CursorIcon::NotAllowed);
         }
         // A selection still being computed: the next click waits for it.
         if self.select_busy() && cursor.is_some() {
@@ -700,7 +693,7 @@ impl AtelierApp {
         let full_uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
 
         // Element being transformed: its source region and its planned place.
-        let transform = if self.tool == Tool::Transform && !self.active_locked() {
+        let transform = if self.tool == Tool::Transform && !self.transform_locked() {
             self.transform_source()
                 .map(|src| (src, self.transform_rect.unwrap_or(src)))
         } else {
@@ -711,7 +704,7 @@ impl AtelierApp {
         // Frame of the final image as it will be after applying.
         let frame = match (self.tool, transform) {
             (Tool::Canvas, _) => self.canvas_rect.unwrap_or(full),
-            (Tool::Transform, Some((_, t))) if self.fit_canvas => {
+            (Tool::Transform, Some((_, t))) if self.fit_canvas && !self.in_quick_mask() => {
                 self.transform_reach().unwrap_or_else(|| {
                     let (w, h) = rotated_size(t.width(), t.height(), angle);
                     Rect::from_center_size(t.center(), vec2(w, h))
@@ -779,7 +772,8 @@ impl AtelierApp {
         // manipulated: it is shown semi-transparent so it isn't lost.
         let dragged = self.layer_drag.as_ref().map(|d| d.layers[0].0);
         let grabbed = dragged.or_else(|| {
-            let lifted = !self.doc.as_ref().is_some_and(Document::transforms_mask);
+            let lifted =
+                !self.in_quick_mask() && !self.doc.as_ref().is_some_and(Document::transforms_mask);
             (transform.is_some() && lifted && (self.drag.is_some() || self.rotate_drag.is_some()))
                 .then_some(active)
         });
@@ -884,7 +878,7 @@ impl AtelierApp {
         let angle = if is_canvas { 0.0 } else { self.transform_angle };
         let rect_screen = view.rect_to_screen(rect);
         let local = |p: Pos2| rotate_around(p, rect_screen.center(), -angle);
-        let locked = !is_canvas && self.active_locked();
+        let locked = !is_canvas && self.transform_locked();
         let mut hover = pointer
             .filter(|_| !locked)
             .and_then(|p| hit_test(rect_screen, local(p)));
@@ -967,6 +961,7 @@ impl AtelierApp {
         // the arrows.
         let hidden = !is_canvas
             && !pending
+            && !self.in_quick_mask()
             && self.doc.as_ref().is_some_and(|d| !d.shown(d.active))
             && self.selected_indices().len() < 2;
         if (locked || hidden) && picked.is_none() && self.drag.is_none() && pointer.is_some() {
@@ -1277,8 +1272,9 @@ impl AtelierApp {
         if self.layer_drag.is_some() {
             return Some(self.move_layers(view, pointer, down));
         }
-        if start && self.refuse_in_quick_mask() {
-            return Some(CursorIcon::NotAllowed);
+        // In Quick Mask Mode, the mask moves (Ctrl with the Type tool).
+        if self.in_quick_mask() {
+            return Some(self.quick_mask_move_input(view, pointer, start, down));
         }
         let ip = view.to_image(pointer?);
         let (px, py) = (ip.x.floor() as i64, ip.y.floor() as i64);
@@ -1317,9 +1313,9 @@ impl AtelierApp {
         if self.layer_drag.is_some() {
             return Some(self.move_layers(view, pointer, down));
         }
-        // Not the layer under the Quick Mask (as with the Move tool).
-        if start && self.refuse_in_quick_mask() {
-            return Some(CursorIcon::NotAllowed);
+        // In Quick Mask Mode, the mask (as with the Move tool).
+        if self.in_quick_mask() {
+            return Some(self.quick_mask_move_input(view, pointer, start, down));
         }
         // With a selection, its pixels, as with the Move tool.
         if (self.select_move.is_some() || (start && self.selection.is_some()))

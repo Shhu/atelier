@@ -224,6 +224,7 @@ impl AtelierApp {
             key: cr.key(),
             mask: OverlayMask::Gray(mask),
             scale,
+            origin: Pos2::ZERO,
             style,
         })
     }

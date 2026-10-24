@@ -243,6 +243,9 @@ impl AtelierApp {
         if self.select_move.is_some() {
             return self.move_selection(view, pointer, down, shift);
         }
+        if self.xform.quick.dragging() {
+            return self.quick_mask_move_input(view, pointer, start, down);
+        }
         let Some(p) = pointer else {
             if !down {
                 self.end_marquee();
@@ -260,6 +263,10 @@ impl AtelierApp {
             .filter(|s| ctrl || (plain && s.contains(ip.x, ip.y)));
         if start {
             if let Some(selection) = grab {
+                // In Quick Mask Mode, Ctrl moves the mask's selected part.
+                if ctrl && self.in_quick_mask() {
+                    return self.quick_mask_move_input(view, pointer, start, down);
+                }
                 if ctrl && !self.can_lift() {
                     return CursorIcon::NotAllowed;
                 }
@@ -488,6 +495,9 @@ impl AtelierApp {
         let Some(moved) = selection.clone().translate(d.0, d.1).within(canvas) else {
             return;
         };
+        if pixels && self.in_quick_mask() {
+            return self.nudge_quick_mask(d);
+        }
         if pixels {
             if !self.can_lift() {
                 return;

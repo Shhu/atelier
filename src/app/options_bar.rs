@@ -174,7 +174,7 @@ impl AtelierApp {
             ui_kit::checkbox(ui, &mut self.auto_select, &t!("input3-auto-select"))
                 .on_hover_text(t!("input3-auto-select-tip", key = ctrl));
             sep(ui);
-            if self.active_locked() {
+            if self.transform_locked() {
                 locked_notice(
                     ui,
                     &t!("options-layer-locked"),
@@ -193,7 +193,7 @@ impl AtelierApp {
             response.on_hover_text(tip);
             return;
         }
-        if self.active_locked() {
+        if self.transform_locked() {
             locked_notice(
                 ui,
                 &t!("options-layer-locked"),

@@ -2640,7 +2640,6 @@ sel4-mask-target-changed = Sélectionner et masquer s'est fermé : le calque, s
 
 ## Quick Mask
 
-sel4-quick-mask-no-move = Mode Masque : déplacer et transformer ne sont pas disponibles. Appuyez d'abord sur { $key } pour terminer.
 sel4-tab-quick-mask = { $zoom } (Masque)
 
 ## Object Selection
@@ -2891,3 +2890,7 @@ ui5-shortcuts-cycle-note = Maj avec la touche d'un outil choisit l'outil suivant
 
 ## Files dragged over an open document
 ui5-drop-place-hint = Déposez pour placer dans cette image. Pour ouvrir dans un onglet à part : Fichier › Ouvrir ({ $key }).
+
+## Quick Mask: moving the mask
+qm6-status-moved = Masque déplacé de { $x }, { $y }
+qm6-quick-mask-name = Masque

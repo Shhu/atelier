@@ -304,10 +304,12 @@ pub(super) enum OverlayMask {
 }
 
 /// A mask shown over the canvas: its coverage, `scale` of its pixels per
-/// canvas pixel, how it is shown, and what identifies its content.
+/// canvas pixel from the canvas point `origin`, how it is shown, and what
+/// identifies its content.
 pub(super) struct OverlaySource {
     pub(super) mask: OverlayMask,
     pub(super) scale: f32,
+    pub(super) origin: Pos2,
     pub(super) style: OverlayStyle,
     pub(super) key: u64,
 }
@@ -1299,7 +1301,10 @@ fn overlay_image(
             );
             let screen = pos2(sx / ppp, sy / ppp);
             let c = view.to_image(screen);
-            let (mx, my) = (c.x * source.scale - 0.5, c.y * source.scale - 0.5);
+            let (mx, my) = (
+                (c.x - source.origin.x) * source.scale - 0.5,
+                (c.y - source.origin.y) * source.scale - 0.5,
+            );
             let (fx, fy) = (mx - mx.floor(), my - my.floor());
             let (ix, iy) = (mx.floor() as i64, my.floor() as i64);
             let top = at(ix, iy) * (1.0 - fx) + at(ix + 1, iy) * fx;
