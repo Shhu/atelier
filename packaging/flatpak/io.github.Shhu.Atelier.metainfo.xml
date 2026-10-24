@@ -70,6 +70,11 @@
     <display_length compare="ge">768</display_length>
   </requires>
   <releases>
+    <release version="0.4.1" date="2026-10-24">
+      <description>
+        <p>A second review pass: safer PSD and image saving (resolution and metadata kept), a crop that asks before applying, a compact Move tool bar, blend mode and opacity in the Layers panel, tools and colors remembered between sessions, faster healing, brushes and filters, and many fixes to undo, selections and smart objects.</p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-10-23">
       <description>
         <p>A stability and usability release after a full review: no more crashes on damaged files, nothing lost when saving PSD files, faster rendering and tools, the usual shortcuts and behaviors of professional editors, a two-column toolbar on small screens, Open Recent, a Help menu and a Diagnostics window.</p>
