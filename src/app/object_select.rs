@@ -67,6 +67,8 @@ struct Shown {
 
 /// A click or a rectangle: on the image `fingerprint`, with Shift and Alt.
 struct Pick {
+    /// The document clicked, and its image then.
+    doc: u64,
     fingerprint: u64,
     prompt: Prompt,
     shift: bool,
@@ -403,7 +405,11 @@ impl AtelierApp {
         if !self.request_model(AfterDownload::ObjectSelection) {
             return;
         }
+        let Some(doc) = self.doc.as_ref().map(Document::uid) else {
+            return;
+        };
         let pick = Pick {
+            doc,
             fingerprint: current,
             prompt,
             shift,
@@ -431,6 +437,7 @@ impl AtelierApp {
     /// (every frame, whatever the tool).
     pub(super) fn poll_object_select(&mut self) {
         let current = self.doc.as_ref().map(fingerprint);
+        let uid = self.doc.as_ref().map(Document::uid);
         let os = &mut self.object_select;
         if let Some((key, result)) = &os.analysing {
             let key = *key;
@@ -506,9 +513,18 @@ impl AtelierApp {
                 }
                 Done::Pick(pick, mask) => {
                     self.object_select.picking -= 1;
-                    // Not on another document (tab switched meanwhile).
                     if Some(pick.fingerprint) == current {
                         self.apply_object(mask, pick.shift, pick.alt);
+                    } else if let Some(now) = current
+                        && uid == Some(pick.doc)
+                    {
+                        // The image changed meanwhile (an undo): the click
+                        // is made again on what shows now, rather than lost
+                        // (never on another tab).
+                        crate::diag::warn(
+                            "Object Selection: image changed during a pick, picked again",
+                        );
+                        self.pick_object(pick.prompt, pick.shift, pick.alt, now);
                     }
                 }
             }
