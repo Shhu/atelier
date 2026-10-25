@@ -551,6 +551,11 @@ fn reduce_later(
                 ..Default::default()
             };
             compose::plan(&layers, canvas, &mut cache, &opts);
+            // The masks it feathered show as such in the document at once
+            // (not feathered again on the UI thread).
+            for m in layers.iter().filter_map(|l| l.mask.as_ref()) {
+                m.share_feathered();
+            }
             cache
         });
     job.ok()
@@ -754,6 +759,7 @@ impl AtelierApp {
             rect
         });
         let level = render_level(*zoom);
+        crate::document::set_display_level(level);
         let doc = &*doc;
         let uid = doc.uid();
         let layers = doc.render_layers();
@@ -861,8 +867,16 @@ impl AtelierApp {
             // Nothing to show meanwhile (a document shown for the first
             // time): a coarse view of it.
             if cv.tiles.is_empty() && cv.stale.is_none() {
-                cv.stale =
-                    coarse_tiles(ctx, &layers, canvas, &opts, level, channel, lut.as_deref());
+                cv.stale = coarse_tiles(
+                    ctx,
+                    &layers,
+                    canvas,
+                    &opts,
+                    level,
+                    channel,
+                    lut.as_deref(),
+                    COARSE_PIXELS,
+                );
             }
             ctx.request_repaint();
             paint_tiles(painter, view, cv, &visible);
@@ -922,15 +936,42 @@ impl AtelierApp {
                 .filter(|(t, _, _)| !cv.tiles.contains_key(t))
                 .copied()
                 .collect();
+            // Those nearest the focus first, within the frame's budget; the
+            // others show coarsely meanwhile.
+            let start = std::time::Instant::now();
             if !missing.is_empty() {
-                let work = compose_work(cv, &generation.plan, &missing, threads);
-                let done = work
-                    .chunks(threads.max(1))
-                    .flat_map(|batch| run_batch(&generation.plan, batch, channel, lut.as_deref()))
-                    .collect();
+                let mut done = Vec::new();
+                let mut made = 0;
+                for chunk in missing.chunks(threads.max(1)) {
+                    if made > 0 && start.elapsed() > tile_budget() {
+                        break;
+                    }
+                    let work = compose_work(cv, &generation.plan, chunk, threads);
+                    for batch in work.chunks(threads.max(1)) {
+                        done.extend(run_batch(&generation.plan, batch, channel, lut.as_deref()));
+                    }
+                    made += chunk.len();
+                }
                 upload(ctx, cv, done, true);
+                #[cfg(test)]
+                TEST_UNCOVERED.set((missing.len(), made));
+                if made < missing.len() {
+                    ctx.request_repaint();
+                    if cv.stale.is_none() {
+                        cv.stale = coarse_tiles(
+                            ctx,
+                            &layers,
+                            canvas,
+                            &opts,
+                            level,
+                            channel,
+                            lut.as_deref(),
+                            COARSE_PAN_PIXELS,
+                        );
+                    }
+                }
                 let frame = cv.frame;
-                for (t, _, _) in &missing {
+                for (t, _, _) in &missing[..made] {
                     let own = CanvasView::tile_rect(*t);
                     let part = match generation.marked {
                         None => None,
@@ -950,7 +991,7 @@ impl AtelierApp {
             generation
                 .work
                 .extend(rest.into_iter().filter(|w| near(&w.tile)));
-            let over_budget = generation.run(threads, channel, lut.as_deref());
+            let over_budget = generation.run(start, threads, channel, lut.as_deref());
             crate::diag::tiles(generation.last_count, over_budget, level);
             if generation.next < generation.work.len() {
                 ctx.request_repaint();
@@ -971,7 +1012,8 @@ impl AtelierApp {
                 last_count: 0,
                 marked: None,
             };
-            let over_budget = generation.run(threads, channel, lut.as_deref());
+            let start = std::time::Instant::now();
+            let over_budget = generation.run(start, threads, channel, lut.as_deref());
             crate::diag::tiles(generation.last_count, over_budget, level);
             if over_budget {
                 ctx.request_repaint();
@@ -1020,9 +1062,14 @@ impl AtelierApp {
 /// Pixels of a coarse view at most (see [`coarse_tiles`]).
 const COARSE_PIXELS: u64 = 1 << 18;
 
+/// Pixels at most of the coarse view shown where a pan uncovers more tiles
+/// than a frame composites during a generation: cheaper still.
+const COARSE_PAN_PIXELS: u64 = 1 << 16;
+
 /// The whole canvas in tiles of a level coarser than `level` (4 times at
-/// least, [`COARSE_PIXELS`] at most), from a pixel of each block: what a
-/// view shows while its reductions are made (a few milliseconds).
+/// least, `most` pixels at most), from a pixel of each block: what a view
+/// shows while its reductions are made (a few milliseconds).
+#[allow(clippy::too_many_arguments)]
 fn coarse_tiles(
     ctx: &egui::Context,
     layers: &[Layer],
@@ -1031,9 +1078,10 @@ fn coarse_tiles(
     level: u32,
     channel: Option<usize>,
     lut: Option<&crate::cms::Lut>,
+    most: u64,
 ) -> Option<(u32, Tiles)> {
     let mut coarse = level + 2;
-    while (u64::from(canvas.w) >> coarse) * (u64::from(canvas.h) >> coarse) > COARSE_PIXELS {
+    while (u64::from(canvas.w) >> coarse) * (u64::from(canvas.h) >> coarse) > most {
         coarse += 1;
     }
     let b = (compose::TILE as i64) << coarse;
@@ -1531,6 +1579,10 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     /// Tests: visible tiles left empty by the last frame.
     pub(super) static TEST_HOLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Tests: tiles uncovered during a generation, and those of them
+    /// composited, by the last frame.
+    pub(super) static TEST_UNCOVERED: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
 }
 
 fn tile_budget() -> std::time::Duration {
@@ -1561,15 +1613,15 @@ struct Generation {
 }
 
 impl Generation {
-    /// Composites the parts still to do for at most [`TILE_BUDGET`]; whether
-    /// some remain.
+    /// Composites the parts still to do until [`TILE_BUDGET`] after `start`
+    /// (a batch at least); whether some remain.
     fn run(
         &mut self,
+        start: std::time::Instant,
         threads: usize,
         channel: Option<usize>,
         lut: Option<&crate::cms::Lut>,
     ) -> bool {
-        let start = std::time::Instant::now();
         let first = self.done.len();
         let mut over_budget = false;
         while self.next < self.work.len() {
@@ -2137,6 +2189,11 @@ impl AtelierApp {
         self.canvas_view
             .as_ref()
             .is_some_and(|v| v.generation.is_some())
+    }
+
+    /// Tiles the view holds at its level.
+    pub(super) fn view_tiles(&self) -> usize {
+        self.canvas_view.as_ref().map_or(0, |v| v.tiles.len())
     }
 
     /// Generations kept by the views of other documents.

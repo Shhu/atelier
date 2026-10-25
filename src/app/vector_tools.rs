@@ -158,13 +158,18 @@ enum Gesture {
         base: VPath,
         stepped: bool,
     },
-    /// The selected components follow the pointer; `last`: where it was.
+    /// The selected components follow the pointer; `last`: where they
+    /// were moved to, `aim`: where the pointer asks (moved whole, a shape
+    /// follows by whole pixels and takes the remainder at the end).
     Components {
         path: PathRef,
         from: Pt,
         last: Pt,
+        aim: Pt,
         base: VPath,
         stepped: bool,
+        /// Alt: the components selected before their copies were made.
+        picked: Option<Vec<usize>>,
     },
     /// Rubber band: selects the anchors (Direct Selection) or the
     /// components (Path Selection) it touches.
@@ -433,8 +438,9 @@ impl AtelierApp {
         let doc = self.doc.as_mut()?;
         let r = match mode {
             ToolMode::Shape => {
+                let unlocked = !doc.is_locked(doc.active);
                 let active = doc.active_layer();
-                match (op, active.shape.is_some() && !active.locked) {
+                match (op, active.shape.is_some() && unlocked) {
                     (Some(op), true) => {
                         sub.op = op;
                         PathRef::Layer(active.id)
@@ -815,7 +821,7 @@ impl AtelierApp {
         (0..doc.layers.len()).rev().find(|&i| {
             let l = &doc.layers[i];
             l.shape.is_some()
-                && !l.locked
+                && !doc.is_locked(i)
                 && doc.shown(i)
                 && doc
                     .path(PathRef::Layer(l.id))
@@ -950,8 +956,10 @@ impl AtelierApp {
         }
         self.vector.anchors.clear();
         let mut stepped = false;
+        let mut picked = None;
         if m.alt && !self.path_locked(r) {
             // Alt-drag: copies of the components move.
+            picked = Some(self.vector.components.clone());
             let sel = &mut self.vector.components;
             let copies: Vec<SubPath> = sel.iter().map(|&k| path.subpaths[k].clone()).collect();
             let n = path.subpaths.len();
@@ -966,8 +974,10 @@ impl AtelierApp {
             path: r,
             from: p,
             last: p,
+            aim: p,
             base: path,
             stepped,
+            picked,
         });
     }
 
@@ -1130,10 +1140,13 @@ impl AtelierApp {
                 path: r,
                 from,
                 last,
+                aim,
                 base,
                 stepped,
+                ..
             } => {
                 let to = if m.shift { constrain_45(*from, p) } else { p };
+                *aim = to;
                 let d = to - *from;
                 if (*stepped || d.len() > small)
                     && self.step_once(stepped, *r, t!("vector-hist-move-path"))
@@ -1141,14 +1154,17 @@ impl AtelierApp {
                     let all = (0..base.subpaths.len()).all(|k| self.vector.components.contains(&k));
                     if let Some(doc) = &mut self.doc {
                         if all {
-                            // Moved whole: a live shape stays one. By
-                            // whole pixels unless zoomed in (its image
-                            // then just moves).
+                            // Moved whole: a live shape stays one. A
+                            // layer's by whole pixels during the drag
+                            // (its image then just moves, even zoomed
+                            // in); the remainder at the end.
                             let mut step = to - *last;
-                            if self.zoom <= 1.0 {
+                            if matches!(r, PathRef::Layer(_)) || self.zoom <= 1.0 {
                                 step = pt(step.x.round(), step.y.round());
                             }
-                            doc.move_path(*r, step);
+                            if step != pt(0.0, 0.0) {
+                                doc.move_path(*r, step);
+                            }
                             *last = *last + step;
                         } else {
                             let mut path = base.clone();
@@ -1225,6 +1241,27 @@ impl AtelierApp {
         let Some(g) = self.vector.gesture.take() else {
             return;
         };
+        // Components dragged back to where they were (or Alt + click):
+        // no step, and no copies.
+        if let Gesture::Components {
+            path: r,
+            from,
+            aim,
+            base,
+            stepped: true,
+            picked,
+            ..
+        } = &g
+            && aim == from
+            && let Some(doc) = &mut self.doc
+            && doc.path(*r).as_ref() == Some(base)
+        {
+            doc.discard_step();
+            if let Some(picked) = picked {
+                self.vector.components = picked.clone();
+            }
+            return;
+        }
         match g {
             Gesture::Marquee { from, to } => {
                 let b = Bounds::of(from, to);
@@ -1247,6 +1284,25 @@ impl AtelierApp {
                             }
                         }
                     }
+                }
+            }
+            Gesture::Components {
+                path: r,
+                last,
+                aim,
+                stepped: true,
+                ..
+            } if aim != last && self.zoom > 1.0 && matches!(r, PathRef::Layer(_)) => {
+                // Zoomed in, the fraction of a pixel the drag left.
+                let all = self
+                    .doc
+                    .as_ref()
+                    .and_then(|d| d.path(r))
+                    .is_some_and(|path| {
+                        (0..path.subpaths.len()).all(|k| self.vector.components.contains(&k))
+                    });
+                if all && let Some(doc) = &mut self.doc {
+                    doc.move_path(r, aim - last);
                 }
             }
             Gesture::ShapeBox {

@@ -1170,6 +1170,100 @@ fn paste_forgets_the_modifiers_of_an_earlier_chord_with_ctrl_held() {
 }
 
 #[test]
+fn paste_after_a_slow_frame_keeps_only_the_v_modifiers() {
+    let ctrl = Modifiers::COMMAND;
+    let shift_ctrl = ctrl.plus(Modifiers::SHIFT);
+    let all = shift_ctrl.plus(Modifiers::ALT);
+    let key = |key, pressed, modifiers| egui::Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed,
+        repeat: false,
+        modifiers,
+    };
+    let run = |frames: Vec<(f64, Modifiers, Vec<egui::Event>)>| {
+        let mut chord = PasteChord {
+            idle: true,
+            ..Default::default()
+        };
+        let mut paste = None;
+        for (time, modifiers, events) in frames {
+            let mut input = egui::InputState::default();
+            input.time = time;
+            input.modifiers = modifiers;
+            input.events = events;
+            paste = chord.update(&input).or(paste);
+        }
+        let input = egui::InputState::default();
+        clipboard_action(&input, paste).map(|a| format!("{a:?}"))
+    };
+    let some = |s: &str| Some(s.to_owned());
+    // Shift+Ctrl+C takes 0.8 s; meanwhile Shift up, then V (image
+    // clipboard: no sign of the press).
+    let frames = vec![
+        (0.0, shift_ctrl, vec![egui::Event::Copy]),
+        (
+            0.8,
+            ctrl,
+            vec![key(Key::C, false, shift_ctrl), key(Key::V, false, ctrl)],
+        ),
+    ];
+    assert_eq!(run(frames), some("Paste"));
+    // The same with a text clipboard.
+    let frames = vec![
+        (0.0, shift_ctrl, vec![egui::Event::Copy]),
+        (
+            0.8,
+            ctrl,
+            vec![
+                key(Key::C, false, shift_ctrl),
+                egui::Event::Paste(String::new()),
+                key(Key::V, false, ctrl),
+            ],
+        ),
+    ];
+    assert_eq!(run(frames), some("Paste"));
+    // A slow Shift+Ctrl+Z, a slow stamp, then Ctrl+V.
+    let frames = vec![
+        (0.0, shift_ctrl, vec![key(Key::Z, true, shift_ctrl)]),
+        (
+            0.6,
+            ctrl,
+            vec![key(Key::Z, false, shift_ctrl), key(Key::V, false, ctrl)],
+        ),
+    ];
+    assert_eq!(run(frames), some("Paste"));
+    let frames = vec![
+        (0.0, all, vec![key(Key::E, true, all)]),
+        (
+            0.6,
+            ctrl,
+            vec![key(Key::E, false, all), key(Key::V, false, ctrl)],
+        ),
+    ];
+    assert_eq!(run(frames), some("Paste"));
+    // Shift+Ctrl+V within the slow frame keeps its Shift.
+    let frames = vec![
+        (0.0, shift_ctrl, vec![egui::Event::Copy]),
+        (
+            0.8,
+            ctrl,
+            vec![
+                key(Key::V, true, shift_ctrl),
+                key(Key::V, false, ctrl),
+            ],
+        ),
+    ];
+    assert_eq!(run(frames), some("PasteInPlace"));
+    // V down before the slow frame: what was held since still counts.
+    let frames = vec![
+        (0.0, shift_ctrl, vec![egui::Event::Paste(String::new())]),
+        (0.8, ctrl, vec![key(Key::V, false, ctrl)]),
+    ];
+    assert_eq!(run(frames), some("PasteInPlace"));
+}
+
+#[test]
 fn held_toggles_do_not_repeat() {
     let mut h = with_logo();
     for repeat in [false, true, true, true] {
@@ -1422,7 +1516,15 @@ fn enter_while_the_focus_goes_to_the_first_field_is_not_a_buttons() {
     let mut h = with_logo();
     h.state_mut()
         .run(Action::Filter(crate::filters::FilterKind::GaussianBlur));
-    // The focus on its way, over the preview and its zoom buttons.
+    h.run_steps(1);
+    // The focus on its way (a field not drawn by the app's own widgets),
+    // over the preview and its zoom buttons.
+    h.ctx.memory_mut(|m| {
+        if let Some(id) = m.focused() {
+            m.surrender_focus(id);
+        }
+    });
+    focus_first_field(&h.ctx);
     h.run_steps(2);
     assert!(focus_hunt(&h.ctx).is_some(), "on its way");
     // Enter then: the focus stops and is let go, so no button takes it
@@ -1562,6 +1664,41 @@ fn a_press_that_closes_a_menu_reaches_no_panel() {
 }
 
 #[test]
+fn a_swallowed_press_without_its_release_does_not_eat_the_next_one() {
+    let mut h = with_logo();
+    let brush = h.get_by_label(&Tool::Brush.name()).rect().center();
+    let event = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    for lost in [None, Some(egui::Event::WindowFocused(false))] {
+        h.get_by_label("Edit").click();
+        h.run_steps(3);
+        assert!(egui::Popup::is_any_open(&h.ctx));
+        let mut swallowed = false;
+        let mut raw = egui::RawInput {
+            events: vec![event(brush, true)],
+            ..Default::default()
+        };
+        swallow_popup_closing_press(&h.ctx, &mut raw, &mut swallowed);
+        assert!(raw.events.is_empty() && swallowed, "press dropped");
+        // Its release never comes; the window may lose the focus.
+        raw.events = lost.into_iter().collect();
+        swallow_popup_closing_press(&h.ctx, &mut raw, &mut swallowed);
+        // The next click keeps its press and its release.
+        raw.events = vec![event(brush, true)];
+        swallow_popup_closing_press(&h.ctx, &mut raw, &mut swallowed);
+        assert_eq!(raw.events.len(), 1, "press kept");
+        raw.events = vec![event(brush, false)];
+        swallow_popup_closing_press(&h.ctx, &mut raw, &mut swallowed);
+        assert_eq!(raw.events.len(), 1, "release kept");
+        h.run_steps(2);
+    }
+}
+
+#[test]
 fn a_resized_panel_corner_follows_the_pointer_back() {
     let mut h = with_logo();
     h.state_mut().run(Action::History);
@@ -1591,4 +1728,228 @@ fn a_resized_panel_corner_follows_the_pointer_back() {
         (after.size() - before.size()).length() < 1.5,
         "{before:?} -> {after:?}"
     );
+}
+
+// ------------------------------------------------- Fourth review
+
+/// Types `text` (its digits as keys and text).
+fn type_digits(h: &mut Harness<'static, AtelierApp>, text: &str) {
+    for c in text.chars() {
+        let key = Key::from_name(&c.to_string()).expect("a key");
+        h.event(egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        });
+        h.event(egui::Event::Text(c.to_string()));
+        h.run_steps(1);
+    }
+}
+
+#[test]
+fn a_dialog_gives_its_first_field_the_keyboard_at_once() {
+    use crate::filters::FilterKind;
+    for action in [
+        Action::Filter(FilterKind::GaussianBlur),
+        Action::LayerStyle(None),
+        Action::ImageSize,
+        Action::Adjust(AdjustKind::Levels),
+    ] {
+        let mut h = with_logo();
+        h.state_mut().run(action);
+        // No walk over the widgets before it (the window's first frame only
+        // sizes it): digits typed right away reach it.
+        h.run_steps(3);
+        assert!(h.ctx.text_edit_focused(), "{action:?}: field focused");
+        assert!(focus_hunt(&h.ctx).is_none(), "{action:?}: no hunt");
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        type_digits(&mut h, "37");
+        h.run_steps(3);
+        assert!(h.ctx.text_edit_focused(), "{action:?}: still focused");
+        assert!(
+            h.query_all_by_value("37").next().is_some(),
+            "{action:?}: 37 typed"
+        );
+    }
+}
+
+#[test]
+fn a_dialog_without_a_text_field_does_not_walk_its_buttons() {
+    let mut h = with_logo();
+    h.state_mut().selection = Some(some_selection());
+    h.run_steps(2);
+    h.state_mut().run(Action::ContentAwareFill);
+    let mut focused = 0;
+    for _ in 0..20 {
+        h.run_steps(1);
+        focused += usize::from(h.ctx.memory(|m| m.focused()).is_some());
+    }
+    assert!(h.state().modal_open(), "open");
+    assert_eq!(focused, 0, "no widget focused on the way");
+}
+
+#[test]
+fn the_shortcuts_filter_takes_what_is_typed() {
+    let mut h = with_logo();
+    h.state_mut().set_tool(Tool::Transform);
+    h.state_mut()
+        .run(Action::Workspace(workspace::Command::Shortcuts));
+    h.run_steps(2);
+    for c in ["b", "r", "u", "s", "h"] {
+        let key = Key::from_name(c).expect("a letter");
+        h.event(egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        });
+        h.event(egui::Event::Text(c.into()));
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+    assert_eq!(h.state().workspace.shortcuts.as_deref(), Some("brush"));
+    assert!(h.state().tool == Tool::Transform, "no tool switched");
+    // Esc still closes it.
+    h.key_press(Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().workspace.shortcuts.is_none(), "closed");
+}
+
+#[test]
+fn the_layers_splitter_follows_the_pointer_back_after_its_limit() {
+    let mut h = with_logo();
+    let x = 1400.0 - 150.0;
+    let find = |h: &mut Harness<'static, AtelierApp>| {
+        (120..980).step_by(2).find_map(|y| {
+            let p = pos2(x, y as f32);
+            h.hover_at(p);
+            h.run_steps(1);
+            (h.output().platform_output.cursor_icon == egui::CursorIcon::ResizeVertical)
+                .then_some(p)
+        })
+    };
+    let start = find(&mut h).expect("the splitter");
+    h.hover_at(start);
+    h.run_steps(1);
+    press(&h, start, true, Modifiers::NONE);
+    h.run_steps(1);
+    // Far up, past the Properties' minimum, then back where it started.
+    let far = start - vec2(0.0, 800.0);
+    for i in 1..=8 {
+        h.hover_at(start.lerp(far, i as f32 / 8.0));
+        h.run_steps(1);
+    }
+    for i in 1..=8 {
+        h.hover_at(far.lerp(start, i as f32 / 8.0));
+        h.run_steps(1);
+    }
+    press(&h, start, false, Modifiers::NONE);
+    h.run_steps(2);
+    let now = find(&mut h).expect("the splitter");
+    assert!((now.y - start.y).abs() <= 4.0, "{start:?} -> {now:?}");
+}
+
+#[test]
+fn digits_set_the_opacity_of_every_selected_unlocked_layer() {
+    let mut h = with_logo();
+    h.state_mut().set_tool(Tool::Transform);
+    let ids: Vec<u64> = doc(&h).layers.iter().map(|l| l.id).collect();
+    h.state_mut().layer_set = ids.clone();
+    h.run_steps(1);
+    let before = steps(&h);
+    h.key_press(Key::Num5);
+    h.run_steps(2);
+    let opacities: Vec<f32> = doc(&h).layers.iter().map(|l| l.opacity).collect();
+    assert_eq!(opacities, [0.5, 0.5], "both");
+    assert_eq!(steps(&h), before + 1, "one step");
+    // A locked one is left as it is.
+    h.state_mut().doc.as_mut().unwrap().layers[0].locked = true;
+    h.state_mut().last_digit = None;
+    h.run_steps(1);
+    h.key_press(Key::Num3);
+    h.run_steps(2);
+    let opacities: Vec<f32> = doc(&h).layers.iter().map(|l| l.opacity).collect();
+    assert_eq!(opacities, [0.5, 0.3], "the unlocked one");
+    // All locked: refused.
+    h.state_mut().doc.as_mut().unwrap().layers[1].locked = true;
+    h.state_mut().last_digit = None;
+    h.run_steps(1);
+    let before = steps(&h);
+    h.key_press(Key::Num8);
+    h.run_steps(2);
+    assert_eq!(doc(&h).layers[1].opacity, 0.3, "locked");
+    assert_eq!(steps(&h), before, "no step");
+    // The blend mode too.
+    for l in &mut h.state_mut().doc.as_mut().unwrap().layers {
+        l.locked = false;
+    }
+    h.state_mut().run(Action::SetBlend(BlendMode::Multiply));
+    let modes: Vec<BlendMode> = doc(&h).layers.iter().map(|l| l.blend).collect();
+    assert_eq!(modes, [BlendMode::Multiply; 2]);
+}
+
+#[test]
+fn ctrl_with_the_type_tool_is_the_move_tool() {
+    let mut h = with_logo();
+    h.state_mut().set_tool(Tool::Text);
+    h.run_steps(2);
+    let n = doc(&h).layers.len();
+    let (a, b) = (screen(&h, 120.0, 120.0), screen(&h, 150.0, 130.0));
+    drag(&mut h, a, b, Modifiers::COMMAND);
+    h.run_steps(2);
+    assert_eq!(doc(&h).layers.len(), n, "no text made");
+    assert_eq!(doc(&h).layers[1].offset, (130, 110), "the layer moved");
+    assert!(h.state().type_tool.edit.is_none());
+}
+
+#[test]
+fn layer_shortcuts_lock_cut_stamp_and_desaturate() {
+    let mut h = with_logo();
+    h.state_mut().set_tool(Tool::Transform);
+    h.run_steps(1);
+    // Ctrl+/: Lock.
+    h.key_press_modifiers(Modifiers::COMMAND, Key::Slash);
+    h.run_steps(2);
+    assert!(doc(&h).active_layer().locked, "locked");
+    h.key_press_modifiers(Modifiers::COMMAND, Key::Slash);
+    h.run_steps(2);
+    assert!(!doc(&h).active_layer().locked, "unlocked");
+    // Shift+Ctrl+J: Layer via Cut, one step.
+    h.state_mut().selection = Some(
+        PixelRect {
+            x: 100,
+            y: 100,
+            w: 20,
+            h: 20,
+        }
+        .into(),
+    );
+    h.run_steps(1);
+    let before = steps(&h);
+    h.key_press_modifiers(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::J);
+    h.run_steps(2);
+    let d = doc(&h);
+    assert_eq!(d.layers.len(), 3, "a new layer");
+    assert_eq!(steps(&h), before + 1, "one step");
+    let logo = d.layers.iter().find(|l| l.name == "Logo").expect("Logo");
+    assert_eq!(logo.pixel_at(105, 105).map(|p| p[3]), Some(0), "cut");
+    assert_eq!(d.active_layer().pixel_at(105, 105), Some([0, 0, 200, 255]));
+    h.state_mut().selection = None;
+    // Alt+Shift+Ctrl+E: Stamp Visible, the layers kept.
+    let all = Modifiers::COMMAND.plus(Modifiers::SHIFT).plus(Modifiers::ALT);
+    h.key_press_modifiers(all, Key::E);
+    h.run_steps(2);
+    let d = doc(&h);
+    assert_eq!(d.layers.len(), 4, "stamped");
+    assert_eq!(d.active_layer().pixel_at(150, 120), Some([0, 0, 200, 255]));
+    assert_eq!(d.active_layer().pixel_at(10, 10), Some([200, 0, 0, 255]));
+    // Shift+Ctrl+U: Desaturate.
+    h.key_press_modifiers(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::U);
+    h.run_steps(2);
+    let [r, g, b, _] = doc(&h).active_layer().pixel_at(10, 10).expect("a pixel");
+    assert!(r == g && g == b, "gray: {r} {g} {b}");
+    assert!(h.state().adjust.is_none(), "no dialog");
 }

@@ -62,7 +62,7 @@ pub(super) struct Marquee {
 }
 
 /// Style of the marquees: free, of fixed proportions, or of fixed size.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MarqueeStyle {
     Normal,
     FixedRatio,
@@ -170,10 +170,16 @@ pub(super) struct SubjectJob {
     /// select the subject.
     remove_from: Option<(u64, u64)>,
     /// The history generation searched in (see
-    /// `Document::history_generation`), and the selection then (Select
+    /// `Document::history_follows`), and the selection then (Select
     /// Subject: one made since is the user's latest).
-    generation: u64,
+    generation: crate::document::HistoryGeneration,
     base: Option<Selection>,
+    /// The image searched (see `object_select::fingerprint`): searched
+    /// again if it changed meanwhile, and with the AI model or not.
+    fingerprint: u64,
+    use_ai: bool,
+    /// What was found, kept while a text is being typed.
+    found: Option<(GrayImage, Option<String>)>,
 }
 
 /// Radius (screen pixels) around the first point to close the lasso.
@@ -243,8 +249,10 @@ impl AtelierApp {
         if self.select_move.is_some() {
             return self.move_selection(view, pointer, down, shift);
         }
+        // A drag of the quick mask goes on as the Move tool's for a moment
+        // (see `canvas`).
         if self.xform.quick.dragging() {
-            return self.quick_mask_move_input(view, pointer, start, down);
+            return CursorIcon::Grabbing;
         }
         let Some(p) = pointer else {
             if !down {
@@ -487,7 +495,8 @@ impl AtelierApp {
     }
 
     /// Arrows with a selection tool: the outline moves, and with `pixels`
-    /// (Ctrl) the selected pixels too, one undo step per press.
+    /// (Ctrl, the Move tool) the selected pixels too, one undo step per
+    /// series of presses.
     pub(super) fn nudge_selection(&mut self, selection: Selection, d: (i64, i64), pixels: bool) {
         let Some(canvas) = self.doc.as_ref().map(Document::full_rect) else {
             return;
@@ -503,6 +512,7 @@ impl AtelierApp {
                 return;
             }
             let Some(doc) = &mut self.doc else { return };
+            let (before, layer_id) = (doc.history_step(), doc.active_layer().id);
             let Some(id) = doc.lift_region(&selection, false) else {
                 self.status = t!("status-selection-empty");
                 return;
@@ -510,6 +520,12 @@ impl AtelierApp {
             let layer = doc.active_layer_mut();
             layer.offset = (layer.offset.0 + d.0, layer.offset.1 + d.1);
             doc.drop_floating(id);
+            // The presses of a series: one step, like the layer's arrows.
+            let key = (layer_id, "nudged pixels");
+            if self.prop_session == Some((key, before)) {
+                doc.join_last_step();
+            }
+            self.prop_session = Some((key, doc.history_step()));
             // Moved with the pixels, in their step.
             self.selection = Some(moved);
             return self.sync_selection();
@@ -1073,7 +1089,7 @@ impl AtelierApp {
             let found = if use_ai {
                 let found = ai::catch_panic(|| ai::subject::select_subject(&image));
                 found.map(|mask| (mask, None)).unwrap_or_else(|e| {
-                    let note = t!("select-ai-unavailable", error = e);
+                    let note = t!("select-ai-unavailable", error = e.shown);
                     (crate::grabcut::select_subject(&image), Some(note))
                 })
             } else {
@@ -1095,28 +1111,45 @@ impl AtelierApp {
             remove_from,
             generation: doc.history_generation(),
             base: self.selection.clone(),
+            fingerprint: super::object_select::fingerprint(doc),
+            use_ai,
+            found: None,
         });
         self.status = t!("select-subject-searching");
     }
 
+    /// The subject search is done (its result may wait for a text).
+    #[cfg(test)]
+    pub(super) fn subject_found(&self) -> bool {
+        self.subject_job.as_ref().is_some_and(|j| j.found.is_some())
+    }
+
     /// Applies the subject search result when it is ready.
     pub(super) fn poll_subject(&mut self, ctx: &egui::Context) {
-        let Some(job) = &self.subject_job else { return };
-        let (mask, note) = match job.result.try_recv() {
-            Ok(found) => found,
-            // The status says so from the start (not every frame: other
-            // messages stay readable).
-            Err(mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                return;
+        let Some(job) = &mut self.subject_job else { return };
+        if job.found.is_none() {
+            match job.result.try_recv() {
+                Ok(found) => job.found = Some(found),
+                // The status says so from the start (not every frame: other
+                // messages stay readable).
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.subject_job = None;
+                    self.status_failed(tm!("select-subject-failed"));
+                    return;
+                }
             }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.subject_job = None;
-                self.status_failed(tm!("select-subject-failed"));
-                return;
-            }
-        };
+        }
+        // A text being typed ends first: its step is never recorded among
+        // the text's own (given up with them if it is left empty).
+        if self.type_tool.edit.is_some() {
+            return;
+        }
         let job = self.subject_job.take().expect("checked");
+        let (mask, note) = job.found.expect("received");
         // Never on another document.
         if self.doc.as_ref().is_none_or(|d| d.uid() != job.doc) {
             return;
@@ -1126,7 +1159,7 @@ impl AtelierApp {
         let Some(doc) = self.doc.as_mut() else { return };
         // Undone or redone meanwhile: found in another image, and recording
         // it would wipe the redo list. Steps recorded forward don't matter.
-        if doc.history_generation() != job.generation {
+        if !doc.history_follows(job.generation) {
             self.status = t!("hist5-subject-undone");
             return;
         }
@@ -1138,6 +1171,13 @@ impl AtelierApp {
         };
         if job.remove_from.is_none() && !unchanged {
             self.status = t!("hist5-subject-selection-changed");
+            return;
+        }
+        // The image changed during the search (rotated, resized, painted,
+        // a layer moved): found where it no longer is, searched again.
+        if job.remove_from.is_none() && super::object_select::fingerprint(doc) != job.fingerprint {
+            self.start_subject(false, job.use_ai);
+            self.status = t!("hist6-subject-searching-again");
             return;
         }
         let remove_from = job.remove_from;

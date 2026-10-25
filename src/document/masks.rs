@@ -65,6 +65,25 @@ pub(super) fn feathers_pending() -> bool {
 /// Below this many mask pixels, the display feathers at once.
 const FEATHER_AT_ONCE: u64 = 1 << 20;
 
+thread_local! {
+    /// The level the display composites at on this thread (see
+    /// `compose::LevelCache`): a feathered image made on a worker thread
+    /// for it is reduced there too.
+    static DISPLAY_LEVEL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The display now composites at `level`.
+pub fn set_display_level(level: u32) {
+    DISPLAY_LEVEL.set(level);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: masks of a million pixels or more feathered on this thread.
+    pub(crate) static TEST_BIG_FEATHERS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// The feathered image for a revision and feather radius (its bits), and
 /// the margin it adds on each side.
 #[derive(Clone)]
@@ -73,6 +92,9 @@ struct Feathered {
     feather: u32,
     image: Arc<GrayImage>,
     margin: i64,
+    /// The image reduced for a level of the display, when made on a
+    /// worker thread (see [`Mask::feathered_reduced`]).
+    reduced: Option<(u32, Arc<GrayImage>)>,
 }
 
 /// How a new mask starts (Layer › Layer Mask).
@@ -299,6 +321,7 @@ impl Mask {
             self.rev,
         );
         let work = Arc::clone(&job);
+        let level = DISPLAY_LEVEL.get().min(16);
         FEATHERING.fetch_add(1, Ordering::Relaxed);
         let spawned = std::thread::Builder::new()
             .name("feather".into())
@@ -312,7 +335,12 @@ impl Mask {
                 }
                 let _running = Running;
                 std::thread::sleep(wait);
-                let f = feathered(&image, default, feather, rev);
+                let mut f = feathered(&image, default, feather, rev);
+                // Reduced for the display here too, not on the UI thread.
+                if level > 0 {
+                    let r = crate::compose::levels::reduce_gray(&f.image, 1 << level);
+                    f.reduced = Some((level, Arc::new(r)));
+                }
                 *work.done.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
             });
         if spawned.is_err() {
@@ -322,6 +350,69 @@ impl Mask {
         }
         *slot = Some(job);
         former
+    }
+
+    /// The image [`Self::shaped_later`] gave for `shown` (its third
+    /// value), already reduced for `level` when a worker thread made it.
+    pub fn feathered_reduced(&self, shown: (u64, u32), level: u32) -> Option<Arc<GrayImage>> {
+        let f = self.feathered.borrow();
+        let f = f.as_ref().filter(|f| (f.rev, f.feather) == shown)?;
+        f.reduced
+            .as_ref()
+            .filter(|(l, _)| *l == level)
+            .map(|(_, r)| Arc::clone(r))
+    }
+
+    /// [`Self::shaped`] at `level` (a pixel per 2^level × 2^level block),
+    /// roughly but fast: a pixel of each block, feathered at that scale.
+    /// For a coarse view (see `compose::Sampled`): the full-size mask is
+    /// never feathered for it. Gives the image and its place in pixels of
+    /// the level.
+    pub fn shaped_coarse(&self, layer_offset: (i64, i64), level: u32) -> (Arc<GrayImage>, (i64, i64)) {
+        let (x, y) = self.origin(layer_offset);
+        let b = 1u32 << level.min(16);
+        let (w, h) = self.image.dimensions();
+        let at = (x.div_euclid(i64::from(b)), y.div_euclid(i64::from(b)));
+        if w == 0 || h == 0 {
+            return (Arc::clone(&self.image), at);
+        }
+        let image = &*self.image;
+        let small = GrayImage::from_fn(w.div_ceil(b), h.div_ceil(b), |px, py| {
+            *image.get_pixel((px * b + b / 2).min(w - 1), (py * b + b / 2).min(h - 1))
+        });
+        let radius = self.feather / b as f32;
+        if radius < 0.25 {
+            return (Arc::new(small), at);
+        }
+        let f = feathered(&small, self.default, radius, self.rev);
+        (f.image, (at.0 - f.margin, at.1 - f.margin))
+    }
+
+    /// The feathered image a copy of the mask made (the display's level
+    /// job, on its own copies of the layers) shows on the others too: they
+    /// share its slot (see [`Self::shaped_later`]).
+    pub fn share_feathered(&self) {
+        let key = (self.rev, self.feather.to_bits());
+        let Some(f) = self
+            .feathered
+            .borrow()
+            .as_ref()
+            .filter(|f| (f.rev, f.feather) == key)
+            .cloned()
+        else {
+            return;
+        };
+        let mut slot = self.feather_job.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|j| j.key == key) {
+            return;
+        }
+        *slot = Some(Arc::new(FeatherJob {
+            key,
+            done: Mutex::new(Some(f)),
+            asked: std::time::Instant::now()
+                .checked_sub(FEATHER_EVERY)
+                .unwrap_or_else(std::time::Instant::now),
+        }));
     }
 
     /// The pixels of `area` (image coordinates) just changed, from revision
@@ -644,6 +735,7 @@ impl Mask {
             feather: key.1,
             image: Arc::new(grown),
             margin: m,
+            reduced: None,
         });
     }
 }
@@ -668,6 +760,25 @@ impl Document {
     pub fn target_mask(&mut self, on: bool) {
         self.mask_target = on.then(|| self.real_active().id);
         self.filter_mask_target = false;
+        if !on {
+            self.release_stand_in();
+        }
+    }
+
+    /// Changes whenever what the pixel operations edit does (see
+    /// [`Self::target_layer`]): the quick mask, the targeted mask, or the
+    /// active layer's pixels.
+    pub fn target_rev(&self) -> u64 {
+        if self.quick_mask.is_some() {
+            return self.quick_mask_key();
+        }
+        let layer = self.real_active();
+        if self.mask_targeted()
+            && let Some(mask) = target_mask(layer, self.filter_mask_target)
+        {
+            return mask.rev();
+        }
+        layer.rev()
     }
 
     /// Whether the painting tools have something to edit: pixels (not a
@@ -730,6 +841,7 @@ impl Document {
         }
         self.checkpoint(t!("xchg-hist-delete-mask"));
         self.layers[self.active].mask = None;
+        self.release_stand_in();
         true
     }
 
@@ -751,6 +863,7 @@ impl Document {
         // Only the opacity changed where the mask showed everything.
         layer.text = text.filter(|_| mask_was_white(layer.mask.as_ref()));
         layer.mask = None;
+        self.release_stand_in();
         true
     }
 
@@ -908,12 +1021,14 @@ impl Document {
         if self.swapped.is_some() {
             return Some(std::borrow::Cow::Borrowed(&self.layers[self.active]));
         }
-        if let Some(proxy) = self.quick_mask_stand_in() {
+        if let Some(proxy) = self.cached_quick_mask_stand_in() {
             return Some(std::borrow::Cow::Owned(proxy));
         }
         if self.mask_targeted() {
             return Some(std::borrow::Cow::Owned(self.cached_stand_in()));
         }
+        // No mask stands in for the layer: its cached stand-in can go.
+        self.release_stand_in();
         let layer = &self.layers[self.active];
         layer
             .has_pixels()
@@ -935,29 +1050,56 @@ impl Document {
             filter,
             (area.x, area.y, area.w, area.h),
         );
-        let mut cache = self.stand_in.borrow_mut();
-        if let Some(c) = cache.as_ref().filter(|c| c.key == key) {
-            return Layer {
-                image: Arc::clone(&c.image),
-                rev: c.rev,
-                offset: c.offset,
-                ..stand_in_shell(layer)
-            };
+        let (image, rev, offset) = self.cached(key, false, || {
+            let made = stand_in(layer, area, filter);
+            (made.image, made.rev, made.offset)
+        });
+        Layer {
+            image,
+            rev,
+            offset,
+            ..stand_in_shell(layer)
         }
-        let made = stand_in(layer, area, filter);
+    }
+
+    /// The stand-in cached under `key` (`quick`: the quick mask's), or the
+    /// one `make` gives, then cached.
+    pub(super) fn cached(
+        &self,
+        key: StandInKey,
+        quick: bool,
+        make: impl FnOnce() -> (Arc<RgbaImage>, u64, (i64, i64)),
+    ) -> (Arc<RgbaImage>, u64, (i64, i64)) {
+        let mut cache = self.stand_in.borrow_mut();
+        if let Some(c) = cache.as_ref().filter(|c| c.key == key && c.quick == quick) {
+            return (Arc::clone(&c.image), c.rev, c.offset);
+        }
+        // The old one goes first (not two canvases at once).
+        *cache = None;
+        let (image, rev, offset) = make();
         *cache = Some(StandIn {
             key,
-            image: Arc::clone(&made.image),
-            rev: made.rev,
-            offset: made.offset,
+            quick,
+            image: Arc::clone(&image),
+            rev,
+            offset,
         });
-        made
+        (image, rev, offset)
+    }
+
+    /// Lets go of the cached stand-in (a canvas of pixels): no dialog asks
+    /// for it any more, or the mask is being painted.
+    pub fn release_stand_in(&self) {
+        self.stand_in.borrow_mut().take();
     }
 
     fn swap_in_mask(&mut self) {
         if self.swapped.is_some() {
             return;
         }
+        // Painted, the stand-in changes: the cached one would only hold a
+        // second canvas.
+        self.release_stand_in();
         if let Some(proxy) = self.quick_mask_stand_in() {
             let layer = &mut self.layers[self.active];
             self.swapped = Some(Box::new(std::mem::replace(layer, proxy)));
@@ -1004,6 +1146,8 @@ fn mask_was_white(mask: Option<&Mask>) -> bool {
 /// made from, its pixels and their revision.
 pub(super) struct StandIn {
     key: StandInKey,
+    /// The quick mask's (else a layer mask's).
+    quick: bool,
     image: Arc<RgbaImage>,
     rev: u64,
     offset: (i64, i64),
@@ -1011,7 +1155,7 @@ pub(super) struct StandIn {
 
 /// Layer id, mask revision, origin, size and default, smart filter mask,
 /// canvas.
-type StandInKey = (
+pub(super) type StandInKey = (
     u64,
     u64,
     (i64, i64),
@@ -1168,6 +1312,10 @@ fn write_back(proxy: &Layer, real: &mut Layer, area: Option<PixelRect>, filter: 
 /// from the default (and its margin) is blurred: elsewhere the blur adds
 /// nothing to the default.
 fn feathered(image: &GrayImage, default: u8, feather: f32, rev: u64) -> Feathered {
+    #[cfg(test)]
+    if u64::from(image.width()) * u64::from(image.height()) >= FEATHER_AT_ONCE {
+        TEST_BIG_FEATHERS.set(TEST_BIG_FEATHERS.get() + 1);
+    }
     let m = if feather > 0.0 {
         (feather * 2.0).ceil() as i64 + 1
     } else {
@@ -1217,6 +1365,7 @@ fn feathered(image: &GrayImage, default: u8, feather: f32, rev: u64) -> Feathere
         feather: feather.to_bits(),
         image: Arc::new(GrayImage::from_raw(w as u32, h as u32, out).expect("size")),
         margin: m,
+        reduced: None,
     }
 }
 
@@ -1312,6 +1461,77 @@ mod tests {
         assert_eq!((at, *image == *direct), (direct_at, true));
     }
 
+    /// A feathered image made on a copy of a large mask (the display's
+    /// level job) shows on the mask itself without feathering it again; one
+    /// made aside for a new radius comes reduced for the display's level.
+    #[test]
+    fn feathered_images_made_aside_are_shared_and_reduced() {
+        let mut image = GrayImage::from_pixel(1100, 1000, Luma([0]));
+        for y in 300..700 {
+            for x in 200..900 {
+                image.put_pixel(x, y, Luma([255]));
+            }
+        }
+        let mut m = Mask::new(image, (0, 0), 0, (0, 0));
+        m.feather = 4.0;
+        let copy = m.clone();
+        let worker = std::thread::spawn(move || {
+            let (image, ..) = copy.shaped_later((0, 0));
+            copy.share_feathered();
+            image
+        });
+        let made = worker.join().unwrap();
+        TEST_BIG_FEATHERS.set(0);
+        let (image, at, key) = m.shaped_later((0, 0));
+        assert_eq!(TEST_BIG_FEATHERS.get(), 0, "not feathered again");
+        assert!(Arc::ptr_eq(&image, &made));
+        assert_eq!((at, key), ((-9, -9), (m.rev(), 4.0f32.to_bits())));
+        // A new radius, the display at level 2.
+        set_display_level(2);
+        m.feather = 7.0;
+        m.shaped_later((0, 0));
+        let start = std::time::Instant::now();
+        let (image, key) = loop {
+            let (image, _, key) = m.shaped_later((0, 0));
+            if key.1 == 7.0f32.to_bits() {
+                break (image, key);
+            }
+            assert!(start.elapsed().as_secs() < 60, "never ready");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        set_display_level(0);
+        let reduced = m.feathered_reduced(key, 2).expect("reduced aside");
+        assert_eq!(*reduced, crate::compose::levels::reduce_gray(&image, 4));
+        assert!(m.feathered_reduced(key, 1).is_none());
+    }
+
+    /// A coarse view's mask: sampled, then feathered at its scale, never
+    /// at full size.
+    #[test]
+    fn a_coarse_view_feathers_the_sampled_mask() {
+        let mut image = GrayImage::from_pixel(1100, 1000, Luma([0]));
+        for y in 300..700 {
+            for x in 200..900 {
+                image.put_pixel(x, y, Luma([255]));
+            }
+        }
+        let mut m = Mask::new(image, (40, 0), 0, (0, 0));
+        m.feather = 16.0;
+        TEST_BIG_FEATHERS.set(0);
+        let (small, at) = m.shaped_coarse((0, 0), 3);
+        assert_eq!(TEST_BIG_FEATHERS.get(), 0);
+        assert!(m.feathered.borrow().is_none());
+        // 1100 / 8 = 138 wide, grown by the margin of a radius of 2.
+        let margin = 5;
+        assert_eq!(small.dimensions(), (138 + 2 * margin, 125 + 2 * margin));
+        assert_eq!(at, (5 - margin as i64, -(margin as i64)));
+        // Inside and outside the shape, and soft across its edge.
+        let px = |x: u32, y: u32| small.get_pixel(x + margin, y + margin).0[0];
+        assert_eq!((px(70, 60), px(5, 5)), (255, 0));
+        let edge = px(25, 60);
+        assert!(edge > 20 && edge < 235, "{edge}");
+    }
+
     /// While the radius keeps changing (its slider), a new feathered image
     /// shows at most every `FEATHER_EVERY`: each one recomposites the layer.
     #[test]
@@ -1371,6 +1591,40 @@ mod tests {
         assert!(!Arc::ptr_eq(&a.image, &c.image));
         assert_ne!(a.rev, c.rev);
         assert_eq!(c.image.get_pixel(5, 5).0, [255, 255, 255, 255]);
+    }
+
+    /// The quick mask's stand-in too (a filter dialog in Quick Mask Mode
+    /// asks for it at every frame), and the cached one is let go once no
+    /// mask stands in for the layer.
+    #[test]
+    fn quick_mask_stand_in_is_made_again_only_when_the_quick_mask_changes() {
+        let mut doc = doc();
+        doc.enter_quick_mask("Quick Mask".into());
+        let a = doc.target_layer().unwrap().into_owned();
+        let b = doc.target_layer().unwrap().into_owned();
+        assert!(Arc::ptr_eq(&a.image, &b.image));
+        assert_eq!(a.rev, b.rev);
+        assert_eq!(doc.target_rev(), doc.quick_mask_key());
+        assert_eq!(a.image.get_pixel(5, 5).0, [255, 255, 255, 255]);
+        assert!(doc.begin_paint());
+        assert!(doc.stand_in.borrow().is_none(), "let go while painted");
+        doc.active_layer_mut()
+            .pixels_mut()
+            .put_pixel(5, 5, Rgba([0, 0, 0, 255]));
+        doc.end_paint();
+        let c = doc.target_layer().unwrap().into_owned();
+        assert!(!Arc::ptr_eq(&a.image, &c.image));
+        assert_ne!(a.rev, c.rev);
+        assert_eq!(c.image.get_pixel(5, 5).0, [0, 0, 0, 255]);
+        doc.leave_quick_mask("Quick Mask".into());
+        assert!(doc.stand_in.borrow().is_none(), "let go on leaving");
+        // A layer mask's, let go once untargeted.
+        assert!(doc.add_mask(NewMask::HideAll, None));
+        let _ = doc.target_layer();
+        assert!(doc.stand_in.borrow().is_some());
+        doc.target_mask(false);
+        assert!(doc.stand_in.borrow().is_none());
+        assert_eq!(doc.target_rev(), doc.active_layer().rev());
     }
 
     #[test]

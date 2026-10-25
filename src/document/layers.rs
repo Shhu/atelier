@@ -46,6 +46,24 @@ impl Document {
         true
     }
 
+    /// The locked group that holds layer `i`, if any (the innermost):
+    /// locking a group locks its layers too.
+    pub fn locking_group(&self, i: usize) -> Option<usize> {
+        let mut at = self.parent(i);
+        while let Some(j) = at {
+            if self.layers[j].locked {
+                return Some(j);
+            }
+            at = self.parent(j);
+        }
+        None
+    }
+
+    /// Locked: itself, or by a group that holds it.
+    pub fn is_locked(&self, i: usize) -> bool {
+        self.layers.get(i).is_some_and(|l| l.locked) || self.locking_group(i).is_some()
+    }
+
     /// Whether a group above layer `i` is closed in the Layers panel.
     pub fn folded(&self, i: usize) -> bool {
         let mut at = self.parent(i);
@@ -95,26 +113,7 @@ impl Document {
     /// Name of a copy of a layer named `name`, like Photoshop: "Logo
     /// copy", then "Logo copy 2"… (a copy's copy too), one no layer has.
     pub fn copy_name(&self, name: &str) -> String {
-        let suffix = t!("doc-layer-copy-name", name = "");
-        // "Logo copy 3" → "Logo copy" → "Logo".
-        let numbered = name
-            .rsplit_once(' ')
-            .filter(|(_, n)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
-            .map_or(name, |(s, _)| s);
-        let stem = numbered
-            .strip_suffix(suffix.as_str())
-            .filter(|s| !s.is_empty())
-            .or_else(|| name.strip_suffix(suffix.as_str()).filter(|s| !s.is_empty()))
-            .unwrap_or(name);
-        let first = t!("doc-layer-copy-name", name = stem);
-        let used = |n: &str| self.layers.iter().any(|l| l.name == n);
-        if !used(&first) {
-            return first;
-        }
-        (2..=self.layers.len() as u32 + 2)
-            .map(|n| t!("tools5-layer-copy-numbered", name = stem, number = n))
-            .find(|n| !used(n))
-            .unwrap_or(first)
+        copy_name_among(name, self.layers.len(), |n| self.layers.iter().any(|l| l.name == n))
     }
 
     /// A layer without pixels of `kind`.
@@ -195,7 +194,7 @@ impl Document {
         if tops
             .iter()
             .flat_map(|r| r.clone())
-            .any(|i| self.layers[i].locked)
+            .any(|i| self.is_locked(i))
             || tops.iter().any(|r| self.nests_artboard(r, 1))
         {
             return false;
@@ -228,7 +227,7 @@ impl Document {
     /// stay in its place.
     pub fn ungroup(&mut self) -> bool {
         let g = self.active;
-        if !self.layers[g].is_group() || self.layers[g].locked {
+        if !self.layers[g].is_group() || self.is_locked(g) {
             return false;
         }
         self.checkpoint(t!("core-menu-ungroup-layers"));
@@ -583,7 +582,7 @@ impl Document {
         if !below.visible || !above.visible || !below.has_pixels() {
             return Err(MergeError::Nothing);
         }
-        if below.locked || above.locked {
+        if self.is_locked(lower) || self.is_locked(upper) {
             return Err(MergeError::Locked);
         }
         let region = self.merge_region([lower, upper])?;
@@ -618,7 +617,7 @@ impl Document {
     pub fn merge_group(&mut self) -> Result<(), MergeError> {
         let g = self.active;
         let r = self.block(g);
-        if self.layers[r.clone()].iter().any(|l| l.locked) {
+        if r.clone().any(|i| self.is_locked(i)) {
             return Err(MergeError::Locked);
         }
         let group = self.layers[g].clone();
@@ -654,7 +653,7 @@ impl Document {
         let [first, _, ..] = visible[..] else {
             return Err(MergeError::Nothing);
         };
-        if visible.iter().any(|&i| self.layers[i].locked) {
+        if visible.iter().any(|&i| self.is_locked(i)) {
             return Err(MergeError::Locked);
         }
         let region = self.merge_region(visible.iter().copied())?;
@@ -676,6 +675,30 @@ impl Document {
 /// `a ∩ b`, or an empty box at `a` if they don't meet.
 fn intersect_or(a: PixelRect, b: PixelRect) -> PixelRect {
     super::intersect(a, b).unwrap_or(PixelRect { w: 0, h: 0, ..a })
+}
+
+/// The name of a copy of `name` ("Logo copy", then "Logo copy 2"…, a
+/// copy's copy numbered too), not `used` among `count` others.
+pub(crate) fn copy_name_among(name: &str, count: usize, used: impl Fn(&str) -> bool) -> String {
+    let suffix = t!("doc-layer-copy-name", name = "");
+    // "Logo copy 3" → "Logo copy" → "Logo".
+    let numbered = name
+        .rsplit_once(' ')
+        .filter(|(_, n)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        .map_or(name, |(s, _)| s);
+    let stem = numbered
+        .strip_suffix(suffix.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| name.strip_suffix(suffix.as_str()).filter(|s| !s.is_empty()))
+        .unwrap_or(name);
+    let first = t!("doc-layer-copy-name", name = stem);
+    if !used(&first) {
+        return first;
+    }
+    (2..=count as u32 + 2)
+        .map(|n| t!("tools5-layer-copy-numbered", name = stem, number = n))
+        .find(|n| !used(n))
+        .unwrap_or(first)
 }
 
 #[cfg(test)]

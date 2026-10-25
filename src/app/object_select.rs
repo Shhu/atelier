@@ -30,7 +30,7 @@ pub(super) struct ObjectSelect {
     /// Analysis of the image: fingerprint of the composite, features.
     features: Option<(u64, Arc<Features>)>,
     /// Analysis in progress, for that fingerprint.
-    analysing: Option<(u64, mpsc::Receiver<Result<Features, String>>)>,
+    analysing: Option<(u64, mpsc::Receiver<Result<Features, crate::ai::Error>>)>,
     /// Image whose analysis failed: tried again on a click, or once the
     /// model is downloaded again.
     failed: Option<u64>,
@@ -68,11 +68,11 @@ struct Shown {
 /// A click or a rectangle: on the image `fingerprint`, with Shift and Alt.
 struct Pick {
     /// The document clicked, its image then and its history generation
-    /// (see `Document::history_generation`: the steps earlier picks record
+    /// (see `Document::history_follows`: the steps earlier picks record
     /// leave it as it is, an undo doesn't).
     doc: u64,
     fingerprint: u64,
-    generation: u64,
+    generation: crate::document::HistoryGeneration,
     prompt: Prompt,
     shift: bool,
     alt: bool,
@@ -90,7 +90,7 @@ struct Queue {
 enum Done {
     /// Preview, for the image and hovering session `key`.
     Hover(u64, Option<Preview>),
-    Pick(Pick, Result<Option<Mask>, String>),
+    Pick(Pick, Result<Option<Mask>, crate::ai::Error>),
 }
 
 /// Thread computing the masks, so the interface never waits for them.
@@ -481,7 +481,7 @@ impl AtelierApp {
                     os.failed = Some(key);
                     os.queued.clear();
                     let error = match outcome {
-                        Ok(Err(e)) => Message::from(e),
+                        Ok(Err(e)) => e,
                         _ => Message::of(|| t!("ai-error-internal")),
                     };
                     let failed = tm!("objsel-failed", error = error);
@@ -544,8 +544,11 @@ impl AtelierApp {
                 }
                 Done::Pick(pick, mask) => {
                     self.object_select.picking -= 1;
-                    let generation = self.doc.as_ref().map(Document::history_generation);
-                    if uid == Some(pick.doc) && generation != Some(pick.generation) {
+                    let followed = self
+                        .doc
+                        .as_ref()
+                        .is_some_and(|d| d.history_follows(pick.generation));
+                    if uid == Some(pick.doc) && !followed {
                         // Undone or redone meanwhile: the click was about
                         // another state (never recorded over it, nor over
                         // the redo list). The steps of earlier picks (a
@@ -585,7 +588,12 @@ impl AtelierApp {
     }
 
     /// Combines the object found with the selection.
-    fn apply_object(&mut self, mask: Result<Option<Mask>, String>, shift: bool, alt: bool) {
+    fn apply_object(
+        &mut self,
+        mask: Result<Option<Mask>, crate::ai::Error>,
+        shift: bool,
+        alt: bool,
+    ) {
         let Some(canvas) = self.doc.as_ref().map(Document::full_rect) else {
             return;
         };
@@ -955,7 +963,7 @@ mod tests {
     /// Masks as the worker would give them, for picks made at `generation`.
     fn picks_done(
         app: &mut AtelierApp,
-        generation: u64,
+        generation: crate::document::HistoryGeneration,
         masks: &[(PixelRect, bool)],
     ) -> mpsc::Sender<Done> {
         let doc = app.doc.as_ref().unwrap();
@@ -1023,6 +1031,24 @@ mod tests {
         app.poll_object_select();
         assert!(app.selection.is_none());
         assert_eq!(app.status, t!("hist5-selection-undone"));
+    }
+
+    /// QA6: a step that changed nothing discarded meanwhile (a cancelled
+    /// dialog) doesn't drop the click.
+    #[test]
+    fn a_click_survives_a_discarded_step() {
+        let mut harness = app_with(image::RgbaImage::new(64, 64));
+        let app = harness.state_mut();
+        app.tool = Tool::ObjectSelect;
+        let d = app.doc.as_mut().unwrap();
+        let generation = d.history_generation();
+        d.checkpoint("Gaussian Blur".into());
+        d.discard_step();
+        let a = PixelRect { x: 2, y: 2, w: 10, h: 10 };
+        let _send = picks_done(app, generation, &[(a, false)]);
+        app.poll_object_select();
+        assert_eq!(app.selection.as_ref().map(|s| s.rect), Some(a));
+        assert!(app.status.is_empty(), "{}", app.status);
     }
 
     /// The same through the real model: a click, then a Shift+click right

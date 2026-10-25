@@ -562,16 +562,33 @@ pub fn artboard_file_stem(name: &str, used: &mut Vec<String>) -> String {
 
 /// The file names `names` (with `prefix`) are exported to in `folder`
 /// with extension `ext`, those that exist: replaced, or kept with the
-/// new files numbered (see [`artboard_path`]).
-pub fn existing_artboard_files(folder: &Path, prefix: &str, names: &[String], ext: &str) -> usize {
+/// new files numbered (see [`artboard_path`]). Those `open` in a tab are
+/// not counted: never replaced, they are kept either way.
+pub fn existing_artboard_files(
+    folder: &Path,
+    prefix: &str,
+    names: &[String],
+    ext: &str,
+    open: &[PathBuf],
+) -> usize {
     let mut used = Vec::new();
     names
         .iter()
         .filter(|name| {
             let stem = artboard_file_stem(&format!("{prefix}{name}"), &mut used);
-            folder.join(format!("{stem}.{ext}")).exists()
+            let path = folder.join(format!("{stem}.{ext}"));
+            path.exists() && !is_open(&path, open)
         })
         .count()
+}
+
+/// `path` is one of the files `open` (spelled otherwise, maybe).
+fn is_open(path: &Path, open: &[PathBuf]) -> bool {
+    open.iter().any(|p| {
+        p == path
+            || std::fs::canonicalize(p)
+                .is_ok_and(|p| std::fs::canonicalize(path).is_ok_and(|q| p == q))
+    })
 }
 
 /// The file `stem`.`ext` in `folder`: replaced if `replace` and not one
@@ -586,12 +603,7 @@ pub fn artboard_path(
     open: &[PathBuf],
 ) -> PathBuf {
     let mut path = folder.join(format!("{stem}.{ext}"));
-    let same = |p: &PathBuf| {
-        *p == path
-            || std::fs::canonicalize(p)
-                .is_ok_and(|p| std::fs::canonicalize(&path).is_ok_and(|q| p == q))
-    };
-    if replace && !open.iter().any(same) {
+    if replace && !is_open(&path, open) {
         used.push(path_stem(&path));
         return path;
     }
@@ -792,10 +804,10 @@ mod tests {
         };
         let which = doc.artboards();
         let names: Vec<String> = which.iter().map(|&i| doc.layers[i].name.clone()).collect();
-        assert_eq!(existing_artboard_files(&folder, "doc_", &names, "png"), 0);
+        assert_eq!(existing_artboard_files(&folder, "doc_", &names, "png", &[]), 0);
         let written = doc.export_artboards_later(&which, files.clone())().unwrap();
         assert_eq!(written.len(), 2);
-        assert_eq!(existing_artboard_files(&folder, "doc_", &names, "png"), 2);
+        assert_eq!(existing_artboard_files(&folder, "doc_", &names, "png", &[]), 2);
         // Again: numbered, the first files kept.
         let again = doc.export_artboards_later(&which, files.clone())().unwrap();
         assert!(again.iter().all(|p| !written.contains(p) && p.exists()));
@@ -807,7 +819,10 @@ mod tests {
         };
         let replaced = doc.export_artboards_later(&which, replace.clone())().unwrap();
         assert_eq!(replaced, written);
-        // A file open in a tab is never replaced: numbered instead.
+        // A file open in a tab is never replaced: numbered instead, and
+        // not counted among those Replace would replace.
+        let tab = std::slice::from_ref(&written[0]);
+        assert_eq!(existing_artboard_files(&folder, "doc_", &names, "png", tab), 1);
         let open = ArtboardFiles {
             open: vec![written[0].clone()],
             ..replace

@@ -61,7 +61,7 @@ pub(super) struct PaintTools {
     /// to rasterize it first.
     pub rasterize_confirm: Option<u64>,
     /// The command that asked it (a fill, a clear…): run once rasterized.
-    pub rasterize_then: Option<Action>,
+    pub rasterize_then: Option<super::Then>,
     /// Alt + right drag under way: where it started (screen), and the size
     /// and hardness then.
     size_drag: Option<(Pos2, f32, f32)>,
@@ -610,20 +610,26 @@ impl AtelierApp {
     /// Before `action` changes the pixels of a text or shape layer (a
     /// fill, a clear): asks to rasterize it first, and runs it then.
     pub(super) fn rasterize_first(&mut self, action: Action) -> bool {
+        // Clear and Cut do nothing without a selection.
+        let needs_selection = matches!(action, Action::ClearSelection | Action::Cut);
+        if needs_selection && self.selection.is_none() {
+            return false;
+        }
+        self.rasterize_then(move |app| app.run(action))
+    }
+
+    /// Before `then` changes the pixels of a text or shape layer (Fill…,
+    /// a color made transparent): asks to rasterize it first, and runs
+    /// `then` once rasterized. Returns whether it asks.
+    pub(super) fn rasterize_then(&mut self, then: impl FnOnce(&mut Self) + 'static) -> bool {
         let Some(doc) = &self.doc else { return false };
         let layer = doc.active_layer();
         let vector = layer.text.is_some() || layer.shape.is_some();
-        // Clear and Cut do nothing without a selection.
-        let needs_selection = matches!(action, Action::ClearSelection | Action::Cut);
-        if !vector
-            || doc.quick_mask().is_some()
-            || doc.mask_targeted()
-            || (needs_selection && self.selection.is_none())
-        {
+        if !vector || doc.quick_mask().is_some() || doc.mask_targeted() {
             return false;
         }
         self.paint.rasterize_confirm = Some(layer.id);
-        self.paint.rasterize_then = Some(action);
+        self.paint.rasterize_then = Some(Box::new(then));
         true
     }
 
@@ -716,8 +722,8 @@ impl AtelierApp {
         let then = self.paint.rasterize_then.take_if(|_| out.ok || out.cancel);
         if out.ok {
             self.run(Action::Rasterize);
-            if let Some(action) = then {
-                self.run(action);
+            if let Some(then) = then {
+                then(self);
             }
         }
     }

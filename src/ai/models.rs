@@ -158,13 +158,28 @@ impl Model {
     /// a run of the program that stopped while downloading).
     pub fn remove_orphans(self) {
         for f in self.files() {
-            remove_orphans(&self.path(f.name));
+            let path = self.path(f.name);
+            remove_orphans(&path);
+            remove_orphan_mark(&path);
         }
     }
 
-    /// Bytes of its files present on disk.
+    /// Bytes of its files present on disk (partial downloads, not the
+    /// marks of the files checked: alone, they leave it "not downloaded").
     pub fn size_on_disk(self) -> u64 {
-        self.files_on_disk().iter().map(|(_, len)| len).sum()
+        bytes_on_disk(&self.files_on_disk())
+    }
+
+    /// Why a file of it at `path` could not be used, it being damaged and
+    /// now removed: what to do next. The fills go on without LaMa, so its
+    /// download is not offered at the next use: it is said where to get it.
+    pub fn damaged_message(path: &Path) -> String {
+        let inpaint = Model::Inpaint;
+        if inpaint.files().iter().any(|f| inpaint.path(f.name) == path) {
+            t!("fx6-ai-inpaint-damaged")
+        } else {
+            t!("fx4-ai-model-damaged")
+        }
     }
 
     /// Removes its files from the computer, after freeing its sessions
@@ -455,6 +470,28 @@ fn mark_of(path: &Path) -> PathBuf {
 
 const CHECKED_MARK: &str = ".checked";
 
+/// `path` is a [`mark_of`] a model file.
+fn is_mark(path: &Path) -> bool {
+    path.to_str().is_some_and(|p| p.ends_with(CHECKED_MARK))
+}
+
+/// Bytes of the files `found` (see [`files_in`]), without the marks.
+fn bytes_on_disk(found: &[(PathBuf, u64)]) -> u64 {
+    found
+        .iter()
+        .filter(|(path, _)| !is_mark(path))
+        .map(|(_, len)| len)
+        .sum()
+}
+
+/// Removes the mark of the model file `path` once the file is gone
+/// (deleted by hand).
+fn remove_orphan_mark(path: &Path) {
+    if !path.exists() {
+        let _ = std::fs::remove_file(mark_of(path));
+    }
+}
+
 /// Size and modification time of a file.
 fn stamp(path: &Path) -> Option<String> {
     let m = std::fs::metadata(path).ok()?;
@@ -611,6 +648,15 @@ fn download_file(
 /// Models folder: `%LOCALAPPDATA%\Atelier\modeles` on Windows,
 /// `~/.cache/atelier` elsewhere.
 pub fn root() -> PathBuf {
+    // Tests never see (or change) the user's models: only those of
+    // `XDG_CACHE_HOME` when it is given, else none.
+    #[cfg(test)]
+    {
+        let cache = std::env::var_os("XDG_CACHE_HOME")
+            .map_or_else(|| std::env::temp_dir().join("atelier-tests"), PathBuf::from);
+        return cache.join("atelier");
+    }
+    #[allow(unreachable_code)]
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         return PathBuf::from(local).join("Atelier").join("modeles");
     }
@@ -854,6 +900,37 @@ mod tests {
         let files = [file("", 2, "")];
         let found = files_in(&dir, &files);
         assert_eq!(found.iter().map(|(_, len)| len).sum::<u64>(), 42);
+    }
+
+    /// The mark of a file checked is listed (Delete removes it) but
+    /// doesn't count on disk: alone, the model is "not downloaded". Once
+    /// its file is gone, it is removed.
+    #[test]
+    fn checked_marks_do_not_count_on_disk() {
+        let dir = temp_dir("marks");
+        let path = dir.join("model.onnx");
+        std::fs::write(mark_of(&path), b"26 bytes of a stamp here..").unwrap();
+        let files = [file("", 2, "")];
+        let found = files_in(&dir, &files);
+        assert_eq!(found.len(), 1, "listed, for Delete");
+        assert_eq!(bytes_on_disk(&found), 0);
+        std::fs::write(&path, [0u8; 2]).unwrap();
+        assert_eq!(bytes_on_disk(&files_in(&dir, &files)), 2);
+        remove_orphan_mark(&path);
+        assert!(mark_of(&path).exists(), "kept beside its file");
+        std::fs::remove_file(&path).unwrap();
+        remove_orphan_mark(&path);
+        assert!(!mark_of(&path).exists(), "removed with its file gone");
+    }
+
+    /// A damaged LaMa file isn't offered for download at the next use (the
+    /// fills go on without it): the message says where to get it.
+    #[test]
+    fn a_damaged_inpaint_model_says_where_to_download_it() {
+        let lama = Model::Inpaint.path(Model::Inpaint.files()[0].name);
+        assert_eq!(Model::damaged_message(&lama), t!("fx6-ai-inpaint-damaged"));
+        let sam = Model::Objects.path(Model::Objects.files()[0].name);
+        assert_eq!(Model::damaged_message(&sam), t!("fx4-ai-model-damaged"));
     }
 
     #[test]

@@ -303,14 +303,17 @@ pub(super) fn smart_of(
     };
     s.link = e.link.map(|l| {
         // A network path a received file names is not visited on opening
-        // (Windows would connect to that host): missing until updated.
+        // (Windows would connect to that host): not looked at until
+        // updated, or edited.
         let exists = |p: &Path| !remote(p) && p.exists();
         let path = match (&l.relative, folder) {
             (Some(r), Some(f)) if !exists(&l.path) && exists(&f.join(r)) => f.join(r),
             _ => l.path,
         };
         Link {
-            missing: !exists(&path),
+            missing: !remote(&path) && !path.exists(),
+            // Its first look says it is missing, if it is.
+            unchecked: true,
             modified: l
                 .modified
                 .and_then(|(s, n)| UNIX_EPOCH.checked_add(Duration::new(s, n.min(999_999_999)))),
@@ -321,8 +324,7 @@ pub(super) fn smart_of(
         let filter = match (f.filter, &f.liquify, f.camera_raw) {
             (Some(filter), ..) => SmartFilterKind::Filter(filter),
             (None, Some(name), _) => {
-                let data = read_entry(zip, name, MAX_CONTENTS.min(claims.budget.left()))?;
-                claims.budget.take_bytes(data.len() as u64)?;
+                let data = claims.bytes(zip, name, MAX_MESH, DEFLATE_RATIO)?;
                 let mesh = Mesh::from_bytes(&data);
                 SmartFilterKind::Liquify(Arc::new(mesh.ok_or(FileError::Damaged)?))
             }
@@ -352,6 +354,10 @@ pub(super) fn smart_of(
 
 /// Read limit of an embedded document.
 const MAX_CONTENTS: u64 = 16 << 30;
+
+/// Read limit of a Liquify mesh: the largest mesh's offsets (64 MB),
+/// deflated, and its header.
+const MAX_MESH: u64 = 65 << 20;
 
 #[cfg(test)]
 mod tests {

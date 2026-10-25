@@ -580,26 +580,27 @@ impl AtelierApp {
                 });
                 // French labels are wider: the buttons wrap rather than
                 // widen the window past its title bar.
+                // Reporting is what a user comes for: the main button.
                 ui.horizontal_wrapped(|ui| {
+                    report = ui_kit::button_with_icon(
+                        ui,
+                        Some(icon::BUG),
+                        &t!("ui4-diag-report"),
+                        Kind::Primary,
+                        None,
+                        true,
+                    )
+                    .on_hover_text(t!("ui4-diag-report-tip"))
+                    .clicked();
                     let copy_label = t!("diag-copy");
                     copy = ui_kit::button_with_icon(
                         ui,
                         Some(icon::COPY),
                         &copy_label,
-                        Kind::Primary,
-                        None,
-                        true,
-                    )
-                    .clicked();
-                    report = ui_kit::button_with_icon(
-                        ui,
-                        Some(icon::BUG),
-                        &t!("ui4-diag-report"),
                         Kind::Normal,
                         None,
                         true,
                     )
-                    .on_hover_text(t!("ui4-diag-report-tip"))
                     .clicked();
                     open_logs = ui_kit::button_with_icon(
                         ui,
@@ -610,15 +611,8 @@ impl AtelierApp {
                         true,
                     )
                     .clicked();
-                    clear = ui_kit::button_with_icon(
-                        ui,
-                        Some(icon::BROOM),
-                        &t!("diag-clear"),
-                        Kind::Normal,
-                        None,
-                        true,
-                    )
-                    .clicked();
+                    // Rarely needed: an icon, named by its tooltip.
+                    clear = ui_kit::icon_button(ui, icon::BROOM, &t!("diag-clear"), true).clicked();
                 });
                 let count = |label: String, n: usize| match n {
                     0 => label,
@@ -1913,6 +1907,72 @@ mod tests {
         assert!(rect.height() >= 600.0 - 40.0 - 46.0 - 28.0 - 40.0, "{rect:?}");
         // The title bar as wide as the window (its ✕ at the right edge).
         assert!(rect.width() <= WIDTH + 40.0, "{rect:?}");
+    }
+
+    /// At the smallest window (660 px), the window fits: its title and ✕
+    /// stay in sight; the buttons hold on one row in French.
+    #[test]
+    fn the_smallest_window_shows_its_close_button() {
+        for lang in [Lang::En, Lang::Fr] {
+            i18n::set_lang(lang);
+            let mut h = Harness::builder()
+                .with_size([660.0, 500.0])
+                .build_eframe(|cc| AtelierApp::new(cc, None));
+            h.run_steps(2);
+            h.state_mut()
+                .run(Action::Workspace(workspace::Command::Diagnostics));
+            h.run_steps(4);
+            let screen = h.ctx.content_rect();
+            let rect = h
+                .ctx
+                .memory(|m| m.area_rect(egui::Id::new("diagnostics")))
+                .expect("shown");
+            let report = h.get_by_label(&t!("ui4-diag-report")).rect();
+            let logs = h.get_by_label(&t!("diag-open-logs")).rect();
+            i18n::set_lang(Lang::En);
+            assert!(
+                screen.contains_rect(rect),
+                "{lang:?}: {rect:?} in {screen:?}"
+            );
+            assert!(
+                rect.contains_rect(report) && rect.contains_rect(logs),
+                "{lang:?}"
+            );
+        }
+        i18n::set_lang(Lang::Fr);
+        let mut h = Harness::builder()
+            .with_size([1024.0, 700.0])
+            .build_eframe(|cc| AtelierApp::new(cc, None));
+        h.run_steps(2);
+        h.state_mut()
+            .run(Action::Workspace(workspace::Command::Diagnostics));
+        h.run_steps(4);
+        let report = h.get_by_label(&t!("ui4-diag-report")).rect();
+        let clear = h.get_by_label(&t!("diag-clear")).rect();
+        i18n::set_lang(Lang::En);
+        assert!(
+            (report.center().y - clear.center().y).abs() < 2.0,
+            "one row"
+        );
+    }
+
+    /// One slow refresh is said in the singular.
+    #[test]
+    fn the_rendering_card_counts_in_the_singular() {
+        for lang in [Lang::En, Lang::Fr] {
+            i18n::set_lang(lang);
+            let one = t!("diag-card-rendering-detail", max = 4, level = 0, over = 1);
+            let two = t!("diag-card-rendering-detail", max = 4, level = 0, over = 2);
+            i18n::set_lang(Lang::En);
+            assert!(
+                !one.contains("refreshes") && !one.contains("rafraîchissements lents"),
+                "{one}"
+            );
+            assert!(
+                two.contains("refreshes") || two.contains("rafraîchissements lents"),
+                "{two}"
+            );
+        }
     }
 
     /// In French, the window names operations and freezes in French; the

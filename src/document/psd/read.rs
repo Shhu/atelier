@@ -101,7 +101,8 @@ struct Resources {
     animation: bool,
     spot: bool,
     variables: bool,
-    other: bool,
+    /// Resources not known, by id.
+    other: Vec<u16>,
 }
 
 /// Image resources that describe the document rather than its layers,
@@ -110,19 +111,22 @@ struct Resources {
 /// URL, global light, spot halftone, document ids, slices, URL list, EXIF,
 /// caption digest, XMP, print scale, pixel aspect ratio, HDR toning,
 /// color samplers, measurement scale, Count tool, print style, clipping
-/// path, Lightroom workflow, print flags.
-const KEPT: [u16; 35] = [
+/// path, Lightroom workflow, print flags; border, the halftoning and
+/// transfer functions of the other modes, dot range, EPS options, JPEG
+/// quality, watermark, workflow URL, jump to XPEP.
+const KEPT: [u16; 46] = [
     1005, 1008, 1010, 1011, 1013, 1016, 1028, 1034, 1035, 1037, 1042, 1043, 1044, 1049, 1050, 1054,
     1058, 1059, 1060, 1061, 1062, 1064, 1070, 1071, 1073, 1074, 1080, 1082, 1083, 1084, 1085, 2999,
-    3000, 8000, 10000,
+    3000, 8000, 10000, 1009, 1012, 1014, 1015, 1017, 1019, 1021, 1030, 1040, 1051, 1052,
 ];
 
 /// Image resources Atelier writes its own of, or that only describe the
 /// file as it was (its thumbnail, version, quick mask, layer and channel
-/// bookkeeping): left out without loss.
-const REWRITTEN: [u16; 21] = [
+/// bookkeeping, the duotone colors of a mode converted, obsolete ones):
+/// left out without loss.
+const REWRITTEN: [u16; 27] = [
     1000, 1001, 1002, 1003, 1004, 1022, 1026, 1033, 1036, 1041, 1046, 1047, 1057, 1066, 1069, 1072,
-    1076, 1078, 1086, 1087, 1088,
+    1076, 1078, 1086, 1087, 1088, 1018, 1020, 1023, 1027, 1029, 1038,
 ];
 
 /// The frames of a frame animation (plug-in resource "mani", block
@@ -200,8 +204,15 @@ fn resources(r: &mut Reader) -> Result<Resources> {
                 out.thumbnail = Some(d.bytes(len - 28)?.to_vec());
             }
             1065 => out.comps = true,
-            1007 | 1077 => out.spot |= has_spot(id, raw),
-            1067 => out.spot = true,
+            1007 => out.spot |= has_spot(id, raw),
+            // The alpha channels' display settings, given back to them.
+            1077 => {
+                out.spot |= has_spot(id, raw);
+                out.kept.push(kept());
+            }
+            // Alternate spot colors: version, count, then the colors
+            // (Photoshop writes it empty too).
+            1067 => out.spot |= raw.get(2..4).is_none_or(|n| n != [0u8, 0]),
             // A frame animation (and its timeline) names its layers.
             1075 => out.animation = true,
             // Photoshop's animation data: one frame is just the layers.
@@ -213,7 +224,8 @@ fn resources(r: &mut Reader) -> Result<Resources> {
             _ if KEPT.contains(&id) => out.kept.push(kept()),
             _ if REWRITTEN.contains(&id) => {}
             // Never silently: what isn't known is a loss.
-            _ => out.other = true,
+            _ if out.other.contains(&id) => {}
+            _ => out.other.push(id),
         }
     }
     if out.alpha_names.is_empty() {
@@ -763,7 +775,7 @@ impl Notes {
             ),
             (
                 &self.smart,
-                t!("xchg-psd-note-smart", names = list(&self.smart)),
+                t!("ui6-psd-note-smart-objects", names = list(&self.smart)),
             ),
             (
                 &self.vector,
@@ -912,6 +924,7 @@ fn merged_planes(f: &File, wanted: &[usize]) -> Result<Vec<Vec<u8>>> {
 }
 
 /// Reads a Photoshop document from its bytes.
+#[cfg(test)]
 pub(super) fn document(data: &[u8]) -> Result<Imported> {
     document_within(data, Budget::new())
 }
@@ -922,9 +935,13 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
     let f = parse(data)?;
     let h = &f.header;
     check_size(h.width, h.height)?;
+    // A layer decodes as its planes (one at the file's depth at a time,
+    // each kept in 8 bits) and its RGBA image: about 2 × its pixels.
+    let depth = u64::from(h.depth).div_ceil(8).max(1);
     for rec in &f.records {
         let (w, ht) = size(rec.rect);
-        budget.take(w, ht, 4)?;
+        let planes = rec.channels.iter().filter(|(id, _)| *id >= -1).count() as u64;
+        budget.take(w, ht, 4 + planes + depth)?;
         if let Some(m) = &rec.mask {
             let (w, ht) = size(m.rect);
             budget.take(w, ht, 1)?;
@@ -939,7 +956,11 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
         }
     }
     // The merged image's channels (the alpha channels, or the flat image).
-    budget.take(h.width, h.height, u64::from(h.channels).max(4))?;
+    budget.take(
+        h.width,
+        h.height,
+        (u64::from(h.channels) * (depth + 1)).max(4),
+    )?;
     if h.mode == MULTICHANNEL && h.channels < 3 {
         return Err(FileError::NotPsd);
     }
@@ -1197,6 +1218,10 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
     }
     .map(Arc::new);
     doc.file_metadata.psd_resources = Arc::new(f.resources.kept.clone());
+    doc.file_metadata.psd_layout = Some(crate::document::PsdLayout {
+        canvas,
+        channels: doc.channels.iter().map(|c| c.name.clone()).collect(),
+    });
     if f.resources.comps {
         notes.lines.push(t!("files4-psd-note-comps"));
     }
@@ -1204,12 +1229,17 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
         (f.resources.animation, t!("files5-psd-note-animation")),
         (f.resources.spot, t!("files5-psd-note-spot")),
         (f.resources.variables, t!("files5-psd-note-variables")),
-        (f.resources.other, t!("files5-psd-note-other")),
     ];
+    let other = &f.resources.other;
+    let other = (!other.is_empty()).then(|| {
+        let ids: Vec<String> = other.iter().map(u16::to_string).collect();
+        t!("files6-psd-note-other", ids = ids.join(", "))
+    });
     notes.lines.extend(
         lost.into_iter()
             .filter(|(lost, _)| *lost)
-            .map(|(_, note)| note),
+            .map(|(_, note)| note)
+            .chain(other),
     );
     doc.mark_saved();
     Ok(Imported {

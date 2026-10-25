@@ -55,7 +55,7 @@ pub fn reduction(size: (u32, u32), hole: &[bool]) -> f32 {
 /// It sees a square around the hole, twice its size where the image
 /// allows, reduced to its size (its proportions kept, the rest of its
 /// square the edge repeated).
-pub fn inpaint(image: &RgbaImage, hole: &[bool]) -> Result<RgbaImage, String> {
+pub fn inpaint(image: &RgbaImage, hole: &[bool]) -> Result<RgbaImage, super::Error> {
     let (w, h) = image.dimensions();
     let Some([x0, y0, cw, ch]) = seen((w, h), hole) else {
         return Ok(image.clone());
@@ -106,7 +106,7 @@ pub fn inpaint(image: &RgbaImage, hole: &[bool]) -> Result<RgbaImage, String> {
         Ok(values.to_vec())
     })?;
     if painted.len() < 3 * n {
-        return Err(t!("ai-error-model-corrupt"));
+        return Err(super::Error::of(|| t!("ai-error-model-corrupt")));
     }
     // Output in 0..255.
     let out = RgbImage::from_fn(SIZE, SIZE, |x, y| {

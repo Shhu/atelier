@@ -1600,7 +1600,7 @@ xchg-gradient-edit-tip = Click to edit the gradient
 xchg-file-filter-psd = PSD document
 xchg-file-error-not-psd = Not a PSD document, or one this version can't read.
 xchg-export-psd-hint = Layers, masks, groups, adjustment and fill layers and layer styles are kept, with the flattened image.
-xchg-status-opened-simplified = Opened: { $path } — { $notes }
+xchg-status-opened-simplified = Opened: { $path } — not kept: { $notes }
 xchg-status-saved-simplified = Saved: { $path } — { $notes }
 xchg-status-exported-simplified = Exported: { $path } — { $notes }
 xchg-psd-alpha-name = Alpha { $number }
@@ -1611,14 +1611,14 @@ xchg-psd-mode-cmyk = CMYK
 xchg-psd-mode-multichannel = Multichannel
 xchg-psd-mode-duotone = Duotone
 xchg-psd-mode-lab = Lab
-xchg-psd-note-depth = { $bits }-bit channels converted to 8 bits
-xchg-psd-note-mode = { $mode } converted to RGB
-xchg-psd-note-text = type layers as pixels: { $names }
+xchg-psd-note-depth = the { $bits }-bit depth (8 bits per channel here)
+xchg-psd-note-mode = the { $mode } mode (RGB here)
+xchg-psd-note-text = the editable type of { $names }
 xchg-psd-note-smart = smart objects as pixels: { $names }
-xchg-psd-note-vector = vector masks rasterized: { $names }
-xchg-psd-note-shapes = shape strokes left out: { $names }
-xchg-psd-note-styles = layer styles simplified: { $names }
-xchg-psd-note-dropped = not supported, left out: { $names }
+xchg-psd-note-vector = the vector masks of { $names }
+xchg-psd-note-shapes = the shape strokes of { $names }
+xchg-psd-note-styles = some layer style settings of { $names }
+xchg-psd-note-dropped = the unsupported layers { $names }
 xchg-psd-note-channels = { $count ->
         [one] one alpha channel left out (56 channels at most)
        *[other] { $count } alpha channels left out (56 channels at most)
@@ -1764,7 +1764,10 @@ smart-status-placed = Placed: { $path }
 smart-status-replaced = Contents replaced: { $path }
 smart-status-updated = Smart object updated: { $name }
 smart-status-parent-gone = The smart object's document is closed: save these contents as a file.
-smart-status-link-missing = Linked files missing, their last copy shown: { $names }
+smart-status-link-missing = { $count ->
+    [one] { $count } linked file missing, its last copy shown: { $names }
+   *[other] { $count } linked files missing, their last copies shown: { $names }
+}
 smart-status-links-updated = Linked files updated: { $names }
 
 ## Filter › Liquify: the workspace and its tools
@@ -2055,7 +2058,7 @@ raw-window-title = Camera Raw
 raw-open = Open
 raw-developing = Developing
 raw-file-filter = Camera Raw
-raw-note-preview-only = its RAW data can't be read: the camera's embedded preview (8 bits) is used
+raw-note-preview-only = its RAW data, which can't be read: the camera's embedded 8-bit preview is used instead
 raw-preview-tip = Drag to move around; double-click to zoom to 100% or fit.
 raw-zoom-fit = Fit
 raw-zoom-fit-tip = Fit in View
@@ -2331,7 +2334,7 @@ input3-hint-selected-layers = the selected layers
 
 files3-quoted-name = "{ $name }"
 files3-psd-note-shapes = shape layers saved as pixels: { $names }
-files3-status-psd-would-lose = This PSD file can't be saved again without changes ({ $notes }). Save as an Atelier document to keep everything.
+files3-status-psd-would-lose = This PSD file can't be saved again without changes: it would lose { $notes }. Save as an Atelier document to keep everything.
 files3-dialog-save-as-lossy = Save As (an Atelier document keeps everything)
 
 ## Clipboard
@@ -2494,7 +2497,7 @@ diag-card-frame-detail = max { $max } over the last minute · { $frames ->
 }
 diag-card-freezes = Freezes (1 min)
 diag-card-freezes-detail = { $total } in total · max { $max } · { $five } in the last 5 min
-diag-card-memory = Process memory
+diag-card-memory = Memory used by Atelier
 diag-card-history = History memory
 diag-card-history-detail = of { $budget } for all tabs · { $steps ->
     [one] { $steps } step
@@ -2511,7 +2514,10 @@ diag-card-rendering-value = { $tiles ->
     [one] { $tiles } tile
    *[other] { $tiles } tiles
 }
-diag-card-rendering-detail = max { $max } per frame · { $over } slow refreshes (1 min)
+diag-card-rendering-detail = max { $max } per refresh · { $over ->
+    [one] { $over } slow refresh
+   *[other] { $over } slow refreshes
+} (1 min)
 diag-card-jobs = Background jobs
 diag-card-jobs-none = None running
 diag-card-ai = AI processing
@@ -2613,7 +2619,7 @@ diag-sys-since = Measures since
 
 files4-note-frames = the animation's other frames
 files4-note-pages = the other pages
-files4-psd-note-comps = layer comps left out
+files4-psd-note-comps = the layer comps
 
 ## Layers: delete
 tools4-status-last-layer = Could not delete: a document keeps at least one layer.
@@ -2655,7 +2661,10 @@ fx4-raw-open-failed = { $name } could not be developed: nothing was opened.
 fx4-ai-model-damaged = model file damaged: it was removed and will be downloaded again at the next use
 
 ## Linked smart objects: Edit Contents, files read again
-smart4-status-link-unreadable = Linked files that could not be read show their last copy: { $names }
+smart4-status-link-unreadable = { $count ->
+    [one] { $count } linked file could not be read and shows its last copy: { $names }
+   *[other] { $count } linked files could not be read and show their last copies: { $names }
+}
 smart4-status-link-saved = Saved in { $name }: the smart objects linked to it follow.
 smart4-status-link-saved-flat = Saved in { $name } with its layers merged: the smart objects linked to it follow. This tab keeps the layers until closed.
 smart4-status-updated-embedded = Smart object updated and embedded (its linked file is missing): { $name }
@@ -2679,8 +2688,8 @@ smart4-artboards-keep-both = Keep Both
 
 ## Help > Diagnostics: memory card
 
-perf4-diag-memory-detail = private { $private }, display copies { $display }
-perf4-diag-memory-display = display copies { $display }
+perf4-diag-memory-detail = { $private } of its own · { $display } for the display
+perf4-diag-memory-display = { $display } for the display
 
 ## Window menu: the side panel
 ui4-menu-layers-properties = Layers and Properties
@@ -2781,7 +2790,7 @@ ui4-diag-tip-freezes = Moments when the window stopped responding for more than 
 ui4-diag-tip-memory = Memory the program uses, including what it shares with other programs.
 ui4-diag-tip-history = Memory kept to undo, for all the open documents; beyond the budget, the oldest steps are dropped.
 ui4-diag-tip-documents = Open documents, the largest one and the layers they hold.
-ui4-diag-tip-rendering = Pieces of the image drawn per refresh. A size level above 0 shows a reduced copy while you zoom out.
+ui4-diag-tip-rendering = Pieces of the image drawn per refresh, and the refreshes that took too long in the last minute.
 ui4-diag-tip-jobs = Work done without blocking the window (filters, AI, saving…).
 ui4-diag-tip-ai = Where the AI models ran: the graphics card or the processor.
 ui4-diag-tip-color = The document's color profile and the monitor's.
@@ -2810,19 +2819,18 @@ files5-error-out-of-memory = opening it would take more memory than this compute
 ## What saving over a file in its format would lose
 
 files5-psd-note-animation = the frame animation
-files5-psd-note-spot = the spot colors (kept as alpha channels)
+files5-psd-note-spot = the spot colors, kept as alpha channels
 files5-psd-note-variables = the variables and data sets
-files5-psd-note-other = other data this app doesn't read
-files5-note-images = the other images it holds (HDR gain map, previews)
+files5-note-images = the other images it holds, such as an HDR gain map or previews
 files5-note-xmp = its XMP or IPTC metadata
 files5-note-exif = its EXIF metadata
-files5-note-other-apps = data other apps stored in it (layers, image resources)
+files5-note-other-apps = data other apps stored in it, such as layers or image resources
 files5-status-batch-would-lose = "{ $name }" would lose: { $notes }. Left as it is.
 
 ## Quick Mask: notice in the options bar
 
 sel5-options-quick-mask = Quick Mask
-sel5-options-quick-mask-tip = Every tool edits the selection, not the layer: paint with black to mask, with white to select. Click or press { $key } to finish.
+sel5-options-quick-mask-tip = Tools edit the selection, not the layer (the Type and shape tools are unavailable): paint with black to mask, with white to select. Click or press { $key } to finish.
 
 ## Object Selection
 
@@ -2867,7 +2875,6 @@ ui5-palette-keywords-visibility = visibility eye show hide
 ui5-palette-keywords-object-select = quick selection
 ui5-palette-keywords-actions = macro record
 ui5-palette-keywords-undo = step backward back
-ui5-palette-keywords-language = english french
 ui5-palette-keywords-desaturate = desaturate
 ui5-palette-keywords-scale = resize
 ui5-palette-keywords-save-for-web = save for web
@@ -2887,5 +2894,132 @@ ui5-shortcuts-cycle-note = Shift with a tool's key picks the next tool of its gr
 ui5-drop-place-hint = Drop to place in this image. To open in a tab of its own: File › Open ({ $key }).
 
 ## Quick Mask: moving the mask
-qm6-status-moved = Quick Mask moved by { $x }, { $y }
+qm6-status-moved = Quick Mask moved by ({ $x }, { $y })
 qm6-quick-mask-name = Quick Mask
+
+## Select Subject computed in the background
+hist6-subject-searching-again = The image changed during the search: finding the subject again…
+
+## Files needing more memory than is free
+
+files6-error-low-memory = opening it needs more memory than is free now (about { $free } GB)
+files6-open-anyway-title = Open Anyway?
+files6-open-anyway-text = "{ $name }" needs more memory than is free now (about { $free } GB). Opening it may slow the computer down while other programs give memory back, and may fail if they can't.
+files6-open-anyway-ok = Open Anyway
+files6-status-open-cancelled = "{ $name }" was not opened.
+
+## What saving over a file in its format would lose
+
+files6-psd-note-other = data this app doesn't read (resources { $ids })
+files6-psd-note-placed = the slices, color samplers and Count marks placed before the canvas size changed
+
+## Quick Mask: tools that make layers
+
+sel6-status-quick-mask-no-layers = Quick Mask: Type and shapes make layers, not a selection. Press { $key } to finish first.
+
+## Quick Mask: Properties
+
+sel6-side-transform-quick-mask = Transform (Quick Mask)
+
+## Select and Mask: locked layer
+
+sel6-mask-layer-locked = The layer is locked: its mask can't be changed. Choose another output.
+
+## Edit Contents saved while its linked file, missing then, is back
+smart6-link-back = { $name } is back: the smart object follows it again, and these edits would be lost. Embed them in the smart object (it is then no longer linked to { $name }), or save them as a file.
+smart6-link-back-embed = Embed Edits
+smart6-status-contents-gone = The smart object of these contents is no longer in its document: save them as a file.
+
+## Linked files: looked for
+smart6-busy-link-look = Looking for { $name }
+smart6-alert-links-not-found = { $count ->
+    [one] Linked file not found: { $names }. The smart object shows its last copy; Update Modified Content looks again once it is back.
+   *[other] { $count } linked files not found: { $names }. The smart objects show their last copy; Update Modified Content looks again once they are back.
+}
+
+## Hidden layers
+tools6-status-group-hidden = The group "{ $group }" that holds "{ $name }" is hidden: show the group to change the layer.
+tools6-status-group-hidden-filter = The group "{ $group }" that holds "{ $name }" is hidden: show the group to filter the layer.
+
+## Locked groups
+tools6-status-group-locked = "{ $name }" is in the locked group "{ $group }": unlock the group in the Layers panel.
+tools6-panel-group-lock-tip = Locked with its group "{ $group }"
+
+## Layer › Align and Distribute
+tools6-menu-align = Align
+tools6-menu-align-to-selection = Align Layers to Selection
+tools6-menu-align-top = Top Edges
+tools6-menu-align-center-v = Vertical Centers
+tools6-menu-align-bottom = Bottom Edges
+tools6-menu-align-left = Left Edges
+tools6-menu-align-center-h = Horizontal Centers
+tools6-menu-align-right = Right Edges
+tools6-menu-distribute = Distribute
+tools6-menu-distribute-h = Horizontally
+tools6-menu-distribute-v = Vertically
+tools6-side-align-to-selection = Align to selection
+
+## Command palette: entries only the palette lists
+ui6-why-already-visible = The selected layers are already visible
+ui6-why-already-hidden = The selected layers are already hidden
+
+## Command palette: other words commands are found by
+ui6-palette-keywords-english = english
+ui6-palette-keywords-french = french français
+ui6-palette-keywords-subject = select subject
+ui6-palette-keywords-invert = invert inverse negative
+ui6-palette-keywords-blending = opacity blend mode
+ui6-palette-keywords-exposure = exposure
+ui6-palette-keywords-full-screen = full screen
+ui6-palette-keywords-straighten = straighten horizon
+ui6-palette-keywords-brush = size hardness paint
+ui6-palette-keywords-eyedropper = color picker pick sample
+
+## File > Open Recent > Clear Recent File List: asked first
+ui6-clear-recent-text = Empty the list of recent files? It can't be undone. The files themselves stay where they are.
+ui6-clear-recent-ok = Clear
+
+## Options bar: the active layer is in a hidden group
+ui6-options-group-hidden = Group hidden
+
+## Levels: names of the number fields, for screen readers
+ui6-levels-input-black = Input black
+ui6-levels-input-gamma = Input gamma
+ui6-levels-input-white = Input white
+ui6-levels-output-black = Output black
+ui6-levels-output-white = Output white
+
+## A PSD file opened: what is not kept of it
+ui6-psd-note-smart-objects = the smart objects { $names }, opened as pixels
+
+## Files dragged over an open image: Atelier documents open in a tab
+ui6-drop-open-hint = Drop to open in a tab of its own.
+ui6-drop-mixed-hint = Drop to place the images in this image. Atelier documents open in a tab of their own.
+
+## Tool bar: the color squares, for screen readers
+ui6-color-foreground = Foreground Color
+ui6-color-background = Background Color
+
+## Filters, adjustments and AI models (fourth fix campaign)
+
+# Shown in parentheses inside retouch-status-ai-failed.
+fx6-ai-inpaint-damaged = model file damaged and removed; download it again in Edit › AI Models
+
+## Layer commands
+
+input6-menu-layer-via-cut = Layer via Cut
+input6-hist-layer-via-cut = Layer via Cut
+input6-menu-stamp-visible = Stamp Visible
+input6-hist-stamp-visible = Stamp Visible
+input6-status-nothing-visible = Nothing visible to stamp.
+input6-menu-desaturate = Desaturate
+input6-hist-desaturate = Desaturate
+
+## Several layers selected
+
+input6-status-layers-opacity = { $count } layers: opacity { $percent }%
+input6-status-layers-blend = { $count } layers: { $mode }
+input6-status-locked-left = { $count ->
+    [one] { $count } locked layer left as it is
+   *[other] { $count } locked layers left as they are
+}

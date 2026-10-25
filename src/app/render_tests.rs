@@ -1078,6 +1078,92 @@ fn tiles_panned_into_view_during_a_generation_show_at_once() {
     assert!(near(shown(&shot, &h, p.x as u32, p.y as u32), [r, g, b]));
 }
 
+/// A pan during a generation uncovering many tiles: those nearest the
+/// focus are composited within the frame's budget, the others show
+/// coarsely meanwhile (never holes), and come over the next frames.
+#[test]
+fn a_pan_during_a_generation_keeps_to_the_budget() {
+    let mut doc = Document::new(solid(3000, 2000, [255, 255, 255, 255]), None);
+    doc.add_layer("red".into(), solid(3000, 2000, [255, 0, 0, 255]), (0, 0));
+    for k in 0..12 {
+        doc.add_layer(format!("l{k}"), solid(3000, 2000, [0, 0, 255, 8]), (0, 0));
+    }
+    let mut h = app_with(doc, Tool::Hand, 2048);
+    h.state_mut().zoom = 1.0;
+    h.run_steps(1);
+    until_reduced(&mut h);
+    for _ in 0..20 {
+        h.run_steps(1);
+    }
+    h.state_mut().doc.as_mut().unwrap().layers[1].opacity = 0.0;
+    super::render::TEST_TILE_BUDGET.set(Some(std::time::Duration::ZERO));
+    super::render::TEST_THREADS.set(Some(1));
+    h.run_steps(1);
+    let started = h.state().generation_pending();
+    // Far, at once: many tiles uncovered.
+    super::render::TEST_UNCOVERED.set((0, 0));
+    h.state_mut().pan -= vec2(1000.0, 600.0);
+    h.run_steps(1);
+    let (uncovered, made) = super::render::TEST_UNCOVERED.get();
+    let holes = super::render::TEST_HOLES.with(std::cell::Cell::get);
+    let after = h.state().view_tiles();
+    for _ in 0..4 {
+        h.run_steps(1);
+        assert_eq!(super::render::TEST_HOLES.with(std::cell::Cell::get), 0);
+    }
+    let later = h.state().view_tiles();
+    super::render::TEST_TILE_BUDGET.set(None);
+    super::render::TEST_THREADS.set(None);
+    assert!(started, "a generation ran");
+    assert!(uncovered >= 4 && made == 1, "{made} of {uncovered} tiles in one frame");
+    assert_eq!(holes, 0, "empty tiles");
+    assert!(later >= after + 3, "the uncovered tiles come: {after} → {later}");
+}
+
+/// A large document whose masks are feathered, shown for the first time:
+/// neither its coarse view nor the view once reduced feathers them at full
+/// size on the UI thread (the level job's feathered images are shared).
+#[test]
+fn a_new_documents_feathered_masks_are_not_feathered_on_the_ui_thread() {
+    let mut h = app_with(
+        Document::new(solid(200, 100, [0, 0, 0, 255]), None),
+        Tool::Hand,
+        2048,
+    );
+    h.state_mut().zoom = 0.3;
+    h.run_steps(2);
+    let mut doc = Document::new(solid(3000, 2000, [255, 255, 255, 255]), None);
+    for k in 0..3 {
+        doc.add_layer(format!("l{k}"), solid(3000, 2000, [0, 160, 0, 255]), (0, 0));
+    }
+    let mut mask = image::GrayImage::from_pixel(3000, 2000, image::Luma([0]));
+    for y in 400..1600 {
+        for x in 500..2500 {
+            mask.put_pixel(x, y, image::Luma([255]));
+        }
+    }
+    let mut mask = crate::document::Mask::new(mask, (0, 0), 0, (0, 0));
+    mask.feather = 12.0;
+    doc.layers[3].mask = Some(mask);
+    h.state_mut().doc = Some(doc);
+    h.state_mut().pan = Vec2::ZERO;
+    crate::document::TEST_BIG_FEATHERS.set(0);
+    h.run_steps(1);
+    assert!(h.state().level_pending(), "reduced on a worker thread");
+    assert_eq!(crate::document::TEST_BIG_FEATHERS.get(), 0, "coarse view");
+    until_reduced(&mut h);
+    for _ in 0..5 {
+        h.run_steps(1);
+    }
+    assert_eq!(crate::document::TEST_BIG_FEATHERS.get(), 0, "once reduced");
+    let shot = h.render().unwrap();
+    let view = h.state().last_view.unwrap();
+    let p = view.to_image(h.ctx.content_rect().center());
+    if (600.0..2400.0).contains(&p.x) && (500.0..1500.0).contains(&p.y) {
+        assert!(near(shown(&shot, &h, p.x as u32, p.y as u32), [0, 160, 0]));
+    }
+}
+
 /// A large document shown for the first time: a coarse view of it while
 /// its reductions are made, not an empty canvas.
 #[test]

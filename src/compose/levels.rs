@@ -50,6 +50,24 @@ pub trait Sources {
         image: &Arc<GrayImage>,
         at: (i64, i64),
     ) -> Src<Luma<u8>>;
+    /// [`Self::gray`], given `reduced`: `image` already at the level (made
+    /// on a worker thread).
+    fn gray_reduced(
+        &mut self,
+        key: SourceKey,
+        version: u64,
+        image: &Arc<GrayImage>,
+        at: (i64, i64),
+        _reduced: Arc<GrayImage>,
+    ) -> Src<Luma<u8>> {
+        self.gray(key, version, image, at)
+    }
+
+    /// A rough view (see [`Sampled`]): masks are feathered at the level,
+    /// not at full size first.
+    fn coarse(&self) -> bool {
+        false
+    }
 }
 
 /// The images as they are (level 0): export, flatten, merges.
@@ -114,6 +132,10 @@ impl Sampled {
 impl Sources for Sampled {
     fn level(&self) -> u32 {
         self.0
+    }
+
+    fn coarse(&self) -> bool {
+        true
     }
 
     fn rgba(
@@ -424,6 +446,37 @@ impl Sources for LevelCache {
         Src {
             image: reduced,
             at: placed,
+        }
+    }
+
+    fn gray_reduced(
+        &mut self,
+        key: SourceKey,
+        version: u64,
+        image: &Arc<GrayImage>,
+        at: (i64, i64),
+        reduced: Arc<GrayImage>,
+    ) -> Src<Luma<u8>> {
+        let b = self.block();
+        let size = image.dimensions();
+        let fits = reduced.dimensions() == (size.0.div_ceil(b), size.1.div_ceil(b));
+        let cached = matches!(self.entries.get(&key), Some(e) if e.version == version);
+        if self.level == 0 || !fits || cached {
+            return self.gray(key, version, image, at);
+        }
+        self.used.insert(key);
+        self.entries.insert(
+            key,
+            Entry {
+                version,
+                at,
+                size,
+                image: Reduced::Gray(Arc::clone(&reduced)),
+            },
+        );
+        Src {
+            image: reduced,
+            at: self.place(at),
         }
     }
 }

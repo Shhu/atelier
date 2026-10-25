@@ -296,6 +296,12 @@ fn field_label_id() -> egui::Id {
     egui::Id::new("ui-kit-field-label")
 }
 
+/// A field with its own label: the `field_label` above was for it, not for
+/// a drop-down further down.
+fn forget_field_label(ui: &Ui) {
+    ui.data_mut(|d| d.remove::<(egui::Id, u64, String)>(field_label_id()));
+}
+
 /// Names a control for screen readers, its value apart, when its label is
 /// drawn elsewhere.
 pub fn name_control(ui: &Ui, id: egui::Id, name: &str, value: &str) {
@@ -598,6 +604,51 @@ fn field_shape(rect: Rect, hovered: bool, focused: bool) -> egui::Shape {
     ))
 }
 
+fn first_field_id() -> egui::Id {
+    egui::Id::new("first-field-wanted")
+}
+
+/// A dialog opening (`on`) wants its first field to take the keyboard, or
+/// is drawn (`!on`): whether a field took it.
+pub fn want_first_field(ctx: &egui::Context, on: bool) -> bool {
+    ctx.data_mut(|d| {
+        if on {
+            d.insert_temp(first_field_id(), true);
+            false
+        } else {
+            d.remove_temp::<bool>(first_field_id()).is_none()
+        }
+    })
+}
+
+/// The first field drawn in an opening dialog takes the keyboard at once,
+/// rather than the focus walking to it one widget a frame (keys typed
+/// meanwhile would be lost).
+pub fn claim_first_field(ui: &Ui, id: egui::Id) {
+    if ui.is_enabled()
+        && ui.ctx().data_mut(|d| {
+            let wanted = d.remove_temp::<bool>(first_field_id()).is_some();
+            if wanted {
+                d.insert_temp(first_field_id().with("claimed"), id);
+            }
+            wanted
+        })
+    {
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+}
+
+/// The field that took the keyboard this frame as its dialog opened (a
+/// number field shows its text field a frame later).
+pub fn claimed_first_field(ctx: &egui::Context) -> Option<egui::Id> {
+    ctx.data_mut(|d| {
+        let key = first_field_id().with("claimed");
+        let id = d.get_temp::<egui::Id>(key);
+        d.remove::<egui::Id>(key);
+        id
+    })
+}
+
 /// Numeric field with its label inside on the left ("X", "W", "Tolerance"…)
 /// and the value on the right, in Geist Mono; drag or type to change it.
 pub fn number_field<N: Numeric>(
@@ -608,6 +659,7 @@ pub fn number_field<N: Numeric>(
     suffix: &str,
     width: f32,
 ) -> Response {
+    forget_field_label(ui);
     // A longer (translated) label widens the field rather than running
     // into the value.
     let label_w = ui
@@ -648,6 +700,7 @@ pub fn number_field<N: Numeric>(
         drag = drag.custom_formatter(|v, _| i18n::short_decimal(v));
     }
     let response = child.add(drag);
+    claim_first_field(&child, response.id);
     // The painted label names the value for screen readers.
     ui.ctx()
         .accesskit_node_builder(response.id, |node| node.set_label(label));
@@ -662,6 +715,7 @@ pub fn text_field(
     text: &mut String,
     id: egui::Id,
 ) -> egui::text_edit::TextEditOutput {
+    forget_field_label(ui);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
     let hovered = ui.rect_contains_pointer(rect);
     let painter = ui.painter().clone();
@@ -680,6 +734,7 @@ pub fn text_field(
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     frameless(&mut child);
+    claim_first_field(&child, id);
     let output = egui::TextEdit::singleline(text)
         .id(id)
         .frame(egui::Frame::NONE)
@@ -729,6 +784,7 @@ pub fn scrub(
     let (min, max) = (*range.start(), *range.end());
     let width = width.max(scrub_min_width(ui, label, value_text));
     let (rect, mut response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click_and_drag());
+    claim_first_field(ui, response.id);
     let id = response.id.with("typing");
     let mut typing: Option<String> = ui.data(|d| d.get_temp(id));
 

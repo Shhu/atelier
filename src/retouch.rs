@@ -139,10 +139,24 @@ pub fn heal_area(
     image: &mut RgbaImage,
     base: &RgbaImage,
     coverage: impl Fn(u32, u32) -> f32,
-    (sample, offset): (&RgbaImage, (i64, i64)),
+    sample: (&RgbaImage, (i64, i64)),
     r: DirtyRect,
     seen: Option<&RgbaImage>,
 ) {
+    heal_area_until(image, base, coverage, sample, r, seen, &|| false);
+}
+
+/// [`heal_area`], given up as soon as `stop` says so (`false`: `image`
+/// is then unchanged).
+pub fn heal_area_until(
+    image: &mut RgbaImage,
+    base: &RgbaImage,
+    coverage: impl Fn(u32, u32) -> f32,
+    (sample, offset): (&RgbaImage, (i64, i64)),
+    r: DirtyRect,
+    seen: Option<&RgbaImage>,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> bool {
     let (iw, ih) = image.dimensions();
     let (w, h) = (r.w as usize, r.h as usize);
     let source_at = |x: u32, y: u32| {
@@ -184,7 +198,9 @@ pub fn heal_area(
             free.push(healed && !edge);
         }
     }
-    let out = heal::heal(&dest, &src, &free, w, h);
+    let Some(out) = heal::heal_until(&dest, &src, &free, w, h, stop) else {
+        return false;
+    };
     for (i, healed) in out.iter().enumerate() {
         if !free[i] {
             continue;
@@ -196,6 +212,7 @@ pub fn heal_area(
         let px: Px = std::array::from_fn(|c| healed[c] * k + b[c] * (1.0 - cover));
         image.get_pixel_mut(x, y).0 = unpremultiply(px);
     }
+    true
 }
 
 /// A fill laid over the layer: `filled` (a region of it, its hole painted
@@ -384,6 +401,11 @@ mod tests {
         assert!(spread > 60, "{row:?}");
         // Outside the stroke: untouched.
         assert_eq!(image.get_pixel(72, 22), base.get_pixel(72, 22));
+        // Stopped (a cancelled Patch): given up, the image as it was.
+        let mut stopped = base.clone();
+        let done = heal_area_until(&mut stopped, &base, cover, (&base, (-60, 0)), r, None, &|| true);
+        assert!(!done);
+        assert!(stopped == base);
     }
 
     /// Proximity Match fills a hole in horizontal stripes from beside it,

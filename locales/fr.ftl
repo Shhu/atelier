@@ -1599,7 +1599,7 @@ xchg-gradient-edit-tip = Cliquez pour modifier le dégradé
 xchg-file-filter-psd = Document PSD
 xchg-file-error-not-psd = Ce n'est pas un document PSD, ou cette version ne sait pas le lire.
 xchg-export-psd-hint = Les calques, masques, groupes, calques de réglage et de remplissage et styles de calque sont conservés, avec l'image aplatie.
-xchg-status-opened-simplified = Ouvert : { $path } — { $notes }
+xchg-status-opened-simplified = Ouvert : { $path } — non conservé : { $notes }
 xchg-status-saved-simplified = Enregistré : { $path } — { $notes }
 xchg-status-exported-simplified = Exporté : { $path } — { $notes }
 xchg-psd-alpha-name = Alpha { $number }
@@ -1610,14 +1610,14 @@ xchg-psd-mode-cmyk = CMJN
 xchg-psd-mode-multichannel = Multicouche
 xchg-psd-mode-duotone = Bichromie
 xchg-psd-mode-lab = Lab
-xchg-psd-note-depth = couches { $bits } bits converties en 8 bits
-xchg-psd-note-mode = { $mode } converti en RVB
-xchg-psd-note-text = calques de texte en pixels : { $names }
+xchg-psd-note-depth = la profondeur de { $bits } bits (8 bits par couche ici)
+xchg-psd-note-mode = le mode { $mode } (RVB ici)
+xchg-psd-note-text = le texte modifiable de { $names }
 xchg-psd-note-smart = objets dynamiques en pixels : { $names }
-xchg-psd-note-vector = masques vectoriels pixellisés : { $names }
-xchg-psd-note-shapes = contours de forme ignorés : { $names }
-xchg-psd-note-styles = styles de calque simplifiés : { $names }
-xchg-psd-note-dropped = non pris en charge, ignorés : { $names }
+xchg-psd-note-vector = les masques vectoriels de { $names }
+xchg-psd-note-shapes = les contours de forme de { $names }
+xchg-psd-note-styles = certains réglages de style de calque de { $names }
+xchg-psd-note-dropped = les calques non pris en charge { $names }
 xchg-psd-note-channels = { $count ->
         [one] { $count } couche alpha ignorée (56 couches au plus)
        *[other] { $count } couches alpha ignorées (56 couches au plus)
@@ -1763,7 +1763,10 @@ smart-status-placed = Importé : { $path }
 smart-status-replaced = Contenu remplacé : { $path }
 smart-status-updated = Objet dynamique mis à jour : { $name }
 smart-status-parent-gone = Le document de l'objet dynamique est fermé : enregistrez ce contenu dans un fichier.
-smart-status-link-missing = Fichiers liés introuvables, leur dernière copie est affichée : { $names }
+smart-status-link-missing = { $count ->
+    [one] { $count } fichier lié introuvable, sa dernière copie est affichée : { $names }
+   *[other] { $count } fichiers liés introuvables, leurs dernières copies sont affichées : { $names }
+}
 smart-status-links-updated = Fichiers liés mis à jour : { $names }
 
 ## Filter › Liquify: the workspace and its tools
@@ -2057,7 +2060,7 @@ raw-window-title = Camera Raw
 raw-open = Ouvrir
 raw-developing = Développement
 raw-file-filter = Camera Raw
-raw-note-preview-only = ses données RAW ne peuvent pas être lues : l'aperçu intégré de l'appareil (8 bits) est utilisé
+raw-note-preview-only = ses données RAW, illisibles : l'aperçu 8 bits intégré par l'appareil est utilisé à la place
 raw-preview-tip = Faites glisser pour vous déplacer ; double-cliquez pour passer à 100 % ou à la taille de la fenêtre.
 raw-zoom-fit = Ajusté
 raw-zoom-fit-tip = Ajuster à la fenêtre
@@ -2333,7 +2336,7 @@ input3-hint-selected-layers = les calques sélectionnés
 
 files3-quoted-name = « { $name } »
 files3-psd-note-shapes = calques de forme enregistrés en pixels : { $names }
-files3-status-psd-would-lose = Ce fichier PSD ne peut pas être réenregistré sans modifications ({ $notes }). Enregistrez un document Atelier pour tout garder.
+files3-status-psd-would-lose = Ce fichier PSD ne peut pas être réenregistré sans modifications : il perdrait { $notes }. Enregistrez un document Atelier pour tout garder.
 files3-dialog-save-as-lossy = Enregistrer sous (un document Atelier garde tout)
 
 ## Clipboard
@@ -2496,7 +2499,7 @@ diag-card-frame-detail = max { $max } sur la dernière minute · { $frames ->
 }
 diag-card-freezes = Blocages (1 min)
 diag-card-freezes-detail = { $total } au total · max { $max } · { $five } dans les 5 dernières minutes
-diag-card-memory = Mémoire du programme
+diag-card-memory = Mémoire utilisée par Atelier
 diag-card-history = Mémoire de l'historique
 diag-card-history-detail = sur { $budget } pour tous les onglets · { $steps ->
     [one] { $steps } étape
@@ -2513,7 +2516,10 @@ diag-card-rendering-value = { $tiles ->
     [one] { $tiles } tuile
    *[other] { $tiles } tuiles
 }
-diag-card-rendering-detail = max { $max } par rafraîchissement · { $over } rafraîchissements lents (1 min)
+diag-card-rendering-detail = max { $max } par rafraîchissement · { $over ->
+    [one] { $over } rafraîchissement lent
+   *[other] { $over } rafraîchissements lents
+} (1 min)
 diag-card-jobs = Calculs en arrière-plan
 diag-card-jobs-none = Aucun en cours
 diag-card-ai = Calcul de l'IA
@@ -2618,7 +2624,7 @@ diag-sys-since = Mesures depuis
 
 files4-note-frames = les autres images de l'animation
 files4-note-pages = les autres pages
-files4-psd-note-comps = compositions de calques ignorées
+files4-psd-note-comps = les compositions de calques
 
 ## Layers: delete
 tools4-status-last-layer = Suppression impossible : un document garde au moins un calque.
@@ -2660,7 +2666,10 @@ fx4-raw-open-failed = Impossible de développer { $name } : rien n'a été ouve
 fx4-ai-model-damaged = fichier du modèle endommagé : il a été supprimé et sera téléchargé à nouveau à la prochaine utilisation
 
 ## Linked smart objects: Edit Contents, files read again
-smart4-status-link-unreadable = Les fichiers liés illisibles montrent leur dernière copie : { $names }
+smart4-status-link-unreadable = { $count ->
+    [one] { $count } fichier lié illisible montre sa dernière copie : { $names }
+   *[other] { $count } fichiers liés illisibles montrent leurs dernières copies : { $names }
+}
 smart4-status-link-saved = Enregistré dans { $name } : les objets dynamiques liés à ce fichier suivent.
 smart4-status-link-saved-flat = Enregistré dans { $name }, calques fusionnés : les objets dynamiques liés à ce fichier suivent. Cet onglet garde les calques jusqu'à sa fermeture.
 smart4-status-updated-embedded = Objet dynamique mis à jour et incorporé (son fichier lié est introuvable) : { $name }
@@ -2684,8 +2693,8 @@ smart4-artboards-keep-both = Conserver les deux
 
 ## Help > Diagnostics: memory card
 
-perf4-diag-memory-detail = privée { $private }, copies d'affichage { $display }
-perf4-diag-memory-display = copies d'affichage { $display }
+perf4-diag-memory-detail = { $private } en propre · { $display } pour l'affichage
+perf4-diag-memory-display = { $display } pour l'affichage
 
 ## Window menu: the side panel
 ui4-menu-layers-properties = Calques et propriétés
@@ -2786,7 +2795,7 @@ ui4-diag-tip-freezes = Moments où la fenêtre a cessé de répondre pendant plu
 ui4-diag-tip-memory = Mémoire qu'utilise le programme, y compris celle qu'il partage avec d'autres programmes.
 ui4-diag-tip-history = Mémoire gardée pour annuler, pour tous les documents ouverts ; au-delà du budget, les étapes les plus anciennes sont supprimées.
 ui4-diag-tip-documents = Documents ouverts, le plus grand et les calques qu'ils contiennent.
-ui4-diag-tip-rendering = Morceaux de l'image dessinés par rafraîchissement. Un niveau de taille au-dessus de 0 montre une copie réduite quand vous dézoomez.
+ui4-diag-tip-rendering = Morceaux de l'image dessinés par rafraîchissement, et les rafraîchissements trop lents de la dernière minute.
 ui4-diag-tip-jobs = Travail fait sans bloquer la fenêtre (filtres, IA, enregistrement…).
 ui4-diag-tip-ai = Où les modèles d'IA ont tourné : sur la carte graphique ou sur le processeur.
 ui4-diag-tip-color = Le profil de couleur du document et celui de l'écran.
@@ -2807,27 +2816,26 @@ hist5-subject-selection-changed = La sélection a changé pendant la recherche 
 ## History: step names
 hist5-delete-layers = Supprimer les calques
 
-## Fichiers trop grands pour être enregistrés ou ouverts
+## Files too large to save or to open
 
 files5-error-layer-too-large = le calque « { $name } » est trop grand pour être enregistré ({ $width } × { $height } px) : recadrez-le ou réduisez-le
 files5-error-out-of-memory = l'ouvrir demanderait plus de mémoire que cet ordinateur n'en a ({ $memory } Go)
 
-## Ce qu'enregistrer un fichier dans son format perdrait
+## What saving over a file in its format would lose
 
 files5-psd-note-animation = l'animation d'images
-files5-psd-note-spot = les couleurs d'accompagnement (gardées comme couches alpha)
+files5-psd-note-spot = les couleurs d'accompagnement, gardées comme couches alpha
 files5-psd-note-variables = les variables et jeux de données
-files5-psd-note-other = d'autres données que cette application ne lit pas
-files5-note-images = les autres images qu'il contient (carte de gain HDR, aperçus)
+files5-note-images = les autres images qu'il contient, comme une carte de gain HDR ou des aperçus
 files5-note-xmp = ses métadonnées XMP ou IPTC
 files5-note-exif = ses métadonnées EXIF
-files5-note-other-apps = des données d'autres applications (calques, ressources d'image)
+files5-note-other-apps = des données d'autres applications, comme des calques ou des ressources d'image
 files5-status-batch-would-lose = « { $name } » perdrait : { $notes }. Laissé tel quel.
 
 ## Quick Mask: notice in the options bar
 
 sel5-options-quick-mask = Mode Masque
-sel5-options-quick-mask-tip = Tous les outils modifient la sélection, pas le calque : peignez en noir pour masquer, en blanc pour sélectionner. Cliquez ou appuyez sur { $key } pour terminer.
+sel5-options-quick-mask-tip = Les outils modifient la sélection, pas le calque (les outils Texte et Forme sont indisponibles) : peignez en noir pour masquer, en blanc pour sélectionner. Cliquez ou appuyez sur { $key } pour terminer.
 
 ## Object Selection
 
@@ -2872,7 +2880,6 @@ ui5-palette-keywords-visibility = visibilité œil afficher masquer
 ui5-palette-keywords-object-select = sélection rapide
 ui5-palette-keywords-actions = actions macro enregistrer
 ui5-palette-keywords-undo = aller en arrière revenir étape précédente
-ui5-palette-keywords-language = anglais français english french
 ui5-palette-keywords-desaturate = désaturer
 ui5-palette-keywords-scale = échelle redimensionner
 ui5-palette-keywords-save-for-web = enregistrer pour le web
@@ -2892,5 +2899,132 @@ ui5-shortcuts-cycle-note = Maj avec la touche d'un outil choisit l'outil suivant
 ui5-drop-place-hint = Déposez pour placer dans cette image. Pour ouvrir dans un onglet à part : Fichier › Ouvrir ({ $key }).
 
 ## Quick Mask: moving the mask
-qm6-status-moved = Masque déplacé de { $x }, { $y }
+qm6-status-moved = Masque du mode Masque déplacé de ({ $x }, { $y })
 qm6-quick-mask-name = Masque
+
+## Select Subject computed in the background
+hist6-subject-searching-again = L'image a changé pendant la recherche : nouvelle recherche du sujet…
+
+## Files needing more memory than is free
+
+files6-error-low-memory = l'ouvrir demande plus de mémoire qu'il n'y en a de libre maintenant (environ { $free } Go)
+files6-open-anyway-title = Ouvrir quand même ?
+files6-open-anyway-text = « { $name } » demande plus de mémoire qu'il n'y en a de libre maintenant (environ { $free } Go). L'ouvrir peut ralentir l'ordinateur le temps que les autres programmes rendent de la mémoire, et peut échouer s'ils ne le peuvent pas.
+files6-open-anyway-ok = Ouvrir quand même
+files6-status-open-cancelled = « { $name } » n'a pas été ouvert.
+
+## What saving over a file in its format would lose
+
+files6-psd-note-other = des données que cette application ne lit pas (ressources { $ids })
+files6-psd-note-placed = les tranches, échantillonneurs de couleur et marques de comptage placés avant le changement de taille de la zone de travail
+
+## Quick Mask: tools that make layers
+
+sel6-status-quick-mask-no-layers = Mode Masque : le texte et les formes créent des calques, pas une sélection. Appuyez d'abord sur { $key } pour en sortir.
+
+## Quick Mask: Properties
+
+sel6-side-transform-quick-mask = Transformation (mode Masque)
+
+## Select and Mask: locked layer
+
+sel6-mask-layer-locked = Le calque est verrouillé : son masque ne peut pas être modifié. Choisissez une autre sortie.
+
+## Edit Contents saved while its linked file, missing then, is back
+smart6-link-back = { $name } est de retour : l'objet dynamique le suit de nouveau, et ces modifications seraient perdues. Incorporez-les dans l'objet dynamique (il n'est alors plus lié à { $name }), ou enregistrez-les dans un fichier.
+smart6-link-back-embed = Incorporer les modifications
+smart6-status-contents-gone = L'objet dynamique de ce contenu n'est plus dans son document : enregistrez ce contenu dans un fichier.
+
+## Linked files: looked for
+smart6-busy-link-look = Recherche de { $name }
+smart6-alert-links-not-found = { $count ->
+    [one] Fichier lié introuvable : { $names }. L'objet dynamique affiche sa dernière copie ; Mettre à jour le contenu modifié le cherche de nouveau une fois revenu.
+   *[other] { $count } fichiers liés introuvables : { $names }. Les objets dynamiques affichent leur dernière copie ; Mettre à jour le contenu modifié les cherche de nouveau une fois revenus.
+}
+
+## Hidden layers
+tools6-status-group-hidden = Le groupe « { $group } » qui contient « { $name } » est masqué : affichez le groupe pour modifier le calque.
+tools6-status-group-hidden-filter = Le groupe « { $group } » qui contient « { $name } » est masqué : affichez le groupe pour filtrer le calque.
+
+## Locked groups
+tools6-status-group-locked = « { $name } » est dans le groupe verrouillé « { $group } » : déverrouillez le groupe dans le panneau Calques.
+tools6-panel-group-lock-tip = Verrouillé avec son groupe « { $group } »
+
+## Layer › Align and Distribute
+tools6-menu-align = Aligner
+tools6-menu-align-to-selection = Aligner les calques sur la sélection
+tools6-menu-align-top = Bords supérieurs
+tools6-menu-align-center-v = Centres verticaux
+tools6-menu-align-bottom = Bords inférieurs
+tools6-menu-align-left = Bords gauches
+tools6-menu-align-center-h = Centres horizontaux
+tools6-menu-align-right = Bords droits
+tools6-menu-distribute = Répartir
+tools6-menu-distribute-h = Horizontalement
+tools6-menu-distribute-v = Verticalement
+tools6-side-align-to-selection = Aligner sur la sélection
+
+## Command palette: entries only the palette lists
+ui6-why-already-visible = Les calques sélectionnés sont déjà visibles
+ui6-why-already-hidden = Les calques sélectionnés sont déjà masqués
+
+## Command palette: other words commands are found by
+ui6-palette-keywords-english = anglais english
+ui6-palette-keywords-french = français french
+ui6-palette-keywords-subject = sélectionner sujet
+ui6-palette-keywords-invert = inverser inversion négatif
+ui6-palette-keywords-blending = opacité mode fusion
+ui6-palette-keywords-exposure = exposition
+ui6-palette-keywords-full-screen = plein écran
+ui6-palette-keywords-straighten = redresser horizon
+ui6-palette-keywords-brush = taille dureté peindre
+ui6-palette-keywords-eyedropper = sélecteur couleur prélever
+
+## File > Open Recent > Clear Recent File List: asked first
+ui6-clear-recent-text = Vider la liste des fichiers récents ? Cette opération est irréversible. Les fichiers eux-mêmes restent à leur place.
+ui6-clear-recent-ok = Effacer
+
+## Options bar: the active layer is in a hidden group
+ui6-options-group-hidden = Groupe masqué
+
+## Levels: names of the number fields, for screen readers
+ui6-levels-input-black = Noir en entrée
+ui6-levels-input-gamma = Gamma en entrée
+ui6-levels-input-white = Blanc en entrée
+ui6-levels-output-black = Noir en sortie
+ui6-levels-output-white = Blanc en sortie
+
+## A PSD file opened: what is not kept of it
+ui6-psd-note-smart-objects = les objets dynamiques { $names }, ouverts en pixels
+
+## Files dragged over an open image: Atelier documents open in a tab
+ui6-drop-open-hint = Déposez pour ouvrir dans un onglet à part.
+ui6-drop-mixed-hint = Déposez pour placer les images dans cette image. Les documents Atelier s'ouvrent dans un onglet à part.
+
+## Tool bar: the color squares, for screen readers
+ui6-color-foreground = Couleur de premier plan
+ui6-color-background = Couleur d'arrière-plan
+
+## Filters, adjustments and AI models (fourth fix campaign)
+
+# Shown in parentheses inside retouch-status-ai-failed.
+fx6-ai-inpaint-damaged = fichier du modèle endommagé et supprimé ; téléchargez-le à nouveau dans Édition › Modèles d'IA
+
+## Layer commands
+
+input6-menu-layer-via-cut = Calque par couper
+input6-hist-layer-via-cut = Calque par couper
+input6-menu-stamp-visible = Fusionner une copie des calques visibles
+input6-hist-stamp-visible = Copie fusionnée des calques visibles
+input6-status-nothing-visible = Rien de visible à fusionner.
+input6-menu-desaturate = Désaturation
+input6-hist-desaturate = Désaturation
+
+## Several layers selected
+
+input6-status-layers-opacity = { $count } calques : opacité { $percent } %
+input6-status-layers-blend = { $count } calques : { $mode }
+input6-status-locked-left = { $count ->
+    [one] { $count } calque verrouillé laissé tel quel
+   *[other] { $count } calques verrouillés laissés tels quels
+}

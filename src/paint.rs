@@ -279,6 +279,11 @@ impl Stroke {
         &self.mask
     }
 
+    /// Masked modes: [`Self::coverage`], taken out of the stroke (ended).
+    pub fn take_coverage(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.mask)
+    }
+
     /// Masked modes: the coverage of a pixel at full opacity.
     pub fn full_coverage(&self) -> f32 {
         self.settings.opacity.clamp(0.0, 1.0) * 65535.0
@@ -617,26 +622,39 @@ impl Stroke {
         };
         let strength = self.settings.flow.clamp(0.0, 1.0) * self.settings.pressure_scale(p);
         let rwd = r.w as usize;
-        if self.source.is_some() {
-            // Sampling all layers: written over the layer, one by one.
-            for (j, py) in (r.y..r.y + r.h).enumerate() {
-                for (i, px) in (r.x..r.x + r.w).enumerate() {
-                    let amount =
-                        self.scratch[j * rwd + i] * strength * limit(&self.clip, px, py, shaped);
-                    if amount > 0.0 {
-                        let out = filtered(px, py, amount);
-                        self.put(image, px, py, out, amount);
-                    }
-                }
-            }
-            return;
-        }
-        // Into the layer, on all the cores (the reads are in `region`).
         let (scratch, clip) = (&self.scratch, &self.clip);
         let width = w as usize;
         let painted = std::sync::atomic::AtomicBool::new(false);
         let raw: &mut [u8] = image.as_mut();
-        let rows = &mut raw[r.y as usize * width * 4..(r.y + r.h) as usize * width * 4];
+        let span = r.y as usize * width * 4..(r.y + r.h) as usize * width * 4;
+        if let Some(source) = &mut self.source {
+            // Sampling all layers: the result into the sampled image, and
+            // as paint over the layer, row by row on all the cores (each
+            // pixel only meets its own two).
+            let src: &mut [u8] = source.as_mut();
+            let (rows, srows) = (&mut raw[span.clone()], &mut src[span]);
+            dab_row_pairs(rows, srows, width * 4, rwd * r.h as usize, |j, line, sline| {
+                let py = r.y + j as u32;
+                let mut any = false;
+                for (i, px) in (r.x..r.x + r.w).enumerate() {
+                    let amount = scratch[j * rwd + i] * strength * limit(clip, px, py, shaped);
+                    if amount > 0.0 {
+                        let out = unpremultiply(filtered(px, py, amount));
+                        let o = px as usize * 4;
+                        sline[o..o + 4].copy_from_slice(&out);
+                        let before: [u8; 4] = line[o..o + 4].try_into().expect("four");
+                        let after = over(before, [out[0], out[1], out[2], to_u8(amount)]);
+                        any |= after != before;
+                        line[o..o + 4].copy_from_slice(&after);
+                    }
+                }
+                any
+            }, &painted);
+            self.painted |= painted.into_inner();
+            return;
+        }
+        // Into the layer, on all the cores (the reads are in `region`).
+        let rows = &mut raw[span];
         dab_rows_work(rows, width * 4, rwd * r.h as usize, |first, band| {
             let mut any = false;
             for (j, line) in band.chunks_exact_mut(width * 4).enumerate() {
@@ -657,22 +675,6 @@ impl Stroke {
             }
         });
         self.painted |= painted.into_inner();
-    }
-
-    /// Writes the result `out` (premultiplied) of an effect of `amount` at
-    /// (x, y): onto the layer, or, sampling all layers, as paint over it.
-    fn put(&mut self, image: &mut RgbaImage, x: u32, y: u32, out: [f32; 4], amount: f32) {
-        let px = unpremultiply(out);
-        let target = image.get_pixel_mut(x, y);
-        let before = target.0;
-        match &mut self.source {
-            Some(source) => {
-                source.put_pixel(x, y, image::Rgba(px));
-                target.0 = over(before, [px[0], px[1], px[2], to_u8(amount)]);
-            }
-            None => target.0 = px,
-        }
-        self.painted |= target.0 != before;
     }
 
     /// Smudge: the paint carried by the finger is laid down under the dab
@@ -743,32 +745,57 @@ impl Stroke {
         };
         let carried = self.carried.as_mut().expect("carried paint");
         let slots = &mut carried.pixels[j0 * cs..(j0 + r.h as usize) * cs];
-        if let Some(source) = &mut self.source {
-            // Sampling all layers: written over the layer, one by one.
-            let mut painted = false;
-            for (jj, line) in slots.chunks_exact_mut(cs).enumerate() {
-                let y = r.y + jj as u32;
-                for (k, s) in line[i0..i0 + rw].iter_mut().enumerate() {
-                    let x = r.x + k as u32;
-                    let cur = premultiply(source.get_pixel(x, y).0);
-                    if let Some((out, amount)) = smudged(jj * rw + k, x, y, cur, s) {
-                        let px = unpremultiply(out);
-                        source.put_pixel(x, y, image::Rgba(px));
-                        let target = image.get_pixel_mut(x, y);
-                        let before = target.0;
-                        target.0 = over(before, [px[0], px[1], px[2], to_u8(amount)]);
-                        painted |= target.0 != before;
-                    }
-                }
-            }
-            self.painted |= painted;
-            return Some(r);
-        }
-        // Into the layer, on all the cores.
         let width = image.width() as usize;
         let painted = std::sync::atomic::AtomicBool::new(false);
         let raw: &mut [u8] = image.as_mut();
-        let rows = &mut raw[r.y as usize * width * 4..(r.y + r.h) as usize * width * 4];
+        let span = r.y as usize * width * 4..(r.y + r.h) as usize * width * 4;
+        let work = rw * r.h as usize;
+        if let Some(source) = &mut self.source {
+            // Sampling all layers: the result into the sampled image, and
+            // as paint over the layer, row by row on all the cores (each
+            // pixel only meets its own two and its slot).
+            let src: &mut [u8] = source.as_mut();
+            let (rows, srows) = (&mut raw[span.clone()], &mut src[span]);
+            type Row<'a> = ((&'a mut [u8], &'a mut [u8]), &'a mut [[u16; 4]]);
+            let row = |jj: usize, ((line, sline), slots): Row| {
+                let y = r.y + jj as u32;
+                let mut any = false;
+                for (k, s) in slots[i0..i0 + rw].iter_mut().enumerate() {
+                    let x = r.x + k as u32;
+                    let o = x as usize * 4;
+                    let cur = premultiply(sline[o..o + 4].try_into().expect("four"));
+                    if let Some((out, amount)) = smudged(jj * rw + k, x, y, cur, s) {
+                        let px = unpremultiply(out);
+                        sline[o..o + 4].copy_from_slice(&px);
+                        let before: [u8; 4] = line[o..o + 4].try_into().expect("four");
+                        let after = over(before, [px[0], px[1], px[2], to_u8(amount)]);
+                        any |= after != before;
+                        line[o..o + 4].copy_from_slice(&after);
+                    }
+                }
+                if any {
+                    painted.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            };
+            if work < SMUDGE_PARALLEL {
+                let lines = rows.chunks_exact_mut(width * 4).zip(srows.chunks_exact_mut(width * 4));
+                for (jj, item) in lines.zip(slots.chunks_exact_mut(cs)).enumerate() {
+                    row(jj, item);
+                }
+            } else {
+                use rayon::prelude::*;
+                rows.par_chunks_exact_mut(width * 4)
+                    .zip(srows.par_chunks_exact_mut(width * 4))
+                    .zip(slots.par_chunks_exact_mut(cs))
+                    .enumerate()
+                    .with_min_len((DAB_BAND / rw.max(1)).max(1))
+                    .for_each(|(jj, item)| row(jj, item));
+            }
+            self.painted |= painted.into_inner();
+            return Some(r);
+        }
+        // Into the layer, on all the cores.
+        let rows = &mut raw[span];
         let row = |jj: usize, line: &mut [u8], slots: &mut [[u16; 4]]| {
             let y = r.y + jj as u32;
             let pixels = line[r.x as usize * 4..(r.x as usize + rw) * 4].chunks_exact_mut(4);
@@ -786,7 +813,7 @@ impl Stroke {
                 painted.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         };
-        if rw * (r.h as usize) < DAB_PARALLEL {
+        if work < SMUDGE_PARALLEL {
             for (jj, (line, s)) in rows
                 .chunks_exact_mut(width * 4)
                 .zip(slots.chunks_exact_mut(cs))
@@ -799,6 +826,8 @@ impl Stroke {
             rows.par_chunks_exact_mut(width * 4)
                 .zip(slots.par_chunks_exact_mut(cs))
                 .enumerate()
+                // Bands of rows: one row each costs more than it saves.
+                .with_min_len((DAB_BAND / rw.max(1)).max(1))
                 .for_each(|(jj, (line, s))| row(jj, line, s));
         }
         self.painted |= painted.into_inner();
@@ -842,6 +871,41 @@ fn dab_rows<T: Send>(data: &mut [T], row: usize, f: impl Fn(usize, &mut [T]) + S
 
 /// Pixels of a dab worked on by one thread, at least.
 const DAB_BAND: usize = 1 << 14;
+
+/// [`DAB_PARALLEL`] for the Smudge tool, whose pixels cost less.
+const SMUDGE_PARALLEL: usize = 1 << 17;
+
+/// `f(row, line, source_line)` over the rows (`row` long) of the layer and
+/// of the image it samples, the same size, on all the cores when large
+/// (`work` pixels in all); `painted` set when one returns `true`.
+fn dab_row_pairs(
+    rows: &mut [u8],
+    sources: &mut [u8],
+    row: usize,
+    work: usize,
+    f: impl Fn(usize, &mut [u8], &mut [u8]) -> bool + Sync,
+    painted: &std::sync::atomic::AtomicBool,
+) {
+    use rayon::prelude::*;
+    let mark = |any: bool| {
+        if any {
+            painted.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+    if work < DAB_PARALLEL {
+        let lines = rows.chunks_exact_mut(row).zip(sources.chunks_exact_mut(row));
+        for (j, (line, sline)) in lines.enumerate() {
+            mark(f(j, line, sline));
+        }
+        return;
+    }
+    let per = (DAB_BAND / (work / (rows.len() / row.max(1)).max(1)).max(1)).max(1);
+    rows.par_chunks_exact_mut(row)
+        .zip(sources.par_chunks_exact_mut(row))
+        .enumerate()
+        .with_min_len(per)
+        .for_each(|(j, (line, sline))| mark(f(j, line, sline)));
+}
 
 /// [`dab_rows`] for rows wider than the dab: `work` pixels in all. Large
 /// dabs go to a pool of threads kept from one dab to the next (starting
@@ -1310,5 +1374,30 @@ mod tests {
         s.add_point(&mut layer, 20.0, 10.0, 1.0);
         let p = layer.get_pixel(20, 10).0;
         assert!(p[3] > 0 && p[0] > 0 && p[0] < 255, "{p:?}");
+    }
+
+    /// Large dabs sampling all layers (worked on in bands of rows, on all
+    /// the cores): the paint laid on the empty layer is as symmetric as
+    /// the stroke, band edges included.
+    #[test]
+    fn large_dabs_sampling_all_layers_are_seamless() {
+        for mode in [StrokeMode::Blur, StrokeMode::Smudge { finger: None }] {
+            let mut layer = RgbaImage::new(600, 600);
+            let visible = RgbaImage::from_fn(600, 600, |x, _| {
+                image::Rgba(if x < 300 { [0, 0, 0, 255] } else { WHITE })
+            });
+            let mut set = settings([0, 0, 0, 255]);
+            (set.size, set.flow) = (400.0, 0.8);
+            let mut s = Stroke::begin(Arc::new(layer.clone()), mode, set)
+                .with_source(Some(visible));
+            for x in [150.0, 250.0, 350.0, 450.0] {
+                s.add_point(&mut layer, x, 300.0, 1.0);
+            }
+            let row = |y: u32| (280..420).map(|x| layer.get_pixel(x, y).0).collect::<Vec<_>>();
+            assert!(row(300).iter().any(|p| p[3] > 0), "{mode:?} painted");
+            for k in 0..120 {
+                assert_eq!(row(300 + k), row(299 - k), "{mode:?}: rows ±{k}");
+            }
+        }
     }
 }

@@ -11,10 +11,11 @@ use super::actions_panel::Stopped;
 use super::dialogs::{DialogSpec, Track, floating_dialog, gap_between_blocks, slider_row};
 use super::*;
 use crate::document::{
-    EmbeddedIn, LinkFresh, LinkRead, SmartFilter, SmartFilterKind, SmartObject, SmartRender,
+    ContentsUpdate, EmbeddedIn, LinkFresh, LinkRead, SmartFilter, SmartFilterKind, SmartObject,
+    SmartRender,
 };
 use crate::filters::{Filter, Target};
-use crate::i18n::t;
+use crate::i18n::{Message, t};
 use crate::xform::{Homography, Map};
 
 /// Pixels (filters counted) rendered at once; beyond, on another thread.
@@ -82,6 +83,13 @@ pub(super) struct SmartUi {
     /// Those reads were asked for (Update Modified Content): every
     /// missing file said again.
     links_asked: bool,
+    /// Documents whose files Update Modified Content asked to read while
+    /// a read without the network files was going on: read again once it
+    /// lands.
+    links_wanted: Vec<u64>,
+    /// Edit Contents of a network file: looked at first, on another
+    /// thread.
+    checking: Option<LinkCheck>,
     /// Documents of linked image files opened by Edit Contents: Save
     /// writes them in their format.
     link_files: Vec<u64>,
@@ -95,7 +103,35 @@ pub(super) struct SmartUi {
 impl SmartUi {
     /// A rendering or the Blending Options keep the keyboard and the image.
     pub(super) fn busy(&self) -> bool {
-        self.rendering.is_some() || self.blending.is_some()
+        self.rendering.is_some() || self.blending.is_some() || self.checking.is_some()
+    }
+
+    /// A dialog's preview kept for its OK.
+    #[cfg(test)]
+    pub(super) fn ready_held(&self) -> bool {
+        self.ready.is_some()
+    }
+
+    /// A network file being looked at for Edit Contents.
+    #[cfg(test)]
+    pub(super) fn checking(&self) -> bool {
+        self.checking.is_some()
+    }
+
+    /// A read of document `uid`'s linked files going on, landing once
+    /// the sender sends (or is dropped).
+    #[cfg(test)]
+    pub(super) fn hold_links_read(&mut self, uid: u64) -> mpsc::Sender<Vec<LinkFresh>> {
+        let (tx, rx) = mpsc::channel();
+        self.links.push((uid, rx));
+        tx
+    }
+
+    /// Update Modified Content's network read waits for document `uid`'s
+    /// read going on, the missing files to be said again.
+    #[cfg(test)]
+    pub(super) fn network_read_waits(&self, uid: u64) -> bool {
+        self.links_wanted.contains(&uid) && self.links_asked
     }
 
     /// The smart filter as the open Blending Options set it.
@@ -107,13 +143,42 @@ impl SmartUi {
 
 type InputKey = (u64, u64, Option<usize>);
 
+/// The key of a smart object's rendering with `filters`: a Liquify mesh
+/// by its own (its `Debug` only counts its moved nodes), shared with the
+/// smart object the filters were taken from.
+fn preview_key(layer: &crate::document::Layer, filters: &[SmartFilter]) -> u64 {
+    let meshes: Vec<usize> = filters
+        .iter()
+        .filter_map(|f| match &f.filter {
+            SmartFilterKind::Liquify(m) => Some(Arc::as_ptr(m) as usize),
+            _ => None,
+        })
+        .collect();
+    hash_of((layer.id, layer.rev(), format!("{filters:?}"), meshes))
+}
+
 /// "Save logo.png?" for a linked file opened by Edit Contents whose format
-/// can't hold all the tab holds.
+/// can't hold all the tab holds, or for contents edited while their linked
+/// file was missing, now back.
 pub(super) struct LinkSave {
     doc: u64,
     text: String,
+    /// Its Save puts the edits in the smart object, unlinking it (else it
+    /// writes the linked file).
+    embed: bool,
     /// The close that asked to save it, done once saved.
     pub(super) then: Option<Confirm>,
+}
+
+/// A network file looked at before Edit Contents opens it (or, missing,
+/// the copy the smart object holds).
+struct LinkCheck {
+    doc: u64,
+    layer: u64,
+    path: PathBuf,
+    name: String,
+    started: f64,
+    rx: mpsc::Receiver<bool>,
 }
 
 struct Blending {
@@ -141,7 +206,7 @@ struct Rendering {
     layer: u64,
     /// The history step the change made: cancelling it undoes it.
     step: u64,
-    name: String,
+    name: Message,
     started: f64,
     job: filters_ui::Job<SmartRender>,
     /// Done once it is in (the step recorded in an action…).
@@ -149,7 +214,7 @@ struct Rendering {
 }
 
 /// What follows a smart object's change once rendered.
-type Then = Box<dyn FnOnce(&mut AtelierApp)>;
+use super::Then;
 
 /// The rendering of a change, from a dialog's preview of it.
 enum SmartReady {
@@ -303,11 +368,10 @@ impl AtelierApp {
                     .active_smart()
                     .and_then(|s| s.filters.get(k))
                     .is_some_and(|f| !f.visible);
-                let name = if on {
-                    t!("smart-hist-show-filter")
-                } else {
-                    t!("smart-hist-hide-filter")
-                };
+                let name = Message::of(|| match on {
+                    true => t!("smart-hist-show-filter"),
+                    false => t!("smart-hist-hide-filter"),
+                });
                 self.edit_smart(name, move |s| {
                     if let Some(f) = s.filters.get_mut(k) {
                         f.visible = on;
@@ -315,7 +379,7 @@ impl AtelierApp {
                 });
             }
             DeleteFilter(k) => {
-                self.edit_smart(t!("smart-menu-delete-filter"), move |s| {
+                self.edit_smart(Message::of(|| t!("smart-menu-delete-filter")), move |s| {
                     if k < s.filters.len() {
                         s.filters.remove(k);
                     }
@@ -324,7 +388,7 @@ impl AtelierApp {
             MoveFilter(from, to) => {
                 let n = self.active_smart().map_or(0, |s| s.filters.len());
                 if from != to && from < n && to < n {
-                    self.edit_smart(t!("smart-hist-move-filter"), move |s| {
+                    self.edit_smart(Message::of(|| t!("smart-hist-move-filter")), move |s| {
                         let f = s.filters.remove(from);
                         s.filters.insert(to, f);
                     });
@@ -332,15 +396,14 @@ impl AtelierApp {
             }
             ToggleFilters => {
                 let on = self.active_smart().is_some_and(|s| !s.filters_enabled);
-                let name = if on {
-                    t!("smart-menu-enable-filters")
-                } else {
-                    t!("smart-menu-disable-filters")
-                };
+                let name = Message::of(|| match on {
+                    true => t!("smart-menu-enable-filters"),
+                    false => t!("smart-menu-disable-filters"),
+                });
                 self.edit_smart(name, move |s| s.filters_enabled = on);
             }
             ClearFilters => {
-                self.edit_smart(t!("smart-menu-clear-filters"), |s| {
+                self.edit_smart(Message::of(|| t!("smart-menu-clear-filters")), |s| {
                     s.filters.clear();
                     s.filter_mask = None;
                 });
@@ -358,7 +421,7 @@ impl AtelierApp {
                 {
                     doc.target_mask(false);
                 }
-                self.edit_smart(t!("smart-menu-delete-filter-mask"), |s| {
+                self.edit_smart(Message::of(|| t!("smart-menu-delete-filter-mask")), |s| {
                     s.filter_mask = None
                 });
             }
@@ -367,11 +430,10 @@ impl AtelierApp {
                     .active_smart()
                     .and_then(|s| s.filter_mask.as_ref())
                     .is_some_and(|m| !m.enabled);
-                let name = if on {
-                    t!("smart-menu-enable-filter-mask")
-                } else {
-                    t!("smart-menu-disable-filter-mask")
-                };
+                let name = Message::of(|| match on {
+                    true => t!("smart-menu-enable-filter-mask"),
+                    false => t!("smart-menu-disable-filter-mask"),
+                });
                 self.edit_smart(name, move |s| {
                     if let Some(m) = &mut s.filter_mask {
                         m.enabled = on;
@@ -395,8 +457,8 @@ impl AtelierApp {
     /// Changes the active smart object with `f` as the undo step `name`,
     /// then renders it again: here when small and without filters (whose
     /// cost can't be told), else on another thread (its busy indicator
-    /// shown).
-    fn edit_smart(&mut self, name: String, f: impl FnOnce(&mut SmartObject)) {
+    /// shown). `name` in English too: a failure goes to the log.
+    fn edit_smart(&mut self, name: Message, f: impl FnOnce(&mut SmartObject)) {
         self.edit_smart_then(name, f, None, None);
     }
 
@@ -405,7 +467,7 @@ impl AtelierApp {
     /// change, computed or being computed already (a dialog's preview).
     fn edit_smart_then(
         &mut self,
-        name: String,
+        name: Message,
         f: impl FnOnce(&mut SmartObject),
         then: Option<Then>,
         ready: Option<SmartReady>,
@@ -413,6 +475,14 @@ impl AtelierApp {
         // A rendering still being computed: the new one shows its change
         // too.
         if let Some(r) = self.smart.rendering.take() {
+            // Only the same smart object (the busy indicator keeps the
+            // others from changing meanwhile).
+            debug_assert!(
+                self.doc
+                    .as_ref()
+                    .is_some_and(|d| d.uid() == r.doc && d.active_layer().id == r.layer),
+                "a rendering folded into another smart object's"
+            );
             r.job.stop();
             if let Some(then) = r.then {
                 then(self);
@@ -420,7 +490,7 @@ impl AtelierApp {
         }
         let Some(doc) = &mut self.doc else { return };
         let i = doc.active;
-        if !doc.edit_smart_later(i, name.clone(), f) {
+        if !doc.edit_smart_later(i, name.shown.clone(), f) {
             return;
         }
         let id = doc.layers[i].id;
@@ -465,6 +535,10 @@ impl AtelierApp {
     /// Free Transform to place it, like Photoshop. Without a document, the
     /// file opens.
     pub(super) fn place_path(&mut self, path: &Path, linked: bool) {
+        let later = path.to_path_buf();
+        if self.crop_first(move |app| app.place_path(&later, linked)) {
+            return;
+        }
         self.commit_pending();
         let Some(doc) = &mut self.doc else {
             self.open_path(path);
@@ -561,10 +635,72 @@ impl AtelierApp {
     /// linked smart object's file opens itself: saved, it updates every
     /// smart object linked to it.
     fn edit_contents(&mut self) {
+        // A network file: looked at on another thread first (a host gone
+        // away would block), the copy shown only if it is really missing.
+        let remote = self
+            .active_smart()
+            .and_then(|s| s.link.as_ref())
+            .filter(|l| l.remote())
+            .map(|l| l.path.clone());
+        if let (Some(path), Some(doc)) = (remote, &self.doc) {
+            let (tx, rx) = mpsc::channel();
+            let ctx = self.ctx.clone();
+            let look = path.clone();
+            std::thread::spawn(move || {
+                let _job = crate::diag::job("Linked file: look");
+                let _ = tx.send(look.exists());
+                ctx.request_repaint();
+            });
+            self.smart.checking = Some(LinkCheck {
+                doc: doc.uid(),
+                layer: doc.active_layer().id,
+                name: files::file_name(&path),
+                path,
+                started: self.ctx.input(|i| i.time),
+                rx,
+            });
+            return;
+        }
+        self.open_contents();
+    }
+
+    /// The network file looked at for Edit Contents: once known, the
+    /// contents open (the file, or the copy if missing); meanwhile, its
+    /// busy indicator, Esc or Cancel giving up.
+    fn link_check_window(&mut self, ctx: &egui::Context) {
+        let Some(c) = &self.smart.checking else {
+            return;
+        };
+        let found = match c.rx.try_recv() {
+            Ok(found) => found,
+            Err(mpsc::TryRecvError::Empty) => {
+                let name = t!("smart6-busy-link-look", name = c.name.as_str());
+                if filters_ui::cancellable_indicator(ctx, "link_check", &name, c.started, None) {
+                    self.smart.checking = None;
+                }
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        };
+        let Some(c) = self.smart.checking.take() else {
+            return;
+        };
+        let Some(doc) = self.doc.as_mut().filter(|d| d.uid() == c.doc) else {
+            return;
+        };
+        doc.link_looked_at(&c.path, found);
+        if doc.active_layer().id == c.layer {
+            self.open_contents();
+        }
+    }
+
+    /// [`Self::edit_contents`], its file (if any) looked at already for a
+    /// network one.
+    fn open_contents(&mut self) {
         let linked = self
             .active_smart()
             .and_then(|s| s.link.as_ref())
-            .filter(|l| !l.missing && l.path.exists())
+            .filter(|l| !l.missing && (l.remote() || l.path.exists()))
             .map(|l| l.path.clone());
         if let Some(path) = linked {
             self.open_path(&path);
@@ -607,6 +743,12 @@ impl AtelierApp {
     /// Save of a smart object's contents (Edit Contents): its smart object
     /// shows them. Returns whether the active document is such contents.
     pub(super) fn save_embedded(&mut self) -> bool {
+        self.save_embedded_with(false)
+    }
+
+    /// [`Self::save_embedded`]; `embed`: the instances following their
+    /// linked file show these edits too, unlinked (asked first).
+    fn save_embedded_with(&mut self, embed: bool) -> bool {
         self.commit_pending();
         let Some(doc) = &mut self.doc else {
             return false;
@@ -618,15 +760,16 @@ impl AtelierApp {
         let parent = self.parked.iter_mut().find(|p| p.doc.uid() == e.parent);
         // A link whose file is missing: embedded, or its file would
         // replace these edits once back.
-        let linked = parent.as_ref().is_some_and(|p| {
-            p.doc.layers.iter().any(|l| {
-                l.smart
-                    .as_ref()
-                    .is_some_and(|s| s.contents.id == e.contents && s.link.as_ref().is_some_and(|k| k.gone()))
+        let link_of = |p: &super::tabs::ParkedDoc| {
+            p.doc.layers.iter().find_map(|l| {
+                let s = l.smart.as_deref().filter(|s| s.contents.id == e.contents)?;
+                s.link.as_ref().map(|k| (k.gone(), k.path.clone()))
             })
-        });
-        match parent.map(|p| p.doc.update_contents(e.contents, contents)) {
-            Some(true) => {
+        };
+        let link = parent.as_deref().and_then(link_of);
+        let linked = embed || link.as_ref().is_some_and(|(gone, _)| *gone);
+        match parent.map(|p| p.doc.update_contents(e.contents, contents, embed)) {
+            Some(ContentsUpdate::Updated) => {
                 doc.mark_saved();
                 self.status = if linked {
                     t!("smart4-status-updated-embedded", name = e.name.as_str())
@@ -634,9 +777,26 @@ impl AtelierApp {
                     t!("smart-status-updated", name = e.name.as_str())
                 };
             }
-            // Its document is closed, or its smart object deleted: a file.
-            _ => {
-                doc.embedded_in = None;
+            // Edited while its file was missing, which is back: these edits
+            // or the file, asked (the file would replace them).
+            Some(ContentsUpdate::Linked) => {
+                let file = link.map_or_else(|| e.name.clone(), |(_, path)| files::file_name(&path));
+                self.smart.link_save = Some(LinkSave {
+                    doc: doc.uid(),
+                    text: t!("smart6-link-back", name = file.as_str()),
+                    embed: true,
+                    then: None,
+                });
+            }
+            // Its smart object deleted, or its contents replaced: a file
+            // (still these contents until saved elsewhere: an undo there
+            // may bring it back).
+            Some(ContentsUpdate::Gone) => {
+                self.status = t!("smart6-status-contents-gone");
+                self.save_as_dialog();
+            }
+            // Its document is closed: a file.
+            None => {
                 self.status = t!("smart-status-parent-gone");
                 self.save_as_dialog();
             }
@@ -677,6 +837,7 @@ impl AtelierApp {
                 self.smart.link_save = Some(LinkSave {
                     doc: doc.uid(),
                     text,
+                    embed: false,
                     then: None,
                 })
             }
@@ -730,13 +891,18 @@ impl AtelierApp {
         };
         let title = t!("smart5-link-save-title", name = doc.display_name());
         let text = ask.text.clone();
+        let ok = if ask.embed {
+            t!("smart6-link-back-embed")
+        } else {
+            t!("smart5-link-save-ok")
+        };
         let center = ctx.content_rect().center();
         let out = floating_dialog(
             ctx,
             DialogSpec {
                 pivot: egui::Align2::CENTER_CENTER,
                 width: 420.0,
-                ok: t!("smart5-link-save-ok"),
+                ok,
                 other: Some(t!("smart5-link-save-as")),
                 ..DialogSpec::new("link_save", title, center)
             },
@@ -753,7 +919,9 @@ impl AtelierApp {
         if out.cancel {
             return;
         }
-        if out.ok {
+        if out.ok && ask.embed {
+            self.save_embedded_with(true);
+        } else if out.ok {
             if !self.write_linked_file() {
                 return;
             }
@@ -831,7 +999,9 @@ impl AtelierApp {
             dy.round() - layer.offset.1 as f64,
         );
         let map = Map::Projective(Homography::affine([1.0, 0.0, dx, 0.0, 1.0, dy]));
-        self.edit_smart(t!("smart-menu-reset-transform"), move |s| s.map = map);
+        self.edit_smart(Message::of(|| t!("smart-menu-reset-transform")), move |s| {
+            s.map = map
+        });
     }
 
     /// Linked smart objects whose file changed are read again on other
@@ -839,13 +1009,32 @@ impl AtelierApp {
     /// active one). Files on another machine only when asked (`network`:
     /// Update Modified Content), never just by showing a document.
     fn update_links(&mut self, all: bool, network: bool) {
-        let mut docs: Vec<&mut Document> = self.doc.iter_mut().collect();
+        let mut uids: Vec<u64> = self.doc.iter().map(Document::uid).collect();
         if all {
-            docs.extend(self.parked.iter_mut().map(|p| &mut p.doc));
+            uids.extend(self.parked.iter().map(|p| p.doc.uid()));
+        }
+        self.read_links(&uids, network);
+    }
+
+    /// [`Self::update_links`] for the documents `uids`.
+    fn read_links(&mut self, uids: &[u64], network: bool) {
+        let mut docs: Vec<&mut Document> = self.doc.iter_mut().collect();
+        docs.extend(self.parked.iter_mut().map(|p| &mut p.doc));
+        if network {
+            // Every missing file said again, also those of the reads
+            // going on.
+            self.smart.links_asked |= !self.smart.links.is_empty();
         }
         for doc in docs {
             let uid = doc.uid();
+            if !uids.contains(&uid) {
+                continue;
+            }
             if self.smart.links.iter().any(|(d, _)| *d == uid) {
+                // Read again with its network files once that one lands.
+                if network && !self.smart.links_wanted.contains(&uid) {
+                    self.smart.links_wanted.push(uid);
+                }
                 continue;
             }
             let reads = doc.stale_links(network);
@@ -900,10 +1089,24 @@ impl AtelierApp {
             if let Some(doc) = doc {
                 let r = doc.put_links(fresh);
                 report.updated.extend(r.updated);
+                report.not_found.extend(r.not_found);
                 report.missing.extend(r.missing);
                 report.still_missing.extend(r.still_missing);
                 report.unreadable.extend(r.unreadable);
             }
+        }
+        // Update Modified Content asked while those were read without the
+        // network files: now with them.
+        let wanted: Vec<u64> = self
+            .smart
+            .links_wanted
+            .iter()
+            .copied()
+            .filter(|uid| !self.smart.links.iter().any(|(d, _)| d == uid))
+            .collect();
+        if !wanted.is_empty() {
+            self.smart.links_wanted.retain(|uid| !wanted.contains(uid));
+            self.read_links(&wanted, true);
         }
         // Said once per file gone (the Layers panel badge shows it), unless
         // Update Modified Content asked.
@@ -911,14 +1114,27 @@ impl AtelierApp {
             report.missing.append(&mut report.still_missing);
             self.smart.links_asked = !self.smart.links.is_empty();
         }
+        // Not found once opened: said in a window, as on opening.
+        if !report.not_found.is_empty() {
+            let mut names = std::mem::take(&mut report.not_found);
+            names.dedup();
+            let text = tm!(
+                "smart6-alert-links-not-found",
+                count = names.len(),
+                names = names.join(", ")
+            );
+            self.report_warning(text);
+        }
         if !report.missing.is_empty() {
             self.status = t!(
                 "smart-status-link-missing",
+                count = report.missing.len(),
                 names = report.missing.join(", ")
             );
         } else if !report.unreadable.is_empty() {
             self.status = t!(
                 "smart4-status-link-unreadable",
+                count = report.unreadable.len(),
                 names = report.unreadable.join(", ")
             );
         } else if !report.updated.is_empty() {
@@ -965,7 +1181,7 @@ impl AtelierApp {
                 // Failed: the change is undone (its rendering is missing).
                 None => {
                     self.undo_smart_change(&r);
-                    let text = tm!("fx3-filter-failed", name = r.name.as_str());
+                    let text = tm!("fx3-filter-failed", name = &r.name);
                     self.actions
                         .step_stopped(Stopped::Failed(text.shown.clone()));
                     self.status_failed(text);
@@ -982,6 +1198,15 @@ impl AtelierApp {
             && self.smart.blending.is_none()
         {
             self.smart.preview = None;
+        }
+        // Its preview no longer shown (the dialog closed, the preview
+        // turned off): its rendering is let go (two full images).
+        if let Some((k, _)) = &self.smart.ready
+            && !matches!(
+                self.preview_shown.as_ref().map(|p| &p.preview),
+                Some(LayerPreview::Filter(x)) if x == k
+            )
+        {
             self.smart.ready = None;
         }
         // The filter dialog closed: no smart filter re-edited any more.
@@ -1003,11 +1228,13 @@ impl AtelierApp {
     /// The busy indicator of a rendering, the Blending Options window.
     pub(super) fn smart_windows(&mut self, ctx: &egui::Context) {
         if let Some(r) = &self.smart.rendering {
-            if filters_ui::cancellable_indicator(ctx, "smart_busy", &r.name, r.started, None) {
+            if filters_ui::cancellable_indicator(ctx, "smart_busy", &r.name.shown, r.started, None)
+            {
                 self.cancel_smart_rendering();
             }
             return;
         }
+        self.link_check_window(ctx);
         self.link_save_window(ctx);
         self.filter_blending_window(ctx);
     }
@@ -1020,7 +1247,7 @@ impl AtelierApp {
         };
         r.job.stop();
         self.undo_smart_change(&r);
-        self.status = t!("retouch-status-cancelled", name = r.name.as_str());
+        self.status = t!("retouch-status-cancelled", name = r.name.shown.as_str());
         self.actions.step_stopped(Stopped::Cancelled);
         self.end_layer_preview();
         self.reset_pending();
@@ -1112,7 +1339,7 @@ impl AtelierApp {
     fn smart_preview(&mut self, ctx: &egui::Context, filters: Vec<SmartFilter>, on: bool) {
         let Some(doc) = &self.doc else { return };
         let layer = doc.active_layer();
-        let key = hash_of((layer.id, layer.rev(), format!("{filters:?}")));
+        let key = preview_key(layer, &filters);
         if let Some(job) = &self.smart.preview {
             match job.poll() {
                 Ok(Some(done)) => {
@@ -1172,14 +1399,14 @@ impl AtelierApp {
         then: impl FnOnce(&mut AtelierApp) + 'static,
     ) {
         let filter = filter.into();
-        let name = filter_name(&filter);
+        let name = Message::of(|| filter_name(&filter));
         let filters = self.with_filter(filter);
         self.smart.editing = None;
         self.smart.input = None;
         let Some(doc) = &self.doc else { return };
         let layer = doc.active_layer();
         // As `smart_preview` keys it.
-        let key = hash_of((layer.id, layer.rev(), format!("{filters:?}")));
+        let key = preview_key(layer, &filters);
         let first = layer
             .smart
             .as_ref()
@@ -1201,7 +1428,7 @@ impl AtelierApp {
         } else {
             self.preview_of_smart(key)
         };
-        self.status = t!("filter-applied", name = name.as_str());
+        self.status = t!("filter-applied", name = name.shown.as_str());
         let change = move |s: &mut SmartObject| {
             s.filters = filters;
             if mask.is_some() {
@@ -1297,7 +1524,7 @@ impl AtelierApp {
         if out.ok {
             let (k, f) = (b.index, b.filter.clone());
             if f != b.opened {
-                self.edit_smart(t!("smart-hist-blending"), move |s| {
+                self.edit_smart(Message::of(|| t!("smart-hist-blending")), move |s| {
                     if let Some(old) = s.filters.get_mut(k) {
                         *old = f;
                     }

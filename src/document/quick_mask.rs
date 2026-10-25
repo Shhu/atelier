@@ -55,6 +55,7 @@ impl Document {
         self.checkpoint(name);
         self.quick_mask = None;
         self.quick_mask_rev = next_rev();
+        self.release_stand_in();
         self.selection = selection;
     }
 
@@ -131,6 +132,34 @@ impl Document {
     /// settings, see `masks.rs`): its gray in the colors, opaque, over the
     /// canvas. `None` outside Quick Mask Mode.
     pub(super) fn quick_mask_stand_in(&self) -> Option<Layer> {
+        let image = self.quick_mask_pixels()?;
+        Some(self.quick_mask_shell(Arc::new(image), next_rev()))
+    }
+
+    /// [`Self::quick_mask_stand_in`], made again only when the quick mask,
+    /// the canvas or the active layer changed: a dialog asks for it at
+    /// every frame.
+    pub(super) fn cached_quick_mask_stand_in(&self) -> Option<Layer> {
+        self.quick_mask.as_ref()?;
+        let c = self.full_rect();
+        let key = (
+            self.real_active().id,
+            self.quick_mask_rev,
+            (c.x, c.y),
+            (c.w, c.h),
+            0,
+            false,
+            (c.x, c.y, c.w, c.h),
+        );
+        let (image, rev, _) = self.cached(key, true, || {
+            let image = self.quick_mask_pixels().expect("in Quick Mask Mode");
+            (Arc::new(image), next_rev(), (c.x, c.y))
+        });
+        Some(self.quick_mask_shell(image, rev))
+    }
+
+    /// The quick mask's gray in the colors, opaque, over the canvas.
+    fn quick_mask_pixels(&self) -> Option<RgbaImage> {
         let mask = self.fitted_quick_mask()?;
         let canvas = self.full_rect();
         let mut raw = vec![255u8; mask.as_raw().len() * 4];
@@ -140,12 +169,17 @@ impl Document {
                 p[..3].fill(v);
             }
         });
-        let image = RgbaImage::from_raw(canvas.w, canvas.h, raw).expect("size");
+        Some(RgbaImage::from_raw(canvas.w, canvas.h, raw).expect("size"))
+    }
+
+    /// The quick mask's stand-in with pixels `image` (revision `rev`).
+    fn quick_mask_shell(&self, image: Arc<RgbaImage>, rev: u64) -> Layer {
+        let canvas = self.full_rect();
         let real = self.real_active();
-        Some(Layer {
+        Layer {
             kind: LayerKind::Pixels,
-            image: Arc::new(image),
-            rev: next_rev(),
+            image,
+            rev,
             bounds: std::cell::Cell::new(None),
             styles_cache: std::cell::RefCell::new(None),
             offset: (canvas.x, canvas.y),
@@ -158,7 +192,7 @@ impl Document {
             locked: false,
             visible: true,
             ..real.clone()
-        })
+        }
     }
 
     /// Copies area `area` (canvas; all of it with `None`) of the quick

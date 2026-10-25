@@ -19,6 +19,7 @@ use crate::i18n::t;
 
 mod metadata;
 pub use metadata::ImageMetadata;
+pub(super) use metadata::{fresh_exif, fresh_xmp};
 
 /// Largest canvas side, in pixels.
 pub const MAX_DIMENSION: u32 = 30_000;
@@ -48,6 +49,9 @@ pub enum FileError {
     /// Opening the file would take more memory than the computer has (its
     /// memory, in bytes).
     OutOfMemory(u64),
+    /// Opening the file would take more memory than is free now (what is
+    /// free, in bytes): it may be opened anyway ([`MemoryUse::Anyway`]).
+    LowMemory(u64),
 }
 
 impl From<std::io::Error> for FileError {
@@ -109,6 +113,10 @@ impl std::fmt::Display for FileError {
                 "files5-error-out-of-memory",
                 memory = (*memory as f64 / f64::from(1 << 30)).round().max(1.0)
             ),
+            FileError::LowMemory(free) => t!(
+                "files6-error-low-memory",
+                free = (*free as f64 / f64::from(1 << 30)).round().max(1.0)
+            ),
         };
         f.write_str(&text)
     }
@@ -139,20 +147,39 @@ pub fn layer_fits(w: u32, h: u32) -> bool {
         && u64::from(w) * u64::from(h) <= u64::from(MAX_DIMENSION).pow(2)
 }
 
-/// The memory the pixels of a document being opened may take, all its
-/// layers, masks, channels and smart objects together: what the computer
-/// has. Each part proves it can hold its pixels (its data can't be
-/// inflated more than deflate allows), and no part is read twice, so only
-/// honest files of that size reach this limit; they are refused rather
-/// than aborting the application when memory runs out.
+/// The memory a document being opened may take while it is read, all its
+/// layers, masks, channels and smart objects together, with what decoding
+/// them holds at once. Each part proves it can hold its pixels (its data
+/// can't be inflated more than deflate allows), and no stored byte is read
+/// twice, so only honest files reach these limits: past a share of the
+/// memory free now ([`Budget::new`]) opening asks first
+/// ([`FileError::LowMemory`]); past all the computer can hold
+/// ([`Budget::anyway`]) it is refused rather than aborting the application.
 pub(super) struct Budget {
     left: u64,
     memory: u64,
+    /// Out of what is free (asked), not out of all the computer holds.
+    free: bool,
 }
 
 impl Budget {
+    /// Three fifths of the memory free now: the other programs and tabs,
+    /// the undo history and the display copies need the rest.
     pub(super) fn new() -> Self {
-        Self::of(physical_memory().unwrap_or(16 << 30))
+        let memory = system_memory();
+        match memory.available {
+            Some(free) => Self {
+                left: (free / 5 * 3).min(memory.total),
+                memory: free,
+                free: true,
+            },
+            None => Self::of(memory.total),
+        }
+    }
+
+    /// All the computer can hold, its memory and swap (opening anyway).
+    pub(super) fn anyway() -> Self {
+        Self::of(system_memory().total)
     }
 
     /// A budget of `memory` bytes.
@@ -160,6 +187,7 @@ impl Budget {
         Self {
             left: memory,
             memory,
+            free: false,
         }
     }
 
@@ -178,32 +206,85 @@ impl Budget {
                 self.left = left;
                 Ok(())
             }
+            None if self.free => Err(FileError::LowMemory(self.memory)),
             None => Err(FileError::OutOfMemory(self.memory)),
         }
     }
+}
 
-    /// What is left, in bytes.
-    pub(super) fn left(&self) -> u64 {
-        self.left
+/// How much memory a document being opened may take (see [`Budget`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryUse {
+    /// A share of what is free now; asked past it.
+    Free,
+    /// All the computer can hold: the user agreed to open it anyway.
+    Anyway,
+}
+
+impl MemoryUse {
+    pub(super) fn budget(self) -> Budget {
+        match self {
+            MemoryUse::Free => Budget::new(),
+            MemoryUse::Anyway => Budget::anyway(),
+        }
     }
 }
 
 /// The computer's memory, in bytes.
+struct SystemMemory {
+    /// Memory and swap (or page file): all it can hold.
+    total: u64,
+    /// Memory free now, other programs' caches included.
+    available: Option<u64>,
+}
+
+/// [`SystemMemory`]; 16 GB when it can't be told.
+fn system_memory() -> SystemMemory {
+    #[cfg_attr(not(test), allow(unused_mut))]
+    let mut memory = memory_info().unwrap_or(SystemMemory {
+        total: 16 << 30,
+        available: None,
+    });
+    #[cfg(test)]
+    if let Some(free) = TEST_FREE_MEMORY.get() {
+        memory.available = Some(free);
+    }
+    memory
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FREE_MEMORY: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: the memory said to be free on this thread (`None`: the real).
+#[cfg(test)]
+pub fn set_test_free_memory(free: Option<u64>) {
+    TEST_FREE_MEMORY.set(free);
+}
+
 #[cfg(target_os = "linux")]
-fn physical_memory() -> Option<u64> {
+fn memory_info() -> Option<SystemMemory> {
     let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = info.lines().find(|l| l.starts_with("MemTotal:"))?;
-    let kb: u64 = line["MemTotal:".len()..]
-        .trim()
-        .trim_end_matches("kB")
-        .trim()
-        .parse()
-        .ok()?;
-    Some(kb * 1024)
+    let field = |name: &str| -> Option<u64> {
+        let line = info.lines().find(|l| l.starts_with(name))?;
+        let kb: u64 = line[name.len()..]
+            .trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse()
+            .ok()?;
+        Some(kb * 1024)
+    };
+    let total = field("MemTotal:")?;
+    Some(SystemMemory {
+        total: total + field("SwapTotal:").unwrap_or(0),
+        available: field("MemAvailable:"),
+    })
 }
 
 #[cfg(windows)]
-fn physical_memory() -> Option<u64> {
+fn memory_info() -> Option<SystemMemory> {
     /// MEMORYSTATUSEX.
     #[repr(C)]
     #[derive(Default)]
@@ -228,11 +309,15 @@ fn physical_memory() -> Option<u64> {
     };
     // SAFETY: the call fills the structure whose size it is given.
     let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
-    (ok != 0).then_some(status.total_phys)
+    // The commit limit: memory and page file.
+    (ok != 0).then_some(SystemMemory {
+        total: status.total_page_file.max(status.total_phys),
+        available: Some(status.avail_phys),
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn physical_memory() -> Option<u64> {
+fn memory_info() -> Option<SystemMemory> {
     let mut memory = 0u64;
     let mut size = size_of::<u64>();
     // SAFETY: "hw.memsize" is a 64-bit integer, written into `memory`
@@ -246,11 +331,15 @@ fn physical_memory() -> Option<u64> {
             0,
         )
     };
-    (ok == 0).then_some(memory)
+    // Swap grows as needed: the memory alone bounds it.
+    (ok == 0).then_some(SystemMemory {
+        total: memory,
+        available: None,
+    })
 }
 
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
-fn physical_memory() -> Option<u64> {
+fn memory_info() -> Option<SystemMemory> {
     None
 }
 
@@ -272,6 +361,19 @@ pub struct FileMetadata {
     pub psd_resources: std::sync::Arc<Vec<PsdResource>>,
     /// An image's resolution, XMP, IPTC, comments… in its format.
     pub image: Option<std::sync::Arc<ImageMetadata>>,
+    /// The canvas and alpha channels `psd_resources` describe.
+    pub psd_layout: Option<PsdLayout>,
+}
+
+/// What a Photoshop document's kept resources were made for: those placed
+/// on the canvas (slices, color samplers, Count marks) go back only on a
+/// canvas of the same size, the channels' display settings (color,
+/// opacity, what they show) to the channels of the same name.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PsdLayout {
+    pub canvas: (u32, u32),
+    /// The alpha channels, in the order of the display settings (1077).
+    pub channels: Vec<String>,
 }
 
 /// An image resource of a Photoshop document, kept as it was.
@@ -567,7 +669,11 @@ pub fn encode_image(
     if w.max(h) > format.max_side() {
         return Err(FileError::FormatTooSmall(format, format.max_side()));
     }
-    let kept = kept.filter(|k| k.format == Some(format));
+    // Its XMP made true for the image saved.
+    let kept = kept
+        .filter(|k| k.format == Some(format))
+        .map(|k| k.for_size((w, h)));
+    let kept = kept.as_ref();
     // TIFF: its own Copyright tag (its encoder takes no EXIF).
     if format == ExportFormat::Tiff {
         return tiff(image, out, icc_profile, copyright, kept);
@@ -660,6 +766,11 @@ fn tiff(
         .map_err(failed)?
         .with_compression(Compression::Lzw);
     let (w, h) = image.dimensions();
+    // The EXIF and GPS directories first: the image's points to them.
+    let dirs = match kept {
+        Some(kept) => kept.write_tiff_dirs(&mut encoder, (w, h)).map_err(failed)?,
+        None => Vec::new(),
+    };
     macro_rules! write {
         ($kind:ty, $data:expr, $extra:expr) => {{
             let mut file = encoder.new_image::<$kind>(w, h).map_err(failed)?;
@@ -673,7 +784,7 @@ fn tiff(
                 tiff_copyright(file.encoder(), text).map_err(failed)?;
             }
             if let Some(kept) = kept {
-                kept.write_tiff(file.encoder(), copyright.is_some())
+                kept.write_tiff(file.encoder(), copyright.is_some(), &dirs)
                     .map_err(failed)?;
             }
             if let Some(icc) = icc {
@@ -1139,6 +1250,13 @@ mod tests {
             .save(dir.join("deep.png"))
             .unwrap();
         assert_eq!(losses("deep.png"), [t!("xchg-psd-note-depth", bits = 16)]);
+        // Said on opening too, as for a Photoshop document.
+        assert_eq!(
+            crate::document::Document::open(&dir.join("deep.png"))
+                .unwrap()
+                .notes,
+            [t!("xchg-psd-note-depth", bits = 16)]
+        );
         // A TIFF of two pages, with a copyright.
         {
             use tiff::encoder::{TiffEncoder, colortype::RGB8};
@@ -1288,5 +1406,26 @@ mod tests {
                 "{format:?}"
             );
         }
+    }
+
+    /// Past three fifths of the memory free, opening asks first; past all
+    /// the computer holds, it is refused.
+    #[test]
+    fn the_budget_asks_past_the_free_memory() {
+        set_test_free_memory(Some(1000));
+        let mut budget = Budget::new();
+        assert!(budget.take_bytes(600).is_ok());
+        assert!(matches!(
+            budget.take_bytes(1),
+            Err(FileError::LowMemory(1000))
+        ));
+        let mut anyway = MemoryUse::Anyway.budget();
+        assert!(anyway.take_bytes(1 << 20).is_ok());
+        set_test_free_memory(None);
+        let mut small = Budget::of(10);
+        assert!(matches!(
+            small.take_bytes(11),
+            Err(FileError::OutOfMemory(10))
+        ));
     }
 }

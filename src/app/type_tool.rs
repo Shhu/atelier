@@ -179,8 +179,9 @@ impl AtelierApp {
         let text = self
             .doc
             .as_ref()
+            .filter(|d| !d.is_locked(d.active))
             .map(Document::active_layer)
-            .filter(|l| l.id == edit.layer && !l.locked)
+            .filter(|l| l.id == edit.layer)
             .and_then(|l| l.text.as_ref());
         match text {
             Some(t) => {
@@ -299,10 +300,9 @@ impl AtelierApp {
     /// undo step per series of edits.
     pub(super) fn change_text(&mut self, f: impl FnOnce(&mut TextData, Option<&mut TypeEdit>)) {
         self.sync_type_edit();
-        let Some(layer) = self.doc.as_ref().map(Document::active_layer) else {
-            return;
-        };
-        let (Some(old), false) = (layer.text.clone(), layer.locked) else {
+        let Some(doc) = &self.doc else { return };
+        let layer = doc.active_layer();
+        let (Some(old), false) = (layer.text.clone(), doc.is_locked(doc.active)) else {
             return;
         };
         let id = layer.id;
@@ -764,10 +764,20 @@ impl AtelierApp {
     ) -> CursorIcon {
         self.sync_type_edit();
         let (ctrl, shift) = self.ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
-        // Ctrl: the Move tool, for texts.
-        let dragging = self.layer_drag.is_some() || self.xform.quick.dragging();
+        // Ctrl: the Move tool for a moment, as with the other tools (with a
+        // selection, its pixels); while typing, for the text.
+        let free = self.type_tool.edit.is_none();
+        let dragging = self.layer_drag.is_some()
+            || self.xform.quick.dragging()
+            || (free && self.select_move.is_some());
         if dragging || (ctrl && self.type_tool.drag.is_none()) {
-            if let Some(cursor) = self.drag_layer_input(view, pointer, start, down, true) {
+            if free {
+                // Its Ctrl is the Move tool's, not "no snapping".
+                self.snap_off = false;
+                if let Some(cursor) = self.temporary_move(view, pointer, start, down, shift) {
+                    return cursor;
+                }
+            } else if let Some(cursor) = self.drag_layer_input(view, pointer, start, down, true) {
                 return cursor;
             }
             if ctrl {
@@ -857,7 +867,7 @@ impl AtelierApp {
         let doc = self.doc.as_ref()?;
         (0..doc.layers.len()).rev().find(|&i| {
             let l = &doc.layers[i];
-            l.visible && !l.locked && l.text.is_some() && to_rect(l.rect()).contains(ip)
+            l.visible && !doc.is_locked(i) && l.text.is_some() && to_rect(l.rect()).contains(ip)
         })
     }
 

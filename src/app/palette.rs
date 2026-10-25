@@ -55,6 +55,8 @@ struct Entry {
     /// An option's state (View › Rulers, Window › History…).
     checked: Option<bool>,
     action: Action,
+    /// How it matches the query (see [`ranked`]); 0 before typing.
+    level: u32,
 }
 
 /// A group of results: its title, the results shown, how many more match.
@@ -83,13 +85,8 @@ impl AtelierApp {
             )
         });
         let p = &mut self.palette;
-        // Enter runs something: a greyed best match stays in sight, above.
         if std::mem::take(&mut p.fresh) {
-            p.active = groups
-                .iter()
-                .flat_map(|(_, entries, _)| entries)
-                .position(|e| e.enabled)
-                .unwrap_or(0);
+            p.active = first_highlight(&groups);
         }
         if down {
             p.active += 1;
@@ -153,6 +150,10 @@ impl AtelierApp {
         for (title, entries) in self.menus() {
             flatten(ctx, &entries, &title, &mut commands);
         }
+        commands.extend(self.palette_only());
+        // The language in use first among equal matches ("langue"): Enter
+        // keeps it.
+        commands.sort_by_key(|e| matches!(e.action, Action::SetLanguage(l) if l != i18n::lang()));
         let tools = Tool::ALL.into_iter().map(|tool| Entry {
             label: tool.name(),
             path: t!("palette-tool"),
@@ -160,6 +161,7 @@ impl AtelierApp {
             enabled: true,
             checked: None,
             action: Action::Tool(tool),
+            level: 0,
         });
         if query.is_empty() {
             // With no image: what starts one (tools included: Crop).
@@ -195,6 +197,43 @@ impl AtelierApp {
             .into_iter()
             .filter(|(_, entries, _)| !entries.is_empty())
             .collect()
+    }
+
+    /// Entries only the palette lists: Layer Mask, which adds one (the
+    /// Layers panel's button), and the other half of Hide / Show Layers, greyed, so that
+    /// "show layers" doesn't land on Hide Layers.
+    fn palette_only(&self) -> Vec<Entry> {
+        let Some(doc) = &self.doc else {
+            return Vec::new();
+        };
+        let path = t!("menu-layer");
+        let entry = |label, enabled, action| Entry {
+            label,
+            path: path.clone(),
+            shortcut: None,
+            enabled,
+            checked: None,
+            action,
+            level: 0,
+        };
+        let mask = if self.selection.is_some() {
+            NewMask::RevealSelection
+        } else {
+            NewMask::RevealAll
+        };
+        let other = if self.selection_hidden() {
+            t!("ui5-menu-hide-layers")
+        } else {
+            t!("ui5-menu-show-layers")
+        };
+        vec![
+            entry(
+                t!("core-menu-layer-mask"),
+                doc.active_layer().mask.is_none(),
+                Action::AddMask(mask),
+            ),
+            entry(other, false, Action::ToggleVisibility),
+        ]
     }
 
     /// Why a greyed command can't run now, in a few words.
@@ -323,6 +362,21 @@ impl AtelierApp {
     }
 }
 
+/// The row highlighted after typing: the best match, or the first
+/// available row matching as well (a label holding the query, its menu
+/// path, its keywords…) below a greyed one, which stays in sight above.
+/// Otherwise the greyed best match: the footer says why, Enter does
+/// nothing (a looser match is not what was asked for).
+fn first_highlight(groups: &[Group]) -> usize {
+    let mut all = groups.iter().flat_map(|(_, entries, _)| entries);
+    let Some(best) = all.next() else { return 0 };
+    if best.enabled {
+        return 0;
+    }
+    all.position(|e| e.enabled && e.level == best.level)
+        .map_or(0, |i| i + 1)
+}
+
 /// Menu commands, submenus flattened ("Image › Adjustments").
 fn flatten(ctx: &egui::Context, entries: &[MenuEntry], path: &str, out: &mut Vec<Entry>) {
     for entry in entries {
@@ -336,6 +390,7 @@ fn flatten(ctx: &egui::Context, entries: &[MenuEntry], path: &str, out: &mut Vec
                 enabled: *enabled,
                 checked: None,
                 action: *action,
+                level: 0,
             }),
             MenuEntry::Check(label, enabled, checked, shortcut, action) => out.push(Entry {
                 label: label.clone(),
@@ -344,6 +399,7 @@ fn flatten(ctx: &egui::Context, entries: &[MenuEntry], path: &str, out: &mut Vec
                 enabled: *enabled,
                 checked: Some(*checked),
                 action: *action,
+                level: 0,
             }),
             MenuEntry::Choice(label, selected, action) => out.push(Entry {
                 label: label.clone(),
@@ -352,6 +408,7 @@ fn flatten(ctx: &egui::Context, entries: &[MenuEntry], path: &str, out: &mut Vec
                 enabled: true,
                 checked: Some(*selected),
                 action: *action,
+                level: 0,
             }),
             MenuEntry::Unavailable(..) => {}
         }
@@ -381,6 +438,8 @@ pub(super) struct Facts {
     last_filter: bool,
     last_transform: bool,
     busy: bool,
+    /// The selected layers are all hidden.
+    hidden: bool,
 }
 
 impl AtelierApp {
@@ -410,6 +469,7 @@ impl AtelierApp {
             last_filter: self.has_last_filter(),
             last_transform: self.has_last_transform(),
             busy: self.subject_job.is_some(),
+            hidden: self.selection_hidden(),
         }
     }
 }
@@ -528,6 +588,13 @@ pub(super) fn unavailable_reason(f: &Facts, action: Action) -> String {
         t!("ui4-why-no-transform-yet")
     } else if matches!(action, Action::RemoveBackground | Action::SelectSubject) && f.busy {
         t!("ui4-why-busy")
+    } else if matches!(action, Action::ToggleVisibility) {
+        // The palette's other half of Hide / Show Layers.
+        if f.hidden {
+            t!("ui6-why-already-hidden")
+        } else {
+            t!("ui6-why-already-visible")
+        }
     } else {
         t!("ui3-why-not-now")
     }
@@ -565,15 +632,19 @@ fn keywords(action: Action) -> String {
         Action::RotateCanvas(_) | Action::RotateArbitrary | Action::FlipCanvas(_) => {
             t!("ui3-palette-keywords-rotate")
         }
-        Action::Tool(Tool::Canvas) | Action::CropToSelection | Action::CropToContent => {
-            t!("ui3-palette-keywords-crop")
-        }
+        Action::Tool(Tool::Canvas) => format!(
+            "{} {}",
+            t!("ui3-palette-keywords-crop"),
+            t!("ui6-palette-keywords-straighten")
+        ),
+        Action::CropToSelection | Action::CropToContent => t!("ui3-palette-keywords-crop"),
         Action::NewDocument => t!("ui5-palette-keywords-new"),
         Action::ToggleVisibility => t!("ui5-palette-keywords-visibility"),
         Action::Tool(Tool::ObjectSelect) => t!("ui5-palette-keywords-object-select"),
         Action::Automate(actions_panel::Command::Panel) => t!("ui5-palette-keywords-actions"),
         Action::Undo => t!("ui5-palette-keywords-undo"),
-        Action::SetLanguage(_) => t!("ui5-palette-keywords-language"),
+        Action::SetLanguage(Lang::En) => t!("ui6-palette-keywords-english"),
+        Action::SetLanguage(Lang::Fr) => t!("ui6-palette-keywords-french"),
         Action::Adjust(AdjustKind::HueSaturation) => t!("ui5-palette-keywords-desaturate"),
         Action::Transform(transform::Command::Mode(transform::Mode::Scale)) => {
             t!("ui5-palette-keywords-scale")
@@ -601,9 +672,24 @@ fn keywords(action: Action) -> String {
         Action::Quit => t!("ui4-palette-keywords-quit"),
         Action::Select(select_menu::Command::QuickMask) => t!("ui4-palette-keywords-quick-mask"),
         Action::Tool(Tool::RedEye) => t!("ui4-palette-keywords-red-eye"),
-        Action::RemoveBackground | Action::SelectSubject => {
+        Action::RemoveBackground => t!("ui3-palette-keywords-cut-out"),
+        Action::SelectSubject => format!(
+            "{} {}",
+            t!("ui6-palette-keywords-subject"),
             t!("ui3-palette-keywords-cut-out")
+        ),
+        Action::InvertSelection | Action::Adjust(AdjustKind::Invert) => {
+            t!("ui6-palette-keywords-invert")
         }
+        Action::LayerStyle(None) => t!("ui6-palette-keywords-blending"),
+        Action::Adjust(AdjustKind::Levels | AdjustKind::Curves) => {
+            t!("ui6-palette-keywords-exposure")
+        }
+        Action::Workspace(workspace::Command::TogglePanels) => {
+            t!("ui6-palette-keywords-full-screen")
+        }
+        Action::Tool(Tool::Brush) => t!("ui6-palette-keywords-brush"),
+        Action::Tool(Tool::Eyedropper) => t!("ui6-palette-keywords-eyedropper"),
         Action::Workspace(workspace::Command::Shortcuts) => t!("ui3-palette-keywords-shortcuts"),
         Action::Workspace(workspace::Command::About) => t!("ui3-palette-keywords-about"),
         Action::Workspace(workspace::Command::Diagnostics) => t!("diag-palette-keywords"),
@@ -619,7 +705,15 @@ fn keywords(action: Action) -> String {
 /// the shallower in the menus.
 /// How an entry ranks: its level, whether it is available, its score, its
 /// depth in the menus (shallower first).
-type Rank = (u32, bool, u32, std::cmp::Reverse<usize>);
+type Rank = (
+    u32,
+    bool,
+    bool,
+    std::cmp::Reverse<usize>,
+    u32,
+    std::cmp::Reverse<usize>,
+    bool,
+);
 
 fn ranked(
     entries: Vec<Entry>,
@@ -632,14 +726,48 @@ fn ranked(
         .filter_map(|e| {
             let score = score_in(&e.label, &e.path, &keywords(e.action), query, vocabulary)?;
             let depth = e.path.matches('›').count();
-            Some(((score / 20, e.enabled, score, std::cmp::Reverse(depth)), e))
+            // Clear Recent File List can't be undone: never ahead of
+            // anything (the files themselves for "recent").
+            let level = if matches!(e.action, Action::Workspace(workspace::Command::ClearRecent)) {
+                0
+            } else {
+                score / 20
+            };
+            // A recent file's name matches by chance: commands first.
+            let command = !matches!(
+                e.action,
+                Action::Workspace(workspace::Command::OpenRecent(_))
+            );
+            // A command that asks first ("…") before one that acts at once.
+            let asks = e.label.ends_with('…');
+            // A label starting with the query: the shallower first (Window ›
+            // Layers before View › Snap To › Layers).
+            let near = std::cmp::Reverse(if level >= 5 { depth } else { 0 });
+            Some((
+                (
+                    level,
+                    e.enabled,
+                    command,
+                    near,
+                    score,
+                    std::cmp::Reverse(depth),
+                    asks,
+                ),
+                e,
+            ))
         })
         .collect();
     // Stable: equal matches keep the menus' order.
     scored.sort_by_key(|(key, _)| std::cmp::Reverse(*key));
-    let best = scored.first().map_or(0, |((_, _, score, _), _)| *score);
+    let best = scored
+        .first()
+        .map_or(0, |((_, _, _, _, score, _, _), _)| *score);
     let more = scored.len().saturating_sub(max);
-    let entries = scored.into_iter().take(max).map(|(_, e)| e).collect();
+    let entries = scored
+        .into_iter()
+        .take(max)
+        .map(|(rank, e)| Entry { level: rank.0, ..e })
+        .collect();
     (entries, more, best)
 }
 
@@ -655,8 +783,9 @@ fn vocabulary<'a>(entries: impl Iterator<Item = &'a Entry>) -> HashSet<String> {
 }
 
 /// Small words a query may hold that commands don't ("black and white").
-const FILLERS: [&str; 12] = [
-    "a", "and", "of", "the", "to", "et", "de", "des", "du", "la", "le", "les",
+const FILLERS: [&str; 24] = [
+    "a", "and", "for", "of", "the", "to", "with", "et", "au", "aux", "avec", "d", "de", "des",
+    "du", "en", "l", "la", "le", "les", "pour", "selon", "un", "une",
 ];
 
 /// [`score_in`] without the words of the menus.
@@ -667,7 +796,8 @@ fn score(label: &str, path: &str, keywords: &str, query: &str) -> Option<u32> {
 
 /// How well a command matches `query` (higher is better), or `None`. A
 /// typed word that is a whole word of the menus (`vocabulary`: "masque",
-/// "select") stands for that word (or its plural): a command holding it
+/// "select"), or its plural ("masques"), stands for that word (or its
+/// plural): a command holding it
 /// only inside a longer word ("Masquer", "Selection") or a near spelling
 /// matches at the lowest level.
 fn score_in(
@@ -699,14 +829,12 @@ fn rate(
     let query = fold(query).replace("colour", "color");
     let label = fold(label);
     let wanted: Vec<&str> = words(&query).filter(|w| !FILLERS.contains(w)).collect();
-    let exact = |typed: &str| whole.is_some_and(|v| v.contains(typed));
-    let matches = |word: &str, typed: &str| {
-        if exact(typed) {
-            word.strip_prefix(typed)
-                .is_some_and(|rest| matches!(rest, "" | "s" | "es"))
-        } else {
-            starts_like(word, typed)
-        }
+    let exact = |typed: &str| whole.and_then(|v| menu_word(typed, v)).is_some();
+    let matches = |word: &str, typed: &str| match whole.and_then(|v| menu_word(typed, v)) {
+        Some(stem) => word
+            .strip_prefix(stem)
+            .is_some_and(|rest| matches!(rest, "" | "s" | "es")),
+        None => starts_like(word, typed),
     };
     // `text` holds the query at the start of a word, ending a word too when
     // its last word is one of the menus'.
@@ -764,6 +892,19 @@ fn rate(
             .unwrap_or(usize::MAX);
         Some(30 + phrase + 4u32.saturating_sub(first.min(4) as u32))
     }
+}
+
+/// The word of the menus `typed` stands for: itself, or its singular
+/// ("masques", "masks"), when the menus hold it.
+fn menu_word<'a>(typed: &'a str, vocabulary: &HashSet<String>) -> Option<&'a str> {
+    [
+        Some(typed),
+        typed.strip_suffix("es"),
+        typed.strip_suffix('s'),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|w| !w.is_empty() && vocabulary.contains(*w))
 }
 
 /// The words of folded text.
@@ -1251,27 +1392,148 @@ mod tests {
         assert!(suggested.iter().all(|e| e.enabled));
     }
 
-    /// The row Enter runs after typing: an available one, even when a
-    /// greyed command matches better (it stays listed above, saying why).
+    /// The highlighted row after typing `query`: its label and action, and
+    /// whether it is available.
+    fn highlighted(h: &mut Harness<'static, AtelierApp>, query: &str) -> (String, Action, bool) {
+        let p = &mut h.state_mut().palette;
+        p.open();
+        p.query = query.to_owned();
+        p.fresh = true;
+        h.run_steps(2);
+        let app = h.state();
+        let groups = app.palette_groups(&h.ctx, query);
+        let row = groups
+            .iter()
+            .flat_map(|(_, entries, _)| entries)
+            .nth(app.palette.active)
+            .map(|e| (e.label.clone(), e.action, e.enabled))
+            .expect("a row");
+        h.state_mut().palette.open = false;
+        h.run_steps(1);
+        row
+    }
+
+    /// The row Enter runs after typing: an available one matching as well
+    /// as a greyed best match (which stays listed above, saying why), never
+    /// a looser match: "cut" doesn't open Remove Background.
     #[test]
-    fn the_highlight_starts_on_an_available_command() {
+    fn the_highlight_stays_at_the_level_of_the_best_match() {
         let mut h = app(true, Lang::En);
-        for query in ["layer mask", "layer style", "transform", "select", "expand", "cut"] {
-            let p = &mut h.state_mut().palette;
-            p.open();
-            p.query = query.to_owned();
-            p.fresh = true;
-            h.run_steps(2);
-            let app = h.state();
-            let groups = app.palette_groups(&h.ctx, query);
-            let active = groups
-                .iter()
-                .flat_map(|(_, entries, _)| entries)
-                .nth(app.palette.active)
-                .map(|e| (e.label.clone(), e.enabled));
-            assert!(active.as_ref().is_some_and(|a| a.1), "{query}: {active:?}");
-            h.state_mut().palette.open = false;
+        for query in ["layer mask", "crop", "new layer"] {
+            let row = highlighted(&mut h, query);
+            assert!(row.2, "{query}: {row:?}");
+        }
+        for (query, not) in [
+            ("cut", Action::RemoveBackground),
+            ("sel", Action::CropToElement),
+            (
+                "select and mask",
+                Action::Select(select_menu::Command::QuickMask),
+            ),
+            ("expand", Action::CanvasSize),
+            ("clear", Action::Workspace(workspace::Command::ClearRecent)),
+        ] {
+            let row = highlighted(&mut h, query);
+            assert!(!row.2, "{query}: the greyed best match stays: {row:?}");
+            assert_ne!(format!("{:?}", row.1), format!("{not:?}"), "{query}");
+        }
+        // Enter on a greyed row does nothing.
+        h.state_mut().palette.open();
+        h.run_steps(2);
+        for c in ["c", "u", "t"] {
+            h.event(egui::Event::Text(c.into()));
             h.run_steps(1);
+        }
+        h.key_press(egui::Key::Enter);
+        h.run_steps(3);
+        assert!(h.state().model_prompt.is_none(), "no model download asked");
+    }
+
+    /// "recent" finds the recent files before Clear Recent File List, which
+    /// asks before emptying the list.
+    #[test]
+    fn clearing_the_recent_files_asks_first() {
+        let mut h = app(true, Lang::En);
+        let groups = h.state().palette_groups(&h.ctx, "recent");
+        let all: Vec<Action> = groups
+            .iter()
+            .flat_map(|(_, e, _)| e)
+            .map(|e| e.action)
+            .collect();
+        let clear = all
+            .iter()
+            .position(|a| matches!(a, Action::Workspace(workspace::Command::ClearRecent)));
+        if let Some(clear) = clear {
+            assert_eq!(clear, all.len() - 1, "{all:?}");
+        }
+        h.state_mut()
+            .run(Action::Workspace(workspace::Command::ClearRecent));
+        h.run_steps(2);
+        assert!(h.state().workspace.clear_recent, "asked");
+        assert!(h.state().workspace.modal());
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert!(!h.state().workspace.clear_recent, "Esc cancels");
+    }
+
+    /// Plurals keep the whole-word rule; the panel, the layer mask and the
+    /// languages by their names; Show Layers never lands on Hide Layers.
+    #[test]
+    fn plurals_panels_and_languages() {
+        let first = |lang: Lang, q: &str| {
+            let h = app(true, lang);
+            let first = found(&h, q).first().map(|(_, a)| *a);
+            i18n::set_lang(Lang::En);
+            first
+        };
+        for (lang, q) in [
+            (Lang::Fr, "masques"),
+            (Lang::Fr, "masque"),
+            (Lang::En, "mask"),
+        ] {
+            assert!(
+                matches!(first(lang, q), Some(Action::AddMask(_))),
+                "{q}: {:?}",
+                first(lang, q)
+            );
+        }
+        for (lang, q) in [(Lang::En, "layers"), (Lang::Fr, "calques")] {
+            assert!(
+                matches!(
+                    first(lang, q),
+                    Some(Action::Workspace(workspace::Command::ToggleSidePanel))
+                ),
+                "{q}: {:?}",
+                first(lang, q)
+            );
+        }
+        assert!(matches!(
+            first(Lang::En, "french"),
+            Some(Action::SetLanguage(Lang::Fr))
+        ));
+        // The language in use first: Enter keeps it.
+        assert!(matches!(
+            first(Lang::Fr, "langue"),
+            Some(Action::SetLanguage(Lang::Fr))
+        ));
+        assert!(matches!(
+            first(Lang::En, "rotation"),
+            Some(Action::RotateArbitrary)
+        ));
+        let mut h = app(true, Lang::En);
+        let row = highlighted(&mut h, "show layers");
+        assert!(!row.2, "{row:?}");
+        assert_eq!(
+            h.state().why_unavailable(row.1),
+            t!("ui6-why-already-visible")
+        );
+        for (lang, q, want) in [
+            (Lang::En, "opacity", "LayerStyle(None)"),
+            (Lang::Fr, "inverser", "Adjust(Invert)"),
+            (Lang::Fr, "selectionner le sujet", "SelectSubject"),
+        ] {
+            let got = format!("{:?}", first(lang, q));
+            assert!(got.contains(want), "{q}: {got}");
         }
     }
 
@@ -1285,7 +1547,10 @@ mod tests {
             i18n::set_lang(Lang::En);
             first
         };
-        assert!(matches!(first(Lang::En, "hide layer"), Some(Action::ToggleVisibility)));
+        assert!(matches!(
+            first(Lang::En, "hide layer"),
+            Some(Action::ToggleVisibility)
+        ));
         assert!(matches!(
             first(Lang::Fr, "masquer le calque"),
             Some(Action::ToggleVisibility)

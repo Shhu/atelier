@@ -113,14 +113,28 @@ fn moved_gray(
     if let Some((dx, dy)) = whole_shift(t) {
         let r = intersect(area.translate(dx, dy), canvas)?;
         let (x, y) = ((r.x - dx - area.x) as u32, (r.y - dy - area.y) as u32);
-        return Some((
-            image::imageops::crop_imm(image, x, y, r.w, r.h).to_image(),
-            r,
-        ));
+        return Some((crop_gray(image, x, y, r.w, r.h), r));
     }
     let (moved, (x, y)) = transform_mask(image, (area.x, area.y), 0, t, filter, canvas);
     let (w, h) = moved.dimensions();
     (w > 0 && h > 0).then_some((moved, PixelRect { x, y, w, h }))
+}
+
+/// The `w` × `h` pixels of `image` from `(x, y)` (within it), row by row.
+fn crop_gray(image: &GrayImage, x: u32, y: u32, w: u32, h: u32) -> GrayImage {
+    let (iw, x, w) = (image.width() as usize, x as usize, w as usize);
+    let raw = image.as_raw();
+    let mut out = GrayImage::new(w as u32, h);
+    if w == 0 {
+        return out;
+    }
+    par_rows(out.as_mut(), w, |first, band| {
+        for (j, line) in band.chunks_exact_mut(w).enumerate() {
+            let start = (y as usize + first + j) * iw + x;
+            line.copy_from_slice(&raw[start..start + w]);
+        }
+    });
+    out
 }
 
 /// The quick mask `mask` (the canvas) as `t` moves what `selection`
@@ -147,9 +161,7 @@ fn moved_quick_mask(
         None => (std::borrow::Cow::Borrowed(mask), None, GrayImage::new(w, h)),
         Some(sel) => {
             let cov = sel.to_mask(area);
-            let mut part =
-                image::imageops::crop_imm(mask, area.x as u32, area.y as u32, aw as u32, area.h)
-                    .to_image();
+            let mut part = crop_gray(mask, area.x as u32, area.y as u32, aw as u32, area.h);
             let mut out = mask.clone();
             let c = cov.as_raw();
             par_rows(part.as_mut(), aw, |first, band| {
@@ -481,6 +493,26 @@ impl Document {
         self.put_quick_mask(moved);
     }
 
+    /// The quick mask `base` (the canvas) with a copy of what `selection`
+    /// selects of it (all of it without one) moved by `d` over it, in
+    /// place of the quick mask, within the current step (Alt+arrows).
+    pub fn copy_quick_mask(
+        &mut self,
+        base: &GrayImage,
+        (dx, dy): (i64, i64),
+        selection: Option<&Selection>,
+    ) {
+        if self.quick_mask.is_none() || base.dimensions() != (self.canvas.0, self.canvas.1) {
+            return;
+        }
+        let t = Transform::projective(
+            bounds(self.full_rect()),
+            xform::Homography::affine([1.0, 0.0, dx as f64, 0.0, 1.0, dy as f64]),
+        );
+        let moved = moved_quick_mask(base, selection, true, &t, Filter::Nearest);
+        self.put_quick_mask(moved);
+    }
+
     /// Puts the result of [`Self::transform_job`] in place, as the undo
     /// step `name`: texts become pixels, shapes follow as vectors, smart
     /// objects stay smart.
@@ -598,7 +630,22 @@ impl Document {
             && let Some(prev) = self.undo.back_mut()
         {
             prev.name = last.name;
+            let prev = prev.seq;
             self.step += 1;
+            // A full history: the oldest step the joined one let go comes
+            // back (the two count as one).
+            if self.evicted.as_ref().is_some_and(|(seq, ..)| *seq == last.seq) {
+                let (_, oldest, forgotten) = self.evicted.take().expect("checked");
+                self.undo.push_front(oldest);
+                self.forgotten = forgotten;
+            }
+            // The redo list it dropped comes back if the joined one is
+            // discarded.
+            if let Some((seq, _)) = &mut self.dropped_redo
+                && *seq == last.seq
+            {
+                *seq = prev;
+            }
         }
     }
 }

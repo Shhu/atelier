@@ -89,6 +89,8 @@ pub(super) struct Workspace {
     /// Help › Keyboard Shortcuts open, and its filter.
     pub shortcuts: Option<String>,
     about: bool,
+    /// File › Open Recent › Clear Recent File List asks first.
+    pub clear_recent: bool,
     /// A failed open or save, shown until dismissed.
     alert: Option<String>,
     /// The status message that reports an error (shown as one).
@@ -103,6 +105,7 @@ impl Default for Workspace {
             hide_side: false,
             shortcuts: None,
             about: false,
+            clear_recent: false,
             alert: None,
             error_status: None,
         }
@@ -112,7 +115,7 @@ impl Default for Workspace {
 impl Workspace {
     /// A window that takes the keyboard is open (About, an alert).
     pub(super) fn modal(&self) -> bool {
-        self.about || self.alert.is_some()
+        self.about || self.clear_recent || self.alert.is_some()
     }
 
     /// The layout changed by a drag: kept for the next sessions.
@@ -164,7 +167,8 @@ impl AtelierApp {
                     self.recent.forget(&path);
                 }
             }
-            Command::ClearRecent => self.recent.clear(),
+            // It can't be undone: asked first.
+            Command::ClearRecent => self.workspace.clear_recent = true,
             Command::TogglePanels => self.workspace.hide_all = !self.workspace.hide_all,
             Command::ToggleSidePanel => {
                 let ws = &mut self.workspace;
@@ -217,7 +221,7 @@ impl AtelierApp {
             .doc
             .as_ref()
             .filter(|d| paints && d.quick_mask().is_none())?;
-        if doc.active_layer().locked {
+        if doc.is_locked(doc.active) {
             Some(PaintBlock::Locked)
         } else if !doc.shown(doc.active) {
             Some(PaintBlock::Hidden)
@@ -253,7 +257,20 @@ impl AtelierApp {
     pub(super) fn report_error(&mut self, message: impl Into<crate::i18n::Message>) {
         let message = message.into();
         crate::diag::error(message.clone());
-        let message = message.shown;
+        self.show_alert(message.shown);
+    }
+
+    /// [`Self::report_error`] for what didn't fail but must be seen (a
+    /// linked file not found on opening), logged as a warning.
+    pub(super) fn report_warning(&mut self, message: impl Into<crate::i18n::Message>) {
+        let message = message.into();
+        crate::diag::warn(message.clone());
+        self.show_alert(message.shown);
+    }
+
+    /// `message` in the status bar, in the warning color, and in the alert
+    /// window (only the status in Batch runs).
+    fn show_alert(&mut self, message: String) {
         self.status = message.clone();
         self.workspace.error_status = Some(message.clone());
         if !self.automate.running() {
@@ -408,7 +425,37 @@ impl AtelierApp {
         self.shortcuts_window(ctx);
         self.diagnostics_window(ctx);
         self.about_window(ctx);
+        self.clear_recent_window(ctx);
         self.error_alert_window(ctx);
+    }
+
+    /// "Clear the recent file list?": Clear / Cancel.
+    fn clear_recent_window(&mut self, ctx: &egui::Context) {
+        if !self.workspace.clear_recent {
+            return;
+        }
+        let out = floating_dialog(
+            ctx,
+            DialogSpec {
+                pivot: egui::Align2::CENTER_CENTER,
+                width: 400.0,
+                ok: t!("ui6-clear-recent-ok"),
+                ..DialogSpec::new(
+                    "clear_recent",
+                    t!("ui3-menu-clear-recent"),
+                    ctx.content_rect().center(),
+                )
+            },
+            |ui| {
+                ui.add(egui::Label::new(t!("ui6-clear-recent-text")).wrap());
+            },
+        );
+        if out.ok {
+            self.recent.clear();
+        }
+        if out.ok || out.cancel {
+            self.workspace.clear_recent = false;
+        }
     }
 
     fn error_alert_window(&mut self, ctx: &egui::Context) {
@@ -483,6 +530,7 @@ impl AtelierApp {
         };
         let rows = self.shortcut_rows(ctx);
         let folded = super::palette::fold(filter.trim());
+        let mut escaped = false;
         let out = floating_dialog(
             ctx,
             DialogSpec {
@@ -490,6 +538,8 @@ impl AtelierApp {
                 footer: false,
                 width: 520.0,
                 resize: Some(420.0),
+                // Typed names go to the filter, not to the tools.
+                filter_field: true,
                 ..DialogSpec::new(
                     "shortcuts",
                     t!("ui3-shortcuts-title"),
@@ -497,12 +547,15 @@ impl AtelierApp {
                 )
             },
             |ui| {
-                ui_kit::text_field(
+                let field = ui_kit::text_field(
                     ui,
                     &t!("ui3-shortcuts-filter"),
                     &mut filter,
                     egui::Id::new("shortcuts-filter"),
                 );
+                // Esc in the filter closes the window too.
+                escaped = field.response.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Escape));
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -544,7 +597,7 @@ impl AtelierApp {
                     });
             },
         );
-        if !out.cancel {
+        if !out.cancel && !escaped {
             self.workspace.shortcuts = Some(filter);
         }
     }
@@ -866,7 +919,12 @@ mod tests {
         h.state_mut().run(Action::Workspace(Command::OpenRecent(0)));
         h.run_steps(2);
         assert_eq!(h.state().doc.as_ref().map(Document::width), Some(8));
+        // Asked first: Enter clears.
         h.state_mut().run(Action::Workspace(Command::ClearRecent));
+        h.run_steps(2);
+        assert!(!h.state().recent.paths().is_empty());
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
         assert!(h.state().recent.paths().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }

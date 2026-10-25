@@ -38,11 +38,13 @@ impl Document {
         self.channels.len() - 1
     }
 
-    /// Duplicate Channel: a copy of channel `i` just after it ("… copy").
+    /// Duplicate Channel: a copy of channel `i` just after it ("… copy",
+    /// numbered like layers' copies).
     pub fn duplicate_channel(&mut self, i: usize) -> Option<usize> {
         let c = self.channels.get(i)?.clone();
         self.checkpoint(t!("xchg-hist-duplicate-channel"));
-        let name = t!("doc-layer-copy-name", name = c.name.as_str());
+        let used = |n: &str| self.channels.iter().any(|c| c.name == n);
+        let name = super::layers::copy_name_among(&c.name, self.channels.len(), used);
         self.channels.insert(i + 1, Channel { name, ..c });
         Some(i + 1)
     }
@@ -124,5 +126,20 @@ mod tests {
         // Color channels of the composite.
         assert_eq!(doc.color_channel(0).get_pixel(0, 0).0[0], 200);
         assert_eq!(doc.color_channel(2).get_pixel(3, 1).0[0], 0);
+    }
+
+    #[test]
+    fn duplicated_channels_are_numbered() {
+        let mut doc = Document::new(RgbaImage::new(4, 2), None);
+        doc.new_channel();
+        let first = doc.channels[0].name.clone();
+        doc.duplicate_channel(0);
+        doc.duplicate_channel(0);
+        let copy = doc.channels[1].name.clone();
+        assert_eq!(copy, t!("tools5-layer-copy-numbered", name = first.as_str(), number = 2));
+        assert_eq!(doc.channels[2].name, t!("doc-layer-copy-name", name = first.as_str()));
+        // A copy's copy: not "copy copy".
+        doc.duplicate_channel(2);
+        assert_eq!(doc.channels[3].name, t!("tools5-layer-copy-numbered", name = first.as_str(), number = 3));
     }
 }

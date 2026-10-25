@@ -52,8 +52,35 @@ impl AtelierApp {
         self.unpark(target);
     }
 
-    /// Opens `doc` in a new tab, right after the active one.
+    /// [`Self::switch_tab`] asked for by the user (its tab, Ctrl+Tab): a
+    /// large transform being applied goes on aside, the switch once it
+    /// lands.
+    pub(super) fn switch_tab_aside(&mut self, i: usize) {
+        if i != self.active_tab && i < self.tab_count() && self.commit_pending_aside() {
+            return self.after_transform(move |app| app.switch_tab(i));
+        }
+        self.switch_tab(i);
+    }
+
+    /// The × of tab `i`: it closes (as the active one, asked about
+    /// first when a crop box is drawn).
+    pub(super) fn close_tab(&mut self, i: usize) {
+        if self.crop_first(move |app| app.close_tab(i)) {
+            return;
+        }
+        self.switch_tab(i);
+        if self.active_tab == i {
+            self.run(Action::CloseDocument);
+        }
+    }
+
+    /// Opens `doc` in a new tab, right after the active one. With a crop
+    /// box drawn, "Crop the image?" is asked first.
     pub(super) fn add_tab(&mut self, doc: Document) {
+        if self.crop_box_pending() {
+            self.crop_first(move |app| app.add_tab(doc));
+            return;
+        }
         if let Some(current) = self.park() {
             self.parked.insert(self.active_tab, current);
             self.active_tab += 1;

@@ -126,25 +126,29 @@ impl AtelierApp {
         }
     }
 
-    /// Blend mode of the active layer, as a series of edits (one undo step).
+    /// Blend mode of the selected layers (the unlocked ones), as a series
+    /// of edits (one undo step).
     fn set_blend(&mut self, mode: BlendMode) {
-        let Some(layer) = self.doc.as_ref().map(Document::active_layer) else {
+        let Some((layers, locked)) = self.set_layers_look(None, Some(mode)) else {
             return;
         };
-        if layer.blend == mode || (mode == BlendMode::PassThrough && !layer.is_group()) {
-            return;
-        }
-        let id = layer.id;
-        self.record_change(t!("xchg-hist-blending"), Some((id, "blend")));
-        if let Some(doc) = &mut self.doc {
-            let layer = doc.active_layer_mut();
-            layer.blend = mode;
-            self.status = t!(
+        let Some(doc) = &self.doc else { return };
+        let status = match layers.as_slice() {
+            [one] => t!(
                 "core-status-blend",
-                name = layer.name.as_str(),
+                name = doc.layers[*one].name.as_str(),
                 mode = mode.label()
-            );
-        }
+            ),
+            _ => t!(
+                "input6-status-layers-blend",
+                count = layers.len(),
+                mode = mode.label()
+            ),
+        };
+        self.status = match locked {
+            0 => status,
+            n => format!("{status} · {}", t!("input6-status-locked-left", count = n)),
+        };
     }
 
     /// Shift++ / Shift+-: next / previous blend mode; Alt+Shift+letter: a

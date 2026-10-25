@@ -24,6 +24,19 @@ const OMEGA: f32 = 1.5;
 /// Over `w` × `h` cells: `src` where `inside`, shifted by the membrane that
 /// meets `dest` around; `dest` elsewhere.
 pub fn heal(dest: &[Px], src: &[Px], inside: &[bool], w: usize, h: usize) -> Vec<Px> {
+    heal_until(dest, src, inside, w, h, &|| false).expect("never stopped")
+}
+
+/// [`heal`], given up (`None`) as soon as `stop` says so, between grids
+/// and cycles.
+pub fn heal_until(
+    dest: &[Px],
+    src: &[Px],
+    inside: &[bool],
+    w: usize,
+    h: usize,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Option<Vec<Px>> {
     let mut diff: Vec<Px> = dest
         .iter()
         .zip(src)
@@ -36,8 +49,11 @@ pub fn heal(dest: &[Px], src: &[Px], inside: &[bool], w: usize, h: usize) -> Vec
             }
         })
         .collect();
-    membrane(&mut diff, inside, w, h);
-    diff.iter()
+    if !membrane_until(&mut diff, inside, w, h, stop) {
+        return None;
+    }
+    let healed = diff
+        .iter()
         .zip(src)
         .zip(dest)
         .zip(inside)
@@ -48,20 +64,38 @@ pub fn heal(dest: &[Px], src: &[Px], inside: &[bool], w: usize, h: usize) -> Vec
                 *d
             }
         })
-        .collect()
+        .collect();
+    Some(healed)
 }
 
 /// Solves Laplace's equation where `free`: each free cell becomes the mean
 /// of its neighbors (within the grid), the others keep their value.
 /// Multigrid: a first guess from coarser grids, then cycles correcting
 /// the remaining error on coarser grids.
+#[cfg(test)]
 pub fn membrane(values: &mut [Px], free: &[bool], w: usize, h: usize) {
+    membrane_until(values, free, w, h, &|| false);
+}
+
+/// [`membrane`], given up (`false`) as soon as `stop` says so.
+fn membrane_until(
+    values: &mut [Px],
+    free: &[bool],
+    w: usize,
+    h: usize,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> bool {
     let fixed = free.iter().filter(|&&f| !f).count();
     if fixed == 0 || fixed == free.len() {
-        return;
+        return true;
     }
-    first_guess(values, free, w, h, 0);
+    if !first_guess(values, free, w, h, 0, stop) {
+        return false;
+    }
     for _ in 0..MAX_CYCLES {
+        if stop() {
+            return false;
+        }
         cycle(values, None, free, w, h);
         let residual = residual(values, None, free, w, h);
         if residual
@@ -71,15 +105,26 @@ pub fn membrane(values: &mut [Px], free: &[bool], w: usize, h: usize) {
             break;
         }
     }
+    true
 }
 
 /// The problem solved on a grid half as fine, whose solution starts the
 /// relaxation of this one. A coarse cell is fixed to the mean of its fixed
 /// cells, if any.
-fn first_guess(values: &mut [Px], free: &[bool], w: usize, h: usize, depth: u32) {
+fn first_guess(
+    values: &mut [Px],
+    free: &[bool],
+    w: usize,
+    h: usize,
+    depth: u32,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> bool {
+    if stop() {
+        return false;
+    }
     let fixed = free.iter().filter(|&&f| !f).count();
     if fixed == 0 || fixed == free.len() {
-        return;
+        return true;
     }
     if w > 3 && h > 3 {
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
@@ -100,7 +145,9 @@ fn first_guess(values: &mut [Px], free: &[bool], w: usize, h: usize, depth: u32)
                 }
             }
         }
-        first_guess(&mut coarse, &coarse_free, cw, ch, depth + 1);
+        if !first_guess(&mut coarse, &coarse_free, cw, ch, depth + 1, stop) {
+            return false;
+        }
         prolong(values, free, w, &coarse, (cw, ch), false);
     } else {
         // A few cells: from the mean of the fixed ones.
@@ -115,6 +162,7 @@ fn first_guess(values: &mut [Px], free: &[bool], w: usize, h: usize, depth: u32)
     }
     let sweeps = (GUESS_SWEEPS << depth.min(8)).min(MAX_SWEEPS);
     Checker::new(values, None, free, w, h).relax(sweeps, values);
+    true
 }
 
 /// A multigrid cycle on L u = f (L: sum of the differences to the

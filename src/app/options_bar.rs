@@ -52,14 +52,18 @@ impl AtelierApp {
                     t!("options-layer-locked"),
                     t!("side-locked-notice"),
                 ),
-                workspace::PaintBlock::Hidden => (
-                    icon::EYE_SLASH,
-                    t!("ui4-options-layer-hidden"),
-                    match self.hidden_group() {
-                        Some(group) => t!("ui5-options-group-hidden-tip", group = group),
-                        None => t!("ui4-options-layer-hidden-tip"),
-                    },
-                ),
+                workspace::PaintBlock::Hidden => match self.hidden_group() {
+                    Some(group) => (
+                        icon::EYE_SLASH,
+                        t!("ui6-options-group-hidden"),
+                        t!("ui5-options-group-hidden-tip", group = group),
+                    ),
+                    None => (
+                        icon::EYE_SLASH,
+                        t!("ui4-options-layer-hidden"),
+                        t!("ui4-options-layer-hidden-tip"),
+                    ),
+                },
             };
             ui.label(egui::RichText::new(format!("{glyph} {label}")).color(color::MUTED))
                 .on_hover_text(tip);
@@ -68,14 +72,18 @@ impl AtelierApp {
         // Quick Mask Mode: every tool edits the selection, not the layer;
         // said as long as it lasts (a click leaves it).
         if self.doc.as_ref().is_some_and(|d| d.quick_mask().is_some()) {
-            let label = format!("{} {}", icon::CIRCLE_HALF, t!("sel5-options-quick-mask"));
+            let name = t!("sel5-options-quick-mask");
+            let label = format!("{} {name}", icon::CIRCLE_HALF);
             let text = egui::RichText::new(label).color(color::ACCENT_TEXT);
             let tip = t!("sel5-options-quick-mask-tip", key = keys::key(Key::Q));
-            if ui
-                .add(egui::Button::new(text).frame(false))
-                .on_hover_text(tip)
-                .clicked()
-            {
+            let response = ui.add(egui::Button::new(text).frame(false));
+            // Named without its glyph, and saying what a click does.
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name.as_str())
+            });
+            ui.ctx()
+                .accesskit_node_builder(response.id, |node| node.set_description(tip.clone()));
+            if response.on_hover_text(tip).clicked() {
                 self.run(Action::Select(super::select_menu::Command::QuickMask));
             }
             sep(ui);
@@ -340,8 +348,12 @@ impl AtelierApp {
             self.transform_rect = Some(r);
         }
         self.resample_dropdown(ui);
-        ui_kit::checkbox(ui, &mut self.fit_canvas, &t!("options-fit-canvas"))
-            .on_hover_text(t!("options-fit-canvas-tip"));
+        // The quick mask is the canvas's size whatever its transform.
+        let quick_mask = self.doc.as_ref().is_some_and(|d| d.quick_mask().is_some());
+        if !quick_mask {
+            ui_kit::checkbox(ui, &mut self.fit_canvas, &t!("options-fit-canvas"))
+                .on_hover_text(t!("options-fit-canvas-tip"));
+        }
         if ui_kit::icon_button(
             ui,
             icon::CROSSHAIR_SIMPLE,
@@ -373,11 +385,15 @@ impl AtelierApp {
             self.transform_angle = angle;
             self.transform_rect = Some(r);
         }
-        let pending = r != src || self.transform_angle != 0.0 || (self.fit_canvas && r != full);
-        let (apply, cancel) = apply_cancel_icons(ui, pending);
-        if apply {
+        let fit = self.fit_canvas && !quick_mask;
+        let pending = r != src || self.transform_angle != 0.0 || (fit && r != full);
+        // Free Transform can be left at once, as with Enter and Esc.
+        let (apply, cancel) = apply_cancel_icons(ui, pending || self.free_transform);
+        if apply && pending {
             self.transform_rect = Some(r);
             self.apply_transform();
+        } else if apply {
+            self.apply_pending(false);
         }
         if cancel {
             self.reset_pending();
@@ -512,9 +528,12 @@ impl AtelierApp {
 
         let subject = t!("options-select-subject");
         let background = t!("options-remove-background");
-        let right = button_width(ui, &subject, true)
-            + button_width(ui, &background, true)
-            + ui.spacing().item_spacing.x;
+        let gap = ui.spacing().item_spacing.x;
+        let full = button_width(ui, &subject, true) + button_width(ui, &background, true) + gap;
+        // Short of room, two icons rather than a row of their own (the
+        // bar's height is that of the tallest bar seen).
+        let compact = room(ui) < full;
+        let right = if compact { 2.0 * 28.0 + gap } else { full };
         // Size of the selection, if there is room for it.
         let (readout, tip) = match &self.selection {
             Some(s) => {
@@ -569,14 +588,19 @@ impl AtelierApp {
         let idle = self.subject_job.is_none();
         let mut action = None;
         right_aligned(ui, right, |ui| {
-            let ai = |ui: &mut egui::Ui, label: &str| {
-                ui_kit::button_with_icon(ui, Some(icon::SPARKLE), label, Kind::Ai, None, idle)
-                    .clicked()
+            // The icons of the canvas's context menu.
+            let ai = |ui: &mut egui::Ui, glyph: &str, label: &str| {
+                if compact {
+                    ui_kit::icon_button(ui, glyph, label, idle).clicked()
+                } else {
+                    ui_kit::button_with_icon(ui, Some(icon::SPARKLE), label, Kind::Ai, None, idle)
+                        .clicked()
+                }
             };
-            if ai(ui, &subject) {
+            if ai(ui, icon::SELECTION_FOREGROUND, &subject) {
                 action = Some(Action::SelectSubject);
             }
-            if ai(ui, &background) {
+            if ai(ui, icon::USER_FOCUS, &background) {
                 action = Some(Action::RemoveBackground);
             }
         });
@@ -683,7 +707,8 @@ impl AtelierApp {
             self.canvas_rect = Some(r);
         }
 
-        let (apply, cancel) = apply_cancel(ui, r != full);
+        // Icons, like the transform bars: the row doesn't wrap for them.
+        let (apply, cancel) = apply_cancel_icons(ui, r != full);
         if apply {
             self.canvas_rect = Some(r);
             self.apply_canvas();
@@ -1020,4 +1045,155 @@ fn dropdown_reserving<R>(
         });
     }
     shown
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::{NodeT as _, Queryable as _};
+
+    /// A 400 × 300 image with a red square layer, the Move tool active.
+    fn app(size: [f32; 2], lang: Lang) -> Harness<'static, AtelierApp> {
+        i18n::set_lang(lang);
+        let mut h = Harness::builder().with_size(size).build_eframe(|cc| {
+            let mut app = AtelierApp::new(cc, None);
+            let mut doc = Document::new(image::RgbaImage::new(400, 300), None);
+            let red = image::RgbaImage::from_pixel(80, 80, image::Rgba([200, 30, 30, 255]));
+            doc.add_layer("Red".into(), red, (40, 40));
+            app.doc = Some(doc);
+            app.tool = Tool::Transform;
+            app
+        });
+        h.run_steps(3);
+        h
+    }
+
+    fn enabled(h: &Harness<'static, AtelierApp>, label: &str) -> bool {
+        !h.get_by_label(label).accesskit_node().is_disabled()
+    }
+
+    /// Ctrl+T: ✕ and ✓ work at once, like Enter and Esc (✓ with nothing
+    /// changed leaves the mode without a step).
+    #[test]
+    fn free_transform_can_be_left_at_once() {
+        let mut h = app([1400.0, 900.0], Lang::En);
+        h.state_mut()
+            .run(Action::Transform(transform::Command::Free));
+        h.run_steps(3);
+        assert!(h.state().free_transform);
+        let (apply, cancel) = (t!("options-apply"), t!("dialog-cancel"));
+        assert!(enabled(&h, &apply) && enabled(&h, &cancel));
+        let steps = h.state().doc.as_ref().unwrap().history().0.len();
+        h.get_by_label(&apply).click();
+        h.run_steps(3);
+        assert!(!h.state().free_transform);
+        assert_eq!(h.state().doc.as_ref().unwrap().history().0.len(), steps);
+        h.state_mut()
+            .run(Action::Transform(transform::Command::Free));
+        h.run_steps(3);
+        h.get_by_label(&cancel).click();
+        h.run_steps(3);
+        assert!(!h.state().free_transform);
+    }
+
+    /// Fit Canvas does nothing to the quick mask: not offered there.
+    #[test]
+    fn fit_canvas_is_not_offered_for_the_quick_mask() {
+        let mut h = app([1600.0, 900.0], Lang::En);
+        h.state_mut()
+            .run(Action::Transform(transform::Command::Free));
+        h.run_steps(3);
+        assert!(h.query_by_label(&t!("options-fit-canvas")).is_some());
+        h.state_mut().reset_pending();
+        let selection = PixelRect {
+            x: 10,
+            y: 10,
+            w: 100,
+            h: 80,
+        };
+        h.state_mut().selection = Some(selection.into());
+        h.state_mut()
+            .run(Action::Select(select_menu::Command::QuickMask));
+        h.state_mut()
+            .run(Action::Transform(transform::Command::Free));
+        h.run_steps(3);
+        assert!(h.state().doc.as_ref().unwrap().quick_mask().is_some());
+        assert!(h.query_by_label(&t!("options-fit-canvas")).is_none());
+    }
+
+    /// The options bar's height, as kept.
+    fn bar_height(h: &Harness<'static, AtelierApp>) -> f32 {
+        h.ctx
+            .data(|d| {
+                d.get_temp::<((u32, &'static str), f32, f32)>(egui::Id::new("options-bar-height"))
+            })
+            .expect("bar shown")
+            .2
+    }
+
+    /// At 1024 px, the selection tools' bars hold on one row (Select
+    /// Subject and Remove Background as icons), in English and French (the
+    /// Magic Wand's, longer in French, from 1366 px), and the Crop bar's
+    /// ✕ ✓ too: visiting them doesn't make every bar taller.
+    #[test]
+    fn selection_bars_hold_on_one_row_at_1024() {
+        let all = [
+            Tool::Select,
+            Tool::Ellipse,
+            Tool::FreeLasso,
+            Tool::MagicWand,
+            Tool::Canvas,
+        ];
+        for (lang, width, tools) in [
+            (Lang::En, 1024.0, &all[..]),
+            (
+                Lang::Fr,
+                1024.0,
+                &[Tool::Select, Tool::Ellipse, Tool::FreeLasso, Tool::Canvas][..],
+            ),
+            (Lang::Fr, 1366.0, &all[..]),
+        ] {
+            let mut h = app([width, 700.0], lang);
+            h.state_mut().set_tool(Tool::Brush);
+            h.run_steps(3);
+            let one_row = bar_height(&h);
+            for &tool in tools {
+                h.state_mut().set_tool(tool);
+                h.run_steps(3);
+                assert_eq!(bar_height(&h), one_row, "{lang:?} {width} {tool:?}");
+            }
+            h.state_mut().set_tool(Tool::Select);
+            h.run_steps(2);
+            assert!(h.query_by_label(&t!("options-select-subject")).is_some());
+            assert!(h.query_by_label(&t!("options-remove-background")).is_some());
+            i18n::set_lang(Lang::En);
+        }
+    }
+
+    /// A layer in a hidden group: the bar says the group is hidden.
+    #[test]
+    fn a_hidden_group_is_named_as_such() {
+        let mut h = app([1400.0, 900.0], Lang::En);
+        let app = h.state_mut();
+        app.tool = Tool::Brush;
+        let doc = app.doc.as_mut().unwrap();
+        doc.group_layers(&[1]);
+        let child = (0..doc.layers.len())
+            .find(|&j| doc.parent(j).is_some())
+            .unwrap();
+        let group = doc.parent(child).unwrap();
+        doc.layers[group].visible = false;
+        doc.active = child;
+        h.run_steps(3);
+        let label = t!("ui6-options-group-hidden");
+        assert!(
+            h.query_by(|n| {
+                let text = n.label().or_else(|| n.value()).unwrap_or_default();
+                text.contains(&label)
+            })
+            .is_some(),
+            "{label}"
+        );
+    }
 }

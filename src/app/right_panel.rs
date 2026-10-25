@@ -65,6 +65,15 @@ impl AtelierApp {
             let room = full.height() - natural - fixed + ROW_GAP;
             VISIBLE_ROWS.max((room / (ROW_HEIGHT + ROW_GAP)).floor().max(0.0) as usize)
         };
+        // Not while the pointer is over the panel: a click on a layer whose
+        // Properties are taller would move the rows under it.
+        let id = Id::new("side-visible-rows");
+        let over = ui.rect_contains_pointer(full);
+        let visible = match ui.data(|d| d.get_temp::<(f32, usize)>(id)) {
+            Some((height, kept)) if over && height == full.height() => kept,
+            _ => visible,
+        };
+        ui.data_mut(|d| d.insert_temp(id, (full.height(), visible)));
         let rows = n.clamp(1, visible) as f32;
         let most = visible as f32 * (ROW_HEIGHT + ROW_GAP) - ROW_GAP;
         let list_height = (rows * ROW_HEIGHT + (rows - 1.0) * ROW_GAP + sub).min(most);
@@ -104,14 +113,25 @@ impl AtelierApp {
         let response = ui
             .interact(rect, Id::new("layers-splitter"), Sense::click_and_drag())
             .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+        // From the height and the pointer at the press: past a limit, the
+        // border comes back with the pointer.
+        let start_id = Id::new("layers-splitter-start");
+        if response.drag_started()
+            && let Some(press) = ui.input(|i| i.pointer.press_origin())
+        {
+            ui.data_mut(|d| d.insert_temp(start_id, (full.bottom() - split, press.y)));
+        }
         let layout = &mut self.workspace.layout;
         if response.double_clicked() {
             layout.layers_share = None;
             self.workspace.save_layout();
-        } else if response.dragged() {
+        } else if response.dragged()
+            && let Some((start, press)) = ui.data(|d| d.get_temp::<(f32, f32)>(start_id))
+            && let Some(pointer) = ui.input(|i| i.pointer.interact_pos())
+        {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
             let most = (full.height() - PROPERTIES_MIN).max(layers_min);
-            let height = full.bottom() - split - response.drag_delta().y;
+            let height = start - (pointer.y - press);
             let share = height.clamp(layers_min, most) / full.height().max(1.0);
             layout.layers_share = Some(share.clamp(0.0, 1.0));
         }
@@ -136,7 +156,8 @@ impl AtelierApp {
     fn properties(&mut self, ui: &mut Ui) {
         let Some(doc) = &self.doc else { return };
         let layer = doc.active_layer();
-        let (layer_id, locked, is_text) = (layer.id, layer.locked, layer.text.is_some());
+        let locked = doc.is_locked(doc.active);
+        let (layer_id, is_text) = (layer.id, layer.text.is_some());
         let kind = kind_label(layer);
         heading_bar(ui, &t!("panel-properties"), |ui| badge(ui, &kind));
 
@@ -415,10 +436,21 @@ impl AtelierApp {
         let mut new_angle = angle;
         let mut turn = 0.0;
         let mut keep_ratio = self.keep_ratio;
-        let count = self.selected_indices().len();
+        // In Quick Mask Mode, the box and the alignment are the mask's.
+        let quick = self.in_quick_mask();
+        let count = if quick {
+            1
+        } else {
+            self.selected_indices().len()
+        };
+        let to_selection = !quick && self.selection.is_some();
         let mut align = None;
+        let title = match quick {
+            true => t!("sel6-side-transform-quick-mask"),
+            false => t!("side-transform"),
+        };
 
-        section(ui, Some(&t!("side-transform")), |ui| {
+        section(ui, Some(&title), |ui| {
             ui.add_enabled_ui(!locked, |ui| {
                 let half = (ui.available_width() - GAP) / 2.0;
                 ui.horizontal(|ui| {
@@ -472,7 +504,7 @@ impl AtelierApp {
                     ui_kit::icon_toggle(ui, icon::LINK, &tip, &mut keep_ratio);
                 });
             });
-            align = align_row(ui, count, !(locked && count == 1));
+            align = align_row(ui, count, !(locked && count == 1), to_selection);
         });
         self.keep_ratio = keep_ratio;
         if let Some(op) = align {
@@ -548,9 +580,12 @@ impl AtelierApp {
         if lock != locked {
             self.run(Action::ToggleLock);
         }
-        self.blend_row(ui);
-        let footer = Rect::from_min_max(pos2(rect.left(), rect.bottom() - FOOTER_HEIGHT), rect.max);
+        // Right under the heading (not after its spacing): the list starts
+        // below it.
         let top = rect.top() + HEADING_HEIGHT + BLEND_ROW;
+        let blend = Rect::from_x_y_ranges(rect.x_range(), rect.top() + HEADING_HEIGHT..=top);
+        self.blend_row(&mut ui.new_child(UiBuilder::new().max_rect(blend)));
+        let footer = Rect::from_min_max(pos2(rect.left(), rect.bottom() - FOOTER_HEIGHT), rect.max);
         let list = Rect::from_min_max(
             pos2(rect.left() + 6.0, top),
             pos2(rect.right() - 6.0, (footer.top() - 6.0).max(top)),
@@ -584,10 +619,12 @@ impl AtelierApp {
         if picked.is_empty() {
             return;
         }
-        let step = if show {
-            t!("xchg-hist-show-layer")
-        } else {
-            t!("xchg-hist-hide-layer")
+        // Several: "Hide Layers", like the menu.
+        let step = match (show, picked.len() > 1) {
+            (true, false) => t!("xchg-hist-show-layer"),
+            (false, false) => t!("xchg-hist-hide-layer"),
+            (true, true) => t!("ui5-menu-show-layers"),
+            (false, true) => t!("ui5-menu-hide-layers"),
         };
         self.record_change(step, None);
         if let Some(doc) = &mut self.doc {
@@ -602,7 +639,9 @@ impl AtelierApp {
     fn blend_row(&mut self, ui: &mut Ui) {
         let Some(doc) = &self.doc else { return };
         let layer = doc.active_layer();
-        let (layer_id, locked, group) = (layer.id, layer.locked, layer.is_group());
+        // The changes go to the selected layers that aren't locked.
+        let locked = self.selected_indices().into_iter().all(|i| doc.is_locked(i));
+        let (layer_id, group) = (layer.id, layer.is_group());
         let (mut opacity, mut blend) = (layer.opacity, layer.blend);
         let row = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), BLEND_ROW));
         let mut child = ui.new_child(
@@ -628,16 +667,9 @@ impl AtelierApp {
         let Some(layer) = self.doc.as_ref().map(Document::active_layer) else {
             return;
         };
-        let changes = [
-            (opacity != layer.opacity, "opacity"),
-            (blend != layer.blend, "blend"),
-        ];
-        let steps: Vec<(String, &str)> = changes
-            .into_iter()
-            .filter(|c| c.0)
-            .map(|(_, prop)| (property_step(prop, layer), prop))
-            .collect();
-        if steps.is_empty() {
+        let opacity = (opacity != layer.opacity).then_some(opacity);
+        let blend = (blend != layer.blend).then_some(blend);
+        if opacity.is_none() && blend.is_none() {
             return;
         }
         // A text being typed ends first (an empty new one goes away).
@@ -649,13 +681,7 @@ impl AtelierApp {
         {
             return;
         }
-        for (step, prop) in steps {
-            self.record_change(step, Some((layer_id, prop)));
-        }
-        if let Some(doc) = &mut self.doc {
-            let layer = doc.active_layer_mut();
-            (layer.opacity, layer.blend) = (opacity, blend);
-        }
+        self.set_layers_look(opacity, blend);
     }
 
     fn layer_rows(&mut self, ui: &mut Ui) {
@@ -719,10 +745,11 @@ impl AtelierApp {
                         pos2(rect.left() + 4.0, rect.center().y - 14.0),
                         Vec2::splat(28.0),
                     );
-                    let (glyph, fg) = if layer.visible {
-                        (icon::EYE, color::MUTED)
-                    } else {
-                        (icon::EYE_SLASH, color::DISABLED)
+                    // Shown, but in a hidden group: its eye dimmed.
+                    let (glyph, fg) = match layer.visible {
+                        true if hidden_above(doc, i) => (icon::EYE, color::DISABLED),
+                        true => (icon::EYE, color::MUTED),
+                        false => (icon::EYE_SLASH, color::DISABLED),
                     };
                     let tip = t!(
                         "input3-visibility-tip",
@@ -845,6 +872,23 @@ impl AtelierApp {
                         {
                             unlock = Some(i);
                         }
+                        right = lock.left() - 4.0;
+                    } else if let Some(g) = doc.locking_group(i) {
+                        // Locked with its group: dimmed, the group unlocks.
+                        let lock = Rect::from_min_size(
+                            pos2(right - 24.0, rect.center().y - 12.0),
+                            Vec2::splat(24.0),
+                        );
+                        painter.text(
+                            lock.center(),
+                            Align2::CENTER_CENTER,
+                            icon::LOCK_SIMPLE,
+                            FontId::proportional(13.0),
+                            color::DISABLED,
+                        );
+                        let tip = t!("tools6-panel-group-lock-tip", group = doc.layers[g].name.as_str());
+                        ui.interact(lock, Id::new(("side_group_lock", layer.id)), Sense::hover())
+                            .on_hover_text(tip);
                         right = lock.left() - 4.0;
                     }
                     if layer.has_pixels() && layer.effects.any() {
@@ -1138,7 +1182,7 @@ impl AtelierApp {
         };
         if let Some((from, above)) = reorder {
             let ids = id_of(self, from).zip(above.map_or(Some(None), |a| id_of(self, a).map(Some)));
-            self.commit_pending();
+            self.commit_pending_but_crop();
             let found = ids.and_then(|(from, above)| {
                 let above = match above {
                     Some(a) => Some(index_of(self, a)?),
@@ -1150,12 +1194,12 @@ impl AtelierApp {
                 && let Some(doc) = &mut self.doc
                 && doc.drop_layer(from, above)
             {
-                self.reset_pending();
+                self.reset_pending_but_crop();
             }
         }
         if let Some((from, group)) = into_group {
             let ids = id_of(self, from).zip(id_of(self, group));
-            self.commit_pending();
+            self.commit_pending_but_crop();
             let found = ids.and_then(|(from, group)| {
                 Some((index_of(self, from)?, index_of(self, group)?))
             });
@@ -1163,7 +1207,7 @@ impl AtelierApp {
                 && let Some(doc) = &mut self.doc
                 && doc.drop_into(from, group)
             {
-                self.reset_pending();
+                self.reset_pending_but_crop();
             }
         }
     }
@@ -1389,6 +1433,11 @@ const CLIP_LINE: f32 = 4.0;
 
 /// Indentation of one level of group in the list.
 const INDENT: f32 = 16.0;
+
+/// A group holding layer `i` is hidden.
+fn hidden_above(doc: &Document, i: usize) -> bool {
+    std::iter::successors(doc.parent(i), |&j| doc.parent(j)).any(|j| !doc.layers[j].visible)
+}
 
 /// The layers the list shows, top first (those in closed groups aside).
 fn shown_rows(doc: &Document) -> Vec<usize> {
@@ -1855,21 +1904,23 @@ fn fill_buttons(ui: &mut Ui, primary: Color32, secondary: Color32) -> Option<Act
     let mut action = None;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = GAP;
-        for (label, chip, key, act) in [
+        for (label, chip, key, act, name) in [
             (
                 t!("panel-fill-foreground"),
                 primary,
                 keys::shortcut(ui.ctx(), &SHORTCUT_FILL_PRIMARY),
                 Action::FillPrimary,
+                t!("menu-edit-fill-foreground"),
             ),
             (
                 t!("panel-fill-background"),
                 secondary,
                 keys::shortcut(ui.ctx(), &SHORTCUT_FILL_SECONDARY),
                 Action::FillSecondary,
+                t!("menu-edit-fill-background"),
             ),
         ] {
-            if fill_button(ui, &label, chip, &key, half).clicked() {
+            if fill_button(ui, (&label, &name), chip, &key, half).clicked() {
                 action = Some(act);
             }
         }
@@ -1878,8 +1929,14 @@ fn fill_buttons(ui: &mut Ui, primary: Color32, secondary: Color32) -> Option<Act
 }
 
 /// Button: color chip, label, and its key on the right (in the tooltip when
-/// it doesn't fit).
-fn fill_button(ui: &mut Ui, label: &str, chip: Color32, key: &str, width: f32) -> Response {
+/// it doesn't fit); `name` for screen readers.
+fn fill_button(
+    ui: &mut Ui,
+    (label, name): (&str, &str),
+    chip: Color32,
+    key: &str,
+    width: f32,
+) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
     let painter = ui.painter();
     let fill = if response.hovered() {
@@ -1926,6 +1983,8 @@ fn fill_button(ui: &mut Ui, label: &str, chip: Color32, key: &str, width: f32) -
             text,
             color::TEXT,
         );
+    // Painted: named for screen readers.
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
     if key_fits {
         response
     } else {
@@ -1935,8 +1994,10 @@ fn fill_button(ui: &mut Ui, label: &str, chip: Color32, key: &str, width: f32) -
 
 /// "Align to canvas" (or "Align N layers") and the align / distribute
 /// buttons; the label goes on its own line when they don't fit beside it.
-fn align_row(ui: &mut Ui, count: usize, enabled: bool) -> Option<AlignOp> {
-    let label = if count > 1 {
+fn align_row(ui: &mut Ui, count: usize, enabled: bool, to_selection: bool) -> Option<AlignOp> {
+    let label = if to_selection {
+        t!("tools6-side-align-to-selection")
+    } else if count > 1 {
         t!("side-align-layers", count = count)
     } else {
         t!("side-align-to-canvas")

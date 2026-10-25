@@ -29,6 +29,18 @@ struct QuickMove {
     by: (i64, i64),
 }
 
+/// A copy of part of the quick mask being moved by Alt+arrows: the mask
+/// before it, the selection then, how far it went, and what the mask and
+/// the selection were after the last press (the series goes on as long as
+/// they stay).
+struct QuickCopy {
+    base: Arc<GrayImage>,
+    selection: Selection,
+    by: (i64, i64),
+    mask_key: u64,
+    selection_key: u64,
+}
+
 /// The quick mask reduced to a level of the view, for the previews: what
 /// moves (times the selection), and with a selection what stays and the
 /// selection's coverage.
@@ -57,6 +69,7 @@ pub(super) struct QuickEdit {
     pub(super) selection: Option<Selection>,
     parts: Option<QuickParts>,
     preview: Option<QuickPreview>,
+    copy: Option<QuickCopy>,
     /// Box of what a transform takes, by a fingerprint of the mask and the
     /// selection.
     bounds: std::cell::Cell<Option<(u64, Option<PixelRect>)>>,
@@ -91,6 +104,15 @@ fn selection_key(s: Option<&Selection>) -> u64 {
     }))
 }
 
+/// "Quick Mask moved by (+12, −3)": the move in all, signed.
+fn moved_status((dx, dy): (i64, i64)) -> String {
+    let sign = |v: i64| match v {
+        1.. => format!("+{v}"),
+        _ => signed(v as f32),
+    };
+    t!("qm6-status-moved", x = sign(dx), y = sign(dy))
+}
+
 /// The move by `(dx, dy)` of what lies in `canvas`.
 fn shift(canvas: PixelRect, (dx, dy): (i64, i64)) -> Transform {
     let b = [0.0, 0.0, canvas.w as f64, canvas.h as f64];
@@ -114,6 +136,7 @@ impl AtelierApp {
             self.status = t!("sel-status-quick-mask-on", key = keys::key(Key::Q));
         }
         self.prop_session = None;
+        self.xform.quick.copy = None;
         self.pull_selection();
     }
 
@@ -185,9 +208,33 @@ impl AtelierApp {
             painter.circle_stroke(frame.center(), 3.5, UiStroke::new(1.0, ink));
         }
         let tip = t!("sel-menu-quick-mask");
+        // Painted: a named toggle for screen readers.
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, on, tip.as_str())
+        });
         if enabled && ui_kit::tip_with_key(response, &tip, &keys::key(Key::Q)).clicked() {
             self.run(Action::Select(super::select_menu::Command::QuickMask));
         }
+    }
+
+    /// A press of the Type tool, or of a shape tool or the Pen making shapes, in
+    /// Quick Mask Mode: refused with a status, as they would make layers
+    /// (Ctrl with them still moves the mask).
+    pub(super) fn quick_mask_refuses_tool(&mut self) -> bool {
+        use super::vector_tools::{PenTool, ToolMode};
+        if !self.in_quick_mask() || self.ctx.input(|i| i.modifiers.command) {
+            return false;
+        }
+        let refused = match self.tool {
+            Tool::Text => true,
+            Tool::Shape(_) => self.vector.shape_mode == ToolMode::Shape,
+            Tool::Pen(PenTool::Pen | PenTool::Freeform) => self.vector.pen_mode == ToolMode::Shape,
+            _ => false,
+        };
+        if refused {
+            self.status = t!("sel6-status-quick-mask-no-layers", key = keys::key(Key::Q));
+        }
+        refused
     }
 
     /// The selection whose part of the quick mask a move or a transform
@@ -202,6 +249,17 @@ impl AtelierApp {
                 .as_ref()
                 .or(self.selection.as_ref()),
         }
+    }
+
+    /// What `quick_mask_source` gives for the mask and the selection as
+    /// they are, known otherwise.
+    fn seed_quick_mask_bounds(&self, b: Option<PixelRect>) {
+        let Some(doc) = self.doc.as_ref().filter(|d| d.quick_mask().is_some()) else {
+            return;
+        };
+        let selection = self.quick_mask_selection();
+        let key = hash_of((doc.uid(), doc.quick_mask_key(), selection_key(selection)));
+        self.xform.quick.bounds.set(Some((key, b)));
     }
 
     /// Box of what a transform of the quick mask takes (see
@@ -275,6 +333,11 @@ impl AtelierApp {
             let Some(p) = pointer.filter(|_| start) else {
                 return CursorIcon::Move;
             };
+            // Nothing selected in the mask (or in its selected part):
+            // nothing moves, no step.
+            if self.quick_mask_empty() {
+                return CursorIcon::Move;
+            }
             self.xform.quick.drag = Some(QuickMove {
                 from: view.to_image(p),
                 selection: self.selection.clone(),
@@ -321,35 +384,165 @@ impl AtelierApp {
         let (dx, dy) = m.by;
         self.selection = m.selection.and_then(|s| s.translate(dx, dy).within(canvas));
         self.sync_selection();
-        self.status = t!(
-            "qm6-status-moved",
-            x = signed(dx as f32),
-            y = signed(dy as f32)
-        );
+        self.status = moved_status((dx, dy));
+    }
+
+    /// Whether what a move of the quick mask takes is empty (said in the
+    /// status): nothing selected in the mask, or in its selected part.
+    fn quick_mask_empty(&mut self) -> bool {
+        if self.quick_mask_source().is_some_and(|b| b.is_some()) {
+            return false;
+        }
+        self.status = t!("xform-status-nothing", name = t!("qm6-quick-mask-name"));
+        true
     }
 
     /// Arrow keys in Quick Mask Mode: the mask moves (with a selection,
     /// what it selects of it, with the outline). A series of presses is a
     /// step, as for a layer; with a selection, each press, as for pixels.
+    /// Alt with the Move tool and a selection, as its drag: a copy moves,
+    /// the presses of the series one step.
     pub(super) fn nudge_quick_mask(&mut self, d: (i64, i64)) {
-        let selection = self.selection.clone();
+        // A selection still being computed lands first: it is what moves.
+        self.wait_select_job();
         let Some(id) = self.doc.as_ref().map(|doc| doc.active_layer().id) else {
             return;
         };
+        let alt = self.tool == Tool::Transform && self.ctx.input(|i| i.modifiers.alt);
+        if alt && self.selection.is_some() && self.nudge_quick_mask_copy(id, d) {
+            return;
+        }
+        if self.quick_mask_empty() {
+            return;
+        }
+        let selection = self.selection.clone();
         let key = selection.is_none().then_some((id, "quick mask"));
+        // The status gives the series' total, as its step does.
+        let series = key.is_some()
+            && self.doc.as_ref().is_some_and(|doc| {
+                self.prop_session
+                    .is_some_and(|(k, step)| Some(k) == key && step == doc.history_step())
+            });
+        let total_id = egui::Id::new("quick-mask-nudged");
+        let before = self
+            .ctx
+            .data(|data| data.get_temp::<(i64, i64)>(total_id))
+            .filter(|_| series)
+            .unwrap_or_default();
+        let total = (before.0 + d.0, before.1 + d.1);
+        self.ctx.data_mut(|data| data.insert_temp(total_id, total));
+        let bounds = self.xform.quick.bounds.get().and_then(|(_, b)| b);
         self.record_change(t!("xchg-hist-move"), key);
         let Some(doc) = &mut self.doc else { return };
         doc.move_quick_mask(d, selection.as_ref());
         let canvas = doc.full_rect();
+        // With a hard edge (or none), what the next press takes is what
+        // this one moved: its box, without scanning the mask again.
+        let hard = selection.as_ref().is_none_or(|s| s.mask.is_none());
         if let Some(s) = selection {
             self.selection = s.translate(d.0, d.1).within(canvas);
             self.sync_selection();
         }
-        self.status = t!(
-            "qm6-status-moved",
-            x = signed(d.0 as f32),
-            y = signed(d.1 as f32)
-        );
+        if let Some(b) = bounds.filter(|_| hard) {
+            self.seed_quick_mask_bounds(intersect(b.translate(d.0, d.1), canvas));
+        }
+        self.status = moved_status(total);
+    }
+
+    /// Align in Quick Mask Mode: what a move of the mask takes (with a
+    /// selection, what it selects of it, with the outline) goes to the
+    /// canvas' edge or center, one step. Distribute has a single element:
+    /// nothing to do.
+    pub(super) fn align_quick_mask(&mut self, op: AlignOp) {
+        self.wait_select_job();
+        if self.quick_mask_empty() {
+            return;
+        }
+        let (Some(Some(b)), Some(doc)) = (self.quick_mask_source(), self.doc.as_ref()) else {
+            return;
+        };
+        let (b, r) = (to_pixel_rect(b), doc.full_rect());
+        let center = |a: i64, len: u32| a + len as i64 / 2;
+        let d = match op {
+            AlignOp::Left => (r.x - b.x, 0),
+            AlignOp::CenterH => (center(r.x, r.w) - center(b.x, b.w), 0),
+            AlignOp::Right => (r.right() - b.right(), 0),
+            AlignOp::Top => (0, r.y - b.y),
+            AlignOp::CenterV => (0, center(r.y, r.h) - center(b.y, b.h)),
+            AlignOp::Bottom => (0, r.bottom() - b.bottom()),
+            AlignOp::DistributeH | AlignOp::DistributeV => (0, 0),
+        };
+        if d == (0, 0) {
+            return;
+        }
+        let selection = self.selection.clone();
+        self.record_change(t!("xchg-hist-align"), None);
+        let Some(doc) = &mut self.doc else { return };
+        doc.move_quick_mask(d, selection.as_ref());
+        if let Some(s) = selection {
+            self.selection = s.translate(d.0, d.1).within(r);
+            self.sync_selection();
+        }
+    }
+
+    /// Alt+arrow in Quick Mask Mode with a selection: a copy of what it
+    /// selects of the mask moves by `d`; the following presses of the
+    /// series move that copy further, within the same step. `false` when
+    /// there is nothing to copy.
+    fn nudge_quick_mask_copy(&mut self, id: u64, d: (i64, i64)) -> bool {
+        let key = (id, "quick mask copy");
+        let Some(doc) = &self.doc else { return false };
+        let step = doc.history_step();
+        let mask_key = doc.quick_mask_key();
+        let series = self.prop_session == Some((key, step));
+        let selection = self.selection.clone();
+        let copy = self.xform.quick.copy.take().filter(|c| {
+            series
+                && self.alt_nudge_copied
+                && c.mask_key == mask_key
+                && selection_key(selection.as_ref()) == c.selection_key
+        });
+        let copy = match copy {
+            Some(c) => c,
+            None => {
+                if self.quick_mask_empty() {
+                    return true;
+                }
+                let Some(base) = self.doc.as_ref().and_then(|doc| doc.quick_mask().cloned()) else {
+                    return false;
+                };
+                let Some(selection) = selection else {
+                    return false;
+                };
+                self.alt_nudge_copied = true;
+                self.record_change(t!("xchg-hist-move"), Some(key));
+                QuickCopy {
+                    base,
+                    selection,
+                    by: (0, 0),
+                    mask_key: 0,
+                    selection_key: 0,
+                }
+            }
+        };
+        let by = (copy.by.0 + d.0, copy.by.1 + d.1);
+        let Some(doc) = &mut self.doc else {
+            return true;
+        };
+        doc.mark_modified();
+        doc.copy_quick_mask(&copy.base, by, Some(&copy.selection));
+        let canvas = doc.full_rect();
+        self.selection = copy.selection.clone().translate(by.0, by.1).within(canvas);
+        self.sync_selection();
+        let Some(doc) = &self.doc else { return true };
+        self.xform.quick.copy = Some(QuickCopy {
+            by,
+            mask_key: doc.quick_mask_key(),
+            selection_key: selection_key(self.selection.as_ref()),
+            ..copy
+        });
+        self.status = moved_status(by);
+        true
     }
 
     /// The quick mask as the drag or the transform being prepared will
@@ -357,17 +550,26 @@ impl AtelierApp {
     /// source box of Free Transform, while previewing.
     pub(super) fn preview_quick_mask(&mut self, frame: Option<Rect>, visible: Rect) {
         let canvas = self.doc.as_ref().map(Document::full_rect);
-        let t = match &self.xform.quick.drag {
-            Some(m) => canvas.map(|c| shift(c, m.by)),
+        let by = self.xform.quick.drag.as_ref().map(|m| m.by);
+        let t = match by {
+            Some(by) => canvas.map(|c| shift(c, by)),
             None => frame.and_then(|src| self.pending_transform(src, false)),
         };
         let copy = self.xform.quick.drag.as_ref().is_some_and(|m| m.copy);
-        if t.is_none_or(|t| self.quick_preview(&t, copy, visible).is_none()) {
+        if t.is_none_or(|t| self.quick_preview(&t, by, copy, visible).is_none()) {
             self.xform.quick.preview = None;
         }
     }
 
-    fn quick_preview(&mut self, t: &Transform, copy: bool, visible: Rect) -> Option<()> {
+    /// `by`: `t` is that move (a drag), shown in whole pixels of the
+    /// preview's level, without resampling.
+    fn quick_preview(
+        &mut self,
+        t: &Transform,
+        by: Option<(i64, i64)>,
+        copy: bool,
+        visible: Rect,
+    ) -> Option<()> {
         let doc = self.doc.as_ref()?;
         let mask = doc.quick_mask()?;
         let canvas = doc.full_rect();
@@ -408,6 +610,18 @@ impl AtelierApp {
         if grid.w == 0 || grid.h == 0 {
             return None;
         }
+        let bi = i64::from(b);
+        if let Some((dx, dy)) = by {
+            let level = |d: i64| (d as f64 / b as f64).round() as i64;
+            let out = shifted_parts(parts, (level(dx), level(dy)), &grid);
+            self.xform.quick.preview = Some(QuickPreview {
+                key,
+                image: Arc::new(out),
+                origin: (grid.x * bi, grid.y * bi),
+                px: b,
+            });
+            return Some(());
+        }
         let src = |image| Source {
             image,
             origin: [0.0, 0.0],
@@ -433,7 +647,6 @@ impl AtelierApp {
                 }
             });
         }
-        let bi = i64::from(b);
         self.xform.quick.preview = Some(QuickPreview {
             key,
             image: Arc::new(out),
@@ -442,6 +655,53 @@ impl AtelierApp {
         });
         Some(())
     }
+}
+
+/// The quick mask's `parts` (at a level of the view) over `grid` (pixels
+/// of that level), what moves shifted by `(sx, sy)` of them: whole pixels,
+/// as a Move drag shows it, what it uncovers unselected.
+fn shifted_parts(parts: &QuickParts, (sx, sy): (i64, i64), grid: &Grid) -> GrayImage {
+    let part = &*parts.part;
+    let (pw, ph) = (i64::from(part.width()), i64::from(part.height()));
+    let gw = grid.w as usize;
+    let mut out = GrayImage::new(grid.w, grid.h);
+    if gw == 0 {
+        return out;
+    }
+    // The columns of the grid what moves covers, and where they come from.
+    let lo = (sx - grid.x).clamp(0, gw as i64) as usize;
+    let hi = (sx - grid.x + pw).clamp(0, gw as i64) as usize;
+    let from = |i: usize| (grid.x + i as i64 - sx) as usize;
+    let row = |y: i64| (0..ph).contains(&y).then(|| (y * pw) as usize);
+    par_rows(out.as_mut(), gw, |first, band| {
+        for (j, line) in band.chunks_exact_mut(gw).enumerate() {
+            let y = grid.y + (first + j) as i64;
+            let moved = row(y - sy).filter(|_| lo < hi);
+            if let Some(start) = moved {
+                let src = &part.as_raw()[start + from(lo)..start + from(lo) + (hi - lo)];
+                line[lo..hi].copy_from_slice(src);
+            }
+            let Some((rest, cov)) = &parts.rest else {
+                continue;
+            };
+            // Over what stays, as far as it covers it.
+            let (rw, rh) = (i64::from(rest.width()), i64::from(rest.height()));
+            if rw == 0 || rh == 0 {
+                continue;
+            }
+            let under = &rest.as_raw()[(y.clamp(0, rh - 1) * rw) as usize..][..rw as usize];
+            let c = moved.map(|start| &cov.as_raw()[start..start + pw as usize]);
+            for (i, v) in line.iter_mut().enumerate() {
+                let u = u32::from(under[(grid.x + i as i64).clamp(0, rw - 1) as usize]);
+                let s = match c {
+                    Some(c) if (lo..hi).contains(&i) => u32::from(c[from(i)]),
+                    _ => 0,
+                };
+                *v = (u32::from(*v) + (u * (255 - s) + 127) / 255).min(255) as u8;
+            }
+        }
+    });
+    out
 }
 
 /// The parts of the quick mask `mask` for a preview, reduced `b` times:
@@ -491,5 +751,75 @@ fn quick_parts(
         key,
         part: Arc::new(part),
         rest: Some((rest, Arc::new(cov))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A drag's preview in whole pixels is what the release makes, over
+    /// the grid shown.
+    #[test]
+    fn a_shifted_preview_matches_the_move() {
+        let mask = Arc::new(GrayImage::from_fn(60, 40, |x, y| {
+            image::Luma([((x * 7 + y * 13) % 256) as u8])
+        }));
+        let canvas = PixelRect {
+            x: 0,
+            y: 0,
+            w: 60,
+            h: 40,
+        };
+        let sel: Selection = PixelRect {
+            x: 10,
+            y: 5,
+            w: 20,
+            h: 20,
+        }
+        .into();
+        for (selection, copy) in [(None, false), (Some(&sel), false), (Some(&sel), true)] {
+            let parts = quick_parts(&mask, selection, copy, canvas, 1, 0);
+            let grid = Grid::covering([5.0, 3.0, 50.0, 38.0], 1.0);
+            let by = (7, -4);
+            let out = shifted_parts(&parts, by, &grid);
+            for gy in 0..grid.h {
+                for gx in 0..grid.w {
+                    let (x, y) = (grid.x + gx as i64, grid.y + gy as i64);
+                    let (sx, sy) = (x - by.0, y - by.1);
+                    let inside = |x: i64, y: i64| (0..60).contains(&x) && (0..40).contains(&y);
+                    let m = |x: i64, y: i64| {
+                        if inside(x, y) {
+                            u32::from(mask.get_pixel(x as u32, y as u32).0[0])
+                        } else {
+                            0
+                        }
+                    };
+                    let c = |x: i64, y: i64| {
+                        u32::from(selection.is_some_and(|_| inside(x, y) && sel.coverage(x, y) > 0))
+                            * 255
+                    };
+                    let want = match selection {
+                        None => m(sx, sy),
+                        Some(_) => {
+                            let part = m(sx, sy) * c(sx, sy) / 255;
+                            let rest = if copy {
+                                m(x, y)
+                            } else {
+                                m(x, y) - m(x, y) * c(x, y) / 255
+                            };
+                            (part + rest * (255 - c(sx, sy)) / 255).min(255)
+                        }
+                    };
+                    let got = u32::from(out.get_pixel(gx, gy).0[0]);
+                    assert_eq!(
+                        got,
+                        want,
+                        "at ({x}, {y}), selection {}, copy {copy}",
+                        selection.is_some()
+                    );
+                }
+            }
+        }
     }
 }

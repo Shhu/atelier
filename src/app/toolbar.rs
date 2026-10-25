@@ -246,7 +246,9 @@ impl AtelierApp {
             egui::FontId::proportional(12.0),
             color,
         );
-        if ui_kit::tip_with_key(response, &t!("panel-swap-colors"), "X").clicked() {
+        let name = t!("panel-swap-colors");
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
+        if ui_kit::tip_with_key(response, &name, "X").clicked() {
             std::mem::swap(&mut self.primary, &mut self.secondary);
         }
 
@@ -266,7 +268,9 @@ impl AtelierApp {
         let black = Rect::from_min_size(reset.min, Vec2::splat(8.0));
         painter.rect(white, 2.0, Color32::WHITE, ring, StrokeKind::Inside);
         painter.rect(black, 2.0, Color32::BLACK, ring, StrokeKind::Inside);
-        if ui_kit::tip_with_key(response, &t!("panel-default-colors"), "D").clicked() {
+        let name = t!("panel-default-colors");
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
+        if ui_kit::tip_with_key(response, &name, "D").clicked() {
             (self.primary, self.secondary) = (Color32::BLACK, Color32::WHITE);
         }
     }
@@ -298,6 +302,15 @@ fn color_square(ui: &mut egui::Ui, rect: Rect, color: &mut Color32, front: bool)
     } else {
         t!("uip-picker-background-title")
     };
+    // Painted: named, with its color, for screen readers.
+    let name = if front {
+        t!("ui6-color-foreground")
+    } else {
+        t!("ui6-color-background")
+    };
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
+    let [r, g, b, _] = color.to_srgba_unmultiplied();
+    ui_kit::name_control(ui, response.id, &name, &format!("#{r:02X}{g:02X}{b:02X}"));
     ui_kit::picker_link(ui.ctx(), response, color, title)
 }
 

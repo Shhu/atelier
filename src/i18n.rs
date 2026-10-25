@@ -580,6 +580,16 @@ mod tests {
         }
     }
 
+    /// The group comments (`##`) are the English ones in every file, in
+    /// the same order, so that the files compare side by side.
+    #[test]
+    fn group_comments_are_the_same_in_every_file() {
+        let groups = |source: &'static str| -> Vec<&'static str> {
+            source.lines().filter(|l| l.starts_with("## ")).collect()
+        };
+        assert_eq!(groups(Lang::Fr.source()), groups(Lang::En.source()));
+    }
+
     #[test]
     fn numbers_follow_the_language() {
         set_lang(Lang::Fr);

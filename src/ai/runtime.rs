@@ -25,7 +25,7 @@ const IDLE: Duration = Duration::from_secs(90);
 /// Loads ONNX Runtime: before any other call to it. On Windows, `ort`
 /// would otherwise load the system's onnxruntime.dll by itself (too old,
 /// or absent) and panic, leaving it unusable for the whole session.
-fn init() -> Result<(), String> {
+fn init() -> Result<(), super::Error> {
     #[cfg(windows)]
     return windows::init();
     #[cfg(not(windows))]
@@ -96,7 +96,7 @@ impl Slot {
     pub fn run<R>(
         &'static self,
         mut f: impl FnMut(&mut Session, Loaded) -> ort::Result<R>,
-    ) -> Result<R, String> {
+    ) -> Result<R, super::Error> {
         init()?;
         let mut state = self.lock();
         let result = self.run_locked(&mut state, &mut f);
@@ -112,7 +112,7 @@ impl Slot {
         &self,
         state: &mut SlotState,
         f: &mut impl FnMut(&mut Session, Loaded) -> ort::Result<R>,
-    ) -> Result<R, String> {
+    ) -> Result<R, super::Error> {
         let (session, device) = match &mut state.session {
             Some(loaded) => loaded,
             empty => empty.insert(self.load(state.cpu_only)?),
@@ -130,22 +130,23 @@ impl Slot {
                 state.cpu_only = true;
                 state.session = None;
                 let (session, _) = state.session.insert(self.load(true)?);
-                f(session, Loaded(())).map_err(|e| e.to_string())
+                f(session, Loaded(())).map_err(|e| e.to_string().into())
             }
-            result => result.map_err(|e| e.to_string()),
+            result => result.map_err(|e| e.to_string().into()),
         }
     }
 
-    fn load(&self, cpu_only: bool) -> Result<(Session, Device), String> {
+    fn load(&self, cpu_only: bool) -> Result<(Session, Device), super::Error> {
         let path = (self.path)();
         // Damaged weights load fine: found by their hash, once.
         if super::models::remove_damaged_once(&path) {
-            return Err(crate::i18n::t!("fx4-ai-model-damaged"));
+            let damaged = || super::models::Model::damaged_message(&path);
+            return Err(super::Error::of(damaged));
         }
         let loaded = session(&path, cpu_only).map_err(|e| {
             // Of the right size but damaged: removed, to download again.
             if super::models::remove_if_damaged(&path) {
-                crate::i18n::t!("fx4-ai-model-damaged")
+                super::Error::of(|| super::models::Model::damaged_message(&path))
             } else {
                 e
             }
@@ -194,7 +195,7 @@ impl Slot {
 
 /// Loads a model: on Windows on the graphics card (DirectML) when it
 /// accepts it and `cpu_only` is false, otherwise on the CPU.
-fn session(model: &Path, cpu_only: bool) -> Result<(Session, Device), String> {
+fn session(model: &Path, cpu_only: bool) -> Result<(Session, Device), super::Error> {
     #[cfg(windows)]
     if !cpu_only {
         match gpu_session(model) {
@@ -224,7 +225,7 @@ fn session(model: &Path, cpu_only: bool) -> Result<(Session, Device), String> {
 /// Session on DirectML only: an error rather than a silent fallback, so
 /// that the device shown is the real one.
 #[cfg(windows)]
-fn gpu_session(model: &Path) -> Result<Session, String> {
+fn gpu_session(model: &Path) -> Result<Session, super::Error> {
     // DirectML allows neither memory reuse nor parallel execution.
     Session::builder()
         .and_then(|b| b.with_memory_pattern(false).map_err(Into::into))
@@ -234,7 +235,7 @@ fn gpu_session(model: &Path) -> Result<Session, String> {
                 .map_err(Into::into)
         })
         .and_then(|mut b| b.commit_from_file(model))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string().into())
 }
 
 /// On Windows, ONNX Runtime, DirectML and the Visual C++ DLLs they need are
@@ -291,7 +292,7 @@ mod windows {
     /// Extracts and loads ONNX Runtime; before any other call to it. Only a
     /// success is kept: a failure (file held by an antivirus, full disk) is
     /// tried again next time.
-    pub fn init() -> Result<(), String> {
+    pub fn init() -> Result<(), super::super::Error> {
         static DONE: Mutex<bool> = Mutex::new(false);
         let mut done = DONE.lock().unwrap_or_else(PoisonError::into_inner);
         if !*done {
@@ -301,9 +302,9 @@ mod windows {
         Ok(())
     }
 
-    fn load() -> Result<(), String> {
-        let local =
-            std::env::var_os("LOCALAPPDATA").ok_or_else(|| t!("ai-error-no-localappdata"))?;
+    fn load() -> Result<(), super::super::Error> {
+        let missing = || super::super::Error::of(|| t!("ai-error-no-localappdata"));
+        let local = std::env::var_os("LOCALAPPDATA").ok_or_else(missing)?;
         let dir = PathBuf::from(local)
             .join("Atelier")
             .join(format!("onnxruntime-{VERSION}"));
@@ -319,7 +320,7 @@ mod windows {
                     .and_then(|()| crate::ai::rename(&partial, &path));
                 if let Err(e) = written {
                     let _ = std::fs::remove_file(&partial);
-                    return Err(e.to_string());
+                    return Err(e.to_string().into());
                 }
             }
         }
@@ -329,7 +330,9 @@ mod windows {
             SetDllDirectoryW(wide(&dir).as_ptr());
             for (name, _) in &FILES[..FILES.len() - 1] {
                 if LoadLibraryW(wide(&dir.join(name)).as_ptr()).is_null() {
-                    return Err(t!("ai-error-dll-not-loaded", name = *name));
+                    return Err(super::super::Error::of(|| {
+                        t!("ai-error-dll-not-loaded", name = *name)
+                    }));
                 }
             }
         }

@@ -24,11 +24,11 @@ pub(super) static SESSION: Slot = Slot::new(model_path);
 /// Coverage (0..255) of the subject of `image`, at its size. The model only
 /// sees the bounding box of the visible pixels, with transparency laid over
 /// white (otherwise it would take the whole cut-out shape for the subject).
-pub fn select_subject(image: &RgbaImage) -> Result<GrayImage, String> {
+pub fn select_subject(image: &RgbaImage) -> Result<GrayImage, super::Error> {
     select_subject_with(&SESSION, image)
 }
 
-fn select_subject_with(slot: &'static Slot, image: &RgbaImage) -> Result<GrayImage, String> {
+fn select_subject_with(slot: &'static Slot, image: &RgbaImage) -> Result<GrayImage, super::Error> {
     let (w, h) = image.dimensions();
     let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
     for (x, y, p) in image.enumerate_pixels() {
@@ -51,7 +51,7 @@ fn select_subject_with(slot: &'static Slot, image: &RgbaImage) -> Result<GrayIma
 }
 
 /// The model on an image: the coverage of its subject.
-fn run(slot: &'static Slot, image: &RgbaImage) -> Result<GrayImage, String> {
+fn run(slot: &'static Slot, image: &RgbaImage) -> Result<GrayImage, super::Error> {
     let resized = image::imageops::resize(image, SIZE, SIZE, FilterType::Triangle);
     let n = (SIZE * SIZE) as usize;
     let mut data = vec![0.0f32; 3 * n];
@@ -69,7 +69,7 @@ fn run(slot: &'static Slot, image: &RgbaImage) -> Result<GrayImage, String> {
         Ok(logits.to_vec())
     })?;
     if logits.len() < (SIZE * SIZE) as usize {
-        return Err(t!("ai-error-model-corrupt"));
+        return Err(super::Error::of(|| t!("ai-error-model-corrupt")));
     }
     let mask = GrayImage::from_fn(SIZE, SIZE, |x, y| {
         let v = 1.0 / (1.0 + (-logits[(y * SIZE + x) as usize]).exp());

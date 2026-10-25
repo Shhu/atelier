@@ -45,10 +45,15 @@ pub struct Imported {
     pub notes: Vec<String>,
 }
 
-/// Reads a Photoshop document.
-pub fn read(path: &Path) -> Result<Imported, FileError> {
+/// Reads a Photoshop document, within `memory`.
+pub fn read(
+    path: &Path,
+    memory: crate::document::file_io::MemoryUse,
+) -> Result<Imported, FileError> {
     let data = std::fs::read(path)?;
-    let mut imported = read::document(&data)?;
+    let mut budget = memory.budget();
+    budget.take_bytes(data.len() as u64)?;
+    let mut imported = read::document_within(&data, budget)?;
     imported.doc.path = Some(path.to_path_buf());
     Ok(imported)
 }
@@ -792,14 +797,10 @@ mod tests {
             d.extend([0, 0, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 100, kind]);
             d
         };
-        let cases: [(Vec<crate::document::PsdResource>, Vec<String>); 6] = [
+        let cases: [(Vec<crate::document::PsdResource>, Vec<String>); 9] = [
             (
                 vec![resource(4000, b"maniIRFR\0\0\0\0")],
                 vec![t!("files5-psd-note-animation")],
-            ),
-            (
-                vec![resource(1077, &display(2))],
-                vec![t!("files5-psd-note-spot")],
             ),
             (vec![resource(1077, &display(0))], vec![]),
             (
@@ -808,9 +809,31 @@ mod tests {
             ),
             (
                 vec![resource(9999, b"?")],
-                vec![t!("files5-psd-note-other")],
+                vec![t!("files6-psd-note-other", ids = "9999")],
             ),
             (vec![resource(1080, b"count")], vec![]),
+            // Alternate spot colors without any (Photoshop writes it so).
+            (vec![resource(1067, &[0, 1, 0, 0])], vec![]),
+            (
+                vec![resource(
+                    1067,
+                    &[0, 1, 0, 1, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                )],
+                vec![t!("files5-psd-note-spot")],
+            ),
+            // Unknown ones are named; harmless known ones go along.
+            (
+                vec![
+                    resource(1068, b"?"),
+                    resource(1079, b"?"),
+                    resource(1068, b"?"),
+                ],
+                vec![t!("files6-psd-note-other", ids = "1068, 1079")],
+            ),
+            (
+                vec![resource(1030, b"quality"), resource(1040, b"mark")],
+                vec![],
+            ),
         ];
         for (resources, notes) in cases {
             let mut doc = sample();
@@ -818,6 +841,19 @@ mod tests {
             let (back, _) = write_read(&doc);
             assert_eq!(back.notes, notes, "{:?}", resources[0].id);
         }
+        // The XMP describes the image saved: upright, its size.
+        let mut doc = sample();
+        let xmp = b"<x:xmpmeta tiff:Orientation=\"6\" exif:PixelXDimension=\"9\"/>";
+        doc.file_metadata.psd_resources = Arc::new(vec![resource(1060, xmp)]);
+        let (back, _) = write_read(&doc);
+        let resources = &back.doc.file_metadata.psd_resources;
+        let xmp = &resources.iter().find(|r| r.id == 1060).unwrap().data;
+        let xmp = String::from_utf8_lossy(xmp);
+        assert!(xmp.contains("tiff:Orientation=\"1\""), "{xmp}");
+        assert!(
+            xmp.contains(&format!("exif:PixelXDimension=\"{}\"", doc.width())),
+            "{xmp}"
+        );
         let mut doc = sample();
         doc.file_metadata.psd_resources = Arc::new(vec![resource(1080, b"count")]);
         let (back, _) = write_read(&doc);
@@ -828,6 +864,78 @@ mod tests {
                 .iter()
                 .any(|r| r.id == 1080)
         );
+    }
+
+    /// The alpha channels' display settings go back to the channels of
+    /// their name; what is placed on the canvas goes back only to a canvas
+    /// of the same size, said otherwise (but the whole image's own slice,
+    /// which Photoshop makes again).
+    #[test]
+    fn display_settings_and_placed_resources_follow_the_document() {
+        use crate::i18n::t;
+        let resource = |id: u16, data: &[u8]| crate::document::PsdResource {
+            id,
+            name: Vec::new(),
+            data: data.to_vec(),
+        };
+        let entry = |opacity: u8, kind: u8| [0, 0, 0, 0xFF, 0, 0, 0, 0, 0, 0, 0, opacity, kind];
+        let display = [&1u32.to_be_bytes()[..], &entry(30, 1), &entry(70, 2)].concat();
+        let mut doc = sample();
+        doc.channels.clear();
+        let mask = Arc::new(image::GrayImage::new(40, 30));
+        for name in ["A", "B"] {
+            doc.channels.push(crate::document::Channel {
+                name: name.into(),
+                mask: mask.clone(),
+            });
+        }
+        let mut slices = 6u32.to_be_bytes().to_vec();
+        slices.extend([0; 16]);
+        slices.extend(0u32.to_be_bytes());
+        slices.extend(1u32.to_be_bytes());
+        doc.file_metadata.psd_resources =
+            Arc::new(vec![resource(1077, &display), resource(1050, &slices)]);
+        doc.file_metadata.psd_layout = Some(crate::document::PsdLayout {
+            canvas: (40, 30),
+            channels: vec!["A".into(), "B".into()],
+        });
+        let (back, notes) = write_read(&doc);
+        assert!(notes.is_empty() && back.notes.is_empty(), "{notes:?}");
+        let find = |d: &Document, id: u16| {
+            (d.file_metadata.psd_resources.iter())
+                .find(|r| r.id == id)
+                .map(|r| r.data.clone())
+        };
+        // The spot color became an alpha channel, said so on opening.
+        let mut alpha = display.clone();
+        *alpha.last_mut().unwrap() = 0;
+        assert_eq!(find(&back.doc, 1077).unwrap(), alpha);
+        assert!(find(&back.doc, 1050).is_some());
+        // B removed, C added: B's settings go, C gets the default.
+        doc.channels.remove(1);
+        doc.channels.push(crate::document::Channel {
+            name: "C".into(),
+            mask: mask.clone(),
+        });
+        let (back, _) = write_read(&doc);
+        let data = find(&back.doc, 1077).unwrap();
+        assert_eq!(&data[4..17], &entry(30, 1));
+        assert_eq!(data[4 + 13 + 11], 50);
+        // Another canvas: the whole image's slice left out without loss,
+        // color samplers said.
+        doc.crop(crate::document::PixelRect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        });
+        let (back, notes) = write_read(&doc);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(find(&back.doc, 1050).is_none());
+        doc.file_metadata.psd_resources = Arc::new(vec![resource(1073, b"samplers")]);
+        assert_eq!(losses(&doc), [t!("files6-psd-note-placed")]);
+        let (back, _) = write_read(&doc);
+        assert!(find(&back.doc, 1073).is_none());
     }
 
     /// A layer wider than the canvas's limit (Image Size on a layer that

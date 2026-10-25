@@ -75,6 +75,8 @@ mod tools4_tests;
 #[cfg(test)]
 mod tools5_tests;
 #[cfg(test)]
+mod tools6_tests;
+#[cfg(test)]
 mod tools_tests;
 mod transform;
 #[cfg(test)]
@@ -217,6 +219,18 @@ const SHORTCUT_HIDE_LAYERS: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
 const SHORTCUT_MERGE_VISIBLE: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E);
+const SHORTCUT_STAMP_VISIBLE: KeyboardShortcut = KeyboardShortcut::new(
+    Modifiers::COMMAND
+        .plus(Modifiers::SHIFT)
+        .plus(Modifiers::ALT),
+    Key::E,
+);
+const SHORTCUT_LAYER_VIA_CUT: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::J);
+const SHORTCUT_TOGGLE_LOCK: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND, Key::Slash);
+const SHORTCUT_DESATURATE: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::U);
 // Layer order: Ctrl+[ ] one step, with Shift all the way down / up.
 // (Display only: the brackets are read by `bracket_press`.)
 const SHORTCUT_RAISE: KeyboardShortcut =
@@ -526,7 +540,7 @@ impl Tool {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResizeFilter {
     Nearest,
     Bilinear,
@@ -655,6 +669,13 @@ enum Action {
     ImageSize,
     ClearSelection,
     LayerFromSelection,
+    /// Layer › New › Layer via Cut (Shift+Ctrl+J).
+    LayerViaCut,
+    /// Stamp Visible (Alt+Shift+Ctrl+E): the visible layers merged into a
+    /// new one.
+    StampVisible,
+    /// Image › Adjustments › Desaturate (Shift+Ctrl+U).
+    Desaturate,
     CropToSelection,
     Align(AlignOp),
     FillPrimary,
@@ -741,6 +762,9 @@ enum Action {
     /// File › Open Recent, the Window menu's workspace, the Help menu.
     Workspace(workspace::Command),
 }
+
+/// Work to run on the app once something it waits for is done.
+pub(super) type Then = Box<dyn FnOnce(&mut AtelierApp)>;
 
 pub struct AtelierApp {
     /// egui context (for window commands outside of drawing).
@@ -930,6 +954,8 @@ pub struct AtelierApp {
     preview_shown: Option<ShownPreview>,
     /// Confirmation asked before losing changes.
     confirm: Option<Confirm>,
+    /// A file needing more memory than is free: "Open anyway?".
+    open_anyway: Option<files::OpenAnyway>,
     /// "Discard hidden layers?" before Flatten Image.
     flatten_confirm: bool,
     /// Command palette (Ctrl+K).
@@ -1176,8 +1202,10 @@ impl Action {
                 | Action::ContentAwareFill
                 | Action::MakeTransparent
                 | Action::Adjust(_)
+                | Action::Desaturate
                 | Action::ClearSelection
                 | Action::Cut
+                | Action::LayerViaCut
         )
     }
 
@@ -1188,11 +1216,11 @@ impl Action {
             self,
             Action::Cut
                 | Action::ClearSelection
+                | Action::LayerViaCut
                 | Action::FillPrimary
                 | Action::FillPrimaryKeep
                 | Action::FillSecondary
                 | Action::FillSecondaryKeep
-                | Action::MakeTransparent
         )
     }
 
@@ -1203,6 +1231,8 @@ impl Action {
         matches!(
             self,
             Action::Cut
+                | Action::LayerViaCut
+                | Action::Desaturate
                 | Action::ClearSelection
                 | Action::FillPrimary
                 | Action::FillPrimaryKeep
@@ -1228,8 +1258,6 @@ impl Action {
                 | Action::InvertMask
                 | Action::LayerStyle(_)
                 | Action::ClearLayerStyle
-                | Action::BlendStep(_)
-                | Action::SetBlend(_)
                 | Action::Transform(_)
                 | Action::Rasterize
         )
@@ -1241,6 +1269,7 @@ impl Action {
         matches!(
             self,
             Action::Cut
+                | Action::Desaturate
                 | Action::ClearSelection
                 | Action::FillPrimary
                 | Action::FillPrimaryKeep
@@ -1511,6 +1540,7 @@ impl AtelierApp {
             menu_layers: Vec::new(),
             prop_session: None,
             confirm: None,
+            open_anyway: None,
             flatten_confirm: false,
             palette: Default::default(),
             recent: crate::recent::Recent::load(),
@@ -1569,7 +1599,10 @@ impl AtelierApp {
             return;
         }
         if tool != self.tool {
-            self.commit_pending();
+            // A large transform goes on aside: the tool changes at once.
+            if !self.commit_pending_aside() {
+                self.commit_pending();
+            }
             let (size, hardness) = (self.brush_size, self.hardness);
             match self.tool_brushes.iter_mut().find(|b| b.0 == self.tool) {
                 Some(b) => (b.1, b.2) = (size, hardness),
@@ -1579,6 +1612,7 @@ impl AtelierApp {
                 (self.brush_size, self.hardness) = (size, hardness);
             }
             self.tool = tool;
+            self.retouch.forget_composites();
             // Gestures of the previous tool don't resume when it comes back.
             self.lasso = None;
             self.edges.cancel_click();
@@ -1629,7 +1663,7 @@ impl AtelierApp {
             .as_ref()
             .is_some_and(|d| d.active != index && index < d.layers.len())
         {
-            self.commit_pending();
+            self.commit_pending_but_crop();
             self.mask_view = false;
             if let Some(doc) = &mut self.doc {
                 doc.active = index;
@@ -1642,6 +1676,22 @@ impl AtelierApp {
     /// Esc, on the contrary, gives it up.
     fn commit_pending(&mut self) {
         self.apply_pending(true);
+    }
+
+    /// [`Self::commit_pending`] before a change of the active layer or of
+    /// the layers' order: a crop box stays drawn (it is about the whole
+    /// image), and nothing else can be pending with it.
+    fn commit_pending_but_crop(&mut self) {
+        if !self.crop_box_pending() {
+            self.commit_pending();
+        }
+    }
+
+    /// [`Self::reset_pending`], a crop box kept.
+    fn reset_pending_but_crop(&mut self) {
+        let crop = self.canvas_rect.filter(|_| self.crop_box_pending());
+        self.reset_pending();
+        self.canvas_rect = crop;
     }
 
     /// Enter: applies what is being prepared; a large transform may still
@@ -1760,6 +1810,10 @@ impl AtelierApp {
     /// tools, the selected elements (or the frame being prepared by the Move
     /// tool); with the other tools, only with Ctrl (the Move tool's key).
     fn nudge(&mut self, (dx, dy): (i64, i64)) {
+        // A selection still being computed (a big marquee just drawn, a
+        // Modify) is the one moved, and the layers it may change are the
+        // ones moved.
+        self.wait_select_job();
         if self.vector_nudge((dx, dy)) {
             return;
         }
@@ -1843,8 +1897,9 @@ impl AtelierApp {
         moved.dedup();
         let ids: Vec<u64> = moved.iter().map(|&i| doc.layers[i].id).collect();
         for i in moved {
+            let locked = doc.is_locked(i);
             let layer = &mut doc.layers[i];
-            if !layer.locked {
+            if !locked {
                 layer.offset.0 += dx;
                 layer.offset.1 += dy;
             }
@@ -1991,6 +2046,10 @@ impl AtelierApp {
     /// Click in the list: alone (single selection), Ctrl (add/remove),
     /// Shift (range from the active layer).
     fn click_layer(&mut self, i: usize, modifiers: egui::Modifiers) {
+        // A large transform being applied: the click once it lands.
+        if self.commit_pending_aside() {
+            return self.after_transform(move |app| app.click_layer(i, modifiers));
+        }
         let current = self.selected_indices();
         let Some(doc) = &self.doc else { return };
         let id = doc.layers[i].id;
@@ -2025,7 +2084,7 @@ impl AtelierApp {
     }
 
     fn active_locked(&self) -> bool {
-        self.doc.as_ref().is_some_and(|d| d.active_layer().locked)
+        self.doc.as_ref().is_some_and(|d| d.is_locked(d.active))
     }
 
     /// The Move tool and Free Transform can't move the active layer, which
@@ -2048,13 +2107,22 @@ impl AtelierApp {
     /// If the active layer is locked, says so and returns `true`, Quick
     /// Mask Mode included (for what acts on the layer itself).
     fn refuse_if_locked(&mut self) -> bool {
-        let Some(layer) = self.doc.as_ref().map(Document::active_layer) else {
+        let Some(doc) = &self.doc else {
             return false;
         };
-        let locked = layer.locked;
+        let layer = doc.active_layer();
+        let locked = doc.is_locked(doc.active);
         if locked {
-            // Shown like the other refusals (see `status_failed`).
-            let m = tm!("status-layer-is-locked", name = layer.name.as_str());
+            // Shown like the other refusals (see `status_failed`); a
+            // locked group locks its layers.
+            let m = match doc.locking_group(doc.active).filter(|_| !layer.locked) {
+                Some(g) => tm!(
+                    "tools6-status-group-locked",
+                    name = layer.name.as_str(),
+                    group = doc.layers[g].name.as_str()
+                ),
+                None => tm!("status-layer-is-locked", name = layer.name.as_str()),
+            };
             let lock = icon::LOCK_SIMPLE;
             self.status_failed(i18n::Message::new(
                 format!("{lock} {}", m.shown),
@@ -2062,6 +2130,12 @@ impl AtelierApp {
             ));
         }
         locked
+    }
+
+    /// Bounds of what the selection selects of the canvas, if any.
+    fn selection_bounds(&self) -> Option<crate::document::PixelRect> {
+        let doc = self.doc.as_ref()?;
+        self.selection.as_ref()?.bounds(doc.full_rect())
     }
 
     fn full_rect(&self) -> Option<Rect> {
@@ -2187,14 +2261,24 @@ impl AtelierApp {
 
     fn run(&mut self, action: Action) {
         let _measured = crate::diag::timer(format!("{action:?}"));
+        // A transform still being computed lands first (and what was
+        // asked for after it): the command works with its result.
+        self.wait_transform();
         // A selection still being computed applies first: the command
         // works with it, as if it had been computed at once.
         self.wait_select_job();
-        // A crop box drawn: saving or closing asks what becomes of it first.
-        if matches!(
-            action,
-            Action::Save | Action::SaveAs | Action::CloseDocument | Action::Quit
-        ) && self.crop_asks(canvas::CropThen::Run(action))
+        // A crop box drawn: whatever would apply it (or leave it, or export
+        // without it) asks what becomes of it first, then goes on.
+        if (action.commits_pending()
+            || matches!(
+                action,
+                Action::Save
+                    | Action::SaveAs
+                    | Action::ExportAs
+                    | Action::Transform(_)
+                    | Action::Quit
+            ))
+            && self.crop_asks(canvas::CropThen::Run(action))
         {
             return;
         }
@@ -2214,6 +2298,11 @@ impl AtelierApp {
             return;
         }
         if action.commits_pending() {
+            // A large transform applied on another thread: the command
+            // once it lands, its indicator showing meanwhile.
+            if self.commit_pending_aside() {
+                return self.after_transform(move |app| app.run(action));
+            }
             self.commit_pending();
         }
         let recorded = self.recorded_action(action);
@@ -2236,10 +2325,14 @@ impl AtelierApp {
     fn run_action(&mut self, action: Action) {
         match action {
             Action::Transform(cmd) => self.transform_command(cmd),
+            // In Quick Mask Mode, the mask (as the Move tool moves it).
+            Action::Align(op) if self.in_quick_mask() => self.align_quick_mask(op),
             Action::Align(op) => {
                 let indices = self.selected_indices();
+                // To the selection when there is one, like Photoshop.
+                let to = self.selection_bounds();
                 if let Some(doc) = &mut self.doc
-                    && doc.align(&indices, op)
+                    && doc.align(&indices, op, to)
                 {
                     self.reset_pending();
                 }
@@ -2271,6 +2364,40 @@ impl AtelierApp {
                 if let (Some(sel), Some(doc)) = (&self.selection, &mut self.doc)
                     && doc.clear_region(sel)
                 {
+                    self.reset_pending();
+                }
+            }
+            Action::LayerViaCut => {
+                if let (Some(sel), Some(doc)) = (&self.selection, &mut self.doc) {
+                    if doc.layer_via_cut(sel) {
+                        self.reset_pending();
+                    } else {
+                        self.status = t!("status-selection-empty");
+                    }
+                }
+            }
+            Action::StampVisible => {
+                if let Some(doc) = &mut self.doc {
+                    if doc.stamp_visible() {
+                        self.reset_pending();
+                    } else {
+                        self.status = t!("input6-status-nothing-visible");
+                    }
+                }
+            }
+            Action::Desaturate if self.smart_filters_apply() => self.refuse_on_smart(),
+            Action::Desaturate => {
+                let selection = self.selection.as_ref();
+                let gray = Adjustment::HueSaturation(HueSaturation {
+                    hue: 0.0,
+                    saturation: -1.0,
+                    lightness: 0.0,
+                    colorize: false,
+                });
+                if let Some(doc) = &mut self.doc
+                    && doc.adjust_active(&gray, selection)
+                {
+                    doc.rename_last_step(t!("input6-hist-desaturate"));
                     self.reset_pending();
                 }
             }
@@ -2799,6 +2926,7 @@ impl AtelierApp {
             || self.smart.link_save.is_some()
             || self.transform_busy()
             || self.confirm.is_some()
+            || self.open_anyway.is_some()
             || self.flatten_confirm
             || self.paint.rasterize_confirm.is_some()
             || self.crop_confirm.is_some()
@@ -2907,7 +3035,7 @@ impl AtelierApp {
                 }
             });
             if let Some(step) = step {
-                self.switch_tab((self.active_tab + step) % n);
+                self.switch_tab_aside((self.active_tab + step) % n);
                 return;
             }
         }
@@ -2925,6 +3053,10 @@ impl AtelierApp {
                     Action::Transform(transform::Command::Free),
                 ),
                 (SHORTCUT_DUPLICATE, Action::LayerFromSelection),
+                (SHORTCUT_LAYER_VIA_CUT, Action::LayerViaCut),
+                (SHORTCUT_STAMP_VISIBLE, Action::StampVisible),
+                (SHORTCUT_TOGGLE_LOCK, Action::ToggleLock),
+                (SHORTCUT_DESATURATE, Action::Desaturate),
                 (SHORTCUT_NEW_LAYER, Action::NewLayer),
                 (SHORTCUT_MERGE_VISIBLE, Action::MergeVisible),
                 (SHORTCUT_MERGE_DOWN, Action::MergeDown),
@@ -3134,6 +3266,7 @@ impl AtelierApp {
                 tries: 0,
                 from: self.focus_at_end,
                 last: self.focus_at_end,
+                first: None,
                 dialog: self.modal_open(),
             });
         }
@@ -3148,15 +3281,23 @@ impl AtelierApp {
             // Shift+Tab moves the focus a frame late: the field it leaves
             // is still focused at first. Back round to it: no other field.
             let arrived = text && (focused != h.from || h.tries > 2);
-            if arrived || h.tries > FOCUS_HUNT_TRIES {
+            let round = !text && focused.is_some() && h.first == focused && h.tries > 2;
+            if arrived || round || h.tries > FOCUS_HUNT_TRIES {
                 hunt = None;
             } else {
                 h.last = focused;
+                if h.first.is_none() {
+                    h.first = focused;
+                }
                 ctx.request_repaint();
             }
         }
         self.focus_at_end = focused;
+        // A number field given the keyboard as its dialog opened: its text
+        // field shows next frame.
+        let claimed = focused.is_some() && ui_kit::claimed_first_field(ctx) == focused;
         if hunt.is_none()
+            && !claimed
             && let Some(id) = ctx.memory(|m| m.focused())
             && !text
             && !ctx.input(|i| i.pointer.any_click())
@@ -3276,19 +3417,86 @@ impl AtelierApp {
         if self.tool_percent(percent, false) {
             return;
         }
-        let Some(id) = self.doc.as_ref().map(|d| d.active_layer().id) else {
+        let Some((layers, locked)) = self.set_layers_look(Some(percent as f32 / 100.0), None)
+        else {
             return;
         };
-        self.record_change(t!("xchg-hist-opacity"), Some((id, "opacity")));
-        if let Some(doc) = &mut self.doc {
-            let layer = doc.active_layer_mut();
-            layer.opacity = percent as f32 / 100.0;
-            self.status = t!(
+        let Some(doc) = &self.doc else { return };
+        let status = match layers.as_slice() {
+            [one] => t!(
                 "status-layer-opacity",
-                name = layer.name.as_str(),
+                name = doc.layers[*one].name.as_str(),
                 percent = percent
-            );
+            ),
+            _ => t!(
+                "input6-status-layers-opacity",
+                count = layers.len(),
+                percent = percent
+            ),
+        };
+        self.status = match locked {
+            0 => status,
+            n => format!("{status} · {}", t!("input6-status-locked-left", count = n)),
+        };
+    }
+
+    /// Opacity and blend mode changes go to every selected layer, as in
+    /// Photoshop, except the locked ones (left as they are). One step; a
+    /// series of changes of the same property is one. `None` (the active
+    /// layer's lock said) when all are locked; otherwise the layers changed
+    /// and the number of locked ones left out.
+    pub(super) fn set_layers_look(
+        &mut self,
+        opacity: Option<f32>,
+        blend: Option<BlendMode>,
+    ) -> Option<(Vec<usize>, usize)> {
+        let doc = self.doc.as_ref()?;
+        let (free, locked): (Vec<usize>, Vec<usize>) = self
+            .selected_indices()
+            .into_iter()
+            .partition(|&i| !doc.is_locked(i));
+        // Pass Through is for groups only.
+        let free: Vec<usize> = free
+            .into_iter()
+            .filter(|&i| blend != Some(BlendMode::PassThrough) || doc.layers[i].is_group())
+            .collect();
+        if free.is_empty() {
+            self.refuse_if_locked();
+            return None;
         }
+        let ids: Vec<u64> = free.iter().map(|&i| doc.layers[i].id).collect();
+        let key = match ids.as_slice() {
+            [one] => *one,
+            _ => hash_of(&ids),
+        };
+        if let Some(o) = opacity
+            && free.iter().any(|&i| doc.layers[i].opacity != o)
+        {
+            self.record_change(t!("xchg-hist-opacity"), Some((key, "opacity")));
+        }
+        let doc = self.doc.as_ref()?;
+        if let Some(b) = blend
+            && free.iter().any(|&i| doc.layers[i].blend != b)
+        {
+            self.record_change(t!("xchg-hist-blending"), Some((key, "blend")));
+        }
+        // Ids again: recording may have ended a text being typed (an empty
+        // new one goes away).
+        let doc = self.doc.as_mut()?;
+        let free: Vec<usize> = ids
+            .iter()
+            .filter_map(|id| doc.layers.iter().position(|l| l.id == *id))
+            .collect();
+        for &i in &free {
+            let layer = &mut doc.layers[i];
+            if let Some(o) = opacity {
+                layer.opacity = o;
+            }
+            if let Some(b) = blend {
+                layer.blend = b;
+            }
+        }
+        Some((free, locked.len()))
     }
 
     /// Shift + digits: the flow of the painting tools, like Photoshop.
@@ -3426,6 +3634,8 @@ struct PasteChord {
     /// All modifiers were up at some point since: the next one down starts
     /// another chord.
     idle: bool,
+    /// The time of the last frame seen.
+    last_time: Option<f64>,
 }
 
 /// Seconds before V during which a modifier let go still counts.
@@ -3435,6 +3645,16 @@ impl PasteChord {
     /// This frame's input: a paste's modifiers, if V (Insert) was released.
     fn update(&mut self, i: &egui::InputState) -> Option<Modifiers> {
         let (time, now) = (i.time, i.modifiers);
+        // After a slow frame (Copy Merged, Undo of a big image) the changes
+        // batched into this one all get its time: they can't tell a Shift
+        // let go long before V from one let go just before. Unless V went
+        // down in an earlier frame, only the V events' own modifiers count.
+        let slow = self
+            .last_time
+            .is_some_and(|t| time - t > PASTE_CHORD_SLACK);
+        self.last_time = Some(time);
+        let down_before = self.down_at.is_some();
+        let mut v_modifiers = Modifiers::NONE;
         if now.is_none() {
             self.idle = true;
         } else if self.idle {
@@ -3455,6 +3675,7 @@ impl PasteChord {
                 // Ctrl+V reported as a text paste: V is down.
                 egui::Event::Paste(_) => {
                     self.down_at.get_or_insert(time);
+                    v_modifiers = v_modifiers.plus(Modifiers::COMMAND);
                     continue;
                 }
                 egui::Event::Key {
@@ -3477,6 +3698,7 @@ impl PasteChord {
                 continue;
             }
             self.note(time, modifiers);
+            v_modifiers = v_modifiers.plus(modifiers);
             if pressed {
                 self.plain_v = if key == Key::V {
                     !modifiers.command
@@ -3488,8 +3710,13 @@ impl PasteChord {
                 }
             } else {
                 if !self.plain_v {
-                    paste = Some(self.held(time));
+                    paste = Some(if slow && !down_before {
+                        v_modifiers
+                    } else {
+                        self.held(time)
+                    });
                 }
+                v_modifiers = Modifiers::NONE;
                 self.plain_v = false;
                 self.down_at = None;
                 self.start(time, now);
@@ -3538,6 +3765,9 @@ struct FocusHunt {
     /// frame.
     from: Option<egui::Id>,
     last: Option<egui::Id>,
+    /// The first widget it passed: back round to it, there is no text
+    /// field.
+    first: Option<egui::Id>,
     /// Within a dialog: over when it closes.
     dialog: bool,
 }
@@ -3573,6 +3803,7 @@ fn focus_first_field(ctx: &egui::Context) {
             tries: 0,
             from: None,
             last: None,
+            first: None,
             dialog: true,
         };
         set_focus_hunt(ctx, Some(hunt));
@@ -3814,6 +4045,11 @@ fn swallow_popup_closing_press(
 ) {
     let title_bar = ctx.data(|d| d.get_temp::<Rect>(title_bar_id()));
     raw.events.retain(|e| {
+        // Its release may never come (the window lost focus mid-press):
+        // the next click keeps its own.
+        if matches!(e, egui::Event::WindowFocused(false) | egui::Event::PointerGone) {
+            *swallowed = false;
+        }
         let &egui::Event::PointerButton {
             pos,
             button: PointerButton::Primary,
@@ -3834,6 +4070,7 @@ fn swallow_popup_closing_press(
             *swallowed = true;
             return false;
         }
+        *swallowed = false;
         true
     });
 }
@@ -3871,9 +4108,14 @@ impl AtelierApp {
             };
             ctx.memory_mut(|m| m.move_focus(direction));
         }
+        // Input while a stroke or a transform is computed aside waits for
+        // it, then applies to its result.
+        self.wait_stroke_job(&ctx);
+        self.wait_transform_for_input(&ctx);
         self.handle_dropped_files(&ctx);
         self.poll_subject(&ctx);
         self.poll_select_job();
+        self.wait_output_on_input(&ctx);
         self.poll_downloads(&ctx);
         self.poll_object_select();
         self.play_actions();
@@ -3990,6 +4232,7 @@ impl AtelierApp {
         self.model_prompt_window(&ctx);
         self.export_window(&ctx);
         self.confirm_window(&ctx);
+        self.open_anyway_window(&ctx);
         self.flatten_confirm_window(&ctx);
         self.rasterize_confirm_window(&ctx);
         self.crop_confirm_window(&ctx);

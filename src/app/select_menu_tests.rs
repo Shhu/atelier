@@ -870,7 +870,8 @@ fn quick_mask_notice_in_the_options_bar() {
     key(&mut h, Key::Q, Modifiers::NONE);
     assert!(quick_mask_on(&h));
     use egui_kittest::kittest::Queryable as _;
-    let label = format!("{} {}", icon::CIRCLE_HALF, t!("sel5-options-quick-mask"));
+    // Named without its glyph.
+    let label = t!("sel5-options-quick-mask");
     h.get_by_label(&label).click();
     h.run_steps(2);
     assert!(!quick_mask_on(&h));
@@ -910,4 +911,81 @@ fn a_selection_combined_with_a_pending_one_does_not_wait() {
     assert_eq!((sel.coverage(50, 50), sel.coverage(550, 550)), (255, 255));
     assert_eq!(sel.coverage(300, 300), 0);
     assert_eq!(h.state().doc.as_ref().unwrap().history().0.len(), steps + 2);
+}
+
+/// Select and Mask on a locked layer's own mask: OK with nothing changed
+/// closes, recording nothing and saying nothing about the lock.
+#[test]
+fn select_and_mask_untouched_on_a_locked_mask_closes() {
+    let mut h = app_with(halves());
+    mask_with_hole(&mut h);
+    h.state_mut()
+        .doc
+        .as_mut()
+        .unwrap()
+        .active_layer_mut()
+        .locked = true;
+    let steps = h.state().doc.as_ref().unwrap().history().0.len();
+    h.state_mut().run(Action::Select(Command::SelectAndMask));
+    h.run_steps(1);
+    h.state_mut().status.clear();
+    h.state_mut().close_select_mask(true);
+    settle(&mut h);
+    let app = h.state();
+    assert!(app.sel.select_mask.is_none(), "closed");
+    assert!(app.status.is_empty(), "{}", app.status);
+    assert_eq!(app.doc.as_ref().unwrap().history().0.len(), steps);
+}
+
+/// Select and Mask on a mask with a density: the preview shows what the
+/// output takes, the stored values for Output Layer Mask, what the mask
+/// shows (density applied) for Output Selection.
+#[test]
+fn select_and_mask_preview_follows_the_output_base() {
+    let mut h = app_with(halves());
+    mask_with_hole(&mut h);
+    h.state_mut().run(Action::Select(Command::SelectAndMask));
+    h.run_steps(2);
+    let hole = |h: &mut Harness<'_, AtelierApp>| {
+        let source = h.state_mut().select_mask_overlay().expect("previewed");
+        let super::select_menu::OverlayMask::Gray(m) = source.mask;
+        m.get_pixel(100, 100).0[0]
+    };
+    assert_eq!(hole(&mut h), 0, "Layer Mask: the stored values");
+    h.state_mut().sel.select_mask.as_mut().unwrap().output = super::select_mask::Output::Selection;
+    h.run_steps(2);
+    let shown = hole(&mut h);
+    assert!(
+        (120..=135).contains(&shown),
+        "Selection: about half, {shown}"
+    );
+    h.state_mut().sel.select_mask.as_mut().unwrap().output = super::select_mask::Output::LayerMask;
+    h.run_steps(2);
+    assert_eq!(hole(&mut h), 0, "back to the stored values");
+}
+
+/// Another tool chosen while a selection is computed in the background:
+/// the tool changes at once (nothing to apply), the selection lands later.
+#[test]
+fn a_tool_chosen_does_not_wait_for_a_selection_being_computed() {
+    let mut h = app_with(halves());
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    h.state_mut()
+        .select_later(super::select_menu::Then::Modified, u64::MAX, move || {
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(30));
+            let square = image::GrayImage::from_pixel(50, 50, image::Luma([255]));
+            Selection::from_mask(&square, (10, 10))
+        });
+    assert!(h.state().select_busy());
+    h.state_mut().set_tool(Tool::Brush);
+    assert_eq!(h.state().tool, Tool::Brush);
+    assert!(h.state().select_busy(), "not waited for");
+    go.send(()).unwrap();
+    let start = std::time::Instant::now();
+    while h.state().select_busy() {
+        assert!(start.elapsed().as_secs() < 60, "never landed");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.run_steps(1);
+    }
+    assert!(h.state().selection.is_some());
 }

@@ -148,23 +148,29 @@ pub(super) struct RetouchTools {
     waiting: Option<(FillRequest, FillContext)>,
     job: Option<FillJob>,
     /// What is visible from the active layer down (Current & Below), kept
-    /// while the document is unchanged: for the strokes, for the brush's
-    /// preview.
+    /// while the document is unchanged: for the strokes and the brush's
+    /// preview (dropped with the tool).
     below: BelowCache,
-    below_shown: BelowCache,
 }
 
 /// A composite of the layers below (see [`composite_below`]), by a
 /// fingerprint of the document's state and the region.
 type BelowCache = Option<(u64, Arc<RgbaImage>)>;
 
-/// [`composite_below`], from `cache` when `doc` is unchanged.
-fn below_cached(cache: &mut BelowCache, doc: &Document, region: PixelRect) -> Arc<RgbaImage> {
+/// [`composite_below`], from `cache` when `doc` is unchanged (in state
+/// `state`, see [`Document::state_id`]).
+fn below_cached(
+    cache: &mut BelowCache,
+    doc: &Document,
+    state: u64,
+    region: PixelRect,
+) -> Arc<RgbaImage> {
     let layer = doc.active_layer();
     let key = hash_of((
         doc.uid(),
-        doc.state_id(),
+        state,
         doc.active,
+        doc.effects_held(),
         layer.id,
         layer.rev(),
         (region.x, region.y, region.w, region.h),
@@ -210,15 +216,36 @@ impl Default for RetouchTools {
             waiting: None,
             job: None,
             below: None,
-            below_shown: None,
         }
     }
 }
 
 impl RetouchTools {
+    /// Another tool, or the document closed: what was kept for the strokes
+    /// goes (a full-size composite).
+    pub(super) fn forget_composites(&mut self) {
+        self.below = None;
+    }
+
     /// A fill under way: it keeps the image and the keyboard.
     pub(super) fn busy(&self) -> bool {
         self.job.is_some()
+    }
+
+    /// The fill under way records `step` in the action being recorded once
+    /// its pixels are in.
+    pub(super) fn record_when_filled(&mut self, step: crate::actions::Recorded) {
+        if let Some(job) = &mut self.job {
+            job.record = Some(step);
+        }
+    }
+
+    /// Cancels the fill under way (its progress window's Cancel).
+    #[cfg(test)]
+    pub(super) fn cancel_job(&self) {
+        if let Some(job) = &self.job {
+            job.progress.cancel();
+        }
     }
 
     /// The AI model is in use.
@@ -251,8 +278,9 @@ enum Method {
 
 /// A fill to compute: a region of the layer.
 struct FillTask {
-    /// What the hole is filled from (the layer, or what is visible).
-    sample: RgbaImage,
+    /// What the hole is filled from: what is visible (`None`: the layer,
+    /// `base`).
+    sample: Option<RgbaImage>,
     /// The layer's pixels.
     base: RgbaImage,
     /// Of each pixel, 0..1: the hole.
@@ -285,34 +313,42 @@ struct FillJob {
     selection: Option<Option<Selection>>,
     /// Its progress is not known (a spinner instead of a bar).
     indeterminate: bool,
+    /// The action step recorded once the pixels are in (Fill… with
+    /// Content-Aware contents): nothing is recorded on cancel or failure.
+    record: Option<crate::actions::Recorded>,
+    /// A tool's stroke (Healing Brush, Spot Healing, Patch): input meanwhile
+    /// waits for it rather than being lost (see `wait_stroke_job`).
+    stroke: bool,
+    /// Where its progress window was last shown.
+    shown: Option<egui::Rect>,
 }
 
 /// A fill's pixels (`None`: cancelled, nothing to copy, or nothing
 /// changed), why the AI model was not used, if it failed, and whether it
 /// left the layer as it was.
-type Filled = (Option<RgbaImage>, Option<String>, bool);
+type Filled = (Option<RgbaImage>, Option<crate::ai::Error>, bool);
 
 impl FillTask {
     fn compute(self, progress: &Progress) -> Filled {
         let hole: Vec<bool> = self.coverage.iter().map(|&c| c > 0.0).collect();
-        let patches =
-            || patchmatch::inpaint(&self.sample, &hole, self.allowed.as_deref(), progress);
+        let sample = self.sample.as_ref().unwrap_or(&self.base);
+        let patches = || patchmatch::inpaint(sample, &hole, self.allowed.as_deref(), progress);
         let mut failure = None;
         let filled = match self.method {
             Method::Patches => patches(),
-            Method::Proximity => retouch::proximity_fill(&self.sample, &hole).or_else(patches),
+            Method::Proximity => retouch::proximity_fill(sample, &hole).or_else(patches),
             Method::Ai => {
-                match crate::ai::catch_panic(|| crate::ai::inpaint::inpaint(&self.sample, &hole)) {
+                match crate::ai::catch_panic(|| crate::ai::inpaint::inpaint(sample, &hole)) {
                     Ok(filled) => {
                         // A large hole the model saw reduced: its answer
                         // gives the shapes, patches the finer texture.
-                        let size = self.sample.dimensions();
+                        let size = sample.dimensions();
                         let reduction = crate::ai::inpaint::reduction(size, &hole);
                         let levels = reduction.log2().floor() as usize;
                         if levels == 0 {
                             Some(filled)
                         } else {
-                            patchmatch::refine(&self.sample, &hole, progress, &filled, levels)
+                            patchmatch::refine(sample, &hole, progress, &filled, levels)
                         }
                     }
                     Err(e) => {
@@ -333,7 +369,7 @@ impl FillTask {
                 self.adapt,
                 self.opacity,
                 self.keep_alpha,
-                self.visible.then_some(&self.sample),
+                self.visible.then_some(sample),
             ),
             // The fill alone, faded by the coverage.
             Output::NewLayer => {
@@ -491,6 +527,15 @@ fn composite_below(doc: &Document, region: PixelRect) -> RgbaImage {
     compose::plan(&below, doc.full_rect(), &mut compose::FullSize, &options).render(region)
 }
 
+/// The state of `from` a stroke on `doc` starts from: the stroke's own
+/// checkpoint changed nothing yet (the preview's composite is still it).
+fn stroke_state(doc: &Document, from: &Document) -> u64 {
+    match from.uid() == doc.uid() {
+        true => doc.last_step_state_id().unwrap_or(doc.state_id()),
+        false => from.state_id(),
+    }
+}
+
 /// The image a source is sampled in, and its corner on the canvas: in
 /// `from`, the document of the source, for a stroke on `doc`.
 fn sample_image(
@@ -509,7 +554,10 @@ fn sample_image(
     match sample {
         _ if doc.mask_targeted() && from.uid() == doc.uid() => (layer.shared_image(), layer.offset),
         Sample::Current => (layer.shared_image(), layer.offset),
-        Sample::CurrentAndBelow => (below_cached(below, from, rect), (rect.x, rect.y)),
+        Sample::CurrentAndBelow => (
+            below_cached(below, from, stroke_state(doc, from), rect),
+            (rect.x, rect.y),
+        ),
         Sample::All => (from.composite_shared(rect), (rect.x, rect.y)),
     }
 }
@@ -553,7 +601,7 @@ impl RetouchTools {
             self.seen = Some(match sample {
                 _ if same => Arc::clone(&image),
                 Sample::All => doc.composite_shared(rect),
-                _ => below_cached(&mut self.below, doc, rect),
+                _ => below_cached(&mut self.below, doc, stroke_state(doc, doc), rect),
             });
         }
         let layer = doc.active_layer().offset;
@@ -737,7 +785,7 @@ impl AtelierApp {
                 Some(stroke)
             }
             Tool::SpotHealing => {
-                self.spot_heal(&stroke, bounds);
+                self.spot_heal(stroke, bounds);
                 None
             }
             _ => Some(stroke),
@@ -746,9 +794,12 @@ impl AtelierApp {
 
     /// Spot Healing Brush: what the stroke covered is filled from around it
     /// and blended in; small spots at once, larger ones on another thread.
-    fn spot_heal(&mut self, stroke: &Stroke, bounds: Option<DirtyRect>) {
+    fn spot_heal(&mut self, mut stroke: Stroke, bounds: Option<DirtyRect>) {
         let name = self.tool.name();
         let (spot_type, sample_all) = (self.retouch.spot_type, self.retouch.spot_sample_all);
+        // Around what was painted, a few brush widths: enough texture to
+        // fill it from, and a long thin stroke doesn't take the whole image.
+        let reach = (self.brush_size * 2.0).ceil() as u32;
         let Some(doc) = &mut self.doc else { return };
         doc.hold_effects(false);
         let Some(b) = bounds.filter(|_| stroke.painted()) else {
@@ -758,43 +809,47 @@ impl AtelierApp {
         };
         let layer = doc.active_layer();
         let size = layer.image().dimensions();
-        let margin = b.w.max(b.h).max(16);
+        let margin = b.w.max(b.h).min(reach).max(16);
         let region = grow(b, margin, size);
-        let base = crop(stroke.base(), region);
         let visible = sample_all && !doc.mask_targeted();
-        let sample = if visible {
-            let r = PixelRect {
-                x: layer.offset.0 + region.x as i64,
-                y: layer.offset.1 + region.y as i64,
-                w: region.w,
-                h: region.h,
-            };
-            doc.composite(r, None)
-        } else {
-            base.clone()
+        // What is seen over the layer (kept from the stroke's start).
+        let seen = visible.then(|| doc.composite_shared(layer.rect()));
+        let (full, cover) = (stroke.full_coverage(), stroke.take_coverage());
+        let holes = {
+            use rayon::prelude::*;
+            (region.y..region.y + region.h)
+                .into_par_iter()
+                .map(|y| {
+                    let row = (y * size.0 + region.x) as usize;
+                    cover[row..row + region.w as usize].iter().filter(|&&c| c > 0).count()
+                })
+                .sum::<usize>()
         };
-        let (full, cover) = (stroke.full_coverage(), stroke.coverage());
-        let coverage: Vec<f32> = (region.y..region.y + region.h)
-            .flat_map(|y| (region.x..region.x + region.w).map(move |x| (x, y)))
-            .map(|(x, y)| (cover[(y * size.0 + x) as usize] as f32 / full).min(1.0))
-            .collect();
-        let holes = coverage.iter().filter(|&&c| c > 0.0).count();
         let ai_wanted = spot_type == SpotType::ContentAware
             && b.w.max(b.h) >= AI_HOLE
             && self.retouch.settings.ai
             && Model::Inpaint.ready();
+        let base = Arc::clone(stroke.base());
         let method = match spot_type {
             SpotType::ProximityMatch => Method::Proximity,
-            SpotType::ContentAware if ai_wanted && ai_usable(&sample) => Method::Ai,
+            SpotType::ContentAware
+                if ai_wanted && opaque_within(seen.as_deref().unwrap_or(&base), region) =>
+            {
+                Method::Ai
+            }
             SpotType::ContentAware => Method::Patches,
         };
         if ai_wanted && method != Method::Ai {
             self.status = t!("fx3-ai-skipped-transparency");
         }
-        let task = FillTask {
-            sample,
-            base,
-            coverage,
+        // Made where it is computed: crops and coverage of megapixels.
+        let make = move || FillTask {
+            sample: seen.map(|s| crop(&s, region)),
+            base: crop(&base, region),
+            coverage: (region.y..region.y + region.h)
+                .flat_map(|y| (region.x..region.x + region.w).map(move |x| (x, y)))
+                .map(|(x, y)| (cover[(y * size.0 + x) as usize] as f32 / full).min(1.0))
+                .collect(),
             allowed: None,
             adapt: true,
             opacity: 1.0,
@@ -804,10 +859,12 @@ impl AtelierApp {
             visible,
         };
         if method == Method::Ai || (method == Method::Patches && holes > SYNC_HOLE) {
-            self.spawn_fill(task, name, (region.x, region.y));
+            let output = Output::CurrentLayer;
+            self.spawn_fill_with(make, output, method, name, (region.x, region.y));
+            self.stroke_job();
             return;
         }
-        let (filled, _, unchanged) = task.compute(&Progress::default());
+        let (filled, _, unchanged) = make().compute(&Progress::default());
         let doc = self.doc.as_mut().expect("checked above");
         match filled {
             Some(pixels) => {
@@ -865,24 +922,32 @@ impl AtelierApp {
             progress,
             rx,
         );
+        self.stroke_job();
     }
 
-    /// Computes `task` on another thread, for the active layer (its pixels
-    /// at `at`); the document stays ready to paint until it is done (see
-    /// `poll_fill`).
-    fn spawn_fill(&mut self, task: FillTask, name: String, at: (u32, u32)) {
+    /// Computes the task `task` makes on another thread, for the active
+    /// layer (its pixels at `at`), its `output` and `method` given; the
+    /// document stays ready to paint until it is done (see `poll_fill`).
+    fn spawn_fill_with(
+        &mut self,
+        task: impl FnOnce() -> FillTask + Send + 'static,
+        output: Output,
+        method: Method,
+        name: String,
+        at: (u32, u32),
+    ) {
         let progress = Arc::new(Progress::default());
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         let shared = Arc::clone(&progress);
-        let (output, ai) = (task.output, task.method == Method::Ai);
+        let ai = method == Method::Ai;
         std::thread::spawn(move || {
             let _job = crate::diag::job(if ai {
                 "Content-Aware Fill (AI)"
             } else {
                 "Content-Aware Fill"
             });
-            let filled = task.compute(&shared);
+            let filled = task().compute(&shared);
             let _ = tx.send(filled);
             ctx.request_repaint();
         });
@@ -912,7 +977,35 @@ impl AtelierApp {
             rx,
             selection: None,
             indeterminate: ai,
+            record: None,
+            stroke: false,
+            shown: None,
         });
+    }
+
+    /// The fill just started is a tool's stroke (see `FillJob::stroke`).
+    fn stroke_job(&mut self) {
+        if let Some(job) = &mut self.retouch.job {
+            job.stroke = true;
+        }
+    }
+
+    /// A press, a key, a paste or a drop while a stroke is computed on
+    /// another thread: the stroke is waited for and put in place first,
+    /// then the input applies as if the stroke had been done at once
+    /// (like a selection, see `wait_select_job`): nothing is lost. A press
+    /// on its progress window (Cancel) and Esc while it shows are its own.
+    pub(super) fn wait_stroke_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.retouch.job.as_ref().filter(|j| j.stroke) else {
+            return;
+        };
+        let shown = job.shown;
+        if !ctx.input(|i| input_waits(i, shown)) {
+            return;
+        }
+        let Some(job) = &self.retouch.job else { return };
+        let result = job.rx.recv().ok();
+        self.fill_done(result);
     }
 
     /// A fill computed on another thread is done: into the layer, or a new
@@ -920,18 +1013,27 @@ impl AtelierApp {
     fn poll_fill(&mut self) {
         let Some(job) = &self.retouch.job else { return };
         // Disconnected: the computation failed (panicked).
-        let ((filled, failure, unchanged), panicked) = match job.rx.try_recv() {
-            Ok(result) => (result, false),
+        let result = match job.rx.try_recv() {
+            Ok(result) => Some(result),
             Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => ((None, None, false), true),
+            Err(mpsc::TryRecvError::Disconnected) => None,
         };
-        let job = self.retouch.job.take().expect("checked above");
+        self.fill_done(result);
+    }
+
+    /// The fill's result (`None`: the computation failed, panicked), put
+    /// in place.
+    fn fill_done(&mut self, result: Option<Filled>) {
+        let panicked = result.is_none();
+        let (filled, failure, unchanged) = result.unwrap_or((None, None, false));
+        let Some(job) = self.retouch.job.take() else { return };
         let cancelled = job.progress.cancelled();
         // Cancelled: never applied, even if it was done meanwhile.
         let filled = filled.filter(|_| !cancelled);
         let Some(doc) = self.doc.as_mut().filter(|d| d.uid() == job.doc) else {
             return;
         };
+        let mut applied = false;
         if job.output == Output::NewLayer {
             if let Some(pixels) = filled {
                 let layer = doc.active_layer();
@@ -940,8 +1042,10 @@ impl AtelierApp {
                     layer.offset.1 + job.at.1 as i64,
                 );
                 doc.add_layer(job.name.clone(), pixels, at);
+                applied = true;
             }
         } else if let Some(pixels) = filled.filter(|_| doc.active_layer().id == job.layer) {
+            applied = true;
             image::imageops::replace(
                 doc.active_layer_mut().pixels_mut(),
                 &pixels,
@@ -967,14 +1071,25 @@ impl AtelierApp {
             doc.end_paint();
             doc.discard_step();
         }
+        if cancelled {
+            // A played step stops the action, quietly.
+            self.actions.step_stopped(actions_panel::Stopped::Cancelled);
+        }
         if let Some(error) = failure {
             self.status_failed(tm!("retouch-status-ai-failed", error = error));
         } else if panicked && !cancelled {
-            self.status_failed(tm!("fx3-filter-failed", name = job.name.as_str()));
+            let text = tm!("fx3-filter-failed", name = job.name.as_str());
+            // A played step stops the action.
+            self.actions
+                .step_stopped(actions_panel::Stopped::Failed(text.shown.clone()));
+            self.status_failed(text);
         } else if cancelled {
             self.status = t!("retouch-status-cancelled", name = job.name.as_str());
         } else if unchanged {
             self.status = t!("tools5-status-unchanged");
+        }
+        if let Some(record) = job.record.filter(|_| applied || (unchanged && !cancelled)) {
+            self.record(record);
         }
         self.reset_pending();
     }
@@ -998,25 +1113,25 @@ impl AtelierApp {
 
     /// Fills the selection of the active layer content-aware, on another
     /// thread: one undo step once done. Asks for the AI model first if it
-    /// is wanted but missing.
-    pub(super) fn start_content_aware(&mut self, request: FillRequest) {
+    /// is wanted but missing. Returns whether the fill started.
+    pub(super) fn start_content_aware(&mut self, request: FillRequest) -> bool {
         if request.settings.ai && !Model::Inpaint.ready() {
             self.retouch.waiting = Some((request, self.fill_context()));
             if self.request_model(AfterDownload::ContentAwareFill) {
                 self.retouch.waiting = None;
             } else {
-                return;
+                return false;
             }
         }
         if self.refuse_if_target_locked() || self.refuse_hidden_layer() {
-            return;
+            return false;
         }
         // Filled on the layer itself: a text or shape is rasterized first
         // (asked), like with the painting tools.
         let on_layer = request.settings.output == Output::CurrentLayer
             || self.doc.as_ref().is_some_and(Document::mask_targeted);
         if on_layer && self.paint_refuses() {
-            return;
+            return false;
         }
         let name = if request.from_fill {
             t!("dialog-fill-title")
@@ -1025,9 +1140,11 @@ impl AtelierApp {
         };
         let Some(selection) = self.selection.clone() else {
             self.status = t!("retouch-status-select-first");
-            return;
+            return false;
         };
-        let Some(doc) = &mut self.doc else { return };
+        let Some(doc) = &mut self.doc else {
+            return false;
+        };
         let mut output = request.settings.output;
         if doc.mask_targeted() {
             output = Output::CurrentLayer;
@@ -1038,12 +1155,12 @@ impl AtelierApp {
             if !doc.begin_paint() {
                 doc.discard_step();
                 self.status = self.nothing_to_paint();
-                return;
+                return false;
             }
         }
         let Some(layer) = doc.target_layer() else {
             self.status = self.nothing_to_paint();
-            return;
+            return false;
         };
         let image = layer.shared_image();
         let size = image.dimensions();
@@ -1055,7 +1172,7 @@ impl AtelierApp {
                 doc.discard_step();
             }
             self.status = t!("status-selection-empty");
-            return;
+            return false;
         };
         let region = match request.settings.area {
             SamplingArea::Auto => grow(hole, hole.w.max(hole.h).max(64), size),
@@ -1066,38 +1183,33 @@ impl AtelierApp {
                 h: size.1,
             },
         };
-        let base = crop(&image, region);
-        let mut coverage = vec![0.0f32; region.w as usize * region.h as usize];
-        crate::filters::par_rows(&mut coverage, region.w.max(1) as usize, |first, band| {
-            let w = region.w as usize;
-            for (j, row) in band.chunks_exact_mut(w).enumerate() {
-                let y = region.y + (first + j) as u32;
-                for (i, v) in row.iter_mut().enumerate() {
-                    *v = clip.coverage(region.x + i as u32, y) as f32 / 255.0;
-                }
-            }
-        });
-        let method = if request.settings.ai && ai_usable(&base) {
-            Method::Ai
-        } else {
-            Method::Patches
-        };
+        let method =
+            if request.settings.ai && Model::Inpaint.ready() && opaque_within(&image, region) {
+                Method::Ai
+            } else {
+                Method::Patches
+            };
         if request.settings.ai && method != Method::Ai && Model::Inpaint.ready() {
             self.status = t!("fx3-ai-skipped-transparency");
         }
-        let task = FillTask {
-            sample: base.clone(),
-            base,
-            coverage,
+        let (adapt, opacity, keep_alpha) =
+            (request.settings.adapt, request.opacity, request.keep_alpha);
+        // The region's copy and its coverage on the worker (tens of
+        // milliseconds at 24 MP), filled from itself.
+        let task = move || FillTask {
+            sample: None,
+            base: crop(&image, region),
+            coverage: coverage_of(&clip, region),
             allowed: None,
-            adapt: request.settings.adapt,
-            opacity: request.opacity,
-            keep_alpha: request.keep_alpha,
+            adapt,
+            opacity,
+            keep_alpha,
             method,
             output,
             visible: false,
         };
-        self.spawn_fill(task, name, (region.x, region.y));
+        self.spawn_fill_with(task, output, method, name, (region.x, region.y));
+        true
     }
 
     /// What a fill waiting for the AI model was asked on: the document,
@@ -1140,7 +1252,7 @@ impl AtelierApp {
     /// Content-Aware Fill window, then the progress of a fill under way.
     pub(super) fn retouch_windows(&mut self, ctx: &egui::Context) {
         self.poll_fill();
-        if let Some(job) = &self.retouch.job {
+        if let Some(job) = &mut self.retouch.job {
             if fill_progress(ctx, job) {
                 job.progress.cancel();
             }
@@ -1375,7 +1487,9 @@ impl AtelierApp {
             let _job = crate::diag::job("Patch");
             let mut image = (*base).clone();
             let cover = |x: u32, y: u32| clip.coverage(x, y) as f32 / 255.0;
-            retouch::heal_area(&mut image, &base, cover, (&base, offset), window, None);
+            // Cancel stops it between grids and cycles of the healing.
+            let stop = || shared.cancelled();
+            retouch::heal_area_until(&mut image, &base, cover, (&base, offset), window, None, &stop);
             let result = if shared.cancelled() {
                 (None, None, false)
             } else {
@@ -1393,6 +1507,7 @@ impl AtelierApp {
             progress,
             rx,
         );
+        self.stroke_job();
         if let Some(job) = &mut self.retouch.job {
             job.indeterminate = true;
             if mode == PatchMode::Destination {
@@ -1550,9 +1665,9 @@ impl AtelierApp {
     fn overlay_texture(&mut self, corner: (i64, i64), covered: u32) -> Option<egui::TextureId> {
         let side = covered.min(1024);
         let step = covered as f32 / side as f32;
-        let mut below_shown = self.retouch.below_shown.take();
-        let made = self.overlay_pixels(corner, covered, side, step, &mut below_shown);
-        self.retouch.below_shown = below_shown;
+        let mut below = self.retouch.below.take();
+        let made = self.overlay_pixels(corner, covered, side, step, &mut below);
+        self.retouch.below = below;
         if let Some((key, image)) = made? {
             let texture = self
                 .ctx
@@ -1586,6 +1701,7 @@ impl AtelierApp {
             corner,
             covered,
             sample as u8,
+            doc.mask_targeted(),
         ));
         if self.retouch.overlay.as_ref().is_none_or(|(k, _)| *k != key) {
             let region = PixelRect {
@@ -1598,14 +1714,33 @@ impl AtelierApp {
             let points = (0..side)
                 .flat_map(move |y| (0..side).map(move |x| (corner.0 + at(x), corner.1 + at(y))));
             let color = |[r, g, b, a]: [u8; 4]| Color32::from_rgba_unmultiplied(r, g, b, a);
+            // A mask (or the quick mask) painted: it is what the stroke
+            // clones, whatever the sampling.
+            let same = self.doc.as_ref().is_some_and(|d| d.uid() == doc.uid());
+            let mask = (same && (doc.mask_targeted() || doc.quick_mask().is_some()))
+                .then(|| doc.target_layer())
+                .flatten();
             let pixels: Vec<Color32> = match sample {
+                _ if let Some(mask) = &mask => points
+                    .map(|(x, y)| color(mask.pixel_at(x, y).unwrap_or([0; 4])))
+                    .collect(),
                 Sample::Current => points
                     .map(|(x, y)| color(layer.pixel_at(x, y).unwrap_or([0; 4])))
                     .collect(),
-                // What the stroke samples: from the layer down (kept).
+                // What the stroke samples: from the layer down; only the
+                // brush's part when shown 1:1, else the stroke's (kept).
+                Sample::CurrentAndBelow if covered == side => composite_below(doc, region)
+                    .pixels()
+                    .map(|p| color(p.0))
+                    .collect(),
                 Sample::CurrentAndBelow => {
+                    let rect = doc.active_layer().rect();
                     let full = doc.full_rect();
-                    let seen = below_cached(below_shown, doc, full);
+                    let full = match self.doc.as_ref().is_some_and(|d| d.uid() == doc.uid()) {
+                        true => rect,
+                        false => full,
+                    };
+                    let seen = below_cached(below_shown, doc, doc.state_id(), full);
                     points
                         .map(|(x, y)| {
                             let (sx, sy) = (x - full.x, y - full.y);
@@ -1690,19 +1825,84 @@ impl AtelierApp {
 /// Document and layer (uid, id), and selection a fill was asked on.
 type FillContext = (Option<(u64, u64)>, Option<Selection>);
 
-/// Whether the AI model can paint `image` in: downloaded, and the image
-/// opaque (it knows no transparency).
-fn ai_usable(image: &RgbaImage) -> bool {
-    Model::Inpaint.ready() && image.pixels().all(|p| p.0[3] == 255)
+/// Every pixel of `r` in `image` is opaque (rows in parallel).
+fn opaque_within(image: &RgbaImage, r: DirtyRect) -> bool {
+    use rayon::prelude::*;
+    let w = image.width() as usize;
+    let raw: &[u8] = image.as_raw();
+    (r.y..r.y + r.h).into_par_iter().all(|y| {
+        let start = (y as usize * w + r.x as usize) * 4;
+        raw[start..start + r.w as usize * 4]
+            .chunks_exact(4)
+            .all(|p| p[3] == 255)
+    })
 }
 
-/// While a fill is computed: blocks the window; after a moment, says which
-/// with its progress, and offers to cancel. Returns whether Cancel was
-/// clicked.
-fn fill_progress(ctx: &egui::Context, job: &FillJob) -> bool {
+/// Of each pixel of `region`, 0..1: how much `clip` covers it (rows in
+/// parallel).
+fn coverage_of(clip: &crate::pixel_ops::Clip, region: DirtyRect) -> Vec<f32> {
+    let mut coverage = vec![0.0f32; region.w as usize * region.h as usize];
+    crate::filters::par_rows(&mut coverage, region.w.max(1) as usize, |first, band| {
+        let w = region.w as usize;
+        for (j, row) in band.chunks_exact_mut(w).enumerate() {
+            let y = region.y + (first + j) as u32;
+            for (i, v) in row.iter_mut().enumerate() {
+                *v = clip.coverage(region.x + i as u32, y) as f32 / 255.0;
+            }
+        }
+    });
+    coverage
+}
+
+/// Whether input of this frame waits for a job (see
+/// `AtelierApp::wait_stroke_job`): a press (not on the job's window,
+/// `shown`), a key (not Esc while the window shows), text, a paste or a
+/// drop.
+pub(super) fn input_waits(i: &egui::InputState, shown: Option<egui::Rect>) -> bool {
+    !i.raw.dropped_files.is_empty()
+        || i.events.iter().any(|e| match e {
+            egui::Event::PointerButton {
+                pressed: true, pos, ..
+            } => !shown.is_some_and(|r| r.contains(*pos)),
+            egui::Event::Key {
+                pressed: true, key, ..
+            } => !(*key == Key::Escape && shown.is_some()),
+            egui::Event::Text(_)
+            | egui::Event::Paste(_)
+            | egui::Event::Copy
+            | egui::Event::Cut => true,
+            _ => false,
+        })
+}
+
+/// While a fill is computed: blocks the window (a tool's stroke: input
+/// waits for it instead, see `wait_stroke_job`); after a moment, says
+/// which with its progress, and offers to cancel (Esc too). Returns
+/// whether it was cancelled.
+fn fill_progress(ctx: &egui::Context, job: &mut FillJob) -> bool {
     let elapsed = ctx.input(|i| i.time) - job.started;
     let visible = elapsed >= PROGRESS_DELAY;
     ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    if job.stroke {
+        job.shown = None;
+        if !visible {
+            return false;
+        }
+        let mut cancel = ctx.input(|i| i.key_pressed(Key::Escape));
+        let shown = egui::Area::new(egui::Id::new("fill_progress"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(color::BG2)
+                    .stroke(UiStroke::new(1.0, color::WINDOW_LINE))
+                    .corner_radius(12)
+                    .inner_margin(egui::Margin::symmetric(18, 14))
+                    .show(ui, |ui| cancel |= progress_contents(ui, job))
+            });
+        job.shown = Some(shown.response.rect);
+        return cancel;
+    }
     let frame = if visible {
         egui::Frame::new()
             .fill(color::BG2)
@@ -1717,24 +1917,30 @@ fn fill_progress(ctx: &egui::Context, job: &FillJob) -> bool {
         .backdrop_color(Color32::TRANSPARENT)
         .frame(frame)
         .show(ctx, |ui| {
-            if !visible {
-                return;
+            if visible {
+                cancel = progress_contents(ui, job);
             }
-            ui.set_width(280.0);
-            ui.label(egui::RichText::new(format!("{}…", job.name)).color(color::TEXT));
-            ui.add_space(8.0);
-            let fraction = job.progress.fraction();
-            if job.indeterminate {
-                ui.add(egui::Spinner::new().size(16.0).color(color::MUTED));
-            } else {
-                ui.add(egui::ProgressBar::new(fraction).desired_height(6.0));
-            }
-            ui.add_space(8.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                cancel =
-                    ui_kit::button(ui, &t!("dialog-cancel"), Kind::Normal, None, true).clicked();
-            });
         });
+    cancel
+}
+
+/// A fill's progress window: its name, progress and Cancel (whether it
+/// was clicked).
+fn progress_contents(ui: &mut egui::Ui, job: &FillJob) -> bool {
+    ui.set_width(280.0);
+    ui.label(egui::RichText::new(format!("{}…", job.name)).color(color::TEXT));
+    ui.add_space(8.0);
+    let fraction = job.progress.fraction();
+    if job.indeterminate {
+        ui.add(egui::Spinner::new().size(16.0).color(color::MUTED));
+    } else {
+        ui.add(egui::ProgressBar::new(fraction).desired_height(6.0));
+    }
+    ui.add_space(8.0);
+    let mut cancel = false;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        cancel = ui_kit::button(ui, &t!("dialog-cancel"), Kind::Normal, None, true).clicked();
+    });
     cancel
 }
 

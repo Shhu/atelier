@@ -804,6 +804,11 @@ impl AtelierApp {
     }
 
     fn start_playing(&mut self, queue: VecDeque<Queued>, name: String, batch: bool) {
+        // A crop box drawn: asked first.
+        if self.crop_box_pending() {
+            self.crop_first(move |app| app.start_playing(queue, name, batch));
+            return;
+        }
         self.commit_pending();
         self.actions.player = Some(Player {
             queue,
@@ -899,15 +904,12 @@ impl AtelierApp {
             if let Some(c) = p.current.take() {
                 match c.stopped {
                     // Like Photoshop, a step cancelled stops the action
-                    // (Batch stops at that file).
+                    // (and a batch: a cancel is not a file's error).
                     Some(Stopped::Cancelled) if !p.batch => {
                         self.status = t!("actions-status-stopped", name = c.action.as_str());
                         return self.stop_playing();
                     }
-                    Some(Stopped::Cancelled) => {
-                        let why = self.status.clone();
-                        return self.step_error(&c.title, &c.action, c.row, why);
-                    }
+                    Some(Stopped::Cancelled) => return self.cancel_batch(),
                     Some(Stopped::Failed(why)) => {
                         return self.step_error(&c.title, &c.action, c.row, why);
                     }
@@ -1021,7 +1023,7 @@ impl AtelierApp {
             return Err(t!("actions-error-no-document"));
         };
         let has_selection = self.selection.is_some();
-        let locked = doc.active_layer().locked;
+        let locked = doc.is_locked(doc.active);
         // A smart object takes filters as smart filters.
         let can_paint = doc.can_paint();
         let filterable = can_paint || self.smart_filters_apply();
@@ -1636,6 +1638,9 @@ impl AtelierApp {
         else {
             return;
         };
+        if self.crop_first(move |app| app.record_again(row)) {
+            return;
+        }
         self.commit_pending();
         self.actions.again = Some(row);
         if let Err(error) = self.play_step(&command, true) {
@@ -3041,6 +3046,94 @@ mod tests {
                 filter: Filter::GaussianBlur { radius: 2.0 },
             })]
         );
+    }
+
+    fn content_aware_fill() -> FillDialog {
+        FillDialog {
+            content: FillContent::ContentAware,
+            color: Color32::BLACK,
+            opacity: 1.0,
+            preserve_transparency: false,
+            adapt: true,
+        }
+    }
+
+    /// Fill… with Content-Aware contents is recorded once the pixels are
+    /// in: not when cancelled, nor when refused (a locked layer).
+    #[test]
+    fn a_cancelled_content_aware_fill_is_not_recorded() {
+        let mut h = app();
+        with_action(&mut h, Vec::new());
+        let app = h.state_mut();
+        app.panel_click(PanelClick::Record);
+        app.selection = Some(
+            crate::document::PixelRect {
+                x: 30,
+                y: 20,
+                w: 30,
+                h: 20,
+            }
+            .into(),
+        );
+        app.apply_fill(content_aware_fill());
+        assert!(app.retouch.busy(), "the fill computes");
+        app.retouch.cancel_job();
+        settle(&mut h, |app| !app.retouch.busy());
+        let app = h.state_mut();
+        assert!(app.actions.library.sets[0].actions[0].steps.is_empty());
+        assert!(!app.doc.as_ref().unwrap().can_undo());
+        // Refused: not recorded either.
+        app.doc.as_mut().unwrap().active_layer_mut().locked = true;
+        app.apply_fill(content_aware_fill());
+        app.apply_fill(FillDialog {
+            content: FillContent::Black,
+            ..content_aware_fill()
+        });
+        assert!(app.actions.library.sets[0].actions[0].steps.is_empty());
+        app.doc.as_mut().unwrap().active_layer_mut().locked = false;
+        app.apply_fill(content_aware_fill());
+        settle(&mut h, |app| !app.retouch.busy());
+        let app = h.state_mut();
+        app.panel_click(PanelClick::Stop);
+        let steps = &app.actions.library.sets[0].actions[0].steps;
+        let titles: Vec<String> = steps.iter().map(|s| step_title(&s.command)).collect();
+        assert_eq!(titles, [t!("dialog-fill-title")]);
+        assert!(app.doc.as_ref().unwrap().can_undo(), "filled");
+    }
+
+    /// A Content-Aware Fill step cancelled while it computes stops the
+    /// action quietly, like a cancelled filter (no error box).
+    #[test]
+    fn a_cancelled_content_aware_fill_step_stops_the_action() {
+        let mut h = app();
+        let original = flat(&h);
+        let fill = Recorded::Fill {
+            contents: contents(FillContent::ContentAware),
+            color: rgb(Color32::BLACK),
+            opacity: 1.0,
+            preserve_transparency: false,
+        };
+        with_action(&mut h, vec![Step::new(fill), invert()]);
+        let app = h.state_mut();
+        app.selection = Some(
+            crate::document::PixelRect {
+                x: 30,
+                y: 20,
+                w: 30,
+                h: 20,
+            }
+            .into(),
+        );
+        app.panel_click(PanelClick::Play);
+        app.play_actions();
+        assert!(app.retouch.busy(), "the fill computes");
+        app.retouch.cancel_job();
+        settle(&mut h, idle);
+        let app = h.state();
+        assert!(app.actions.message.is_none(), "no error box");
+        assert_eq!(app.status, t!("actions-status-stopped", name = "A"));
+        assert_eq!(app.doc.as_ref().unwrap().history().1, 0);
+        assert_eq!(flat(&h), original, "nothing applied, Invert not played");
     }
 
     /// The same for a smart filter: its rendering cancelled, nothing is

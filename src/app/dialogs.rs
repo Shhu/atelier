@@ -190,6 +190,16 @@ impl AtelierApp {
         let Some(tr) = self.transparency.take() else {
             return;
         };
+        // A text or shape layer: rasterized first, if the user agrees.
+        if apply
+            && self.rasterize_then(move |app| {
+                app.transparency = Some(tr);
+                app.close_transparency(true);
+            })
+        {
+            self.end_layer_preview();
+            return;
+        }
         if apply {
             let [r, g, b, _] = tr.color.to_srgba_unmultiplied();
             if let Some(doc) = &mut self.doc
@@ -208,9 +218,9 @@ impl AtelierApp {
     }
 
     /// Histograms of what an adjustment changes: the active layer's pixels
-    /// (its mask's when targeted), inside the selection (computed once per
-    /// pixel revision and selection).
-    fn active_histogram(&mut self) -> Option<Histograms> {
+    /// (its mask's when targeted, the quick mask), inside the selection
+    /// (computed once per revision of that target and selection).
+    pub(super) fn active_histogram(&mut self) -> Option<Histograms> {
         let doc = self.doc.as_ref()?;
         let layer = doc.active_layer();
         let selection = self.selection.as_ref().map(|s| {
@@ -218,9 +228,16 @@ impl AtelierApp {
             let mask = s.mask.as_ref().map_or(0, |m| Arc::as_ptr(m) as usize);
             (r.x, r.y, r.w, r.h, mask, s.inverted)
         });
+        let canvas = doc.full_rect();
         let key = (
             layer.id,
-            hash_of((layer.rev(), doc.mask_targeted(), selection)),
+            hash_of((
+                layer.rev(),
+                doc.target_rev(),
+                doc.mask_targeted(),
+                (canvas.x, canvas.y, canvas.w, canvas.h),
+                selection,
+            )),
         );
         if self.histogram.as_ref().is_none_or(|(k, _)| *k != key) {
             let target = super::filters_ui::active_target(doc, self.selection.as_ref())?;
@@ -233,6 +250,9 @@ impl AtelierApp {
     /// Image adjustment (see [`AdjustKind`]): blocks the rest of the window
     /// but without a backdrop, to see the corrected image live.
     pub(super) fn adjust_window(&mut self, ctx: &egui::Context) {
+        if self.adjusting_window(ctx) {
+            return;
+        }
         let Some(mut dialog) = self.adjust.take() else {
             return;
         };
@@ -289,20 +309,19 @@ impl AtelierApp {
             dialog.point = None;
         }
         if out.ok {
-            let adjustment = dialog.adjustment.clone();
-            self.record(crate::actions::Recorded::Adjust { adjustment });
-        }
-        if out.ok
-            && let Some(doc) = &mut self.doc
-            && doc.adjust_active(&dialog.adjustment, self.selection.as_ref())
-        {
-            self.status = t!("dialog-adjust-applied", name = dialog.adjustment.title());
+            // The preview's result when it is there, else on another thread
+            // (recorded once in).
+            self.apply_adjustment(dialog.adjustment.clone());
         }
         self.adjust = Some(dialog);
         if out.ok || out.cancel {
             self.adjust = None;
+            self.forget_adjust_preview();
             self.end_layer_preview();
             self.reset_pending();
+            if let Some(doc) = &self.doc {
+                doc.release_stand_in();
+            }
         }
     }
 
@@ -384,12 +403,20 @@ impl AtelierApp {
         if self.refuse_hidden_layer() {
             return;
         }
-        self.record(crate::actions::Recorded::Fill {
+        // A text or shape layer: rasterized first, if the user agrees
+        // (Content-Aware Fill refuses it itself).
+        if d.content != FillContent::ContentAware
+            && !self.refuse_if_target_locked()
+            && self.rasterize_then(move |app| app.apply_fill(d))
+        {
+            return;
+        }
+        let recorded = crate::actions::Recorded::Fill {
             contents: actions_panel::contents(d.content),
             color: actions_panel::rgb(d.color),
             opacity: d.opacity,
             preserve_transparency: d.preserve_transparency,
-        });
+        };
         if d.content == FillContent::ContentAware {
             // The AI model only when it is there: no question here.
             let settings = retouch_tools::FillSettings {
@@ -398,13 +425,17 @@ impl AtelierApp {
                 ai: self.retouch.settings.ai && crate::ai::models::Model::Inpaint.ready(),
                 ..self.retouch.settings
             };
-            self.start_content_aware(retouch_tools::FillRequest {
+            // Recorded once the pixels are in (not when cancelled).
+            if self.start_content_aware(retouch_tools::FillRequest {
                 settings,
                 opacity: d.opacity,
                 keep_alpha: d.preserve_transparency,
                 from_fill: true,
-            });
+            }) {
+                self.retouch.record_when_filled(recorded);
+            }
         } else if !self.refuse_if_target_locked() {
+            self.record(recorded);
             let (color, which) = match d.content {
                 FillContent::Foreground => (self.primary, t!("dialog-fill-with-foreground")),
                 FillContent::Background => (self.secondary, t!("dialog-fill-with-background")),
@@ -936,8 +967,49 @@ fn free_place(ctx: &egui::Context, others: &[Rect], height: f32) -> Pos2 {
             Some(_) => break,
         }
     }
-    // No free place: cascaded from the last panel placed, its title bar
-    // left in sight (never exactly over another one).
+    // No free place: cascaded, over no other panel's title bar (its top
+    // `CASCADE` px stay in sight), from the last panel placed, then from
+    // the others, then down each column.
+    let title = |r: &Rect| Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + CASCADE)).shrink(0.5);
+    // How much of the title bars a panel there would cover (px²), if it
+    // is in bounds.
+    let covers = |pos: Pos2| {
+        let body = Rect::from_min_max(pos2(pos.x - WIDTH, pos.y), pos2(pos.x, pos.y + height));
+        let inside = pos.y + height <= bottom && pos.x - WIDTH >= left;
+        inside.then(|| {
+            let area = |r: &Rect| {
+                let t = title(r);
+                if t.intersects(body) {
+                    t.intersect(body).area()
+                } else {
+                    0.0
+                }
+            };
+            others.iter().map(area).sum::<f32>()
+        })
+    };
+    // Down and to the left, or straight down.
+    let steps = [vec2(-CASCADE, CASCADE), vec2(0.0, CASCADE)];
+    let from_panels = others.iter().rev().flat_map(|r| {
+        steps
+            .into_iter()
+            .flat_map(move |step| (1..8).map(move |k| r.right_top() + step * k as f32))
+    });
+    let columns = (0..4)
+        .map(|c| pos2(start.x - c as f32 * (WIDTH + 8.0), start.y))
+        .flat_map(|top| {
+            steps
+                .into_iter()
+                .flat_map(move |step| (0..16).map(move |k| top + step * k as f32))
+        });
+    // Too many for the room: over as few title bars as can be.
+    let best = from_panels
+        .chain(columns)
+        .filter_map(|p| covers(p).map(|n| (n, p)))
+        .min_by(|a, b| a.0.total_cmp(&b.0));
+    if let Some((_, pos)) = best {
+        return pos;
+    }
     let Some(last) = others.last() else {
         return start;
     };
@@ -961,9 +1033,10 @@ const CASCADE: f32 = 28.0;
 /// with none (confirmations, alerts, progress), and those whose keys go to
 /// something else or that are about choices rather than values. The others
 /// open with it focused, so that "5 Enter" needs no mouse.
-const NO_FIRST_FIELD: [&str; 23] = [
+const NO_FIRST_FIELD: [&str; 25] = [
     "confirm",
     "flatten_confirm",
+    "clear_recent",
     "rasterize_confirm",
     "alert",
     "about",
@@ -977,6 +1050,8 @@ const NO_FIRST_FIELD: [&str; 23] = [
     "models_delete",
     "ai_models",
     "liquify_revert",
+    // Choices only.
+    "content_aware_fill",
     // Letters choose their tools.
     "liquify",
     "camera_raw",
@@ -1058,6 +1133,9 @@ pub(super) struct DialogSpec<'a> {
     pub resize: Option<f32>,
     /// A modal: its first text field takes the keyboard when it opens.
     pub first_field: bool,
+    /// A window that isn't modal whose first field (a filter) takes the
+    /// keyboard when it opens.
+    pub filter_field: bool,
 }
 
 impl DialogSpec<'_> {
@@ -1079,6 +1157,7 @@ impl DialogSpec<'_> {
             footer: true,
             resize: None,
             first_field: !NO_FIRST_FIELD.contains(&id),
+            filter_field: false,
         }
     }
 }
@@ -1116,6 +1195,7 @@ pub(super) fn floating_dialog(
         footer,
         resize,
         first_field,
+        filter_field,
     } = spec;
     if !modal
         && HIDDEN_WITH_PANELS.contains(&id)
@@ -1132,6 +1212,9 @@ pub(super) fn floating_dialog(
     // Always within the window, below the menus and options bar, header
     // and footer included: a dialog taller than that scrolls its body.
     let screen = dialog_bounds(ctx);
+    // Never wider than that either (its border aside): the title and the
+    // close button stay in sight on the smallest window.
+    let width = width.min((screen.width() - 2.0).max(MIN_PANEL_WIDTH));
     // Between header, body and footer: two gaps of 8 px; the border: 2 px.
     // Without a footer, its room goes to the body.
     let footer_room = if footer { DIALOG_FOOTER + 8.0 } else { 0.0 };
@@ -1339,19 +1422,39 @@ pub(super) fn floating_dialog(
         m.areas()
             .visible_last_frame(&egui::LayerId::new(egui::Order::Foreground, id))
     });
+    // Its first field takes the keyboard at once, so that "1920 Tab 1080
+    // Enter" needs no mouse (unless something else has it). The first frame
+    // of a window only sizes it: then the next one.
+    let pending = id.with("first-field-pending");
+    let again = ctx.data_mut(|d| d.remove_temp::<bool>(pending)).is_some();
+    let wants_field = again
+        || (opening
+            && if modal { first_field } else { filter_field }
+            && super::focus_hunt(ctx).is_none()
+            && ctx.memory(|m| m.focused()).is_none());
+    if wants_field {
+        ui_kit::want_first_field(ctx, true);
+    }
+    let field_left = |ctx: &egui::Context| {
+        if !ui_kit::want_first_field(ctx, false) && wants_field {
+            if opening {
+                ctx.data_mut(|d| d.insert_temp(pending, true));
+            } else if modal {
+                // None of the app's fields: the focus walks to the first
+                // text field.
+                super::focus_first_field(ctx);
+            }
+        }
+    };
     let rect = if modal {
         let shown = egui::Modal::new(id)
             .area(area)
             .backdrop_color(Color32::TRANSPARENT)
             .frame(frame.inner_margin(0))
             .show(ctx, content);
+        field_left(ctx);
         // Not while a drop-down is open (Esc only closes it), nor under
         // another modal (a Color Picker opened from this one).
-        // Its first field takes the keyboard, so that "1920 Tab 1080
-        // Enter" needs no mouse.
-        if opening && first_field {
-            super::focus_first_field(ctx);
-        }
         if !shown.any_popup_open && !popup_open_at_frame_start(ctx) && shown.is_top_modal {
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 out.cancel = true;
@@ -1362,7 +1465,9 @@ pub(super) fn floating_dialog(
         }
         shown.response.rect
     } else {
-        area.show(ctx, |ui| frame.show(ui, content)).response.rect
+        let rect = area.show(ctx, |ui| frame.show(ui, content)).response.rect;
+        field_left(ctx);
+        rect
     };
     // The offset keeps only what was shown: a dialog pushed against an
     // edge comes back as soon as it is dragged back.
@@ -1442,6 +1547,8 @@ fn footer_button(ui: &mut egui::Ui, label: &str, primary: bool, enabled: bool) -
     );
     ui.painter()
         .galley(rect.center() - galley.size() / 2.0, galley, fg);
+    // Painted: named for screen readers (a greyed OK reads as disabled).
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     response
 }
 
@@ -1790,6 +1897,8 @@ pub(super) fn slider_row_steps(
         } else {
             Rect::from_min_size(head.right_top() - vec2(field_w, 0.0), vec2(field_w, 26.0))
         };
+        // Named by its row for screen readers ("Cyan / Red" for a pair).
+        let name = right.map_or_else(|| label.to_owned(), |right| format!("{label} / {right}"));
         value_field(
             ui,
             field,
@@ -1798,6 +1907,7 @@ pub(super) fn slider_row_steps(
             unit,
             (bipolar, right.is_some()),
             steps.decimals,
+            &name,
         );
 
         // Track and handle.
@@ -1865,6 +1975,7 @@ pub(super) fn slider_row_steps(
 /// Compact value field of a slider (64 × 26): Geist Mono, unit in grey
 /// right after the value (`unit` carries its own space: " px", "°"), "+"
 /// before positive values of a two-sided range.
+#[allow(clippy::too_many_arguments)]
 fn value_field(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -1873,6 +1984,7 @@ fn value_field(
     unit: &str,
     (signed, centered): (bool, bool),
     decimals: usize,
+    name: &str,
 ) {
     let painter = ui.painter().clone();
     let frame = painter.add(egui::Shape::Noop);
@@ -1928,6 +2040,9 @@ fn value_field(
                     .ok()
             }),
     );
+    ui_kit::claim_first_field(&child, response.id);
+    ui.ctx()
+        .accesskit_node_builder(response.id, |node| node.set_label(name));
     let border = if response.has_focus() {
         color::ACCENT
     } else if response.hovered() {
@@ -2009,8 +2124,10 @@ fn levels_editor(ui: &mut egui::Ui, ch: &mut LevelsChannel, hist: &[u32; 256], t
     ui.horizontal(|ui| {
         let w = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
         let mut black = ch.in_black;
-        ui.add_sized([w, 26.0], egui::DragValue::new(&mut black).range(0..=254));
-        ui.add_sized(
+        let field = ui.add_sized([w, 26.0], egui::DragValue::new(&mut black).range(0..=254));
+        ui_kit::claim_first_field(ui, field.id);
+        named(ui, &field, &t!("ui6-levels-input-black"));
+        let field = ui.add_sized(
             [w, 26.0],
             egui::DragValue::new(&mut ch.gamma)
                 .range(crate::pixel_ops::MIN_GAMMA..=crate::pixel_ops::MAX_GAMMA)
@@ -2018,8 +2135,10 @@ fn levels_editor(ui: &mut egui::Ui, ch: &mut LevelsChannel, hist: &[u32; 256], t
                 .custom_formatter(|v, _| i18n::decimal(v, 2))
                 .custom_parser(i18n::parse_decimal),
         );
+        named(ui, &field, &t!("ui6-levels-input-gamma"));
         let mut white = ch.in_white;
-        ui.add_sized([w, 26.0], egui::DragValue::new(&mut white).range(1..=255));
+        let field = ui.add_sized([w, 26.0], egui::DragValue::new(&mut white).range(1..=255));
+        named(ui, &field, &t!("ui6-levels-input-white"));
         ch.in_black = black.min(white.saturating_sub(1));
         ch.in_white = white.max(ch.in_black.saturating_add(1));
     });
@@ -2038,15 +2157,23 @@ fn levels_editor(ui: &mut egui::Ui, ch: &mut LevelsChannel, hist: &[u32; 256], t
     }
     ui.horizontal(|ui| {
         let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-        ui.add_sized(
+        let field = ui.add_sized(
             [w, 26.0],
             egui::DragValue::new(&mut ch.out_black).range(0..=255),
         );
-        ui.add_sized(
+        named(ui, &field, &t!("ui6-levels-output-black"));
+        let field = ui.add_sized(
             [w, 26.0],
             egui::DragValue::new(&mut ch.out_white).range(0..=255),
         );
+        named(ui, &field, &t!("ui6-levels-output-white"));
     });
+}
+
+/// Names a Levels field for screen readers (they show only numbers).
+fn named(ui: &egui::Ui, field: &egui::Response, name: &str) {
+    ui.ctx()
+        .accesskit_node_builder(field.id, |node| node.set_label(name));
 }
 
 /// Two hue spectra, as at the bottom of Photoshop's window: before

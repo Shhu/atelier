@@ -69,7 +69,7 @@ struct Logits {
 }
 
 /// Analyses `image` (transparency over white): to do once per image.
-pub fn encode(image: &RgbaImage) -> Result<Features, String> {
+pub fn encode(image: &RgbaImage) -> Result<Features, super::Error> {
     let resized = image::imageops::resize(image, SIZE, SIZE, FilterType::Triangle);
     let n = (SIZE * SIZE) as usize;
     let mut data = vec![0.0f32; 3 * n];
@@ -101,7 +101,7 @@ pub fn encode(image: &RgbaImage) -> Result<Features, String> {
 /// Coverage of the object designated by `prompt`, at the size of the
 /// encoded image, cropped around the object; `None` if the prompt is empty
 /// or nothing is found.
-pub fn segment(features: &Features, prompt: &Prompt) -> Result<Option<Mask>, String> {
+pub fn segment(features: &Features, prompt: &Prompt) -> Result<Option<Mask>, super::Error> {
     let Some(logits) = decode(features, prompt)? else {
         return Ok(None);
     };
@@ -143,12 +143,12 @@ pub fn segment_preview(
     features: &Features,
     prompt: &Prompt,
     size: (u32, u32),
-) -> Result<Option<GrayImage>, String> {
+) -> Result<Option<GrayImage>, super::Error> {
     Ok(decode(features, prompt)?.map(|logits| coverage(&logits, size, [0, 0, size.0, size.1])))
 }
 
 /// The decoder on `prompt`: the best of its candidate masks.
-fn decode(features: &Features, prompt: &Prompt) -> Result<Option<Logits>, String> {
+fn decode(features: &Features, prompt: &Prompt) -> Result<Option<Logits>, super::Error> {
     if prompt.points.is_empty() && prompt.rect.is_none() {
         return Ok(None);
     }

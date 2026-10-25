@@ -223,7 +223,8 @@ impl Document {
                 return;
             };
             // By whole pixels, a shape rendered whole: the same image
-            // elsewhere (its styles stay drawn).
+            // elsewhere (its styles stay drawn, or, held for an image
+            // drawn since, follow it).
             let whole = d.x.fract() == 0.0 && d.y.fract() == 0.0;
             let fits = shape
                 .extent()
@@ -232,6 +233,7 @@ impl Document {
             if whole && fits {
                 let l = &mut self.layers[i];
                 l.offset = (l.offset.0 + d.x as i64, l.offset.1 + d.y as i64);
+                l.carry_styles(d);
                 self.mark_modified();
                 return;
             }
@@ -360,6 +362,41 @@ mod tests {
             doc.move_path(PathRef::Layer(id), pt(7.5, 0.25));
         }
         assert_eq!(canvas(&doc), (start.0 + 150, start.1 + 5));
+        doc.hold_effects(false);
+    }
+
+    /// Whole and fractional steps mixed (a drag zoomed in): the held
+    /// styles stay with the shape.
+    #[test]
+    fn held_styles_follow_a_shape_dragged_by_mixed_steps() {
+        let mut doc = Document::new(RgbaImage::from_pixel(300, 60, Rgba([255; 4])), None);
+        doc.add_shape_layer(
+            "Rectangle".into(),
+            "Rectangle",
+            rect_shape(10.0, 5.0, 30.0, 25.0),
+        );
+        let fx = &mut doc.active_layer_mut().effects;
+        fx.stroke.enabled = true;
+        fx.stroke.width = 3.0;
+        let id = doc.active_layer().id;
+        let place = |doc: &Document| {
+            let l = doc.active_layer();
+            let s = l.styles_shown(true, true).expect("styles");
+            let b = l.content_bounds().expect("pixels");
+            (
+                l.offset.0 + s.exterior[0].offset.0 - b.x,
+                l.offset.1 + s.exterior[0].offset.1 - b.y,
+            )
+        };
+        doc.active_layer().styles(false).expect("styles");
+        let start = place(&doc);
+        doc.hold_effects(true);
+        for _ in 0..20 {
+            doc.move_path(PathRef::Layer(id), pt(0.5, 0.0));
+            doc.move_path(PathRef::Layer(id), pt(1.0, 0.0));
+        }
+        let end = place(&doc);
+        assert!((end.0 - start.0).abs() <= 1 && end.1 == start.1, "{start:?} {end:?}");
         doc.hold_effects(false);
     }
 

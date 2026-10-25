@@ -172,8 +172,9 @@ struct Lift {
     /// The floating layer.
     id: u64,
     selection: Selection,
-    /// History position right after the lift.
+    /// History position right after the lift, and the mark before it.
     step: u64,
+    mark: crate::document::HistoryMark,
 }
 
 /// The pending transform as it was before a drag: Ctrl+Z inside Free
@@ -198,6 +199,9 @@ pub(super) struct Snapshot {
 struct Applied {
     mark: crate::document::HistoryMark,
     selection: Option<Selection>,
+    /// The pixels were lifted then (the selection's): lifted again when
+    /// Ctrl+Z comes back to before it.
+    lifted: bool,
 }
 
 /// Above this many pixels, a transform is computed on another thread.
@@ -224,6 +228,9 @@ struct Commit {
     fit: bool,
     /// The canvas before.
     canvas: PixelRect,
+    /// A plain scale or turn of one large layer (computed aside): its frame's
+    /// size and angle, said as the plain path says it.
+    placed: Option<(u32, u32, f32)>,
 }
 
 /// A transform computed on another thread.
@@ -234,6 +241,9 @@ struct Applying {
     started: f64,
     commit: Commit,
     applied: Option<Applied>,
+    /// What was asked for after it (a command, a tab, a layer clicked),
+    /// done once it lands (see `commit_pending_aside`).
+    then: Vec<super::Then>,
 }
 
 /// The last transform applied, for Transform Again.
@@ -319,6 +329,9 @@ pub(super) struct Transforming {
     /// a number field dragged): its kind and when it was last edited.
     series: Option<(&'static str, f64)>,
     applied: Option<Applied>,
+    /// The later warps applied by a change of mode, the last one last:
+    /// Ctrl+Z comes back to before each.
+    switches: Vec<Applied>,
     /// The mode to go on in once the warp being applied is done.
     reenter: Option<Mode>,
     /// Moves and transforms of the quick mask.
@@ -364,6 +377,7 @@ impl Default for Transforming {
             redo: Vec::new(),
             series: None,
             applied: None,
+            switches: Vec::new(),
             reenter: None,
             reenter_undo: None,
             quick: Default::default(),
@@ -609,6 +623,36 @@ fn inside(q: &[Pos2], p: Pos2) -> bool {
     odd
 }
 
+/// While a transform is computed: after a moment, says so. Not modal:
+/// input meanwhile waits for it (see `wait_transform_for_input`).
+fn busy_note(ctx: &egui::Context, name: &str, started: f64) {
+    let elapsed = ctx.input(|i| i.time) - started;
+    let delay = filters_ui::BUSY_DELAY;
+    if elapsed < delay {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay - elapsed));
+        return;
+    }
+    use ui_kit::color;
+    egui::Area::new(egui::Id::new("transform_busy"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(color::BG2)
+                .stroke(UiStroke::new(1.0, color::WINDOW_LINE))
+                .corner_radius(12)
+                .inner_margin(egui::Margin::symmetric(18, 14))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.add(egui::Spinner::new().size(16.0).color(color::MUTED));
+                        ui.label(egui::RichText::new(format!("{name}…")).color(color::TEXT));
+                    });
+                });
+        });
+}
+
 /// Distance from `p` to the segment `a`–`b`.
 fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
@@ -698,6 +742,8 @@ impl AtelierApp {
         if self.tool != Tool::Transform {
             return false;
         }
+        // The Move tool's transform applied aside: framed once in place.
+        self.wait_transform();
         if self.transform_rect.is_some() {
             self.free_transform = true;
             return true;
@@ -738,6 +784,7 @@ impl AtelierApp {
         else {
             return true;
         };
+        let mark = doc.history_mark();
         let Some(id) = doc.lift_region(&selection, false) else {
             self.status = t!("xform-status-empty");
             return false;
@@ -747,6 +794,7 @@ impl AtelierApp {
             id,
             selection,
             step,
+            mark,
         });
         // Its outline comes back where the pixels go.
         self.selection = None;
@@ -767,15 +815,17 @@ impl AtelierApp {
             }
             self.selection = Some(lift.selection);
         }
-        // A warp applied on the way (another mode chosen after it) goes too.
+        if let Some(selection) = self.xform.quick.selection.take() {
+            self.selection = Some(selection);
+        }
+        // A warp applied on the way (another mode chosen after it) goes
+        // too, with the selection from before it.
+        self.xform.switches.clear();
         if let Some(applied) = self.xform.applied.take() {
             if let Some(doc) = &mut self.doc {
                 doc.rollback_to(applied.mark);
             }
             self.selection = applied.selection;
-        }
-        if let Some(selection) = self.xform.quick.selection.take() {
-            self.selection = Some(selection);
         }
         self.xform.quick.clear(false);
         let x = &mut self.xform;
@@ -933,14 +983,20 @@ impl AtelierApp {
         while let Some(s) = self.xform.undo.pop() {
             if s.switch {
                 // Before the warp applied by a change of mode: it is given
-                // up, and its grid comes back.
-                let Some(applied) = self.xform.applied.take() else {
+                // up, and its grid comes back (the pixels lifted again).
+                let Some(applied) = self.xform.switches.pop().or_else(|| self.xform.applied.take())
+                else {
                     continue;
                 };
                 if let Some(doc) = &mut self.doc {
                     doc.rollback_to(applied.mark);
                 }
                 self.selection = applied.selection;
+                if applied.lifted {
+                    // Its floating layer went with the rollback.
+                    self.xform.lift = None;
+                    self.lift_selection();
+                }
                 self.restore_snapshot(s);
                 self.xform.redo.clear();
                 return true;
@@ -1001,7 +1057,7 @@ impl AtelierApp {
         selected
             .iter()
             .copied()
-            .filter(|&i| !doc.layers[i].locked && !inside(i))
+            .filter(|&i| !doc.is_locked(i) && !inside(i))
             .collect()
     }
 
@@ -1142,23 +1198,35 @@ impl AtelierApp {
                 self.xform.warp = None;
                 self.xform.quad = quad;
             } else {
-                // The first warp applied (pixels not lifted): Ctrl+Z can
-                // come back to it, with the points before it.
-                let first = self.xform.applied.is_none() && self.xform.lift.is_none();
+                // Each warp applied: Ctrl+Z can come back to it, with the
+                // points before it.
                 let before = Snapshot {
                     switch: true,
                     ..self.snapshot().0
                 };
-                self.xform.reenter_undo =
-                    first.then(|| (std::mem::take(&mut self.xform.undo), before));
+                self.xform.reenter_undo = Some((std::mem::take(&mut self.xform.undo), before));
                 let Some(doc) = &self.doc else { return };
-                let applied = self.xform.applied.take().unwrap_or(Applied {
-                    mark: doc.history_mark(),
-                    selection: self.selection.clone(),
-                });
+                // From before the pixels were lifted (with the selection
+                // then); in Quick Mask Mode, the selection was set aside.
+                let lift = self.xform.lift.as_ref();
+                let selection = lift.map(|l| l.selection.clone());
+                let this = Applied {
+                    mark: lift.map_or_else(|| doc.history_mark(), |l| l.mark),
+                    selection: selection
+                        .or_else(|| self.xform.quick.selection.clone())
+                        .or_else(|| self.selection.clone()),
+                    lifted: lift.is_some(),
+                };
+                let first = self.xform.applied.take();
                 self.xform.reenter = Some(mode);
                 self.apply_transform();
-                self.xform.applied = Some(applied);
+                self.xform.applied = Some(match first {
+                    Some(first) => {
+                        self.xform.switches.push(this);
+                        first
+                    }
+                    None => this,
+                });
                 // Large: once computed (see `transform_window`).
                 if !self.transform_busy() {
                     self.reenter_transform();
@@ -1445,9 +1513,14 @@ impl AtelierApp {
             l.text.is_none() && !l.is_group() && u64::from(w) * u64::from(h) >= ASYNC_PIXELS
         };
         let alone = targets.len() == 1 && !quick;
-        if plain && !mask && !smart && !grouped_text && !after_warp && !large && alone {
+        let simple = plain && !mask && !smart && !grouped_text && !after_warp && alone;
+        if simple && !large {
             return false;
         }
+        let placed = simple
+            .then(|| self.transform_rect.map(round_rect))
+            .flatten()
+            .map(|r| (r.width().max(1.0) as u32, r.height().max(1.0) as u32, self.transform_angle));
         let Some(t) = self
             .transform_source()
             .and_then(|src| self.pending_transform(src, true))
@@ -1525,6 +1598,7 @@ impl AtelierApp {
             selection,
             fit,
             canvas,
+            placed,
         };
         if t.is_identity() {
             self.finish_transform(commit, None);
@@ -1560,6 +1634,7 @@ impl AtelierApp {
             started: self.ctx.input(|i| i.time),
             commit,
             applied,
+            then: Vec::new(),
         });
         true
     }
@@ -1581,8 +1656,24 @@ impl AtelierApp {
         self.land_transform(a, done);
     }
 
+    /// A press, a key, a paste or a drop while a transform is computed on
+    /// another thread: it is waited for and put in place first, as if it
+    /// had landed by itself, then the input applies: nothing is lost.
+    pub(super) fn wait_transform_for_input(&mut self, ctx: &egui::Context) {
+        if self.xform.applying.is_none()
+            || !ctx.input(|i| super::retouch_tools::input_waits(i, None))
+        {
+            return;
+        }
+        let Some(a) = self.xform.applying.take() else {
+            return;
+        };
+        let done = a.rx.recv().ok();
+        self.land_transform(a, done);
+    }
+
     /// A transform computed aside, once done: in place if its document is
-    /// still the one shown.
+    /// still the one shown; then what was asked for meanwhile.
     fn land_transform(&mut self, a: Applying, done: Option<Vec<Transformed>>) {
         if a.applied.is_some() {
             self.xform.applied = a.applied;
@@ -1592,6 +1683,34 @@ impl AtelierApp {
             self.reenter_transform();
         } else {
             (self.xform.reenter, self.xform.applied) = (None, None);
+            self.xform.switches.clear();
+        }
+        for then in a.then {
+            then(self);
+        }
+    }
+
+    /// Applies what is being prepared when it is a transform, without
+    /// waiting for one computed on another thread (seconds at 24
+    /// megapixels): whether one is. What comes next then goes through
+    /// [`Self::after_transform`], the frames showing its indicator
+    /// meanwhile, rather than the window freezing.
+    pub(super) fn commit_pending_aside(&mut self) -> bool {
+        if self.transform_rect.is_none() || self.crop_box_pending() {
+            return false;
+        }
+        self.apply_pending(false);
+        // Something else asked for: the transform isn't entered again.
+        self.xform.reenter = None;
+        self.xform.applying.is_some()
+    }
+
+    /// `then` once the transform being computed lands (at once without
+    /// one).
+    pub(super) fn after_transform(&mut self, then: impl FnOnce(&mut Self) + 'static) {
+        match &mut self.xform.applying {
+            Some(a) => a.then.push(Box::new(then)),
+            None => then(self),
         }
     }
 
@@ -1604,8 +1723,7 @@ impl AtelierApp {
         let done = match a.rx.try_recv() {
             Ok(done) => Some(done),
             Err(mpsc::TryRecvError::Empty) => {
-                let name = a.commit.name.clone();
-                return filters_ui::busy_indicator(ctx, &name, a.started);
+                return busy_note(ctx, &a.commit.name, a.started);
             }
             Err(mpsc::TryRecvError::Disconnected) => None,
         };
@@ -1618,8 +1736,23 @@ impl AtelierApp {
     /// Puts a transform in place with the pixels computed for it (`None`:
     /// it changes nothing), with its texts, lifted pixels, canvas and status.
     fn finish_transform(&mut self, c: Commit, done: Option<Vec<Transformed>>) {
+        // A warp applied by a change of mode: the warps applied before it
+        // stay pending, the transform goes on (see `reenter_transform`).
+        if self.xform.reenter.is_some() {
+            let kept = self.xform.applied.take();
+            let switches = std::mem::take(&mut self.xform.switches);
+            self.put_transform(c, done);
+            (self.xform.applied, self.xform.switches) = (kept, switches);
+            return;
+        }
+        self.put_transform(c, done);
+    }
+
+    /// [`Self::finish_transform`], everything pending with it applied.
+    fn put_transform(&mut self, c: Commit, done: Option<Vec<Transformed>>) {
         // A warp applied on the way is kept, with this in the same step.
         let applied = self.xform.applied.take();
+        self.xform.switches.clear();
         let Some(doc) = &mut self.doc else { return };
         let changed = done.is_some();
         let quick = c.target == TransformTarget::QuickMask;
@@ -1695,6 +1828,9 @@ impl AtelierApp {
         });
         let (name, layer) = (c.name.as_str(), c.layer.as_str());
         self.status = t!("xform-status-done", what = name, name = layer);
+        if let Some((w, h, angle)) = c.placed {
+            self.placed_status(c.layers[0], (w, h, angle), fitted.is_some());
+        }
         if c.rasterized {
             let note = t!("canvas-status-text-rasterized", name = layer);
             self.status = format!("{} — {note}", self.status);
@@ -1705,6 +1841,33 @@ impl AtelierApp {
             self.after_geometry_change(to_rect(r).center() - old_center);
         }
         self.reset_transform();
+    }
+
+    /// A plain scale or turn computed aside: said as the plain path says
+    /// it (see `apply_transform`), the layer going into the artboard it
+    /// now is over.
+    fn placed_status(&mut self, index: usize, (w, h, angle): (u32, u32, f32), fitted: bool) {
+        let turned = match angle {
+            0.0 => String::new(),
+            a => t!("status-rotated", angle = i18n::short_decimal(f64::from(a))),
+        };
+        if fitted {
+            self.status = t!("status-canvas-fit-element", width = w, height = h, rotated = turned);
+            return;
+        }
+        let Some(layer) = self.doc.as_ref().and_then(|d| d.layers.get(index)) else {
+            return;
+        };
+        let (id, r) = (layer.id, layer.content_bounds().unwrap_or(layer.rect()));
+        self.status = t!(
+            "status-element-placed",
+            width = w,
+            height = h,
+            x = r.x,
+            y = r.y,
+            rotated = turned
+        );
+        self.artboards_after_move(&[id]);
     }
 
     /// Moves the distorted frame or the warp grid (arrow keys).
@@ -2293,12 +2456,19 @@ fn grab_cursor(grab: Grab, dragging: bool) -> CursorIcon {
 fn selected_pixels_bounds(doc: &Document, selection: &Selection) -> Option<PixelRect> {
     let region = selection.bounds(doc.full_rect())?;
     let pixels = doc.active_pixels(Some(selection))?;
-    let (w, h) = pixels.dimensions();
-    let opaque = |x: u32, y: u32| pixels.get_pixel(x, y).0[3] > 0;
-    let rows: Vec<u32> = (0..h).filter(|&y| (0..w).any(|x| opaque(x, y))).collect();
-    let (&y0, &y1) = (rows.first()?, rows.last()?);
-    let x0 = (0..w).find(|&x| (y0..=y1).any(|y| opaque(x, y)))?;
-    let x1 = (0..w).rev().find(|&x| (y0..=y1).any(|y| opaque(x, y)))?;
+    // Each row's first and last pixel shown, rows on all the cores.
+    use rayon::prelude::*;
+    let w = pixels.width() as usize;
+    let (y0, y1, x0, x1) = pixels
+        .par_chunks_exact(w.max(1) * 4)
+        .enumerate()
+        .filter_map(|(y, row)| {
+            let shown = |p: &[u8]| p[3] > 0;
+            let first = row.chunks_exact(4).position(shown)?;
+            let last = row.chunks_exact(4).rposition(shown)?;
+            Some((y as u32, y as u32, first as u32, last as u32))
+        })
+        .reduce_with(|a, b| (a.0.min(b.0), a.1.max(b.1), a.2.min(b.2), a.3.max(b.3)))?;
     Some(PixelRect {
         x: region.x + i64::from(x0),
         y: region.y + i64::from(y0),

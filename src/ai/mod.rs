@@ -13,15 +13,19 @@ use std::time::Duration;
 
 use crate::i18n::t;
 
+/// An AI feature's error, in the interface's language and in English (for
+/// the log and the report): the errors are made on the worker threads.
+pub type Error = crate::i18n::Message;
+
 /// Runs `f`, a panic becoming an error: a background job always reports
 /// its end, and Select Subject can still fall back on the non-AI method.
-pub fn catch_panic<R>(f: impl FnOnce() -> Result<R, String>) -> Result<R, String> {
+pub fn catch_panic<R>(f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|panic| {
         let message = panic
             .downcast_ref::<&str>()
             .map(|s| s.to_string())
             .or_else(|| panic.downcast_ref::<String>().cloned());
-        Err(message.unwrap_or_else(|| t!("ai-error-internal")))
+        Err(message.map_or_else(|| Error::of(|| t!("ai-error-internal")), Error::from))
     })
 }
 
@@ -45,8 +49,11 @@ mod tests {
     /// A panic in a background job becomes an error with its message.
     #[test]
     fn panics_become_errors() {
-        let result: Result<(), String> = super::catch_panic(|| panic!("model {} broken", 2));
-        assert_eq!(result, Err("model 2 broken".to_owned()));
-        assert_eq!(super::catch_panic(|| Ok(4)), Ok(4));
+        let result: Result<(), super::Error> = super::catch_panic(|| panic!("model {} broken", 2));
+        assert_eq!(
+            result.err().map(|e| e.shown),
+            Some("model 2 broken".to_owned())
+        );
+        assert_eq!(super::catch_panic(|| Ok(4)).ok(), Some(4));
     }
 }

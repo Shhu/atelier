@@ -10,6 +10,8 @@ impl AtelierApp {
         use MenuEntry::{Choice, Item, Separator, Submenu};
         let has_doc = self.doc.is_some();
         let has_sel = self.selection.is_some();
+        let picked = if has_doc { self.selected_indices().len() } else { 0 };
+        let align = |label: String, op: AlignOp| Item(label, has_doc, None, Action::Align(op));
         let can_undo = self.doc.as_ref().is_some_and(Document::can_undo);
         let can_redo = self.doc.as_ref().is_some_and(Document::can_redo);
         let can_merge = self
@@ -265,6 +267,15 @@ impl AtelierApp {
                                     Action::Adjust(a.kind),
                                 )])
                             })
+                            .chain([
+                                Separator,
+                                Item(
+                                    t!("input6-menu-desaturate"),
+                                    has_doc && !self.smart_filters_apply(),
+                                    Some(&SHORTCUT_DESATURATE),
+                                    Action::Desaturate,
+                                ),
+                            ])
                             .collect(),
                     ),
                     Separator,
@@ -352,6 +363,12 @@ impl AtelierApp {
                         has_doc,
                         Some(&SHORTCUT_DUPLICATE),
                         Action::LayerFromSelection,
+                    ),
+                    Item(
+                        t!("input6-menu-layer-via-cut"),
+                        has_doc && self.selection.is_some(),
+                        Some(&SHORTCUT_LAYER_VIA_CUT),
+                        Action::LayerViaCut,
                     ),
                     Item(t!("core-menu-new-group"), has_doc, None, Action::NewGroup),
                     Item(
@@ -449,6 +466,39 @@ impl AtelierApp {
                             ),
                         ],
                     ),
+                    Submenu(
+                        if has_sel {
+                            t!("tools6-menu-align-to-selection")
+                        } else {
+                            t!("tools6-menu-align")
+                        },
+                        vec![
+                            align(t!("tools6-menu-align-top"), AlignOp::Top),
+                            align(t!("tools6-menu-align-center-v"), AlignOp::CenterV),
+                            align(t!("tools6-menu-align-bottom"), AlignOp::Bottom),
+                            Separator,
+                            align(t!("tools6-menu-align-left"), AlignOp::Left),
+                            align(t!("tools6-menu-align-center-h"), AlignOp::CenterH),
+                            align(t!("tools6-menu-align-right"), AlignOp::Right),
+                        ],
+                    ),
+                    Submenu(
+                        t!("tools6-menu-distribute"),
+                        vec![
+                            Item(
+                                t!("tools6-menu-distribute-h"),
+                                picked >= 3,
+                                None,
+                                Action::Align(AlignOp::DistributeH),
+                            ),
+                            Item(
+                                t!("tools6-menu-distribute-v"),
+                                picked >= 3,
+                                None,
+                                Action::Align(AlignOp::DistributeV),
+                            ),
+                        ],
+                    ),
                     Item(
                         if self.selection_hidden() {
                             t!("ui5-menu-show-layers")
@@ -462,7 +512,7 @@ impl AtelierApp {
                     Item(
                         t!("menu-layer-toggle-lock"),
                         has_doc,
-                        None,
+                        Some(&SHORTCUT_TOGGLE_LOCK),
                         Action::ToggleLock,
                     ),
                     Separator,
@@ -481,6 +531,12 @@ impl AtelierApp {
                         has_doc,
                         Some(&SHORTCUT_MERGE_VISIBLE),
                         Action::MergeVisible,
+                    ),
+                    Item(
+                        t!("input6-menu-stamp-visible"),
+                        has_doc,
+                        Some(&SHORTCUT_STAMP_VISIBLE),
+                        Action::StampVisible,
                     ),
                     Item(
                         t!("menu-layer-flatten"),
@@ -662,7 +718,12 @@ impl AtelierApp {
         vec![
             Item(t!("menu-layer-duplicate"), true, None, Action::Duplicate),
             Item(t!("menu-layer-delete"), n > 1, None, Action::Delete),
-            Item(t!("menu-layer-toggle-lock"), true, None, Action::ToggleLock),
+            Item(
+                t!("menu-layer-toggle-lock"),
+                true,
+                Some(&SHORTCUT_TOGGLE_LOCK),
+                Action::ToggleLock,
+            ),
             Separator,
             Item(
                 format!("{}…", t!("core-blending-options")),

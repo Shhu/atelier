@@ -119,6 +119,9 @@ pub(super) struct SelectMask {
     step: u64,
     layer: u64,
     own_mask: bool,
+    /// Its own mask is refined as it shows (density and feather applied),
+    /// for an output that takes it so; else its stored values.
+    shown_values: bool,
 }
 
 impl SelectMask {
@@ -131,6 +134,11 @@ impl SelectMask {
             && (!self.own_mask || refines_layer_mask(doc))
     }
 
+    /// Its own mask refined into itself with nothing changed.
+    fn untouched(&self) -> bool {
+        self.own_mask && self.output == Output::LayerMask && self.refine == Refine::default()
+    }
+
     /// The refined preview, computed again when the settings changed.
     fn preview(&mut self) -> Arc<GrayImage> {
         if self.shown.as_ref().is_none_or(|(r, _)| *r != self.refine) {
@@ -140,6 +148,33 @@ impl SelectMask {
         }
         Arc::clone(&self.shown.as_ref().expect("just made").1)
     }
+}
+
+/// What Select and Mask refines of the active layer's own mask: its stored
+/// values, or with `shown` what it shows, its density and feather
+/// included, as when its thumbnail is Ctrl+clicked.
+fn own_mask_source(doc: &Document, shown: bool) -> Option<Selection> {
+    if shown {
+        return doc.mask_selection(doc.active);
+    }
+    let layer = doc.active_layer();
+    let canvas = doc.full_rect();
+    let mask = layer.mask.as_ref()?;
+    let raw = mask.raw_over(canvas, layer.offset);
+    Selection::from_mask(&raw, (canvas.x, canvas.y))
+}
+
+/// Whether `output` takes the active layer's own mask as it shows: into
+/// the mask itself (or its copy, for a new layer with mask) its stored
+/// values are refined; otherwise what it shows, when its density or
+/// feather change it.
+fn takes_shown_values(doc: &Document, output: Output) -> bool {
+    matches!(output, Output::Selection | Output::NewLayer)
+        && doc
+            .active_layer()
+            .mask
+            .as_ref()
+            .is_some_and(|m| m.density < 1.0 || m.feather > 0.0)
 }
 
 /// A selection's coverage over `canvas`, reduced to at most
@@ -191,13 +226,7 @@ impl AtelierApp {
         // result. An empty one (Hide All) is a start too.
         let own_mask = refines_layer_mask(doc);
         let source = match own_mask {
-            true => {
-                let layer = doc.active_layer();
-                let canvas = doc.full_rect();
-                let mask = layer.mask.as_ref().expect("checked");
-                let raw = mask.raw_over(canvas, layer.offset);
-                Selection::from_mask(&raw, (canvas.x, canvas.y))
-            }
+            true => own_mask_source(doc, false),
             false => match self.selection.clone() {
                 Some(sel) => Some(sel),
                 None => {
@@ -224,7 +253,26 @@ impl AtelierApp {
             step: doc.history_step(),
             layer: doc.active_layer().id,
             own_mask,
+            shown_values: false,
         });
+    }
+
+    /// Its own mask refined: the base the preview and the result share
+    /// follows Output To (stored or shown values, see
+    /// `takes_shown_values`).
+    fn follow_output(&self, sm: &mut SelectMask) {
+        let Some(doc) = self.doc.as_ref().filter(|_| sm.own_mask) else {
+            return;
+        };
+        let shown = takes_shown_values(doc, sm.output);
+        if shown == sm.shown_values {
+            return;
+        }
+        sm.source = own_mask_source(doc, shown);
+        let (reduced, scale) = reduced_coverage(sm.source.as_ref(), doc.full_rect());
+        (sm.reduced, sm.scale) = (Arc::new(reduced), scale);
+        sm.shown = None;
+        sm.shown_values = shown;
     }
 
     /// The refined selection over the canvas, as the view mode shows it.
@@ -262,6 +310,7 @@ impl AtelierApp {
                 .as_ref()
                 .is_some_and(|d| d.active_layer().mask.is_some());
         let neutral = sm.refine == Refine::default();
+        let locked = self.doc.as_ref().is_some_and(|d| d.is_locked(d.active));
         let out = floating_dialog(
             ctx,
             DialogSpec {
@@ -372,7 +421,9 @@ impl AtelierApp {
                             }
                         },
                     );
-                    if sm.output == Output::LayerMask && replaced {
+                    if sm.output == Output::LayerMask && locked {
+                        ui_kit::hint(ui, t!("sel6-mask-layer-locked"));
+                    } else if sm.output == Output::LayerMask && replaced {
                         ui_kit::hint(ui, t!("sel-mask-replaces-mask"));
                     }
                 });
@@ -381,6 +432,7 @@ impl AtelierApp {
         if out.reset {
             sm.refine = Refine::default();
         }
+        self.follow_output(&mut sm);
         self.sel.select_mask = Some(sm);
         if out.ok || out.cancel {
             self.close_select_mask(out.ok);
@@ -391,18 +443,19 @@ impl AtelierApp {
     /// size and outputs it.
     pub(super) fn close_select_mask(&mut self, apply: bool) {
         // A locked layer's mask is neither changed nor added: the window
-        // stays open for another output.
+        // stays open for another output (its own mask left untouched has
+        // nothing to change).
         if apply
             && self
                 .sel
                 .select_mask
                 .as_ref()
-                .is_some_and(|sm| sm.output == Output::LayerMask)
+                .is_some_and(|sm| sm.output == Output::LayerMask && !sm.untouched())
             && self.refuse_if_locked()
         {
             return;
         }
-        let (Some(sm), Some(doc)) = (self.sel.select_mask.take(), self.doc.as_ref()) else {
+        let (Some(mut sm), Some(doc)) = (self.sel.select_mask.take(), self.doc.as_ref()) else {
             return;
         };
         if !apply {
@@ -415,25 +468,13 @@ impl AtelierApp {
             self.status = t!("sel4-mask-target-changed");
             return;
         }
-        let (mut source, r) = (sm.source, sm.refine);
         // Its own mask, untouched: nothing to do.
-        if sm.own_mask && sm.output == Output::LayerMask && r == Refine::default() {
+        if sm.untouched() {
             return;
         }
-        // Into the mask itself (or its copy, for a new layer with mask),
-        // its stored values are refined; otherwise what it shows, its
-        // density and feather included, as when its thumbnail is
-        // Ctrl+clicked.
-        if sm.own_mask
-            && matches!(sm.output, Output::Selection | Output::NewLayer)
-            && doc
-                .active_layer()
-                .mask
-                .as_ref()
-                .is_some_and(|m| m.density < 1.0 || m.feather > 0.0)
-        {
-            source = doc.mask_selection(doc.active);
-        }
+        // The base follows Output To (already, as the window showed it).
+        self.follow_output(&mut sm);
+        let (source, r) = (sm.source, sm.refine);
         let to = OutputTo {
             output: sm.output,
             layer: sm.layer,

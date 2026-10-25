@@ -65,6 +65,7 @@ impl AtelierApp {
             return;
         };
         let size = format!("{} × {} px", doc.width(), doc.height());
+        let select_busy = self.select_busy();
         let hints = self.key_hints(ui.ctx());
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -97,6 +98,16 @@ impl AtelierApp {
                 );
                 let (sep, _) = ui.allocate_exact_size(vec2(1.0, 14.0), Sense::hover());
                 ui.painter().rect_filled(sep, 0.0, ui_kit::color::LINE);
+                // A selection being computed: said while it lasts (what
+                // waits for it then shows this frame).
+                if select_busy {
+                    ui.add(egui::Spinner::new().size(12.0).color(muted));
+                    if message.is_none() {
+                        let s = t!("sel-status-working");
+                        text(ui, s, egui::FontId::proportional(12.0), muted);
+                        return;
+                    }
+                }
                 if let Some((s, color)) = message {
                     text(ui, s, egui::FontId::proportional(12.0), color);
                     return;

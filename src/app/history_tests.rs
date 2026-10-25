@@ -589,3 +589,204 @@ fn deleting_several_layers_is_named_for_several() {
     let several = t!("hist5-delete-layers");
     assert_eq!(d.history().0.last().copied(), Some(several.as_str()));
 }
+
+// ------------------------------------------------- QA6: background results
+
+/// A photo with a red square (the subject) on blue.
+fn subject_photo() -> image::RgbaImage {
+    let mut img = image::RgbaImage::from_pixel(400, 300, image::Rgba([20, 40, 200, 255]));
+    for y in 100..200 {
+        for x in 150..250 {
+            img.put_pixel(x, y, image::Rgba([240, 30, 20, 255]));
+        }
+    }
+    img
+}
+
+/// Runs frames until Select Subject is done with (applied or dropped).
+fn subject_done(h: &mut Harness<'_, AtelierApp>) {
+    let start = std::time::Instant::now();
+    while h.state().subject_job.is_some() {
+        assert!(start.elapsed().as_secs() < 60, "subject never found");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        h.run_steps(1);
+    }
+    h.run_steps(1);
+}
+
+/// Runs frames until the subject is found (it may wait for a text).
+fn subject_found(h: &mut Harness<'_, AtelierApp>) {
+    let start = std::time::Instant::now();
+    while !h.state().subject_found() {
+        assert!(start.elapsed().as_secs() < 60, "subject never found");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        h.run_steps(1);
+    }
+    h.run_steps(1);
+}
+
+/// Select and Mask, Output To New Layer on a big canvas (computed in the
+/// background), then the pointer on its way to another layer's eye: the
+/// output lands first (the rows don't move under the click), and the eye
+/// clicked hides its own layer.
+#[test]
+fn an_eye_clicked_while_select_and_mask_outputs_hides_its_layer() {
+    let mut h = app(2000, 1500);
+    let l2 = {
+        let d = h.state_mut().doc.as_mut().unwrap();
+        d.add_empty_layer();
+        d.add_empty_layer();
+        d.layers[1].name = "L1".into();
+        d.layers[2].name = "L2".into();
+        let (w, hh) = d.layers[1].image().dimensions();
+        d.layers[1].replace_pixels(image::RgbaImage::from_pixel(w, hh, image::Rgba([0, 255, 0, 255])));
+        d.active = 1;
+        d.layers[2].id
+    };
+    h.run_steps(2);
+    let eye = |h: &Harness<'_, AtelierApp>| {
+        h.state()
+            .ctx
+            .read_response(egui::Id::new(("side_eye", l2)))
+            .expect("the eye of L2 shown")
+            .rect
+            .center()
+    };
+    h.state_mut().selection = Some(rect(100, 100, 1500, 1000));
+    h.state_mut().sync_selection();
+    h.state_mut().open_select_mask();
+    h.state_mut().sel.select_mask.as_mut().unwrap().output = super::select_mask::Output::NewLayer;
+    h.state_mut().close_select_mask(true);
+    assert!(h.state().select_busy(), "computed in the background");
+    h.hover_at(eye(&h) + vec2(0.0, 2.0));
+    h.run_steps(1);
+    assert!(!h.state().select_busy(), "landed at the first input");
+    h.run_steps(1);
+    let at = eye(&h);
+    h.hover_at(at);
+    h.run_steps(1);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        });
+        h.run_steps(1);
+    }
+    let d = doc(&h);
+    let layers: Vec<_> = d.layers.iter().map(|l| (l.name.as_str(), l.visible)).collect();
+    assert_eq!(layers.len(), 4, "{layers:?}");
+    assert_eq!(layers[3], ("L2", false), "{layers:?}");
+    assert!(layers[2].1, "the new layer stays visible: {layers:?}");
+    assert_ne!(layers[2].0, "L1", "{layers:?}");
+    assert_eq!(d.history().0.last().copied(), Some(t!("xchg-hist-hide-layer").as_str()));
+}
+
+/// Select Subject, then a dialog opened and cancelled meanwhile (a step
+/// that changed nothing, discarded): the subject still lands.
+#[test]
+fn select_subject_survives_a_cancelled_dialog() {
+    let mut h = app(400, 300);
+    {
+        let app = h.state_mut();
+        app.doc = Some(Document::new(subject_photo(), None));
+        app.start_subject(false, false);
+        let d = app.doc.as_mut().unwrap();
+        d.checkpoint("Gaussian Blur".into());
+        d.discard_step();
+    }
+    subject_done(&mut h);
+    assert!(h.state().selection.is_some(), "{}", h.state().status);
+    assert_eq!(doc(&h).history().0, [t!("hist3-select-subject")]);
+}
+
+/// Select Subject, then a rotation before it is found: searched again in
+/// the rotated image, the selection lands on the subject where it now is.
+#[test]
+fn select_subject_after_a_rotation_finds_it_again() {
+    let mut h = app(400, 300);
+    {
+        let app = h.state_mut();
+        app.doc = Some(Document::new(subject_photo(), None));
+        app.start_subject(false, false);
+        app.run(Action::RotateCanvas(90));
+    }
+    subject_done(&mut h);
+    let d = doc(&h);
+    assert_eq!((d.width(), d.height()), (300, 400));
+    let r = h.state().selection.as_ref().expect("the subject").rect;
+    // The red square now lies at x 100..200, y 150..250.
+    let (cx, cy) = (r.x + r.w as i64 / 2, r.y + r.h as i64 / 2);
+    assert!((cx - 150).abs() <= 10 && (cy - 200).abs() <= 10, "{r:?}");
+    assert_eq!(d.history().0.last().copied(), Some(t!("hist3-select-subject").as_str()));
+}
+
+/// Select Subject found while a new text is open: it waits for the text,
+/// which, left empty, takes only its own steps away.
+#[test]
+fn select_subject_found_during_a_text_lands_after_it() {
+    for cancel in [false, true] {
+        let mut h = app(400, 300);
+        {
+            let app = h.state_mut();
+            app.doc = Some(Document::new(subject_photo(), None));
+            app.start_subject(false, false);
+            app.create_text(pos2(10.0, 30.0), None);
+            if cancel {
+                app.type_text("Hi");
+            }
+        }
+        subject_found(&mut h);
+        assert!(h.state().selection.is_none(), "not among the text's steps");
+        if cancel {
+            h.state_mut().cancel_text();
+        } else {
+            h.state_mut().commit_text();
+        }
+        subject_done(&mut h);
+        assert!(h.state().selection.is_some(), "{}", h.state().status);
+        assert_eq!(doc(&h).history().0, [t!("hist3-select-subject")]);
+        assert_eq!(doc(&h).layers.len(), 1);
+    }
+}
+
+/// A big marquee drawn (computed in the background), then an arrow right
+/// away: the new marquee moves, the old selection is not brought back.
+#[test]
+fn an_arrow_right_after_a_big_marquee_moves_it() {
+    let mut h = app(3000, 2000);
+    h.state_mut().tool = Tool::Select;
+    h.state_mut().selection = Some(rect(10, 10, 100, 100));
+    h.state_mut().commit_selection(None);
+    let r = PixelRect { x: 500, y: 500, w: 2000, h: 1400 };
+    h.state_mut()
+        .select_shape(r, false, SelectMode::Replace, 0.0, true);
+    assert!(h.state().select_busy());
+    h.key_press(egui::Key::ArrowRight);
+    h.run_steps(1);
+    settle(&mut h);
+    let moved = PixelRect { x: 501, ..r };
+    assert_eq!(h.state().selection.as_ref().map(|s| s.rect), Some(moved));
+    assert_ne!(h.state().status, t!("hist3-selection-changed"));
+}
+
+/// Quick Mask, Move tool, Select › Modify › Expand computed in the
+/// background, then an arrow: the expanded selection is what moves.
+#[test]
+fn a_quick_mask_arrow_during_a_modify_moves_the_modified_selection() {
+    let mut h = app(3000, 2000);
+    h.state_mut().selection = Some(rect(100, 100, 2000, 1500));
+    h.state_mut().commit_selection(None);
+    h.state_mut().toggle_quick_mask();
+    h.state_mut().selection = Some(rect(200, 200, 1800, 1200));
+    h.state_mut().commit_selection(None);
+    h.state_mut().tool = Tool::Transform;
+    h.state_mut()
+        .modify_selection_step(ModifyKind::Expand, 20.0, false, false);
+    h.key_press(egui::Key::ArrowRight);
+    h.run_steps(1);
+    settle(&mut h);
+    let r = h.state().selection.as_ref().expect("a selection").rect;
+    assert_eq!(r, PixelRect { x: 181, y: 180, w: 1840, h: 1240 });
+}

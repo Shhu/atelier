@@ -4,16 +4,40 @@ use super::keys;
 use super::*;
 use crate::i18n::t;
 
-/// A crop box drawn this many screen pixels on its narrow side, at least:
-/// a slip of the hand while clicking draws none.
+/// A crop box drawn by a drag of this many screen pixels, at least: a slip
+/// of the hand while clicking draws none (a thin banner can be drawn).
 const CROP_SLIP: f32 = 8.0;
 
 /// What was going to happen when "Crop the image?" was asked.
-#[derive(Clone, Copy, Debug)]
 pub(super) enum CropThen {
     Tool(Tool),
     Tab(usize),
     Run(Action),
+    /// Anything else: an open, a drop, a paste, a played action…
+    Later(super::Then),
+}
+
+impl std::fmt::Debug for CropThen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CropThen::Tool(tool) => write!(f, "Tool({tool:?})"),
+            CropThen::Tab(i) => write!(f, "Tab({i})"),
+            CropThen::Run(action) => write!(f, "Run({action:?})"),
+            CropThen::Later(_) => write!(f, "Later"),
+        }
+    }
+}
+
+impl CropThen {
+    /// Carries on with what was asked for.
+    fn resume(self, app: &mut AtelierApp) {
+        match self {
+            CropThen::Tool(tool) => app.set_tool(tool),
+            CropThen::Tab(i) => app.switch_tab(i),
+            CropThen::Run(action) => app.run(action),
+            CropThen::Later(then) => then(app),
+        }
+    }
 }
 
 impl AtelierApp {
@@ -48,7 +72,11 @@ impl AtelierApp {
         if image.dimensions() != target.image().dimensions() {
             return;
         }
-        let shown = ShownPreview::new(preview, doc.active_layer(), image);
+        let shown = ShownPreview {
+            // A mask's preview is for its revision.
+            rev: doc.target_rev(),
+            ..ShownPreview::new(preview, doc.active_layer(), image)
+        };
         self.preview_shown = Some(if doc.quick_mask().is_some() {
             shown.on_quick_mask(target.offset)
         } else if doc.mask_targeted() {
@@ -198,8 +226,9 @@ impl AtelierApp {
             self.wait_select_job();
         }
         // (Ctrl with the Eyedropper: the Move tool for a moment, below.)
+        // (Ctrl+Alt: the Move tool for a moment, dragging a copy.)
         let picks = (self.tool == Tool::Eyedropper && !self.snap_off)
-            || (alt && matches!(self.tool, Tool::Brush | Tool::Bucket));
+            || (alt && !ctrl && matches!(self.tool, Tool::Brush | Tool::Bucket));
         if start
             && picks
             && let Some(p) = pointer
@@ -213,6 +242,7 @@ impl AtelierApp {
         // Alt + click (Clone Stamp, Healing Brush): the source point.
         if start
             && alt
+            && !ctrl
             && self.tool.clones()
             && let Some(p) = pointer
         {
@@ -281,7 +311,10 @@ impl AtelierApp {
             && (self.layer_drag.is_some()
                 || (paints_or_selects && self.select_move.is_some())
                 || (start && ctrl)))
-            || (paints_or_selects && self.xform.quick.dragging());
+            // A drag of the quick mask goes on (a marquee's too: the
+            // selection it moves doesn't make it a marquee drag).
+            || ((paints_or_selects || matches!(self.tool, Tool::Select | Tool::Ellipse))
+                && self.xform.quick.dragging());
         if temp_move {
             // Its Ctrl is the Move tool's, not "no snapping".
             self.snap_off = false;
@@ -291,6 +324,10 @@ impl AtelierApp {
         // Said before the press.
         let temp_move_hover = !temp_move && (paints_or_selects || marquee) && ctrl && !down;
         let down = down && !temp_move;
+        // Type and shapes make layers: not in Quick Mask Mode.
+        if start && self.quick_mask_refuses_tool() {
+            start = false;
+        }
         match self.tool {
             Tool::Brush
             | Tool::Eraser
@@ -962,8 +999,7 @@ impl AtelierApp {
         let hidden = !is_canvas
             && !pending
             && !self.in_quick_mask()
-            && self.doc.as_ref().is_some_and(|d| !d.shown(d.active))
-            && self.selected_indices().len() < 2;
+            && self.doc.as_ref().is_some_and(|d| !d.shown(d.active));
         if (locked || hidden) && picked.is_none() && self.drag.is_none() && pointer.is_some() {
             if start && !self.refuse_if_locked() {
                 self.refuse_hidden_layer();
@@ -1032,6 +1068,13 @@ impl AtelierApp {
                         .as_ref()
                         .map(|d| snap_targets(d, &[d.active], &self.rulers.settings));
                 }
+                // The crop box snaps moved or resized, as when drawn.
+                if is_canvas && hover.is_some() {
+                    self.snap_targets = self
+                        .doc
+                        .as_ref()
+                        .map(|d| snap_targets(d, &[], &self.rulers.settings));
+                }
             }
         }
 
@@ -1079,6 +1122,32 @@ impl AtelierApp {
                 let (w, h) = rotated_size(rect.width(), rect.height(), angle);
                 let bbox = Rect::from_center_size(rect.center(), vec2(w, h));
                 rect = rect.translate(self.snap_offset(bbox, axes));
+            } else if is_canvas && !keep_ratio && !alt {
+                // The edges dragged snap.
+                let h = drag.handle;
+                let x = match h {
+                    Handle::E | Handle::NE | Handle::SE => Some(rect.max.x),
+                    Handle::W | Handle::NW | Handle::SW => Some(rect.min.x),
+                    _ => None,
+                };
+                let y = match h {
+                    Handle::S | Handle::SE | Handle::SW => Some(rect.max.y),
+                    Handle::N | Handle::NE | Handle::NW => Some(rect.min.y),
+                    _ => None,
+                };
+                let at = pos2(x.unwrap_or(rect.center().x), y.unwrap_or(rect.center().y));
+                let axes = vec2(f32::from(x.is_some() as u8), f32::from(y.is_some() as u8));
+                let d = self.snap_offset(Rect::from_min_max(at, at), axes);
+                match h {
+                    Handle::E | Handle::NE | Handle::SE => rect.max.x += d.x,
+                    Handle::W | Handle::NW | Handle::SW => rect.min.x += d.x,
+                    _ => {}
+                }
+                match h {
+                    Handle::S | Handle::SE | Handle::SW => rect.max.y += d.y,
+                    Handle::N | Handle::NE | Handle::NW => rect.min.y += d.y,
+                    _ => {}
+                }
             }
             // The canvas, or the element, must fit in a layer.
             if is_canvas {
@@ -1142,7 +1211,7 @@ impl AtelierApp {
             };
             let r = round_rect(r);
             // A click, or a slip of the hand, draws nothing.
-            if d.x.abs().min(d.y.abs()) * view.zoom >= CROP_SLIP
+            if d.length() * view.zoom >= CROP_SLIP
                 && r.width() >= 1.0
                 && r.height() >= 1.0
                 && fits_max_dimension(r.size(), 0.0)
@@ -1171,8 +1240,21 @@ impl AtelierApp {
         if !self.crop_box_pending() {
             return false;
         }
-        self.crop_confirm = Some(then);
+        // Asked already (several files dropped at once): this one follows.
+        self.crop_confirm = Some(match self.crop_confirm.take() {
+            Some(first) => CropThen::Later(Box::new(move |app| {
+                first.resume(app);
+                then.resume(app);
+            })),
+            None => then,
+        });
         true
+    }
+
+    /// [`Self::crop_asks`] for anything else than a tool, tab or action:
+    /// `then` runs once answered. Returns whether it asks.
+    pub(super) fn crop_first(&mut self, then: impl FnOnce(&mut Self) + 'static) -> bool {
+        self.crop_box_pending() && self.crop_asks(CropThen::Later(Box::new(then)))
     }
 
     /// "Crop the image?": Crop, Don't Crop (the box goes), or Cancel (it
@@ -1222,11 +1304,7 @@ impl AtelierApp {
             self.apply_canvas();
         }
         self.reset_pending();
-        match then {
-            CropThen::Tool(tool) => self.set_tool(tool),
-            CropThen::Tab(i) => self.switch_tab(i),
-            CropThen::Run(action) => self.run(action),
-        }
+        then.resume(self);
     }
 
     /// Whether the Move tool shows the frame and handles of what it moves:
@@ -1283,7 +1361,7 @@ impl AtelierApp {
             let doc = self.doc.as_ref()?;
             (0..doc.layers.len()).rev().find(|&i| {
                 let l = &doc.layers[i];
-                l.visible && !l.locked && l.text.is_some() && to_rect(l.rect()).contains(ip)
+                l.visible && !doc.is_locked(i) && l.text.is_some() && to_rect(l.rect()).contains(ip)
             })?
         } else {
             // Visible pixel of an element, or else the active element's
@@ -1302,7 +1380,7 @@ impl AtelierApp {
     /// Ctrl held with a painting tool: the Move tool's drag of the selected
     /// layers, or with Auto-Select of the one under the pointer. Returns the
     /// cursor.
-    fn temporary_move(
+    pub(super) fn temporary_move(
         &mut self,
         view: View,
         pointer: Option<Pos2>,
@@ -1338,6 +1416,11 @@ impl AtelierApp {
                 return Some(CursorIcon::NotAllowed);
             }
             self.start_layer_drag(target, ip, true);
+            // Ctrl+Alt: a copy is dragged, as Alt with the Move tool.
+            let alt = self.ctx.input(|i| i.modifiers.alt);
+            if let Some(d) = &mut self.layer_drag {
+                d.copy = alt;
+            }
         }
         Some(CursorIcon::Move)
     }
@@ -1351,13 +1434,14 @@ impl AtelierApp {
         if group {
             let others = self.selected_indices().into_iter().filter(|&i| i != target);
             let doc = self.doc.as_ref().expect("checked above");
-            moved.extend(others.filter(|&i| !doc.layers[i].locked));
+            // Selected but locked or hidden: left where it is.
+            moved.extend(others.filter(|&i| !doc.is_locked(i) && doc.shown(i)));
         }
         let Some(doc) = &self.doc else { return };
         // A group moves with its layers, a layer with those linked to it
         // (the grabbed one stays first).
         let mut all: Vec<usize> = moved.iter().flat_map(|&i| doc.moving_with(i)).collect();
-        all.retain(|&i| i != target && !doc.layers[i].locked);
+        all.retain(|&i| i != target && !doc.is_locked(i));
         all.sort_unstable();
         all.dedup();
         let moved: Vec<usize> = [target].into_iter().chain(all).collect();
@@ -1413,7 +1497,7 @@ impl AtelierApp {
         let mut copied: Vec<usize> = selected
             .iter()
             .copied()
-            .filter(|&i| !inside(i) && (i == target || !doc.layers[i].locked))
+            .filter(|&i| !inside(i) && (i == target || !doc.is_locked(i)))
             .collect();
         // From the top: a copy goes above its original, the indices below
         // stay.
@@ -1861,12 +1945,11 @@ impl AtelierApp {
         if ui_kit::tip_with_key(response, &t!("menu-file-open"), &key).clicked() {
             self.run(Action::Open);
         }
-        if let Some(i) = close.or(switch) {
-            self.switch_tab(i);
-        }
-        // Not while "Crop the image?" waits for an answer (the switch).
-        if close.is_some() && self.crop_confirm.is_none() {
-            self.run(Action::CloseDocument);
+        // A crop box drawn: asked first, then the tab closes.
+        if let Some(i) = close {
+            self.close_tab(i);
+        } else if let Some(i) = switch {
+            self.switch_tab_aside(i);
         }
     }
 
@@ -1949,6 +2032,7 @@ impl AtelierApp {
         self.reset_pending();
         self.leave_select_modes();
         self.forget_document_jobs();
+        self.retouch.forget_composites();
         self.doc = None;
         self.stroke = None;
         self.selection = None;

@@ -19,15 +19,30 @@ pub struct ImageMetadata {
     /// JPEG: whole marker segments (XMP, extended XMP, IPTC, comments).
     /// PNG: whole chunks (text, international text, XMP).
     pub raw: Vec<Vec<u8>>,
-    /// TIFF: tags kept by number, BYTE (XMP, IPTC) or ASCII (copyright,
-    /// artist, description) values.
-    pub tiff: Vec<(u16, TiffValue)>,
+    /// TIFF: the first directory's tags kept (XMP, IPTC, image resources,
+    /// copyright, artist, description, camera…), byte for byte.
+    pub tiff: Vec<TiffTag>,
+    /// TIFF: the EXIF and GPS directories, written back as directories of
+    /// their own.
+    pub tiff_dirs: Vec<TiffDir>,
 }
 
+/// A TIFF tag kept: its number, type and value (in this computer's byte
+/// order, as the encoder writes).
 #[derive(Clone, Debug, PartialEq)]
-pub enum TiffValue {
-    Bytes(Vec<u8>),
-    Text(String),
+pub struct TiffTag {
+    pub tag: u16,
+    pub kind: u16,
+    pub data: Vec<u8>,
+}
+
+/// A TIFF directory a tag points to (EXIF, GPS, interoperability).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TiffDir {
+    /// The tag pointing to it.
+    pub pointer: u16,
+    pub tags: Vec<TiffTag>,
+    pub dirs: Vec<TiffDir>,
 }
 
 /// What reading found that can't be written back.
@@ -44,9 +59,20 @@ pub struct Unkept {
     pub photoshop: bool,
 }
 
-/// TIFF tags kept: XMP, IPTC, copyright, artist, description.
+/// TIFF tags kept from the first directory, whatever their type, as
+/// bytes: XMP, IPTC (often LONG).
 const TIFF_BYTES: [u16; 2] = [700, 33723];
-const TIFF_TEXT: [u16; 3] = [33432, 315, 270];
+/// …as text, byte for byte whatever its encoding (Latin-1 "©" from older
+/// software, several NUL-separated parts): copyright, artist,
+/// description, document name, make, model, date, host computer.
+const TIFF_TEXT: [u16; 8] = [33432, 315, 270, 269, 271, 272, 306, 316];
+/// Image resources (Photoshop's), layers some applications store, the
+/// EXIF and GPS directories, and the interoperability one inside EXIF.
+const TIFF_RESOURCES: u16 = 34377;
+const TIFF_LAYERS: u16 = 37724;
+const TIFF_EXIF: u16 = 34665;
+const TIFF_GPS: u16 = 34853;
+const TIFF_INTEROP: u16 = 40965;
 
 /// Reads what `path` (in `format`) holds beside its pixels.
 pub fn read(path: &Path, format: Option<ImageFormat>) -> (ImageMetadata, Unkept) {
@@ -133,7 +159,15 @@ fn jpeg(data: &[u8], unkept: &mut Unkept) -> ImageMetadata {
 /// without its thumbnail (resources 1033 and 1036), which would show the
 /// image as it was; `None` if it can't be read.
 fn without_thumbnail(segment: &[u8]) -> Option<Vec<u8>> {
-    let data = segment.get(4 + IPTC.len()..)?;
+    let kept = without_thumbnails(segment.get(4 + IPTC.len()..)?)?;
+    let body = [IPTC, &kept].concat();
+    let len = u16::try_from(body.len() + 2).ok()?;
+    Some([&[0xFF, 0xED][..], &len.to_be_bytes(), &body].concat())
+}
+
+/// Photoshop image resources (one "8BIM" block after another) without
+/// their thumbnail (1033 and 1036); `None` if they can't be read.
+fn without_thumbnails(data: &[u8]) -> Option<Vec<u8>> {
     let mut kept = Vec::new();
     let mut at = 0;
     while at < data.len() {
@@ -152,9 +186,7 @@ fn without_thumbnail(segment: &[u8]) -> Option<Vec<u8>> {
             kept.extend(resource);
         }
     }
-    let body = [IPTC, &kept].concat();
-    let len = u16::try_from(body.len() + 2).ok()?;
-    Some([&[0xFF, 0xED][..], &len.to_be_bytes(), &body].concat())
+    Some(kept)
 }
 
 /// The chunks of a PNG: (type, the whole chunk, its data).
@@ -235,34 +267,229 @@ fn tiff(path: &Path, unkept: &mut Unkept) -> Option<ImageMetadata> {
     {
         meta.density = Some((x * k, y * k));
     }
-    for tag in TIFF_BYTES {
-        match d.find_tag(Tag::from_u16_exhaustive(tag)).ok().flatten() {
-            None => {}
-            Some(v) => match v.into_u8_vec() {
-                Ok(bytes) => meta.tiff.push((tag, TiffValue::Bytes(bytes))),
-                Err(_) => unkept.xmp = true,
-            },
-        }
-    }
-    for tag in TIFF_TEXT {
-        match d.find_tag(Tag::from_u16_exhaustive(tag)).ok().flatten() {
-            None => {}
-            Some(v) => match v.into_string() {
-                Ok(text) => meta.tiff.push((tag, TiffValue::Text(text))),
-                Err(_) => unkept.xmp = true,
-            },
-        }
-    }
-    let has = |d: &mut tiff::decoder::Decoder<_>, tag: u16| {
-        d.find_tag(Tag::from_u16_exhaustive(tag))
-            .ok()
-            .flatten()
-            .is_some()
+    drop(d);
+    // The tags themselves, read raw: the decoder refuses text that isn't
+    // UTF-8 and cuts it at the first NUL.
+    let Some(mut file) = RawTiff::open(path) else {
+        unkept.xmp = true;
+        return Some(meta);
     };
-    unkept.exif = has(&mut d, 34665);
-    // Image resources, and the layers some applications store.
-    unkept.photoshop = has(&mut d, 34377) || has(&mut d, 37724);
+    let Some(ifd0) = file.first_ifd() else {
+        unkept.xmp = true;
+        return Some(meta);
+    };
+    let has = |tag: u16| ifd0.iter().any(|e| e.tag == tag);
+    for e in &ifd0 {
+        let kind = match e.tag {
+            t if TIFF_BYTES.contains(&t) => 1,
+            t if TIFF_TEXT.contains(&t) => 2,
+            // Without the layers they describe, safe to give back (but
+            // the thumbnail, which would show the image as it was).
+            TIFF_RESOURCES if !has(TIFF_LAYERS) => 1,
+            TIFF_EXIF | TIFF_GPS => {
+                match file.dir(e, 0) {
+                    Some(dir) => meta.tiff_dirs.push(dir),
+                    None => unkept.exif = true,
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        let data = match file.data(e) {
+            Some(data) if e.tag == TIFF_RESOURCES => without_thumbnails(&data),
+            data => data,
+        };
+        match data {
+            Some(mut data) => {
+                if kind == 2 && data.last() != Some(&0) {
+                    data.push(0);
+                }
+                meta.tiff.push(TiffTag {
+                    tag: e.tag,
+                    kind,
+                    data,
+                });
+            }
+            None if e.tag == TIFF_RESOURCES => unkept.photoshop = true,
+            None => unkept.xmp = true,
+        }
+    }
+    unkept.photoshop |= has(TIFF_LAYERS);
     Some(meta)
+}
+
+/// An entry of a TIFF directory: its tag, type, count and value field
+/// (the value, or where it is).
+struct RawEntry {
+    tag: u16,
+    kind: u16,
+    count: u64,
+    field: [u8; 8],
+}
+
+/// A TIFF file read by its directories.
+struct RawTiff {
+    file: std::io::BufReader<std::fs::File>,
+    len: u64,
+    little: bool,
+    /// BigTIFF: 8-byte counts and offsets.
+    big: bool,
+}
+
+/// Bytes of an element of TIFF type `kind`, and of the parts its byte
+/// order applies to; `None` for an unknown type.
+fn type_size(kind: u16) -> Option<(u64, usize)> {
+    Some(match kind {
+        1 | 2 | 6 | 7 => (1, 1),
+        3 | 8 => (2, 2),
+        4 | 9 | 11 | 13 => (4, 4),
+        5 | 10 => (8, 4),
+        12 | 16..=18 => (8, 8),
+        _ => return None,
+    })
+}
+
+/// A tag's value at most (larger is refused).
+const MAX_TIFF_VALUE: u64 = 64 << 20;
+
+impl RawTiff {
+    fn open(path: &Path) -> Option<Self> {
+        use std::io::Read;
+        let file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        let mut file = std::io::BufReader::new(file);
+        let mut head = [0u8; 4];
+        file.read_exact(&mut head).ok()?;
+        let little = match &head[..2] {
+            b"II" => true,
+            b"MM" => false,
+            _ => return None,
+        };
+        let version = if little {
+            u16::from_le_bytes([head[2], head[3]])
+        } else {
+            u16::from_be_bytes([head[2], head[3]])
+        };
+        let big = match version {
+            42 => false,
+            43 => true,
+            _ => return None,
+        };
+        Some(Self {
+            file,
+            len,
+            little,
+            big,
+        })
+    }
+
+    fn read(&mut self, at: u64, n: u64) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        if n > MAX_TIFF_VALUE || at.checked_add(n)? > self.len {
+            return None;
+        }
+        self.file.seek(SeekFrom::Start(at)).ok()?;
+        let mut out = vec![0; n as usize];
+        self.file.read_exact(&mut out).ok()?;
+        Some(out)
+    }
+
+    fn uint(&self, b: &[u8]) -> u64 {
+        let mut v = 0u64;
+        for i in 0..b.len() {
+            let byte = if self.little {
+                b[b.len() - 1 - i]
+            } else {
+                b[i]
+            };
+            v = v << 8 | u64::from(byte);
+        }
+        v
+    }
+
+    fn first_ifd(&mut self) -> Option<Vec<RawEntry>> {
+        let at = match self.big {
+            false => self.read(4, 4)?,
+            true => self.read(8, 8)?,
+        };
+        let at = self.uint(&at);
+        self.ifd(at)
+    }
+
+    /// The entries of the directory at `at`.
+    fn ifd(&mut self, at: u64) -> Option<Vec<RawEntry>> {
+        let (count_size, entry_size, field) = if self.big { (8, 20, 8) } else { (2, 12, 4) };
+        let count = self.read(at, count_size)?;
+        let count = self.uint(&count);
+        if count > 4096 {
+            return None;
+        }
+        let data = self.read(at + count_size, count * entry_size)?;
+        Some(
+            data.chunks_exact(entry_size as usize)
+                .map(|e| {
+                    let mut value = [0; 8];
+                    value[..field].copy_from_slice(&e[e.len() - field..]);
+                    RawEntry {
+                        tag: self.uint(&e[0..2]) as u16,
+                        kind: self.uint(&e[2..4]) as u16,
+                        count: self.uint(&e[4..e.len() - field]),
+                        field: value,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// An entry's value, in the file's byte order.
+    fn data(&mut self, e: &RawEntry) -> Option<Vec<u8>> {
+        let size = type_size(e.kind)?.0.checked_mul(e.count)?;
+        let field = if self.big { 8 } else { 4 };
+        if size <= field {
+            return Some(e.field[..size as usize].to_vec());
+        }
+        let at = self.uint(&e.field[..field as usize]);
+        self.read(at, size)
+    }
+
+    /// The directory entry `e` points to, its values in this computer's
+    /// byte order; `None` if it can't be kept whole (`depth`: how deep
+    /// in directories it is).
+    fn dir(&mut self, e: &RawEntry, depth: u32) -> Option<TiffDir> {
+        let at = self.data(e)?;
+        if depth > 1 || !matches!(e.kind, 4 | 13 | 16 | 18) || e.count != 1 {
+            return None;
+        }
+        let at = self.uint(&at);
+        let mut dir = TiffDir {
+            pointer: e.tag,
+            tags: Vec::new(),
+            dirs: Vec::new(),
+        };
+        for e in self.ifd(at)? {
+            if e.tag == TIFF_INTEROP {
+                dir.dirs.push(self.dir(&e, depth + 1)?);
+                continue;
+            }
+            // Other directories, or BigTIFF values a TIFF can't hold.
+            if matches!(e.kind, 13 | 16..=18) {
+                return None;
+            }
+            let (_, unit) = type_size(e.kind)?;
+            let mut data = self.data(&e)?;
+            if self.little != cfg!(target_endian = "little") {
+                for part in data.chunks_exact_mut(unit) {
+                    part.reverse();
+                }
+            }
+            dir.tags.push(TiffTag {
+                tag: e.tag,
+                kind: e.kind,
+                data,
+            });
+        }
+        Some(dir)
+    }
 }
 
 /// A resolution in whole pixels per inch.
@@ -272,6 +499,25 @@ fn density_u16((x, y): (f64, f64)) -> (u16, u16) {
 }
 
 impl ImageMetadata {
+    /// These metadata for the image of `size` being saved, upright: their
+    /// XMP's orientation, pixel dimensions and thumbnail made true again
+    /// (as [`fresh_exif`] does the EXIF's), or the XMP left as it was where
+    /// it can't be edited.
+    pub fn for_size(&self, size: (u32, u32)) -> ImageMetadata {
+        let mut out = self.clone();
+        for part in &mut out.raw {
+            if let Some(fresh) = fresh_xmp_part(part, size) {
+                *part = fresh;
+            }
+        }
+        for t in &mut out.tiff {
+            if t.tag == 700 {
+                t.data = fresh_xmp(&t.data, size);
+            }
+        }
+        out
+    }
+
     /// A JPEG's resolution for its encoder.
     pub fn jpeg_density(&self) -> Option<image::codecs::jpeg::PixelDensity> {
         let (x, y) = density_u16(self.density?);
@@ -326,11 +572,13 @@ impl ImageMetadata {
     }
 
     /// A TIFF's kept tags and resolution, written by `encoder` (its
-    /// copyright unless a `new_copyright` is written).
+    /// copyright unless a `new_copyright` is written), with `dirs` the
+    /// directories [`Self::write_tiff_dirs`] wrote.
     pub fn write_tiff<W: std::io::Write + std::io::Seek, K: tiff::encoder::TiffKind>(
         &self,
         encoder: &mut tiff::encoder::DirectoryEncoder<'_, W, K>,
         new_copyright: bool,
+        dirs: &[(u16, u32)],
     ) -> tiff::TiffResult<()> {
         use tiff::encoder::Rational;
         use tiff::tags::Tag;
@@ -346,23 +594,208 @@ impl ImageMetadata {
             encoder.write_tag(Tag::XResolution, rational(x))?;
             encoder.write_tag(Tag::YResolution, rational(y))?;
         }
-        for (tag, value) in &self.tiff {
-            if new_copyright && *tag == 33432 {
+        for t in &self.tiff {
+            if new_copyright && t.tag == 33432 {
                 continue;
             }
-            match value {
-                TiffValue::Bytes(b) => encoder.write_tag(Tag::from_u16_exhaustive(*tag), &b[..])?,
-                TiffValue::Text(t) => {
-                    let mut text = t.clone().into_bytes();
-                    text.push(0);
-                    let entry = encoder.write_entry_bytes(tiff::tags::Type::ASCII, &text)?;
-                    let mut tags = tiff::Directory::empty();
-                    tags.extend([(Tag::from_u16_exhaustive(*tag), entry)]);
-                    encoder.extend_from(&tags);
-                }
-            }
+            write_raw(encoder, t.tag, t.kind, &t.data)?;
+        }
+        for &(tag, at) in dirs {
+            encoder.write_tag(Tag::from_u16_exhaustive(tag), at)?;
         }
         Ok(())
+    }
+
+    /// The kept EXIF and GPS directories, written by `encoder` before the
+    /// image's (the EXIF's pixel dimensions made `size`): their pointer
+    /// tags and offsets, for [`Self::write_tiff`].
+    pub fn write_tiff_dirs<W: std::io::Write + std::io::Seek>(
+        &self,
+        encoder: &mut tiff::encoder::TiffEncoder<W>,
+        size: (u32, u32),
+    ) -> tiff::TiffResult<Vec<(u16, u32)>> {
+        if self.format != Some(ExportFormat::Tiff) {
+            return Ok(Vec::new());
+        }
+        self.tiff_dirs
+            .iter()
+            .map(|d| Ok((d.pointer, write_dir(encoder, d, size)?)))
+            .collect()
+    }
+}
+
+/// A tag of `kind` whose `data` is in this computer's byte order.
+fn write_raw<W: std::io::Write + std::io::Seek, K: tiff::encoder::TiffKind>(
+    encoder: &mut tiff::encoder::DirectoryEncoder<'_, W, K>,
+    tag: u16,
+    kind: u16,
+    data: &[u8],
+) -> tiff::TiffResult<()> {
+    let Some(kind) = tiff::tags::Type::from_u16(kind) else {
+        return Ok(());
+    };
+    let entry = encoder.write_entry_bytes(kind, data)?;
+    let mut tags = tiff::Directory::empty();
+    tags.extend([(tiff::tags::Tag::from_u16_exhaustive(tag), entry)]);
+    encoder.extend_from(&tags);
+    Ok(())
+}
+
+/// Directory `dir` (and those inside it), written; where it is.
+fn write_dir<W: std::io::Write + std::io::Seek>(
+    encoder: &mut tiff::encoder::TiffEncoder<W>,
+    dir: &TiffDir,
+    (w, h): (u32, u32),
+) -> tiff::TiffResult<u32> {
+    let inner = (dir.dirs.iter())
+        .map(|d| Ok((d.pointer, write_dir(encoder, d, (w, h))?)))
+        .collect::<tiff::TiffResult<Vec<_>>>()?;
+    let mut out = encoder.extra_directory()?;
+    for t in &dir.tags {
+        match (dir.pointer, t.tag) {
+            (TIFF_EXIF, 40962) => out.write_tag(tiff::tags::Tag::from_u16_exhaustive(t.tag), w)?,
+            (TIFF_EXIF, 40963) => out.write_tag(tiff::tags::Tag::from_u16_exhaustive(t.tag), h)?,
+            _ => write_raw(&mut out, t.tag, t.kind, &t.data)?,
+        }
+    }
+    for (tag, at) in inner {
+        out.write_tag(tiff::tags::Tag::from_u16_exhaustive(tag), at)?;
+    }
+    Ok(out.finish_with_offsets()?.offset)
+}
+
+/// A JPEG segment or PNG chunk holding XMP, made true for `size`
+/// ([`ImageMetadata::for_size`]); `None` when it holds none, compressed
+/// XMP, or would grow past what a segment holds.
+fn fresh_xmp_part(part: &[u8], size: (u32, u32)) -> Option<Vec<u8>> {
+    const PNG_XMP: &[u8] = b"XML:com.adobe.xmp\0";
+    if part.starts_with(&[0xFF, 0xE1]) && part.get(4..)?.starts_with(XMP) {
+        let packet = fresh_xmp(&part[4 + XMP.len()..], size);
+        let len = u16::try_from(2 + XMP.len() + packet.len()).ok()?;
+        return Some([&[0xFF, 0xE1][..], &len.to_be_bytes(), XMP, &packet].concat());
+    }
+    let body = part.get(8..part.len().checked_sub(4)?)?;
+    if part.get(4..8)? == b"iTXt" && body.starts_with(PNG_XMP) {
+        let rest = &body[PNG_XMP.len()..];
+        // Compression flag and method, then language and translated
+        // keyword (each ended by a NUL), then the text.
+        if rest.first() != Some(&0) {
+            return None;
+        }
+        let mut at = 2;
+        for _ in 0..2 {
+            at += rest.get(at..)?.iter().position(|&b| b == 0)? + 1;
+        }
+        let text = fresh_xmp(&rest[at..], size);
+        let body = [PNG_XMP, &rest[..at], &text].concat();
+        return Some(png_chunk(b"iTXt", &body));
+    }
+    None
+}
+
+/// The properties of an XMP packet that describe the pixels: they are
+/// set to the saved image's (upright, `size`), the thumbnails left out.
+const XMP_SIZED: [&str; 5] = [
+    "tiff:Orientation",
+    "tiff:ImageWidth",
+    "tiff:ImageLength",
+    "exif:PixelXDimension",
+    "exif:PixelYDimension",
+];
+
+/// An XMP packet made true for the image of `size` being saved, upright:
+/// [`XMP_SIZED`] set, as attributes or elements, and its thumbnails
+/// (`xmp:Thumbnails`) left out; the packet's padding takes up the
+/// difference in length, so that it stays the same size when it can.
+pub fn fresh_xmp(xmp: &[u8], (w, h): (u32, u32)) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(xmp) else {
+        return xmp.to_vec();
+    };
+    let values = [1, w, h, w, h];
+    let mut out = text.to_owned();
+    for (name, value) in XMP_SIZED.iter().zip(values) {
+        set_xmp(&mut out, name, &value.to_string());
+    }
+    // The thumbnails: an element, removed whole.
+    while let Some(start) = out.find("<xmp:Thumbnails") {
+        let Some(end) = out[start..].find("</xmp:Thumbnails>") else {
+            break;
+        };
+        out.replace_range(start..start + end + "</xmp:Thumbnails>".len(), "");
+    }
+    while let Some(start) = find_attribute(&out, "xmp:Thumbnails") {
+        let Some(end) = attribute_value(&out, start).map(|(_, end)| end + 1) else {
+            break;
+        };
+        out.replace_range(start..end, "");
+    }
+    // The padding before the trailer absorbs the change.
+    let grown = out.len() as isize - text.len() as isize;
+    if let Some(trailer) = out.rfind("<?xpacket end") {
+        let pad = out[..trailer]
+            .bytes()
+            .rev()
+            .take_while(|b| b.is_ascii_whitespace())
+            .count();
+        if grown > 0 {
+            let cut = (grown as usize).min(pad.saturating_sub(1));
+            out.replace_range(trailer - cut..trailer, "");
+        } else if grown < 0 {
+            out.insert_str(trailer, &" ".repeat(grown.unsigned_abs()));
+        }
+    }
+    out.into_bytes()
+}
+
+/// Where attribute `name` starts (as a whole name, followed by `=`).
+fn find_attribute(text: &str, name: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(i) = text[from..].find(name) {
+        let at = from + i;
+        let before = text[..at].chars().next_back();
+        let after = text[at + name.len()..].trim_start();
+        if before.is_some_and(char::is_whitespace) && after.starts_with('=') {
+            return Some(at);
+        }
+        from = at + name.len();
+    }
+    None
+}
+
+/// The value of the attribute starting at `at`: its first byte and its
+/// closing quote's.
+fn attribute_value(text: &str, at: usize) -> Option<(usize, usize)> {
+    let eq = at + text[at..].find('=')?;
+    let rest = &text[eq + 1..];
+    let skip = rest.len() - rest.trim_start().len();
+    let open = eq + 1 + skip;
+    let quote = text[open..]
+        .chars()
+        .next()
+        .filter(|c| *c == '"' || *c == '\'')?;
+    let close = open + 1 + text[open + 1..].find(quote)?;
+    Some((open + 1, close))
+}
+
+/// Property `name` set to `value`, wherever it is written as an attribute
+/// or as a simple element.
+fn set_xmp(text: &mut String, name: &str, value: &str) {
+    let mut from = 0;
+    while let Some(at) = find_attribute(&text[from..], name).map(|i| from + i) {
+        let Some((start, end)) = attribute_value(text, at) else {
+            break;
+        };
+        text.replace_range(start..end, value);
+        from = start + value.len();
+    }
+    let (open, close) = (format!("<{name}>"), format!("</{name}>"));
+    let mut from = 0;
+    while let Some(start) = text[from..].find(&open).map(|i| from + i + open.len()) {
+        let Some(end) = text[start..].find(&close).map(|i| start + i) else {
+            break;
+        };
+        text.replace_range(start..end, value);
+        from = start + value.len();
     }
 }
 
@@ -618,6 +1051,245 @@ mod tests {
             .concat()
         );
         assert_eq!(without_thumbnail(&segment[..segment.len() - 3]), None);
+    }
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("atelier-metadata-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn resource(id: u16, data: &[u8]) -> Vec<u8> {
+        let mut r = b"8BIM".to_vec();
+        r.extend(id.to_be_bytes());
+        r.extend([0, 0]);
+        r.extend((data.len() as u32).to_be_bytes());
+        r.extend(data);
+        if data.len() % 2 == 1 {
+            r.push(0);
+        }
+        r
+    }
+
+    /// A camera or Photoshop TIFF's tags go back byte for byte: text that
+    /// isn't UTF-8 or holds several parts, IPTC stored as LONG, image
+    /// resources (without their thumbnail), the EXIF directory (its pixel
+    /// dimensions made the image's) with the one inside it, the GPS one;
+    /// its XMP is made true for the image saved.
+    #[test]
+    fn tiff_tags_and_directories_are_kept_byte_for_byte() {
+        use tiff::encoder::{Rational, TiffEncoder, colortype};
+        use tiff::tags::{Tag, Type};
+        let dir = temp("tiff-kept");
+        let path = dir.join("camera.tif");
+        let xmp = b"<x:xmpmeta><rdf:Description tiff:Orientation=\"6\" \
+                    exif:PixelXDimension=\"4000\"/></x:xmpmeta>";
+        let resources = [resource(1005, &[0; 16]), resource(1036, b"old thumbnail")].concat();
+        {
+            let mut enc = TiffEncoder::new(std::fs::File::create(&path).unwrap()).unwrap();
+            let raw =
+                |e: &mut tiff::encoder::DirectoryEncoder<'_, _, _>, tag: u16, ty, data: &[u8]| {
+                    let entry = e.write_entry_bytes(ty, data).unwrap();
+                    let mut tags = tiff::Directory::empty();
+                    tags.extend([(Tag::from_u16_exhaustive(tag), entry)]);
+                    e.extend_from(&tags);
+                };
+            let mut interop = enc.extra_directory().unwrap();
+            raw(&mut interop, 1, Type::ASCII, b"R98\0");
+            let interop = interop.finish_with_offsets().unwrap().offset;
+            let mut exif = enc.extra_directory().unwrap();
+            exif.write_tag(Tag::from_u16_exhaustive(40962), 4000u16)
+                .unwrap();
+            exif.write_tag(Tag::from_u16_exhaustive(40963), 3000u32)
+                .unwrap();
+            exif.write_tag(Tag::from_u16_exhaustive(33434), Rational { n: 1, d: 250 })
+                .unwrap();
+            raw(&mut exif, 37500, Type::UNDEFINED, b"Maker notes");
+            exif.write_tag(Tag::from_u16_exhaustive(TIFF_INTEROP), interop)
+                .unwrap();
+            let exif = exif.finish_with_offsets().unwrap().offset;
+            let mut gps = enc.extra_directory().unwrap();
+            gps.write_tag(Tag::from_u16_exhaustive(0), &[2u8, 3, 0, 0][..])
+                .unwrap();
+            let gps = gps.finish_with_offsets().unwrap().offset;
+            let mut im = enc.new_image::<colortype::RGB8>(2, 2).unwrap();
+            let e = im.encoder();
+            raw(e, 33432, Type::ASCII, b"\xa9 2003 Studio Lumi\xe8re\0");
+            raw(e, 315, Type::ASCII, b"Photographer QA\0Editor QA\0");
+            let iptc: [u32; 2] = [0x1c027400, 0x0951412d];
+            e.write_tag(Tag::from_u16_exhaustive(33723), &iptc[..])
+                .unwrap();
+            e.write_tag(Tag::from_u16_exhaustive(700), &xmp[..])
+                .unwrap();
+            e.write_tag(Tag::from_u16_exhaustive(TIFF_RESOURCES), &resources[..])
+                .unwrap();
+            e.write_tag(Tag::from_u16_exhaustive(TIFF_EXIF), exif)
+                .unwrap();
+            e.write_tag(Tag::from_u16_exhaustive(TIFF_GPS), gps)
+                .unwrap();
+            im.write_data(&[7; 12]).unwrap();
+        }
+        let (meta, unkept) = read(&path, Some(ImageFormat::Tiff));
+        assert_eq!(unkept, Unkept::default());
+        let tag =
+            |m: &ImageMetadata, n: u16| m.tiff.iter().find(|t| t.tag == n).map(|t| t.data.clone());
+        assert_eq!(tag(&meta, 33432).unwrap(), b"\xa9 2003 Studio Lumi\xe8re\0");
+        assert_eq!(tag(&meta, 315).unwrap(), b"Photographer QA\0Editor QA\0");
+        assert_eq!(
+            tag(&meta, TIFF_RESOURCES).unwrap(),
+            resource(1005, &[0; 16])
+        );
+        assert_eq!(meta.tiff_dirs.len(), 2);
+
+        // Saved over, as Save and Close does.
+        let image = image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        super::super::encode_image(
+            &image,
+            &mut out,
+            ExportFormat::Tiff,
+            90,
+            None,
+            None,
+            None,
+            Some(&meta),
+        )
+        .unwrap();
+        let saved = dir.join("saved.tif");
+        std::fs::write(&saved, out.into_inner()).unwrap();
+        let (back, unkept) = read(&saved, Some(ImageFormat::Tiff));
+        assert_eq!(unkept, Unkept::default());
+        for n in [33432, 315, 33723, TIFF_RESOURCES] {
+            assert_eq!(tag(&back, n), tag(&meta, n), "{n}");
+        }
+        let xmp = String::from_utf8(tag(&back, 700).unwrap()).unwrap();
+        assert!(xmp.contains("tiff:Orientation=\"1\""), "{xmp}");
+        assert!(xmp.contains("exif:PixelXDimension=\"8\""), "{xmp}");
+        let exif = back
+            .tiff_dirs
+            .iter()
+            .find(|d| d.pointer == TIFF_EXIF)
+            .unwrap();
+        let value = |n: u16| exif.tags.iter().find(|t| t.tag == n).unwrap();
+        assert_eq!(value(40962).data, 8u32.to_ne_bytes());
+        assert_eq!(value(40963).data, 6u32.to_ne_bytes());
+        assert_eq!(value(37500).data, b"Maker notes");
+        assert_eq!(
+            value(33434).data,
+            [1u32.to_ne_bytes(), 250u32.to_ne_bytes()].concat()
+        );
+        assert_eq!(exif.dirs[0].tags[0].data, b"R98\0");
+        let gps = back
+            .tiff_dirs
+            .iter()
+            .find(|d| d.pointer == TIFF_GPS)
+            .unwrap();
+        assert_eq!(gps.tags[0].data, [2, 3, 0, 0]);
+        // Still a TIFF the decoder reads.
+        assert_eq!(image::open(&saved).unwrap().width(), 8);
+    }
+
+    /// A big-endian EXIF directory's values come in this computer's byte
+    /// order (the encoder writes in it).
+    #[test]
+    fn big_endian_tiff_directories_are_read_in_native_order() {
+        let mut d = b"MM\0*".to_vec();
+        d.extend(8u32.to_be_bytes());
+        // IFD0 at 8: the EXIF pointer.
+        d.extend(1u16.to_be_bytes());
+        d.extend(TIFF_EXIF.to_be_bytes());
+        d.extend(4u16.to_be_bytes());
+        d.extend(1u32.to_be_bytes());
+        d.extend(26u32.to_be_bytes());
+        d.extend(0u32.to_be_bytes());
+        // EXIF at 26: a LONG and a RATIONAL (at 26 + 2 + 24 + 4 = 56).
+        d.extend(2u16.to_be_bytes());
+        d.extend(40963u16.to_be_bytes());
+        d.extend(4u16.to_be_bytes());
+        d.extend(1u32.to_be_bytes());
+        d.extend(3000u32.to_be_bytes());
+        d.extend(33434u16.to_be_bytes());
+        d.extend(5u16.to_be_bytes());
+        d.extend(1u32.to_be_bytes());
+        d.extend(56u32.to_be_bytes());
+        d.extend(0u32.to_be_bytes());
+        d.extend(1u32.to_be_bytes());
+        d.extend(250u32.to_be_bytes());
+        let path = temp("tiff-be").join("be.tif");
+        std::fs::write(&path, &d).unwrap();
+        let mut file = RawTiff::open(&path).unwrap();
+        let ifd0 = file.first_ifd().unwrap();
+        let exif = file.dir(&ifd0[0], 0).unwrap();
+        assert_eq!(exif.tags[0].data, 3000u32.to_ne_bytes());
+        assert_eq!(
+            exif.tags[1].data,
+            [1u32.to_ne_bytes(), 250u32.to_ne_bytes()].concat()
+        );
+        // Damaged: a directory past the end.
+        let mut cut = d.clone();
+        cut.truncate(30);
+        std::fs::write(&path, &cut).unwrap();
+        let mut file = RawTiff::open(&path).unwrap();
+        let ifd0 = file.first_ifd().unwrap();
+        assert!(file.dir(&ifd0[0], 0).is_none());
+    }
+
+    /// The XMP's orientation, pixel dimensions and thumbnail describe the
+    /// image saved, as attributes or elements, the packet's padding taking
+    /// up the difference; JPEG segments and PNG chunks are rebuilt.
+    #[test]
+    fn xmp_describes_the_image_saved() {
+        let packet = "<?xpacket begin=\"\"?><x:xmpmeta><rdf:Description \
+                      tiff:Orientation=\"6\" tiff:ImageWidth='4000'>\
+                      <exif:PixelXDimension>4000</exif:PixelXDimension>\
+                      <exif:PixelYDimension>3000</exif:PixelYDimension>\
+                      <xmp:Thumbnails><rdf:Alt>old</rdf:Alt></xmp:Thumbnails>\
+                      <dc:rights>QA</dc:rights></rdf:Description></x:xmpmeta>\
+                      <?xpacket end=\"w\"?>";
+        let padded = packet.replace("<?xpacket end", &format!("{}<?xpacket end", " ".repeat(50)));
+        let fresh = String::from_utf8(fresh_xmp(padded.as_bytes(), (64, 48))).unwrap();
+        assert!(fresh.contains("tiff:Orientation=\"1\""), "{fresh}");
+        assert!(fresh.contains("tiff:ImageWidth='64'"), "{fresh}");
+        assert!(fresh.contains("<exif:PixelXDimension>64</exif:PixelXDimension>"));
+        assert!(fresh.contains("<exif:PixelYDimension>48</exif:PixelYDimension>"));
+        assert!(!fresh.contains("Thumbnails") && fresh.contains("<dc:rights>QA"));
+        // The padding took the difference: the same length.
+        assert_eq!(fresh.len(), padded.len());
+        // Nothing to change, or not text: as it was.
+        assert_eq!(fresh_xmp(b"<x:xmpmeta/>", (1, 1)), b"<x:xmpmeta/>");
+        assert_eq!(fresh_xmp(&[0xFF, 0xFE, 0], (1, 1)), [0xFF, 0xFE, 0]);
+
+        let segment = [
+            &[0xFF, 0xE1][..],
+            &((2 + XMP.len() + packet.len()) as u16).to_be_bytes(),
+            XMP,
+            packet.as_bytes(),
+        ]
+        .concat();
+        let chunk = png_chunk(
+            b"iTXt",
+            &[b"XML:com.adobe.xmp\0\0\0\0\0".as_slice(), packet.as_bytes()].concat(),
+        );
+        let meta = ImageMetadata {
+            raw: vec![segment, chunk, png_chunk(b"tEXt", b"Comment\0hi")],
+            ..ImageMetadata::default()
+        };
+        let sized = meta.for_size((64, 48));
+        let jpeg = &sized.raw[0];
+        assert_eq!(
+            u16::from_be_bytes([jpeg[2], jpeg[3]]) as usize,
+            jpeg.len() - 2
+        );
+        assert!(jpeg.windows(20).any(|w| w == b"tiff:Orientation=\"1\""));
+        let png = &sized.raw[1];
+        let found = chunks(&[b"\x89PNG\r\n\x1a\n".as_slice(), png].concat())
+            .first()
+            .map(|(k, _, body)| (*k, body.to_vec()))
+            .unwrap();
+        assert_eq!(&found.0, b"iTXt");
+        assert!(found.1.windows(20).any(|w| w == b"tiff:Orientation=\"1\""));
+        assert_eq!(sized.raw[2], meta.raw[2]);
     }
 
     fn jpeg_meta(data: &[u8], unkept: &mut Unkept) -> ImageMetadata {

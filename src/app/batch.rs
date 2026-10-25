@@ -519,7 +519,7 @@ impl AtelierApp {
                         Destination::Folder => t!("actions-destination-folder"),
                     };
                     let shown = label(d.destination);
-                    ui_kit::combo(ui, "batch_destination", None, &shown, width, |ui| {
+                    let combo = ui_kit::combo(ui, "batch_destination", None, &shown, width, |ui| {
                         for x in [
                             Destination::None,
                             Destination::SaveAndClose,
@@ -528,6 +528,9 @@ impl AtelierApp {
                             ui.selectable_value(&mut d.destination, x, label(x));
                         }
                     });
+                    // Under a section title, not a field label: named here.
+                    let name = t!("actions-batch-destination");
+                    ui_kit::name_control(ui, combo.response.id, &name, &shown);
                     if d.destination == Destination::Folder {
                         let title = t!("actions-batch-destination");
                         folder_row(ui, "batch_destination_folder", &mut d.dest_folder, &title);
@@ -779,14 +782,32 @@ impl AtelierApp {
         // anything is written (found halfway, the files before it would be
         // processed twice once the batch is run again).
         if d.destination == Destination::SaveAndClose {
+            // The modified tabs' files canonicalized once, an item only when
+            // its name is one of theirs (on a network folder, each call is
+            // a round trip).
+            let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+            let tabs: Vec<(PathBuf, Option<PathBuf>)> = (0..self.tab_count())
+                .filter_map(|i| self.tab(i).map(|(d, _)| d))
+                .filter(|d| d.modified)
+                .filter_map(|d| d.path.clone())
+                .map(|p| {
+                    let canonical = std::fs::canonicalize(&p).ok();
+                    (p, canonical)
+                })
+                .collect();
+            let open = |path: &Path| {
+                tabs.iter().any(|(p, canonical)| {
+                    p == path
+                        || (name(p) == name(path)
+                            && canonical.is_some()
+                            && std::fs::canonicalize(path).ok() == *canonical)
+                })
+            };
             let modified: Vec<String> = items
                 .iter()
                 .filter_map(|item| match item {
-                    Item::File(path) => self
-                        .tab_of(path)
-                        .filter(|&i| self.tab(i).is_some_and(|(d, _)| d.modified))
-                        .map(|_| files::file_name(path)),
-                    Item::Tab(_) => None,
+                    Item::File(path) if open(path) => Some(files::file_name(path)),
+                    _ => None,
                 })
                 .collect();
             if !modified.is_empty() {
@@ -1291,15 +1312,24 @@ impl AtelierApp {
             },
         );
         if out.ok || out.cancel {
-            let done = run.done as u32;
-            let copy = run.current.as_ref().filter(|c| c.copy).map(|c| c.uid);
-            self.automate.run = None;
-            if let Some(uid) = copy {
-                self.close_by_uid(uid);
-            }
-            self.stop_playing();
-            self.status = t!("actions-batch-cancelled", count = done);
+            self.cancel_batch();
         }
+    }
+
+    /// Cancel of the batch (its progress window, or a step cancelled): the
+    /// document being processed is left as it is, no other file is.
+    pub(super) fn cancel_batch(&mut self) {
+        let Some(run) = &self.automate.run else {
+            return self.stop_playing();
+        };
+        let done = run.done as u32;
+        let copy = run.current.as_ref().filter(|c| c.copy).map(|c| c.uid);
+        self.automate.run = None;
+        if let Some(uid) = copy {
+            self.close_by_uid(uid);
+        }
+        self.stop_playing();
+        self.status = t!("actions-batch-cancelled", count = done);
     }
 
     fn alert_window(&mut self, ctx: &egui::Context) {
@@ -1384,7 +1414,7 @@ fn naming_slots(ui: &mut egui::Ui, slots: &mut [Option<NamePart>; 4]) {
                         let shown = slot
                             .as_ref()
                             .map_or_else(|| t!("actions-name-none"), part_label);
-                        ui_kit::combo(ui, id, None, &shown, half, |ui| {
+                        let combo = ui_kit::combo(ui, id, None, &shown, half, |ui| {
                             ui.selectable_value(slot, None, t!("actions-name-none"));
                             for p in PARTS {
                                 let label = part_label(&p);
@@ -1396,6 +1426,9 @@ fn naming_slots(ui: &mut egui::Ui, slots: &mut [Option<NamePart>; 4]) {
                                 t!("actions-name-text"),
                             );
                         });
+                        // "File Naming 2": the label above names the row.
+                        let name = format!("{} {}", t!("actions-file-naming"), row * 2 + col + 1);
+                        ui_kit::name_control(ui, combo.response.id, &name, &shown);
                     }
                 }
             }
@@ -1857,6 +1890,48 @@ mod tests {
         assert!(h.state().automate.alert.is_some(), "stopped");
         assert_eq!(h.state().tab_count(), 1, "the copy closed");
         assert!(h.state().doc.as_ref().unwrap().modified, "the tab kept");
+    }
+
+    /// A step cancelled during a batch (Esc or Cancel on a filter being
+    /// applied) stops the batch, even when errors are logged: it is not a
+    /// file's error, and the next file doesn't start the same filter.
+    #[test]
+    fn a_step_cancelled_stops_the_batch() {
+        let (src, dest) = (folder("cancel-src"), folder("cancel-dest"));
+        for name in ["a.png", "b.png", "c.png"] {
+            png(&src.join(name), (400, 300), 60);
+        }
+        let mut h = app();
+        h.state_mut().actions.library.sets[0].actions[0].steps =
+            vec![Step::new(Recorded::Filter {
+                filter: crate::filters::Filter::GaussianBlur { radius: 80.0 },
+            })];
+        let log = dest.join("log.txt");
+        let d = BatchDialog {
+            log: true,
+            log_file: Some(log.clone()),
+            ..batch(&src, &dest)
+        };
+        h.state_mut().start_batch(&d);
+        let mut cancelled = false;
+        for _ in 0..500 {
+            h.run_steps(1);
+            if h.state().filters.busy() {
+                h.state_mut().cancel_filter();
+                cancelled = true;
+                break;
+            }
+        }
+        assert!(cancelled, "the filter was applied");
+        run(&mut h);
+        let app = h.state();
+        assert!(app.automate.run.is_none(), "stopped");
+        assert!(!app.actions.playing());
+        assert!(app.automate.alert.is_none(), "no error");
+        assert_eq!(app.status, t!("actions-batch-cancelled", count = 0));
+        assert!(!log.exists(), "nothing logged");
+        let written = std::fs::read_dir(&dest).unwrap().count();
+        assert_eq!(written, 0, "no other file processed");
     }
 
     /// The Image Processor on open documents works on copies: the

@@ -451,6 +451,8 @@ impl AtelierApp {
         self.enlarge_for_dialog();
         let Some(doc) = &mut self.doc else { return };
         let Some(target) = filters_ui::active_target(doc, self.selection.as_ref()) else {
+            // The layer enlarged above is put back as it was.
+            self.shrink_after_preview();
             self.status = t!("status-selection-empty");
             return;
         };
@@ -671,7 +673,8 @@ impl AtelierApp {
             // panicked): nothing opens, the layer it enlarged goes back.
             (Err(_), _) => {
                 self.shrink_after_preview();
-                let text = tm!("fx3-filter-failed", name = t!("raw-filter-title"));
+                let name = crate::i18n::Message::of(|| t!("raw-filter-title"));
+                let text = tm!("fx3-filter-failed", name = name);
                 self.actions
                     .step_stopped(Stopped::Failed(text.shown.clone()));
                 self.status_failed(text);
@@ -873,7 +876,9 @@ impl AtelierApp {
                         None => {
                             doc.end_paint();
                             doc.discard_step();
-                            let text = tm!("fx3-filter-failed", name = name.as_str());
+                            // The name in English too, for the log and the report.
+                            let name = crate::i18n::Message::of(|| t!("raw-filter-title"));
+                            let text = tm!("fx3-filter-failed", name = name);
                             self.actions
                                 .step_stopped(Stopped::Failed(text.shown.clone()));
                             self.status_failed(text);

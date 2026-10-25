@@ -171,6 +171,9 @@ fn notes(doc: &Document, layers: &[Layer], kept: usize, cmyk: bool) -> Vec<Strin
     if cmyk && layers.len() > 1 {
         notes.push(t!("color-psd-note-cmyk-layers"));
     }
+    if placed_lost(doc) {
+        notes.push(t!("files6-psd-note-placed"));
+    }
     notes
 }
 
@@ -198,6 +201,81 @@ fn block_start(layers: &[Layer], g: usize) -> usize {
     j
 }
 
+/// Resources placed on the canvas: slices, color samplers, Count marks.
+const PLACED: [u16; 3] = [1050, 1073, 1080];
+
+/// The canvas is the one the kept resources were placed on (or isn't
+/// known: as they were).
+fn placed_fit(doc: &Document) -> bool {
+    let layout = doc.file_metadata.psd_layout.as_ref();
+    layout.is_none_or(|l| l.canvas == (doc.width(), doc.height()))
+}
+
+/// The placed resources that would be left out, but slices that are only
+/// the one of the whole image (Photoshop makes it again).
+fn placed_lost(doc: &Document) -> bool {
+    !placed_fit(doc)
+        && doc.file_metadata.psd_resources.iter().any(|r| match r.id {
+            1050 => slices(&r.data).is_none_or(|n| n > 1),
+            id => PLACED.contains(&id),
+        })
+}
+
+/// The slices of a Slices resource (version 6, or a descriptor's list).
+fn slices(data: &[u8]) -> Option<usize> {
+    let mut r = super::bytes::Reader::new(data);
+    match r.u32().ok()? {
+        6 => {
+            r.skip(16).ok()?;
+            r.unicode().ok()?;
+            Some(r.u32().ok()? as usize)
+        }
+        7 | 8 => {
+            r.skip(4).ok()?;
+            let d = super::descriptor::Descriptor::read(&mut r).ok()?;
+            Some(d.list(b"slices").map_or(0, <[_]>::len))
+        }
+        _ => None,
+    }
+}
+
+/// The display settings (1077) of the `channels` written, each taken
+/// from the file's channel of its name (a new one gets the default), spot
+/// colors as the alpha channels they became; `None` without any.
+fn display_info(
+    data: &[u8],
+    doc: &Document,
+    channels: &[crate::document::Channel],
+) -> Option<Vec<u8>> {
+    const ENTRY: usize = 13;
+    let entries: Vec<&[u8]> = data.get(4..)?.chunks_exact(ENTRY).collect();
+    let names = match &doc.file_metadata.psd_layout {
+        Some(l) => l.channels.clone(),
+        None => channels.iter().map(|c| c.name.clone()).collect(),
+    };
+    if channels.is_empty() || entries.len() != names.len() {
+        return None;
+    }
+    let mut used = vec![false; names.len()];
+    let mut out = data[..4].to_vec();
+    for c in channels {
+        let found = (0..names.len()).find(|&i| !used[i] && names[i] == c.name);
+        match found {
+            Some(i) => {
+                used[i] = true;
+                out.extend(&entries[i][..12]);
+                out.push(match entries[i][12] {
+                    2 => 0,
+                    kind => kind,
+                });
+            }
+            // Red at 50 %, showing the selected areas.
+            None => out.extend([0, 0, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 50, 0]),
+        }
+    }
+    Some(out)
+}
+
 fn resources(
     r: &mut Writer,
     doc: &Document,
@@ -219,13 +297,27 @@ fn resources(
     // What the file opened held beside the layers, as it was: its
     // resolution first (72 pixels per inch without one).
     let kept = &doc.file_metadata.psd_resources;
+    // Its XMP and EXIF made true for the image saved (upright, its size).
+    let canvas = (doc.width(), doc.height());
     let raw = |r: &mut Writer, res: &crate::document::PsdResource| {
+        use std::borrow::Cow;
+        let data = match res.id {
+            1060 => Cow::Owned(crate::document::file_io::fresh_xmp(&res.data, canvas)),
+            1058 => Cow::Owned(crate::document::file_io::fresh_exif(&res.data, canvas)),
+            1077 => match display_info(&res.data, doc, channels) {
+                Some(data) => Cow::Owned(data),
+                None => return,
+            },
+            // Placed for another canvas: left out (said by `notes`).
+            id if PLACED.contains(&id) && !placed_fit(doc) => return,
+            _ => Cow::Borrowed(&res.data[..]),
+        };
         r.bytes(b"8BIM");
         r.u16(res.id);
         r.pascal(&res.name, 2);
-        r.u32(res.data.len() as u32);
-        r.bytes(&res.data);
-        r.zeros(res.data.len() % 2);
+        r.u32(data.len() as u32);
+        r.bytes(&data);
+        r.zeros(data.len() % 2);
     };
     match kept.iter().find(|k| k.id == 1005) {
         Some(res) => raw(r, res),

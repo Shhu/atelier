@@ -196,9 +196,9 @@ struct SelectJob {
     then: Then,
     base: Option<Selection>,
     /// The history generation it started in (see
-    /// `Document::history_generation`): steps recorded meanwhile don't
+    /// `Document::history_follows`): steps recorded meanwhile don't
     /// matter, an undo or a redo does.
-    generation: u64,
+    generation: crate::document::HistoryGeneration,
     name: Option<String>,
 }
 
@@ -564,6 +564,37 @@ impl AtelierApp {
         }
     }
 
+    /// Select and Mask's output still being computed lands at the first
+    /// input after its OK (the pointer moved, a key): it adds a layer or a
+    /// mask and changes the active layer, which the Layers panel, the
+    /// Properties, the shortcuts and the menus must show before they pick
+    /// a layer (an eye clicked would hide another one, the rows moving
+    /// under the pointer).
+    pub(super) fn wait_output_on_input(&mut self, ctx: &egui::Context) {
+        let output = self
+            .sel
+            .job
+            .iter()
+            .chain(&self.sel.chained)
+            .any(|j| matches!(j.then, Then::Output(_)));
+        if output
+            && ctx.input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::PointerMoved(_)
+                            | egui::Event::PointerButton { .. }
+                            | egui::Event::MouseWheel { .. }
+                            | egui::Event::Key { pressed: true, .. }
+                            | egui::Event::Text(_)
+                    )
+                })
+            })
+        {
+            self.wait_select_job();
+        }
+    }
+
     /// With a selection being computed, a new one that only combines with
     /// it (Then::Select) is chained on a worker after it, rather than
     /// waited for on the interface thread: gives `work` back otherwise.
@@ -633,7 +664,7 @@ impl AtelierApp {
         // Undone or redone meanwhile: it was computed from another state,
         // and recording it would wipe the redo list. Steps recorded forward
         // (a Layers panel change) don't matter.
-        if doc.history_generation() != job.generation {
+        if !doc.history_follows(job.generation) {
             self.status = t!("hist5-selection-undone");
             return;
         }
@@ -1049,6 +1080,11 @@ impl AtelierApp {
     /// Applies Transform Selection (Enter, double-click in the frame, or
     /// anything else that commits what is pending).
     pub(super) fn apply_selection_transform(&mut self) {
+        // Nothing to apply: a selection being computed goes on (a tool
+        // chosen right after a click doesn't wait for it).
+        if self.sel.transform.is_none() {
+            return;
+        }
         self.wait_select_job();
         let (Some(t), Some(canvas)) = (
             self.sel.transform.take(),

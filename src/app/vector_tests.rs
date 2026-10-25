@@ -484,3 +484,52 @@ fn quick_mask_keeps_a_locked_shape_in_place() {
         h.state().status
     );
 }
+
+/// A shape layer dragged with Path Selection zoomed in: its image moves by
+/// whole pixels during the drag (not drawn again at each step, its styles
+/// following), and takes the fraction left at the end.
+#[test]
+fn a_shape_dragged_zoomed_in_moves_by_whole_pixels_until_released() {
+    use crate::vector::{Bounds, Live, Shape, ShapeKind, ShapeStroke, pt};
+    let mut h = app(Tool::PathSelect);
+    h.state_mut().zoom = 4.0;
+    let live = Live::new(
+        ShapeKind::Rectangle,
+        Bounds::of(pt(20.0, 20.0), pt(80.0, 70.0)),
+    );
+    let shape = Shape::live(live, Paint::Color([255, 0, 0]), ShapeStroke::default());
+    let d = h.state_mut().doc.as_mut().unwrap();
+    d.add_shape_layer("R".into(), "R", shape);
+    let id = d.active_layer().id;
+    h.run_steps(3);
+    let bounds = |h: &Harness<'static, AtelierApp>| {
+        let b = doc(h).path(PathRef::Layer(id)).unwrap().bounds().unwrap();
+        (b.min.x, b.min.y)
+    };
+    let start = screen(&h, 50.0, 45.0);
+    h.hover_at(start);
+    h.run_steps(1);
+    h.drag_at(start);
+    h.run_steps(1);
+    let to = screen(&h, 60.25, 48.5);
+    let mut revs = std::collections::HashSet::new();
+    for i in 1..=12 {
+        h.hover_at(start.lerp(to, i as f32 / 12.0));
+        h.run_steps(1);
+        let l = doc(&h).active_layer();
+        revs.insert(l.rev());
+        let (x, y) = bounds(&h);
+        assert!(x.fract() == 0.0 && y.fract() == 0.0, "whole pixels: {x}, {y}");
+    }
+    assert!(revs.len() <= 2, "drawn again during the drag: {}", revs.len());
+    h.event(egui::Event::PointerButton {
+        pos: to,
+        button: PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    h.run_steps(2);
+    let (x, y) = bounds(&h);
+    assert!((x - 30.25).abs() < 0.01 && (y - 23.5).abs() < 0.01, "{x}, {y}");
+    assert!(doc(&h).active_layer().shape.as_ref().unwrap().live.is_some());
+}

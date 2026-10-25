@@ -147,6 +147,19 @@ pub(super) struct Filters {
     /// The preview whose computation failed (for that layer and revision):
     /// not started again.
     adjust_failed: Option<(LayerPreview, u64, u64)>,
+    /// An adjustment's OK being computed.
+    adjusting: Option<AdjustApplying>,
+}
+
+/// An adjustment applied (its dialog's OK), computed on another thread:
+/// for the document, layer and target revision then.
+struct AdjustApplying {
+    adjustment: crate::pixel_ops::Adjustment,
+    doc: u64,
+    layer: u64,
+    rev: u64,
+    started: f64,
+    job: Job<RgbaImage>,
 }
 
 /// A layer enlarged to the canvas for a dialog's preview: its document and
@@ -162,7 +175,7 @@ struct Enlarged {
 impl Filters {
     /// A dialog or a filter being applied keeps the keyboard and the image.
     pub(super) fn busy(&self) -> bool {
-        self.dialog.is_some() || self.applying.is_some()
+        self.dialog.is_some() || self.applying.is_some() || self.adjusting.is_some()
     }
 
     /// The settings a filter's dialog opens with (an action's step).
@@ -301,7 +314,7 @@ const SQUARE_ZOOMS: [f32; 14] = [
     0.0625, 0.125, 0.25, 0.3333, 0.5, 0.6667, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0,
 ];
 /// Delay (s) before the busy indicator of a filter being applied shows.
-const BUSY_DELAY: f64 = 0.3;
+pub(super) const BUSY_DELAY: f64 = 0.3;
 
 /// What a filter works on: the active layer's pixels, or its mask when
 /// targeted (see [`Document::target_layer`]), and the area of the
@@ -627,6 +640,9 @@ impl AtelierApp {
         }
         self.end_layer_preview();
         self.reset_pending();
+        if let Some(doc) = &self.doc {
+            doc.release_stand_in();
+        }
     }
 
     /// The preview of an adjustment dialog (or Make Transparent) on the
@@ -634,8 +650,7 @@ impl AtelierApp {
     /// the next is ready, one computation at a time.
     pub(super) fn adjust_preview(&mut self, preview: LayerPreview) {
         let Some(doc) = &self.doc else { return };
-        let layer = doc.active_layer();
-        let (id, rev) = (layer.id, layer.rev());
+        let (id, rev) = (doc.active_layer().id, doc.target_rev());
         if let Some((done, layer, rev_then, job)) = &self.filters.adjust {
             match job.poll() {
                 Ok(None) => return,
@@ -694,6 +709,109 @@ impl AtelierApp {
         self.filters.adjust = Some((preview, id, rev, job));
     }
 
+    /// OK of the adjustment dialog: `adjustment` applied to the target
+    /// (inside the selection). The preview shown is put in when it is the
+    /// result; else the one being computed is waited for, or the result is
+    /// computed on another thread (see [`Self::adjusting_window`]).
+    pub(super) fn apply_adjustment(&mut self, adjustment: crate::pixel_ops::Adjustment) {
+        let Some(doc) = &self.doc else { return };
+        if adjustment.is_neutral() {
+            return self.record(crate::actions::Recorded::Adjust { adjustment });
+        }
+        let (doc_id, id, rev) = (doc.uid(), doc.active_layer().id, doc.target_rev());
+        let wanted = LayerPreview::Adjust(adjustment.clone());
+        if let Some(p) = self
+            .preview_shown
+            .take_if(|p| (&p.preview, p.layer, p.rev) == (&wanted, id, rev))
+        {
+            return self.put_adjustment(adjustment, Arc::unwrap_or_clone(p.image));
+        }
+        self.preview_shown = None;
+        let Some(doc) = &self.doc else { return };
+        let job = match self.filters.adjust.take() {
+            Some((preview, layer, rev_then, job))
+                if (&preview, layer, rev_then) == (&wanted, id, rev) && !job.stopped() =>
+            {
+                job
+            }
+            _ => {
+                let Some(target) = active_target(doc, self.selection.as_ref()) else {
+                    self.status = t!("status-selection-empty");
+                    return;
+                };
+                let name = format!("Adjustment: {:?}", adjustment.kind());
+                let a = adjustment.clone();
+                Job::spawn(&self.ctx, 0, [0; 4], Some(name), move || {
+                    target.process(0, |image, _| a.apply(image))
+                })
+            }
+        };
+        self.filters.adjusting = Some(AdjustApplying {
+            adjustment,
+            doc: doc_id,
+            layer: id,
+            rev,
+            started: self.ctx.input(|i| i.time),
+            job,
+        });
+    }
+
+    /// The adjustment's result `image` replaces the target's pixels (one
+    /// step; computed again here if it no longer fits them), and is
+    /// recorded.
+    fn put_adjustment(&mut self, adjustment: crate::pixel_ops::Adjustment, image: RgbaImage) {
+        let Some(doc) = &mut self.doc else { return };
+        if doc.put_processed_active(adjustment.title(), image)
+            || doc.adjust_active(&adjustment, self.selection.as_ref())
+        {
+            self.status = t!("dialog-adjust-applied", name = adjustment.title());
+        }
+        self.record(crate::actions::Recorded::Adjust { adjustment });
+    }
+
+    /// The indicator of an adjustment being applied, then its result put
+    /// in. Returns whether one is under way.
+    pub(super) fn adjusting_window(&mut self, ctx: &egui::Context) -> bool {
+        let Some(a) = &self.filters.adjusting else {
+            return false;
+        };
+        let result = match a.job.poll() {
+            Ok(None) => {
+                let name = a.adjustment.title();
+                if cancellable_indicator(ctx, "adjust_busy", &name, a.started, None) {
+                    self.filters.adjusting = None;
+                    self.status = t!("retouch-status-cancelled", name = name.as_str());
+                    self.actions.step_stopped(Stopped::Cancelled);
+                    self.reset_pending();
+                    return false;
+                }
+                return true;
+            }
+            Ok(Some(image)) => Some(image),
+            Err(()) => None,
+        };
+        let a = self.filters.adjusting.take().expect("checked above");
+        let current = self.doc.as_ref().is_some_and(|d| {
+            (d.uid(), d.active_layer().id, d.target_rev()) == (a.doc, a.layer, a.rev)
+        });
+        match result {
+            Some(image) if current => self.put_adjustment(a.adjustment, image),
+            Some(_) => {}
+            None => {
+                let adjustment = a.adjustment;
+                let text = tm!(
+                    "fx3-filter-failed",
+                    name = Message::of(|| adjustment.title())
+                );
+                self.actions
+                    .step_stopped(Stopped::Failed(text.shown.clone()));
+                self.status_failed(text);
+            }
+        }
+        self.reset_pending();
+        false
+    }
+
     /// The adjustment dialog closed: its preview being computed is dropped.
     pub(super) fn forget_adjust_preview(&mut self) {
         self.filters.adjust = None;
@@ -712,9 +830,9 @@ impl AtelierApp {
     }
 
     fn refuse_hidden(&mut self, filter: bool) -> bool {
-        match self.hidden_target(filter) {
-            Some(text) => {
-                self.status = text;
+        match self.hidden_message(filter) {
+            Some(message) => {
+                self.status_failed(message);
                 true
             }
             None => false,
@@ -725,15 +843,22 @@ impl AtelierApp {
     /// group). `filter`: in a filter's words. In Quick Mask Mode, the mask
     /// is changed instead, always shown.
     pub(super) fn hidden_target(&self, filter: bool) -> Option<String> {
+        self.hidden_message(filter).map(|m| m.shown)
+    }
+
+    /// [`Self::hidden_target`], for the report too: the hidden group named
+    /// when the layer's own eye is on.
+    fn hidden_message(&self, filter: bool) -> Option<crate::i18n::Message> {
         let doc = self.doc.as_ref()?;
         if doc.shown(doc.active) || doc.quick_mask().is_some() {
             return None;
         }
         let name = doc.active_layer().name.as_str();
-        Some(if filter {
-            t!("fx3-filter-layer-hidden", name = name)
-        } else {
-            t!("fx4-layer-hidden", name = name)
+        Some(match (self.hidden_group(), filter) {
+            (Some(group), true) => tm!("tools6-status-group-hidden-filter", name = name, group = group),
+            (Some(group), false) => tm!("tools6-status-group-hidden", name = name, group = group),
+            (None, true) => tm!("fx3-filter-layer-hidden", name = name),
+            (None, false) => tm!("fx4-layer-hidden", name = name),
         })
     }
 
@@ -855,6 +980,9 @@ impl AtelierApp {
         } else if out.cancel {
             self.end_layer_preview();
             self.shrink_after_preview();
+            if let Some(doc) = &self.doc {
+                doc.release_stand_in();
+            }
         } else {
             self.filters.dialog = Some(dialog);
         }
@@ -1882,5 +2010,164 @@ mod tests {
         h.run_steps(1);
         let moved = h.state().filters.dialog.as_ref().unwrap().center;
         assert!(moved.x < center.x, "{center:?} → {moved:?}");
+    }
+
+    /// A document of `w` × `h` with varied colors.
+    fn sized(w: u32, h: u32) -> Harness<'static, AtelierApp> {
+        let mut harness = Harness::builder()
+            .with_size([1200.0, 900.0])
+            .build_eframe(move |cc| {
+                let mut app = AtelierApp::new(cc, None);
+                let image = image::RgbaImage::from_fn(w, h, |x, y| {
+                    image::Rgba([(x % 251) as u8, (y % 241) as u8, 90, 255])
+                });
+                app.doc = Some(Document::new(image, None));
+                app
+            });
+        harness.run_steps(2);
+        harness
+    }
+
+    /// Levels and Curves show the histogram of the targeted mask, and of
+    /// the quick mask, as they are now: not the one of before an edit.
+    #[test]
+    fn histogram_follows_mask_and_quick_mask_edits() {
+        use crate::pixel_ops::Adjustment;
+        let mut h = sized(300, 200);
+        let app = h.state_mut();
+        let doc = app.doc.as_mut().unwrap();
+        assert!(doc.add_mask(crate::document::NewMask::RevealAll, None));
+        doc.target_mask(true);
+        let white = app.active_histogram().unwrap();
+        assert_eq!(white[0][0], 0);
+        let doc = app.doc.as_mut().unwrap();
+        assert!(doc.adjust_active(&Adjustment::Invert, None));
+        let cached = app.active_histogram().unwrap();
+        app.histogram = None;
+        assert_eq!(cached, app.active_histogram().unwrap(), "layer mask");
+        assert_eq!(cached[0][255], 0, "the mask is black now");
+
+        let doc = app.doc.as_mut().unwrap();
+        doc.target_mask(false);
+        app.selection = Some(
+            crate::document::PixelRect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 200,
+            }
+            .into(),
+        );
+        app.run(Action::Select(
+            super::super::select_menu::Command::QuickMask,
+        ));
+        h.run_steps(2);
+        let app = h.state_mut();
+        assert!(app.doc.as_ref().unwrap().quick_mask().is_some());
+        app.selection = None;
+        let before = app.active_histogram().unwrap();
+        let doc = app.doc.as_mut().unwrap();
+        assert!(doc.adjust_active(&Adjustment::Invert, None));
+        let cached = app.active_histogram().unwrap();
+        app.histogram = None;
+        assert_eq!(cached, app.active_histogram().unwrap(), "quick mask");
+        assert_ne!(cached, before);
+    }
+
+    /// Liquify and the Camera Raw Filter opened with a selection off the
+    /// canvas say so and leave the layer as it was (not enlarged).
+    #[test]
+    fn liquify_and_camera_raw_with_an_empty_selection_leave_the_layer() {
+        for which in ["liquify", "camera raw"] {
+            let mut h = sized(300, 200);
+            let app = h.state_mut();
+            let doc = app.doc.as_mut().unwrap();
+            let small = image::RgbaImage::from_pixel(50, 50, image::Rgba([200, 0, 0, 255]));
+            doc.add_layer("small".into(), small, (20, 20));
+            let depth = doc.history().1;
+            app.selection = Some(
+                crate::document::PixelRect {
+                    x: 1000,
+                    y: 1000,
+                    w: 30,
+                    h: 30,
+                }
+                .into(),
+            );
+            match which {
+                "liquify" => app.open_liquify_with(None),
+                _ => app.camera_raw_filter(None),
+            }
+            h.run_steps(3);
+            let app = h.state();
+            let doc = app.doc.as_ref().unwrap();
+            let layer = doc.active_layer();
+            assert_eq!(layer.image().dimensions(), (50, 50), "{which}");
+            assert_eq!(layer.offset, (20, 20), "{which}");
+            assert_eq!(doc.history().1, depth, "{which}");
+            assert_eq!(app.status, t!("status-selection-empty"), "{which}");
+            assert!(!app.liquify.busy() && !app.camera_raw.busy(), "{which}");
+        }
+    }
+
+    /// OK of an adjustment puts in the preview's result when it is shown
+    /// (nothing computed again on the UI thread); without one, the result
+    /// is computed on another thread, then put in and recorded.
+    #[test]
+    fn adjustment_ok_reuses_its_preview_or_computes_off_the_ui_thread() {
+        use crate::pixel_ops::{Adjustment, HueSaturation};
+        let hue = Adjustment::HueSaturation(HueSaturation {
+            hue: 40.0,
+            ..Default::default()
+        });
+        let mut h = sized(200, 150);
+        let expected = {
+            let doc = h.state().doc.as_ref().unwrap();
+            doc.processed_active(None, |i| hue.apply(i)).unwrap()
+        };
+        h.state_mut().run(Action::Adjust(AdjustKind::HueSaturation));
+        h.state_mut().adjust.as_mut().unwrap().adjustment = hue.clone();
+        let wanted = LayerPreview::Adjust(hue.clone());
+        settle(&mut h, |app| {
+            app.preview_shown
+                .as_ref()
+                .is_some_and(|p| p.preview == wanted)
+        });
+        let app = h.state_mut();
+        let dialog = app.adjust.take().unwrap();
+        app.apply_adjustment(dialog.adjustment);
+        assert!(app.filters.adjusting.is_none(), "put in at once");
+        assert_eq!(pixels(&h), expected);
+        assert_eq!(h.state().doc.as_ref().unwrap().history().1, 1);
+
+        // No preview: on another thread, one step, recorded once in.
+        let mut h = sized(200, 150);
+        let expected = {
+            let doc = h.state().doc.as_ref().unwrap();
+            doc.processed_active(None, |i| hue.apply(i)).unwrap()
+        };
+        let app = h.state_mut();
+        app.actions.library.sets = vec![crate::actions::Set {
+            name: "S".into(),
+            actions: vec![crate::actions::Sequence {
+                name: "A".into(),
+                key: None,
+                steps: Vec::new(),
+                expanded: true,
+            }],
+            expanded: true,
+        }];
+        app.actions.start_recording((0, 0));
+        app.apply_adjustment(hue.clone());
+        assert!(
+            app.filters.adjusting.is_some(),
+            "computed on another thread"
+        );
+        assert!(app.modal_open(), "the image waits for it");
+        settle(&mut h, |app| app.filters.adjusting.is_none());
+        assert_eq!(pixels(&h), expected);
+        let app = h.state();
+        assert_eq!(app.doc.as_ref().unwrap().history().1, 1);
+        assert_eq!(app.actions.library.sets[0].actions[0].steps.len(), 1);
     }
 }

@@ -282,6 +282,9 @@ fn search_button(ui: &mut egui::Ui, free: Rect) -> Option<egui::Response> {
         );
     }
     let response = response.on_hover_cursor(CursorIcon::PointingHand);
+    // A button that opens the palette, named as the field it looks like.
+    let name = t!("palette-placeholder");
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
     Some(if width < full {
         response.on_hover_text(t!("palette-placeholder"))
     } else {
@@ -348,6 +351,8 @@ fn window_button(ui: &mut egui::Ui, kind: WindowButton, tip: &str) -> egui::Resp
             painter.line_segment([p(10.0, 2.0), p(2.0, 10.0)], stroke);
         }
     }
+    // Painted: named by its tooltip for screen readers.
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tip));
     response.on_hover_text(tip)
 }
 

@@ -129,6 +129,16 @@ struct Manifest {
     exif: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     photoshop_resources: Option<String>,
+    /// The canvas and channels those resources describe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    photoshop_layout: Option<PhotoshopLayoutEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PhotoshopLayoutEntry {
+    width: u32,
+    height: u32,
+    channels: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -968,6 +978,15 @@ pub(super) fn write(
         exif: doc.file_metadata.exif.is_some().then(|| EXIF.into()),
         photoshop_resources: (!doc.file_metadata.psd_resources.is_empty())
             .then(|| PSD_RESOURCES.into()),
+        photoshop_layout: doc
+            .file_metadata
+            .psd_layout
+            .as_ref()
+            .map(|l| PhotoshopLayoutEntry {
+                width: l.canvas.0,
+                height: l.canvas.1,
+                channels: l.channels.clone(),
+            }),
     };
 
     let mut zip = ZipWriter::new(out);
@@ -1394,9 +1413,9 @@ fn layer_entry(layer: &super::Layer, image: Option<String>) -> LayerEntry {
     }
 }
 
-/// Reads an Atelier document.
-pub(super) fn read(path: &Path) -> Result<Document, FileError> {
-    read_archive(&mut open(path)?, Some(path), &mut Budget::new())
+/// Reads an Atelier document, within `memory`.
+pub(super) fn read(path: &Path, memory: super::file_io::MemoryUse) -> Result<Document, FileError> {
+    read_archive(&mut open(path)?, Some(path), &mut memory.budget())
 }
 
 /// An Atelier document held in memory (a smart object's contents), its
@@ -1430,7 +1449,8 @@ impl<'a> Claims<'a> {
         }
     }
 
-    /// [`read_pixels`], once per entry, the pixels taken from the budget.
+    /// [`read_pixels`], once per entry, the pixels and the PNG holding
+    /// them (both in memory until it is decoded) taken from the budget.
     pub(super) fn pixels(
         &mut self,
         zip: &mut ZipArchive<impl Read + Seek>,
@@ -1440,21 +1460,64 @@ impl<'a> Claims<'a> {
     ) -> Result<Vec<u8>, FileError> {
         self.claim(name)?;
         self.budget.take(size.0, size.1, bpp)?;
-        read_pixels(zip, name, size, bpp)
+        let png = read_pixels(zip, name, size, bpp)?;
+        self.budget.take_bytes(png.len() as u64)?;
+        Ok(png)
+    }
+
+    /// The bytes of entry `name` (`limit` at most), once, taken from the
+    /// budget; refused when its stored bytes are too few to hold them,
+    /// inflated more than `ratio` times (a few megabytes of deflated zeros
+    /// would otherwise claim gigabytes).
+    pub(super) fn bytes(
+        &mut self,
+        zip: &mut ZipArchive<impl Read + Seek>,
+        name: &str,
+        limit: u64,
+        ratio: u64,
+    ) -> Result<Vec<u8>, FileError> {
+        self.claim(name)?;
+        let entry = zip.by_name(name).map_err(zip_error)?;
+        if entry.compressed_size().saturating_mul(ratio) + (1 << 16) < entry.size() {
+            return Err(FileError::Damaged);
+        }
+        let size = entry.size();
+        drop(entry);
+        self.budget.take_bytes(size.min(limit))?;
+        read_entry(zip, name, limit)
     }
 
     /// An embedded document (`limit` bytes at most), its bytes taken from
-    /// the budget, then read.
+    /// the budget, then read. Atelier stores it as it is (its pictures are
+    /// compressed already): deflated, it can't shrink much.
     pub(super) fn document(
         &mut self,
         zip: &mut ZipArchive<impl Read + Seek>,
         name: &str,
         limit: u64,
     ) -> Result<Document, FileError> {
-        self.claim(name)?;
-        let data = read_entry(zip, name, limit.min(self.budget.left()))?;
-        self.budget.take_bytes(data.len() as u64)?;
+        let data = self.bytes(zip, name, limit, 64)?;
         read_bytes(&data, self.budget)
+    }
+}
+
+/// Refuses an archive two of whose entries share stored bytes: a central
+/// directory may give many names to one entry, each of which would
+/// decode to its own copy (Atelier never writes such archives).
+fn check_overlaps(zip: &mut ZipArchive<impl Read + Seek>) -> Result<(), FileError> {
+    let mut ranges = Vec::with_capacity(zip.len());
+    for i in 0..zip.len() {
+        let entry = zip.by_index_raw(i).map_err(zip_error)?;
+        let start = entry.data_start().ok_or(FileError::Damaged)?;
+        let end = start
+            .checked_add(entry.compressed_size())
+            .ok_or(FileError::Damaged)?;
+        ranges.push((entry.header_start(), start, end));
+    }
+    ranges.sort_unstable();
+    match ranges.windows(2).all(|w| w[0].2 <= w[1].0) {
+        true => Ok(()),
+        false => Err(FileError::Damaged),
     }
 }
 
@@ -1464,6 +1527,7 @@ fn read_archive(
     path: Option<&Path>,
     budget: &mut Budget,
 ) -> Result<Document, FileError> {
+    check_overlaps(zip)?;
     let mut claims = Claims::new(budget);
     let manifest = read_manifest(zip)?;
     check_size(manifest.width, manifest.height)?;
@@ -1524,6 +1588,13 @@ fn read_archive(
         let data = read_entry(zip, name, MAX_SMALL_ENTRY)?;
         file_metadata.psd_resources = Arc::new(resources_of(&data).ok_or(FileError::Damaged)?);
     }
+    file_metadata.psd_layout = manifest
+        .photoshop_layout
+        .as_ref()
+        .map(|l| super::PsdLayout {
+            canvas: (l.width, l.height),
+            channels: l.channels.clone(),
+        });
 
     let mut doc = Document::new(RgbaImage::new(0, 0), path.map(Path::to_path_buf));
     let folder = path.and_then(Path::parent);
@@ -2489,6 +2560,89 @@ mod tests {
         assert!(read(1 << 20).is_ok());
     }
 
+    /// A central directory giving a layer's name to another layer's
+    /// entry (each name would decode to its own copy, past any per-name
+    /// check): the archive is refused.
+    #[test]
+    fn aliased_entries_are_refused() {
+        let path = temp("aliased-entry");
+        let mut doc = Document::new(RgbaImage::from_pixel(8, 8, Rgba([9, 9, 9, 255])), None);
+        doc.add_layer(
+            "A".into(),
+            RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 255])),
+            (0, 0),
+        );
+        doc.save(&path).unwrap();
+        let mut data = std::fs::read(&path).unwrap();
+        let u16_at = |d: &[u8], at: usize| u16::from_le_bytes([d[at], d[at + 1]]) as usize;
+        let u32_at = |d: &[u8], at: usize| u32::from_le_bytes(d[at..at + 4].try_into().unwrap());
+        let end = data.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
+        let (count, mut at) = (u16_at(&data, end + 10), u32_at(&data, end + 16) as usize);
+        // The central records of the two layers' pictures.
+        let mut layers = Vec::new();
+        for _ in 0..count {
+            let n = u16_at(&data, at + 28);
+            let name = String::from_utf8_lossy(&data[at + 46..at + 46 + n]).to_string();
+            if name.starts_with("layers/") {
+                layers.push(at);
+            }
+            at += 46 + n + u16_at(&data, at + 30) + u16_at(&data, at + 32);
+        }
+        let [first, second] = layers[..] else {
+            panic!("{layers:?}")
+        };
+        // CRC, sizes and local header of the first, for the second.
+        let fields: Vec<u8> =
+            [&data[first + 16..first + 28], &data[first + 42..first + 46]].concat();
+        data[second + 16..second + 28].copy_from_slice(&fields[..12]);
+        data[second + 42..second + 46].copy_from_slice(&fields[12..]);
+        let aliased = path.with_file_name("aliased.atelier");
+        std::fs::write(&aliased, &data).unwrap();
+        assert!(matches!(Document::open(&aliased), Err(FileError::Damaged)));
+        assert!(Document::open(&path).is_ok());
+    }
+
+    /// An embedded document deflated far more than one holding pictures
+    /// can be (a smart object's contents of deflated zeros): refused before
+    /// it is read. Stored, as Atelier writes it, it is read.
+    #[test]
+    fn embedded_documents_hold_what_their_bytes_can() {
+        let mut out = ZipWriter::new(Cursor::new(Vec::new()));
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let deflated = stored.compression_method(CompressionMethod::Deflated);
+        out.start_file("smart/1.atelier", deflated).unwrap();
+        out.write_all(&vec![0; 8 << 20]).unwrap();
+        out.start_file("smart/2.atelier", stored).unwrap();
+        out.write_all(&vec![0; 1 << 20]).unwrap();
+        let mut zip = ZipArchive::new(Cursor::new(out.finish().unwrap().into_inner())).unwrap();
+        let mut budget = Budget::of(1 << 30);
+        let mut claims = Claims::new(&mut budget);
+        assert!(matches!(
+            claims.bytes(&mut zip, "smart/1.atelier", 16 << 30, 64),
+            Err(FileError::Damaged)
+        ));
+        assert_eq!(
+            claims
+                .bytes(&mut zip, "smart/2.atelier", 16 << 30, 64)
+                .unwrap()
+                .len(),
+            1 << 20
+        );
+        // Read once.
+        assert!(
+            claims
+                .bytes(&mut zip, "smart/2.atelier", 16 << 30, 64)
+                .is_err()
+        );
+        // Its bytes come out of the budget before they are read.
+        let mut budget = Budget::of(1000);
+        let mut claims = Claims::new(&mut budget);
+        assert!(matches!(
+            claims.bytes(&mut zip, "smart/2.atelier", 16 << 30, 64),
+            Err(FileError::OutOfMemory(1000))
+        ));
+    }
+
     /// No layer is written that the readers would refuse.
     #[test]
     fn layers_no_reader_takes_are_not_written() {
@@ -2539,6 +2693,10 @@ mod tests {
                 data: b"<x:xmpmeta/>".to_vec(),
             },
         ]);
+        doc.file_metadata.psd_layout = Some(crate::document::PsdLayout {
+            canvas: (4, 4),
+            channels: vec!["Alpha 1".into()],
+        });
         doc.save(&path).unwrap();
         let back = Document::open(&path).unwrap().doc;
         assert_eq!(back.file_metadata, doc.file_metadata);

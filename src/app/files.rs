@@ -11,11 +11,28 @@ pub(super) const OPEN_EXTENSIONS: &[&str] = &[
     "tiff", "tga", "ico", "qoi",
 ];
 
+/// A file whose opening needs more memory than is free: asked first.
+pub(super) struct OpenAnyway {
+    path: PathBuf,
+    /// What is free, in bytes.
+    free: u64,
+}
+
 impl AtelierApp {
     pub(super) fn open_path(&mut self, path: &Path) {
+        self.open_path_within(path, crate::document::MemoryUse::Free);
+    }
+
+    /// [`Self::open_path`], taking at most `memory`.
+    fn open_path_within(&mut self, path: &Path, memory: crate::document::MemoryUse) {
         // Already open: show its tab, like Photoshop.
         if let Some(i) = self.tab_of(path) {
             self.switch_tab(i);
+            return;
+        }
+        // A crop box drawn: asked first.
+        let later = path.to_path_buf();
+        if self.crop_first(move |app| app.open_path_within(&later, memory)) {
             return;
         }
         // A camera RAW file opens in Camera Raw first.
@@ -25,9 +42,16 @@ impl AtelierApp {
         }
         let shown = path.display().to_string();
         let started = std::time::Instant::now();
-        let opened = Document::open(path);
+        let opened = Document::open_within(path, memory);
         crate::diag::record(format!("Open: {}", format_of(path)), started.elapsed());
         match opened {
+            // An honest file larger than what is free: asked (Batch logs it).
+            Err(crate::document::FileError::LowMemory(free)) if !self.automate.running() => {
+                self.open_anyway = Some(OpenAnyway {
+                    path: path.to_path_buf(),
+                    free,
+                });
+            }
             Ok(opened) => {
                 self.status = if opened.animated {
                     t!("file-status-opened-first-frame", path = shown)
@@ -57,6 +81,42 @@ impl AtelierApp {
                     error = crate::i18n::Message::of(|| e.to_string())
                 ));
             }
+        }
+    }
+
+    /// "Open anyway?" for a file needing more memory than is free.
+    pub(super) fn open_anyway_window(&mut self, ctx: &egui::Context) {
+        let Some(ask) = &self.open_anyway else { return };
+        let name = file_name(&ask.path);
+        let free = (ask.free as f64 / f64::from(1 << 30)).round().max(1.0);
+        let center = ctx.content_rect().center();
+        let out = dialogs::floating_dialog(
+            ctx,
+            dialogs::DialogSpec {
+                pivot: egui::Align2::CENTER_CENTER,
+                width: 420.0,
+                ok: t!("files6-open-anyway-ok"),
+                first_field: false,
+                ..dialogs::DialogSpec::new("open_anyway", t!("files6-open-anyway-title"), center)
+            },
+            |ui| {
+                ui.label(t!(
+                    "files6-open-anyway-text",
+                    name = name.as_str(),
+                    free = free
+                ));
+            },
+        );
+        if !out.ok && !out.cancel {
+            return;
+        }
+        let Some(ask) = self.open_anyway.take() else {
+            return;
+        };
+        if out.ok {
+            self.open_path_within(&ask.path, crate::document::MemoryUse::Anyway);
+        } else {
+            self.status = t!("files6-status-open-cancelled", name = name.as_str());
         }
     }
 
@@ -312,6 +372,10 @@ impl AtelierApp {
             self.status = t!("files3-status-paste-into-no-selection");
             return;
         }
+        if self.crop_box_pending() {
+            self.crop_first(move |app| app.paste_image(image, mode));
+            return;
+        }
         self.commit_pending();
         // Paste in Place: where the same pixels were copied from (as
         // Paste otherwise): centered on the selection, else on the part
@@ -418,8 +482,21 @@ impl AtelierApp {
             egui::StrokeKind::Inside,
         );
         let key = super::keys::shortcut(ctx, &SHORTCUT_OPEN);
+        // Atelier documents open in a tab: said when the paths are known
+        // (Windows, X11).
+        let native: Vec<bool> = ctx.input(|i| {
+            let paths = i.raw.hovered_files.iter().filter_map(|f| f.path.as_deref());
+            paths.map(is_native).collect()
+        });
+        let text = if !native.is_empty() && native.iter().all(|&n| n) {
+            t!("ui6-drop-open-hint")
+        } else if native.contains(&true) {
+            t!("ui6-drop-mixed-hint")
+        } else {
+            t!("ui5-drop-place-hint", key = key)
+        };
         let galley = painter.layout(
-            t!("ui5-drop-place-hint", key = key),
+            text,
             egui::FontId::proportional(15.0),
             color::TEXT,
             (area.width() - 80.0).max(120.0),
@@ -917,5 +994,34 @@ mod tests {
             seen.contains(center) && x < 300 && y < 300,
             "{x}, {y} in {seen:?}"
         );
+    }
+
+    /// A document needing more memory than is free asks first: Cancel
+    /// leaves it, Open Anyway opens it.
+    #[test]
+    fn a_file_needing_more_than_the_free_memory_asks_first() {
+        use egui_kittest::kittest::Queryable as _;
+        let dir = folder("open-anyway");
+        let path = dir.join("big.atelier");
+        Document::new(image([9, 9, 9, 255]), None)
+            .save(&path)
+            .unwrap();
+        let mut harness = harness(Vec::new());
+        crate::document::set_test_free_memory(Some(1000));
+        harness.state_mut().open_path(&path);
+        harness.run_steps(2);
+        assert!(harness.state().open_anyway.is_some());
+        assert_eq!(harness.state().tab_count(), 0);
+        harness.get_by_label(&t!("dialog-cancel")).click();
+        harness.run_steps(2);
+        assert!(harness.state().open_anyway.is_none());
+        assert_eq!(harness.state().tab_count(), 0);
+        harness.state_mut().open_path(&path);
+        harness.run_steps(2);
+        harness.get_by_label(&t!("files6-open-anyway-ok")).click();
+        harness.run_steps(2);
+        crate::document::set_test_free_memory(None);
+        assert!(harness.state().open_anyway.is_none());
+        assert_eq!(harness.state().tab_count(), 1);
     }
 }

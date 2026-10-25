@@ -361,3 +361,206 @@ fn a_tall_panel_lists_more_layers() {
 fn steps_of(h: &Harness<'static, AtelierApp>) -> usize {
     h.state().doc.as_ref().unwrap().history().0.len()
 }
+
+/// Floating panels opened one by one from the menus (the usual way), in
+/// small windows: none hides the title bar of one opened before (where
+/// the five can't all fit, the Actions panel being tall, one is partly
+/// covered at most).
+#[test]
+fn panels_opened_one_by_one_leave_the_title_bars_in_sight() {
+    for (lang, size, overlaps) in [
+        (Lang::En, [1024.0, 700.0], 1),
+        (Lang::Fr, [1280.0, 720.0], 1),
+        (Lang::Fr, [1366.0, 768.0], 0),
+    ] {
+        let mut h = window_with(lang, size, Tool::Brush);
+        let panels = [
+            (Action::History, "history"),
+            (Action::Channels, "channels"),
+            (Action::Paths, "paths"),
+            (Action::Swatches, "swatches"),
+            (Action::Automate(actions_panel::Command::Panel), "actions"),
+        ];
+        for (action, _) in panels {
+            h.state_mut().run(action);
+            h.run_steps(6);
+        }
+        let rects: Vec<(&str, Rect)> = panels
+            .iter()
+            .map(|&(_, id)| {
+                let r = h.ctx.memory(|m| m.area_rect(egui::Id::new(id)));
+                (id, r.unwrap_or_else(|| panic!("{id} shown")))
+            })
+            .collect();
+        i18n::set_lang(Lang::En);
+        let mut covered = 0;
+        for (i, (b, rb)) in rects.iter().enumerate() {
+            // Its title, left of the ✕.
+            let title = Rect::from_min_size(rb.min, vec2(rb.width() - 32.0, 20.0));
+            for (a, ra) in &rects[i + 1..] {
+                assert!(
+                    !ra.contains_rect(title),
+                    "{size:?}: {b} {rb:?} under {a} {ra:?}"
+                );
+                covered += usize::from(ra.intersects(title));
+            }
+        }
+        assert!(covered <= overlaps, "{size:?}: {rects:?}");
+    }
+}
+
+/// A click on a layer whose Properties are taller doesn't move the rows
+/// under the pointer: the list keeps its height while the pointer is over
+/// the panel.
+#[test]
+fn the_layers_list_keeps_its_height_under_the_pointer() {
+    let mut h = window_with(Lang::En, [1920.0, 1080.0], Tool::Brush);
+    for _ in 0..8 {
+        h.state_mut().run(Action::NewLayer);
+    }
+    h.run_steps(3);
+    let rows = |h: &Harness<'static, AtelierApp>| {
+        h.ctx
+            .data(|d| d.get_temp::<(f32, usize)>(egui::Id::new("side-visible-rows")))
+            .expect("list shown")
+            .1
+    };
+    let heading = h.get_by_label(&t!("panel-layers")).rect();
+    h.hover_at(heading.center() + vec2(0.0, 80.0));
+    h.run_steps(2);
+    let before = rows(&h);
+    // Properties suddenly much shorter (another layer's): the list would
+    // grow.
+    let natural = egui::Id::new("side-properties-natural");
+    h.ctx.data_mut(|d| d.insert_temp(natural, 0.0f32));
+    h.run_steps(1);
+    assert_eq!(rows(&h), before, "kept under the pointer");
+    // Once the pointer leaves, it fits again.
+    h.hover_at(pos2(400.0, 500.0));
+    h.ctx.data_mut(|d| d.insert_temp(natural, 0.0f32));
+    h.run_steps(1);
+    assert!(rows(&h) > before, "{} > {before}", rows(&h));
+}
+
+/// The blend row sits between the Layers heading and the list, the first
+/// row not over it.
+#[test]
+fn the_blend_row_is_clear_of_the_list() {
+    let h = window_with(Lang::Fr, [1366.0, 768.0], Tool::Brush);
+    let heading = h.get_by_label(&t!("panel-layers")).rect();
+    let blend = h.get_by_label(&t!("panel-blend-mode")).rect();
+    // The heading bar, then the blend row (36 px, its fields 4 px in),
+    // then the list.
+    assert!(blend.top() >= heading.bottom(), "{blend:?} {heading:?}");
+    assert!(
+        blend.bottom() <= heading.bottom() + 36.0 - 3.0,
+        "{blend:?} {heading:?}"
+    );
+}
+
+/// Painted controls are named for screen readers: dialog footers, slider
+/// values, the Levels fields, the color squares, the Quick Mask button,
+/// the search box of the title bar.
+#[test]
+fn painted_controls_have_names() {
+    use egui_kittest::kittest::NodeT as _;
+    let mut h = window_with(Lang::En, [1400.0, 900.0], Tool::Brush);
+    // (A name may show twice.)
+    let role = |h: &Harness<'static, AtelierApp>, name: &str| {
+        let roles: Vec<_> = h
+            .get_all_by_label(name)
+            .map(|n| n.accesskit_node().role())
+            .collect();
+        *roles
+            .iter()
+            .find(|r| **r != egui::accesskit::Role::Unknown)
+            .unwrap_or(&roles[0])
+    };
+    for name in [
+        t!("ui6-color-foreground"),
+        t!("ui6-color-background"),
+        t!("panel-swap-colors"),
+        t!("panel-default-colors"),
+        t!("sel-menu-quick-mask"),
+        t!("palette-placeholder"),
+    ] {
+        assert_ne!(role(&h, &name), egui::accesskit::Role::Unknown, "{name}");
+    }
+    h.state_mut().run(Action::ImageSize);
+    h.run_steps(4);
+    assert_eq!(role(&h, &t!("dialog-ok")), egui::accesskit::Role::Button);
+    assert_eq!(
+        role(&h, &t!("dialog-cancel")),
+        egui::accesskit::Role::Button
+    );
+    h.key_press(Key::Escape);
+    h.run_steps(3);
+    h.state_mut().run(Action::Filter(FilterKind::GaussianBlur));
+    h.run_steps(4);
+    assert!(
+        h.query_by_label(&t!("filter-radius")).is_some(),
+        "the radius field"
+    );
+    h.key_press(Key::Escape);
+    h.run_steps(3);
+    h.state_mut().run(Action::Adjust(AdjustKind::Levels));
+    h.run_steps(4);
+    for key in [
+        t!("ui6-levels-input-black"),
+        t!("ui6-levels-input-gamma"),
+        t!("ui6-levels-input-white"),
+        t!("ui6-levels-output-black"),
+        t!("ui6-levels-output-white"),
+    ] {
+        assert!(h.query_by_label(&key).is_some(), "{key}");
+    }
+}
+
+/// Arrows in Quick Mask Mode: the status gives the series' total, signed,
+/// as the step does.
+#[test]
+fn quick_mask_arrows_say_the_total_move() {
+    let mut h = window_with(Lang::En, [1400.0, 900.0], Tool::Transform);
+    let app = h.state_mut();
+    app.selection = Some(
+        PixelRect {
+            x: 20,
+            y: 20,
+            w: 60,
+            h: 60,
+        }
+        .into(),
+    );
+    app.run(Action::Select(select_menu::Command::QuickMask));
+    app.selection = None;
+    for _ in 0..3 {
+        app.nudge_quick_mask((1, 0));
+    }
+    app.nudge_quick_mask((0, -2));
+    assert_eq!(app.status, t!("qm6-status-moved", x = "+3", y = "−2"));
+}
+
+/// The names of Liquify and Camera Raw reach the log in English.
+#[test]
+fn filter_names_reach_the_log_in_english() {
+    i18n::set_lang(Lang::Fr);
+    let liquify = crate::i18n::Message::of(|| t!("liquify-title"));
+    let failed = tm!("fx3-filter-failed", name = liquify);
+    // An AI error made on a worker, in French.
+    let ai = std::thread::spawn(|| {
+        i18n::set_lang(Lang::Fr);
+        crate::ai::catch_panic::<()>(|| Err(crate::ai::Error::of(|| t!("ai-error-model-corrupt"))))
+    })
+    .join()
+    .unwrap();
+    i18n::set_lang(Lang::En);
+    assert!(
+        failed.english.contains(&t!("liquify-title")),
+        "{}",
+        failed.english
+    );
+    assert_eq!(
+        ai.err().map(|e| e.english),
+        Some(t!("ai-error-model-corrupt"))
+    );
+}

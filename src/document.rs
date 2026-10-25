@@ -41,19 +41,25 @@ pub use artboards::{
     artboard_file_stem, artboard_path, existing_artboard_files, windows_device,
 };
 pub use color::{ProofSetup, to_cmyk};
+pub use file_io::MemoryUse;
+#[cfg(test)]
+pub use file_io::set_test_free_memory;
 pub use file_io::{
-    ExportFormat, FileError, FileMetadata, MAX_DIMENSION, Opened, PsdResource, check_size,
+    ExportFormat, FileError, FileMetadata, MAX_DIMENSION, Opened, PsdLayout, PsdResource, check_size,
     file_size, file_thumbnail,
 };
 pub use file_io::{encode_cmyk, has_cmyk};
 pub use file_io::{ImageMetadata, encode_image, write_atomic};
-pub use masks::{Mask, NewMask};
+pub use masks::{Mask, NewMask, set_display_level};
+#[cfg(test)]
+pub(crate) use masks::TEST_BIG_FEATHERS;
 pub use native::is_native;
 pub use native::{adjustment_from_json, adjustment_to_json};
 pub use psd::is_psd;
 pub use shared_composite::note_painted;
 pub use smart::{
-    Contents, EmbeddedIn, Link, LinkFresh, LinkRead, LinkReport, SmartFilter, SmartFilterKind,
+    Contents, ContentsUpdate, EmbeddedIn, Link, LinkFresh, LinkRead, LinkReport, SmartFilter,
+    SmartFilterKind,
     SmartObject, SmartRender,
 };
 pub use styles_jobs::styles_pending;
@@ -513,25 +519,41 @@ fn pixels_within(layer: &Layer, r: PixelRect, selection: Option<&Selection>) -> 
         layer.offset.1 - r.y,
     );
     if let Some(s) = selection.filter(|s| s.inverted || s.mask.is_some()) {
-        for (x, y, p) in out.enumerate_pixels_mut() {
-            p.0[3] = scale(p.0[3], s.coverage(r.x + x as i64, r.y + y as i64));
-        }
+        use rayon::prelude::*;
+        let w = r.w as usize * 4;
+        // Row by row on all cores (24 megapixels: tens of milliseconds).
+        out.par_chunks_exact_mut(w.max(4)).enumerate().for_each(|(y, row)| {
+            for (x, p) in row.chunks_exact_mut(4).enumerate() {
+                p[3] = scale(p[3], s.coverage(r.x + x as i64, r.y + y as i64));
+            }
+        });
     }
     out
 }
 
-/// Modifies the pixels of `clip` one by one (layer coordinates).
-fn edit_pixels(layer: &mut Layer, clip: &Clip, mut f: impl FnMut(&mut [u8; 4], u8)) {
+/// Modifies the pixels of `clip` (layer coordinates), row by row on all
+/// cores.
+fn edit_pixels(layer: &mut Layer, clip: &Clip, f: impl Fn(&mut [u8; 4], u8) + Sync) {
+    use rayon::prelude::*;
     let [x0, y0, x1, y1] = clip.rect;
     let image = layer.pixels_mut();
-    for y in y0..y1 {
+    let w = image.width() as usize * 4;
+    if w == 0 || y1 <= y0 {
+        return;
+    }
+    let rows = image.par_chunks_exact_mut(w).skip(y0 as usize).take((y1 - y0) as usize);
+    rows.enumerate().for_each(|(j, row)| {
+        let y = y0 + j as u32;
         for x in x0..x1 {
             let coverage = clip.coverage(x, y);
             if coverage > 0 {
-                f(&mut image.get_pixel_mut(x, y).0, coverage);
+                let p: &mut [u8; 4] = (&mut row[x as usize * 4..x as usize * 4 + 4])
+                    .try_into()
+                    .expect("four bytes");
+                f(p, coverage);
             }
         }
-    }
+    });
 }
 
 /// Erases a pixel according to the selection coverage.
@@ -610,6 +632,19 @@ struct Step {
     seq: u64,
 }
 
+/// The history position a result computed in the background started
+/// from (see [`Document::history_generation`]).
+#[derive(Clone, Copy, Debug)]
+pub struct HistoryGeneration {
+    generation: u64,
+    /// Steps numbered up to this one were recorded before it.
+    seq: u64,
+}
+
+/// Steps discarded (see [`Document::history_follows`]) remembered at
+/// most: an older generation no longer follows.
+const MAX_DISCARDS: usize = 64;
+
 /// Position in the history to go back to with [`Document::rollback_to`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryMark {
@@ -657,6 +692,12 @@ pub struct Document {
     /// Changes when the history goes back or sideways (see
     /// [`Self::history_generation`]).
     generation: u64,
+    /// The generation of the last undo or redo: older ones don't follow.
+    hard_generation: u64,
+    /// Since then, the generation each discarded step gave and that step's
+    /// number, kept increasing in both (a later discard of an older step
+    /// is all that matters for the generations before it).
+    discards: Vec<(u64, u64)>,
     /// The oldest step a full history let go to record the step numbered
     /// here, and whether steps were forgotten before: given back if that
     /// step is discarded (it changed nothing).
@@ -725,6 +766,8 @@ impl Document {
             step: 0,
             seq: 0,
             generation: 0,
+            hard_generation: 0,
+            discards: Vec::new(),
             evicted: None,
             forgotten: false,
             dropped_redo: None,
@@ -751,15 +794,21 @@ impl Document {
     /// Opens an Atelier or Photoshop document, or an image file (its
     /// format read from its content) as a one-layer document.
     pub fn open(path: &Path) -> Result<Opened, FileError> {
+        Self::open_within(path, MemoryUse::Free)
+    }
+
+    /// [`Self::open`], taking at most `memory` ([`FileError::LowMemory`]
+    /// past what is free: the user may open it anyway).
+    pub fn open_within(path: &Path, memory: MemoryUse) -> Result<Opened, FileError> {
         if is_native(path) {
             return Ok(Opened {
-                doc: native::read(path)?,
+                doc: native::read(path, memory)?,
                 animated: false,
                 notes: Vec::new(),
             });
         }
         if is_psd(path) {
-            let psd::Imported { mut doc, notes } = psd::read(path)?;
+            let psd::Imported { mut doc, notes } = psd::read(path, memory)?;
             doc.file_notes = notes.clone();
             return Ok(Opened {
                 doc,
@@ -783,13 +832,14 @@ impl Document {
         doc.icc_profile = decoded.icc_profile.map(Arc::new);
         doc.file_metadata.exif = decoded.exif.map(Arc::new);
         doc.file_metadata.image = Some(Arc::new(decoded.metadata));
-        // Not said on opening (the first frame is): kept for saving over
-        // the file in its format.
-        doc.file_notes = decoded.losses;
+        // Said on opening, as for a Photoshop document (an animation says
+        // its first frame instead), and kept for saving over the file in
+        // its format.
+        doc.file_notes = decoded.losses.clone();
         Ok(Opened {
             doc,
             animated: decoded.animated,
-            notes: Vec::new(),
+            notes: decoded.losses,
         })
     }
 
@@ -892,6 +942,8 @@ impl Document {
             step: 0,
             seq: 0,
             generation: 0,
+            hard_generation: 0,
+            discards: Vec::new(),
             evicted: None,
             forgotten: false,
             dropped_redo: None,
@@ -991,7 +1043,7 @@ impl Document {
     /// Topmost visible and unlocked layer with a non-transparent pixel at
     /// (x, y).
     pub fn pick_layer(&self, x: i64, y: i64) -> Option<usize> {
-        self.layers_at(x, y).find(|&i| !self.layers[i].locked)
+        self.layers_at(x, y).find(|&i| !self.is_locked(i))
     }
 
     /// Visible layers with a non-transparent pixel at (x, y), topmost
@@ -1220,13 +1272,47 @@ impl Document {
         self.state_id
     }
 
-    /// Changes when the history goes back or sideways: an undo, a redo (a
-    /// click in the History panel), a step discarded or rolled back. Steps
-    /// recorded forward leave it as it is: a result computed in the
-    /// background still applies after them, but never over a state it was
-    /// not computed from (nor wiping the redo list it did not know).
-    pub fn history_generation(&self) -> u64 {
-        self.generation
+    /// The state the last step recorded (see [`Self::state_id`]): right
+    /// after a checkpoint, the one the document still shows.
+    pub fn last_step_state_id(&self) -> Option<u64> {
+        self.undo.back().map(|s| s.state.id)
+    }
+
+    /// The history position now, for [`Self::history_follows`]: a result
+    /// computed in the background from the current state still applies
+    /// after steps recorded forward, but never over a state it was not
+    /// computed from (nor wiping the redo list it did not know).
+    pub fn history_generation(&self) -> HistoryGeneration {
+        HistoryGeneration {
+            generation: self.generation,
+            seq: self.seq,
+        }
+    }
+
+    /// Whether the history only went forward since `from`: no undo, no
+    /// redo (a click in the History panel), and no step discarded or
+    /// rolled back that was there then. Discarding a step recorded since
+    /// (a cancelled dialog: it changed nothing) gives back a state that
+    /// followed `from`.
+    pub fn history_follows(&self, from: HistoryGeneration) -> bool {
+        if from.generation == self.generation {
+            return true;
+        }
+        if from.generation < self.hard_generation {
+            return false;
+        }
+        self.discards
+            .iter()
+            .find(|(generation, _)| *generation > from.generation)
+            .is_none_or(|(_, seq)| *seq > from.seq)
+    }
+
+    /// The history went back (an undo, a redo): every earlier generation
+    /// is about another state.
+    fn history_moved(&mut self) {
+        self.generation += 1;
+        self.hard_generation = self.generation;
+        self.discards.clear();
     }
 
     /// The document was just saved: its current state is the saved one.
@@ -1251,6 +1337,14 @@ impl Document {
             self.restore(prev.state);
             self.step += 1;
             self.generation += 1;
+            while self.discards.last().is_some_and(|(_, seq)| *seq >= prev.seq) {
+                self.discards.pop();
+            }
+            self.discards.push((self.generation, prev.seq));
+            if self.discards.len() > MAX_DISCARDS {
+                let (generation, _) = self.discards.remove(0);
+                self.hard_generation = generation;
+            }
             // The oldest step it made the history let go comes back.
             if self.evicted.as_ref().is_some_and(|(seq, ..)| *seq == prev.seq) {
                 let (_, oldest, forgotten) = self.evicted.take().expect("checked");
@@ -1313,7 +1407,7 @@ impl Document {
         self.dropped_redo = None;
         self.evicted = None;
         self.step += 1;
-        self.generation += 1;
+        self.history_moved();
         true
     }
 
@@ -1326,7 +1420,7 @@ impl Document {
         self.dropped_redo = None;
         self.evicted = None;
         self.step += 1;
-        self.generation += 1;
+        self.history_moved();
         true
     }
 
@@ -1529,14 +1623,30 @@ impl Document {
     /// New empty layer, numbered like Photoshop's ("Layer 1", "Layer 2"…:
     /// a counter per document, skipping names already in use).
     pub fn add_empty_layer(&mut self) {
-        let name = loop {
+        let name = self.next_layer_name();
+        self.add_layer(name, RgbaImage::new(self.canvas.0, self.canvas.1), (0, 0));
+    }
+
+    /// "Layer n", n never used before in the document.
+    fn next_layer_name(&mut self) -> String {
+        loop {
             self.layer_number += 1;
             let name = t!("doc-layer-default-name", number = self.layer_number);
             if self.layers.iter().all(|l| l.name != name) {
                 break name;
             }
+        }
+    }
+
+    /// Stamp Visible (Alt+Shift+Ctrl+E): what is visible, merged into a new
+    /// layer above the active one; the layers stay. One step.
+    pub fn stamp_visible(&mut self) -> bool {
+        let Some((image, r)) = self.merged_pixels(None) else {
+            return false;
         };
-        self.add_layer(name, RgbaImage::new(self.canvas.0, self.canvas.1), (0, 0));
+        let name = self.next_layer_name();
+        self.add_layer_as(t!("input6-hist-stamp-visible"), name, image, (r.x, r.y));
+        true
     }
 
     /// Splits the active layer into one layer per group of visible pixels
@@ -1775,6 +1885,22 @@ impl Document {
             && self.replace_active(adjustment.title(), within, |image| adjustment.apply(image))
     }
 
+    /// Records the step `name` and puts `image`, what
+    /// [`Self::processed_active`] gave on another thread (a dialog's
+    /// preview), in place of the target's pixels. Refused (`false`) when it
+    /// no longer fits them.
+    pub fn put_processed_active(&mut self, name: String, image: RgbaImage) -> bool {
+        self.with_target(|doc| {
+            if doc.active_layer().image().dimensions() != image.dimensions() {
+                return false;
+            }
+            doc.checkpoint(name);
+            doc.active_layer_mut().replace_pixels(image);
+            true
+        })
+        .unwrap_or(false)
+    }
+
     /// Records the step `name` and replaces the active layer's pixels with
     /// [`Self::processed_active`].
     fn replace_active(
@@ -1811,19 +1937,22 @@ impl Document {
         (p[3] > 0).then_some(p)
     }
 
-    /// Aligns the layers `indices` (their visible pixels): to the canvas if
-    /// there is only one, to each other otherwise. Locked layers don't move.
-    /// Returns `false` if nothing moved.
-    pub fn align(&mut self, indices: &[usize], op: AlignOp) -> bool {
+    /// Aligns the layers `indices` (their visible pixels): to `to` (the
+    /// selection's bounds) when given, else to the canvas if there is only
+    /// one, to each other otherwise. Locked layers don't move. Returns
+    /// `false` if nothing moved.
+    pub fn align(&mut self, indices: &[usize], op: AlignOp, to: Option<PixelRect>) -> bool {
         let items: Vec<(usize, PixelRect)> = indices
             .iter()
-            .filter(|&&i| i < self.layers.len() && !self.layers[i].locked)
+            .filter(|&&i| i < self.layers.len() && !self.is_locked(i))
             .filter_map(|&i| self.element_bounds(i).map(|b| (i, b)))
             .collect();
         if items.is_empty() {
             return false;
         }
-        let reference = if indices.len() == 1 {
+        let reference = if let Some(to) = to {
+            to
+        } else if indices.len() == 1 {
             self.full_rect()
         } else {
             items
@@ -2041,7 +2170,8 @@ impl Document {
         ) else {
             return None;
         };
-        if pixels.pixels().all(|p| p.0[3] == 0) {
+        use rayon::prelude::*;
+        if !pixels.par_chunks_exact(4).any(|p| p[3] != 0) {
             return None;
         }
         self.checkpoint(t!("xchg-hist-move"));
@@ -2089,11 +2219,25 @@ impl Document {
             (floating.offset.1 - target.offset.1) as u32,
         );
         let image = target.pixels_mut();
-        for (x, y, p) in floating.image().enumerate_pixels() {
-            if p.0[3] > 0 {
-                let dst = image.get_pixel_mut(x + dx, y + dy);
-                dst.0 = over(dst.0, p.0);
-            }
+        // Row by row on all cores (a Select All moved: 24 megapixels).
+        use rayon::prelude::*;
+        let (fw, tw) = (floating.image().width() as usize * 4, image.width() as usize * 4);
+        if fw > 0 {
+            let rows = image.par_chunks_exact_mut(tw).skip(dy as usize);
+            rows.zip(floating.image().par_chunks_exact(fw)).for_each(|(row, src)| {
+                let row = &mut row[dx as usize * 4..dx as usize * 4 + fw];
+                for (d, s) in row.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                    match s[3] {
+                        0 => {}
+                        255 => d.copy_from_slice(s),
+                        _ => {
+                            let (dp, sp): ([u8; 4], [u8; 4]) =
+                                (d.try_into().expect("four"), s.try_into().expect("four"));
+                            d.copy_from_slice(&over(dp, sp));
+                        }
+                    }
+                }
+            });
         }
         true
     }
@@ -2115,6 +2259,29 @@ impl Document {
         );
         let step = t!("menu-layer-via-copy");
         self.add_layer_as(step, name, pixels, (region.x, region.y));
+        true
+    }
+
+    /// Layer via Cut (Shift+Ctrl+J): [`Self::layer_from_region`], the
+    /// pixels taken cleared from the active layer. One step.
+    pub fn layer_via_cut(&mut self, selection: &Selection) -> bool {
+        let mark = self.history_mark();
+        let source = self.active_layer().id;
+        if !self.layer_from_region(selection) {
+            return false;
+        }
+        let made = self.active;
+        let Some(at) = self.layers.iter().position(|l| l.id == source) else {
+            return true;
+        };
+        self.active = at;
+        let cleared = self.clear_region(selection);
+        let made_id = self.layers[made].id;
+        self.active = self.layers.iter().position(|l| l.id == made_id).unwrap_or(made);
+        if cleared {
+            self.join_since(mark);
+            self.rename_last_step(t!("input6-hist-layer-via-cut"));
+        }
         true
     }
 
@@ -3164,26 +3331,26 @@ mod tests {
             doc.add_layer("c".into(), RgbaImage::from_pixel(2, 2, RED), (x, y));
         }
         let all = [1, 2, 3];
-        assert!(doc.align(&all, AlignOp::Top));
+        assert!(doc.align(&all, AlignOp::Top, None));
         assert!(all.iter().all(|&i| doc.layers[i].offset.1 == 1));
-        assert!(doc.align(&all, AlignOp::Right));
+        assert!(doc.align(&all, AlignOp::Right, None));
         assert!(all.iter().all(|&i| doc.layers[i].offset.0 == 14));
-        assert!(!doc.align(&all, AlignOp::Right));
+        assert!(!doc.align(&all, AlignOp::Right, None));
 
         // Distribution: equal spacing between 1, 5 and 14 → 1, 7.5 (8), 14.
         let mut doc = Document::new(RgbaImage::new(20, 10), None);
         for (x, y) in [(1, 1), (5, 6), (14, 3)] {
             doc.add_layer("c".into(), RgbaImage::from_pixel(2, 2, RED), (x, y));
         }
-        assert!(doc.align(&all, AlignOp::DistributeH));
+        assert!(doc.align(&all, AlignOp::DistributeH, None));
         assert_eq!(doc.layers[2].offset.0, 8);
-        assert!(!doc.align(&[1, 2], AlignOp::DistributeH));
+        assert!(!doc.align(&[1, 2], AlignOp::DistributeH, None));
 
         // A single layer: aligned to the canvas; locked: does not move.
-        assert!(doc.align(&[3], AlignOp::CenterV));
+        assert!(doc.align(&[3], AlignOp::CenterV, None));
         assert_eq!(doc.layers[3].offset.1, 4);
         doc.layers[1].locked = true;
-        assert!(!doc.align(&[1], AlignOp::Bottom));
+        assert!(!doc.align(&[1], AlignOp::Bottom, None));
     }
 
     #[test]
@@ -3401,16 +3568,76 @@ mod tests {
         let start = doc.history_generation();
         doc.checkpoint("a".into());
         doc.checkpoint("b".into());
-        assert_eq!(doc.history_generation(), start, "steps forward");
+        assert!(doc.history_follows(start), "steps forward");
         doc.undo();
         let undone = doc.history_generation();
-        assert_ne!(undone, start);
+        assert!(!doc.history_follows(start));
         doc.redo();
-        assert_ne!(doc.history_generation(), undone);
+        assert!(!doc.history_follows(undone));
         let redone = doc.history_generation();
         doc.checkpoint("c".into());
         doc.discard_step();
-        assert_ne!(doc.history_generation(), redone, "a step discarded");
+        assert!(doc.history_follows(redone), "a step recorded since discarded");
+        doc.discard_step();
+        assert!(!doc.history_follows(redone), "a step there before discarded");
+    }
+
+    /// QA6: a step that changed nothing (a cancelled dialog) discarded
+    /// while a result is computed doesn't invalidate it; a rollback past
+    /// where it started, an undo or a later undo do, for good.
+    #[test]
+    fn discarding_a_newer_step_keeps_the_generation_followed() {
+        let mut doc = Document::new(RgbaImage::new(4, 4), None);
+        doc.checkpoint("a".into());
+        let mark = doc.history_mark();
+        let before = doc.history_generation();
+        for i in 0..MAX_DISCARDS / 2 {
+            doc.checkpoint(format!("t{i}"));
+            doc.checkpoint(format!("u{i}"));
+            doc.discard_step();
+        }
+        let later = doc.history_generation();
+        assert!(doc.history_follows(before));
+        doc.rollback_to(mark);
+        assert!(doc.history_follows(before), "back to where it started");
+        assert!(!doc.history_follows(later), "steps there then discarded");
+        doc.checkpoint("b".into());
+        let b = doc.history_generation();
+        doc.undo();
+        doc.redo();
+        assert!(!doc.history_follows(before));
+        assert!(!doc.history_follows(b));
+        // Many discards: the oldest generations no longer follow, the
+        // recent ones still do.
+        let old = doc.history_generation();
+        for i in 0..MAX_DISCARDS * 2 {
+            doc.checkpoint(format!("v{i}"));
+            doc.checkpoint(format!("w{i}"));
+            doc.discard_step();
+        }
+        let recent = doc.history_generation();
+        doc.checkpoint("x".into());
+        doc.discard_step();
+        assert!(doc.history_follows(recent));
+        assert!(!doc.history_follows(old), "forgotten: not taken as followed");
+    }
+
+    /// QA6: with a full history, two steps joined into one (Alt+arrow's
+    /// copy and move) let only one oldest step go.
+    #[test]
+    fn joined_steps_of_a_full_history_let_one_step_go() {
+        let mut doc = Document::new(RgbaImage::new(4, 4), None);
+        for i in 0..MAX_UNDO {
+            doc.checkpoint(format!("s{i}"));
+        }
+        let mark = doc.history_mark();
+        doc.checkpoint("copy".into());
+        doc.checkpoint("move".into());
+        doc.join_since(mark);
+        let (names, done) = doc.history();
+        assert_eq!((names.len(), done), (MAX_UNDO, MAX_UNDO));
+        assert_eq!(names[0], "s1");
+        assert_eq!(names[MAX_UNDO - 1], "move");
     }
 
     #[test]

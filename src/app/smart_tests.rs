@@ -732,3 +732,181 @@ fn small_smart_objects_with_filters_render_in_the_background() {
     h.state_mut().run(Action::Smart(Command::ClearFilters));
     assert!(!h.state().smart.busy());
 }
+
+/// A linked file missing, Edit Contents edits the embedded copy; the file
+/// comes back (focus regained) before the tab is saved: Save asks whether
+/// to embed the edits (the file would replace them), the tab still the
+/// smart object's contents; Embed puts them in, unlinked.
+#[test]
+fn link_back_before_contents_saved_asks_to_embed() {
+    let dir = folder("link-back");
+    let path = dir.join("logo.png");
+    let away = dir.join("away.png");
+    RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255])).save(&path).unwrap();
+    let mut h = app();
+    h.state_mut().place_path(&path, true);
+    h.key_press(egui::Key::Enter);
+    let applied = |app: &AtelierApp| !app.transform_pending() && !app.transform_busy();
+    settle(&mut h, applied);
+    std::fs::rename(&path, &away).unwrap();
+    h.state_mut().smart.focused = false;
+    h.run_steps(1);
+    settle(&mut h, |app| !app.links_reading());
+    h.run_steps(2);
+    h.state_mut().run(Action::Smart(Command::EditContents));
+    h.run_steps(2);
+    assert!(doc(&h).embedded_in.is_some());
+    h.state_mut().primary = Color32::from_rgb(255, 0, 0);
+    h.state_mut().run(Action::FillPrimary);
+    std::fs::rename(&away, &path).unwrap();
+    h.state_mut().smart.focused = false;
+    h.run_steps(1);
+    settle(&mut h, |app| !app.links_reading());
+    h.run_steps(2);
+    super::files::SAVE_DIALOG.with_borrow_mut(|d| d.asked.clear());
+    h.state_mut().run(Action::Save);
+    h.run_steps(2);
+    let asked = super::files::SAVE_DIALOG.with_borrow_mut(|d| std::mem::take(&mut d.asked));
+    assert!(asked.is_empty(), "no Save As for a smart object still there");
+    assert!(h.state().smart.link_save.is_some(), "embed or not, asked");
+    assert!(doc(&h).embedded_in.is_some() && doc(&h).modified);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert!(h.state().smart.link_save.is_none());
+    assert!(!doc(&h).modified, "put in the smart object");
+    h.state_mut().switch_tab(0);
+    h.run_steps(2);
+    assert!(smart(&h).link.is_none(), "embedded");
+    let r = doc(&h).active_layer().rect();
+    let (x, y) = ((r.x + 10) as u32, (r.y + 10) as u32);
+    assert_eq!(doc(&h).flatten().get_pixel(x, y).0, [255, 0, 0, 255]);
+}
+
+/// Edit Contents, then the smart object deleted: Save says so and offers
+/// Save As; cancelled, the tab stays its contents, and once the delete is
+/// undone its Save updates the smart object again.
+#[test]
+fn contents_tab_kept_when_its_smart_object_is_gone() {
+    let mut h = app();
+    h.state_mut().run(Action::Smart(Command::Convert));
+    h.run_steps(2);
+    h.state_mut().run(Action::Smart(Command::EditContents));
+    h.run_steps(2);
+    assert!(doc(&h).embedded_in.is_some());
+    h.state_mut().primary = Color32::from_rgb(255, 0, 0);
+    h.state_mut().run(Action::FillPrimary);
+    h.state_mut().switch_tab(0);
+    h.run_steps(2);
+    assert!(h.state_mut().doc.as_mut().unwrap().delete_active());
+    h.run_steps(2);
+    h.state_mut().switch_tab(1);
+    h.run_steps(2);
+    super::files::SAVE_DIALOG.with_borrow_mut(|d| d.asked.clear());
+    h.state_mut().run(Action::Save);
+    h.run_steps(2);
+    let asked = super::files::SAVE_DIALOG.with_borrow_mut(|d| std::mem::take(&mut d.asked));
+    assert_eq!(asked.len(), 1, "Save As offered");
+    assert!(doc(&h).embedded_in.is_some(), "still its contents");
+    h.state_mut().switch_tab(0);
+    h.run_steps(2);
+    h.state_mut().run(Action::Undo);
+    h.run_steps(2);
+    h.state_mut().switch_tab(1);
+    h.run_steps(2);
+    h.state_mut().run(Action::Save);
+    h.run_steps(2);
+    assert!(!doc(&h).modified, "the smart object updated");
+}
+
+/// A document saved with a linked smart object, its file then gone:
+/// reopened, the missing link is said in a window, once.
+#[test]
+fn reopened_missing_link_is_said() {
+    let dir = folder("reopen-missing");
+    let path = dir.join("logo.png");
+    RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255])).save(&path).unwrap();
+    let mut d = Document::new(RgbaImage::from_pixel(100, 100, Rgba([255; 4])), None);
+    d.place_file(&path, true).unwrap();
+    let saved = dir.join("doc.atelier");
+    d.save(&saved).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let mut h = app();
+    h.state_mut().status = String::new();
+    h.state_mut().open_path(&saved);
+    h.run_steps(2);
+    settle(&mut h, |app| !app.links_reading());
+    h.run_steps(2);
+    let said = |h: &Harness<'static, AtelierApp>| {
+        let s = &h.state().status;
+        (s.contains("logo") || s.contains("smart6-alert-links-not-found"))
+            && h.state().workspace.error_status.as_ref() == Some(s)
+    };
+    assert!(said(&h), "said: {:?}", h.state().status);
+    assert!(smart(&h).link.as_ref().unwrap().missing, "with its badge");
+    // Looked at again (focus back): not said again.
+    h.state_mut().status = String::new();
+    h.state_mut().smart.focused = false;
+    h.run_steps(1);
+    settle(&mut h, |app| !app.links_reading());
+    h.run_steps(2);
+    assert!(h.state().status.is_empty(), "once: {:?}", h.state().status);
+}
+
+/// A smart filter's dialog cancelled after its preview was computed: the
+/// preview's rendering (its base and filtered images) is let go.
+#[test]
+fn cancelled_smart_filter_dialog_lets_its_rendering_go() {
+    let mut h = app();
+    h.state_mut().run(Action::Smart(Command::ConvertForFilters));
+    h.state_mut().run(Action::Filter(FilterKind::GaussianBlur));
+    settle(&mut h, |app| {
+        matches!(
+            app.preview_shown.as_ref().map(|p| &p.preview),
+            Some(LayerPreview::Filter(_))
+        )
+    });
+    assert!(h.state().smart.ready_held(), "kept for OK");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(5);
+    assert!(!h.state().filters.busy());
+    assert!(!h.state().smart.ready_held(), "nothing held once closed");
+}
+
+/// Edit Contents of a smart object linked to a network file: the file is
+/// looked at on another thread first (the window waits), then, missing,
+/// the copy opens; its Save embeds it as for any missing file.
+#[test]
+fn network_link_looked_at_before_edit_contents() {
+    let mut h = app();
+    h.state_mut().run(Action::Smart(Command::Convert));
+    h.run_steps(2);
+    let unc = std::path::PathBuf::from(r"\\nas\share\logo.png");
+    let s = h.state_mut().doc.as_mut().unwrap().active_layer_mut().smart.as_deref_mut().unwrap();
+    s.link = Some(crate::document::Link {
+        unchecked: true,
+        ..crate::document::Link::new(&unc)
+    });
+    h.state_mut().run(Action::Smart(Command::EditContents));
+    assert!(h.state().smart.checking(), "looked at first");
+    settle(&mut h, |app| !app.smart.checking());
+    h.run_steps(2);
+    assert!(doc(&h).embedded_in.is_some(), "missing: the copy");
+    h.state_mut().switch_tab(0);
+    let link = smart(&h).link.clone().unwrap();
+    assert!(link.missing && !link.unchecked);
+}
+
+/// Update Modified Content while a focus read of the document goes on:
+/// its network files are read once that read lands, the missing files
+/// said again.
+#[test]
+fn update_modified_content_during_a_focus_read() {
+    let mut h = app();
+    let uid = doc(&h).uid();
+    let held = h.state_mut().smart.hold_links_read(uid);
+    h.state_mut().run(Action::Smart(Command::UpdateModified));
+    assert!(h.state().smart.network_read_waits(uid));
+    drop(held);
+    h.run_steps(2);
+    assert!(!h.state().smart.network_read_waits(uid));
+}

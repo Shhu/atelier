@@ -373,10 +373,18 @@ impl Builder<'_, '_> {
                 at: p.at,
             },
             (_, Some(p)) if p.layer == l.id => self.sources.gray(key, p.version, p.image, p.origin),
+            // A coarse view: feathered at its scale, not at full size.
+            _ if self.sources.coarse() => {
+                let (image, at) = m.shaped_coarse(l.offset, self.sources.level());
+                Src { image, at }
+            }
             // The display: a feather radius being changed shows once ready.
             _ if self.opts.later_styles => {
                 let (image, origin, shown) = m.shaped_later(l.offset);
-                self.sources.gray(key, hash_of(shown), &image, origin)
+                match m.feathered_reduced(shown, self.sources.level()) {
+                    Some(r) => self.sources.gray_reduced(key, hash_of(shown), &image, origin, r),
+                    None => self.sources.gray(key, hash_of(shown), &image, origin),
+                }
             }
             _ => {
                 let (image, origin) = m.shaped(l.offset);

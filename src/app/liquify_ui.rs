@@ -580,6 +580,8 @@ impl AtelierApp {
         self.enlarge_for_dialog();
         let Some(doc) = &mut self.doc else { return };
         let Some(target) = smart.or_else(|| active_target(doc, selection.as_ref())) else {
+            // The layer enlarged above is put back as it was.
+            self.shrink_after_preview();
             self.status = t!("status-selection-empty");
             return;
         };
@@ -747,7 +749,9 @@ impl AtelierApp {
                 Err(()) => {
                     doc.end_paint();
                     doc.discard_step();
-                    let text = tm!("fx3-filter-failed", name = name.as_str());
+                    // The name in English too, for the log and the report.
+                    let name = crate::i18n::Message::of(|| t!("liquify-title"));
+                    let text = tm!("fx3-filter-failed", name = name);
                     self.actions
                         .step_stopped(Stopped::Failed(text.shown.clone()));
                     self.status_failed(text);

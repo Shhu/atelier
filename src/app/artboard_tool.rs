@@ -899,7 +899,7 @@ impl AtelierApp {
         };
         let names: Vec<String> = which.iter().map(|&i| doc.layers[i].name.clone()).collect();
         let ext = files.format.extensions()[0];
-        let count = existing_artboard_files(&files.folder, &files.prefix, &names, ext);
+        let count = existing_artboard_files(&files.folder, &files.prefix, &names, ext, &files.open);
         let uid = doc.uid();
         self.ask_replace(
             count,
@@ -1023,7 +1023,7 @@ impl AtelierApp {
         };
         let names: Vec<String> = which.iter().map(|&i| doc.layers[i].name.clone()).collect();
         let ext = options.format.extensions()[0];
-        let count = existing_artboard_files(&folder, "", &names, ext);
+        let count = existing_artboard_files(&folder, "", &names, ext, &self.open_paths());
         let uid = doc.uid();
         let options = options.clone();
         self.ask_replace(

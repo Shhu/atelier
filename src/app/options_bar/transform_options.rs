@@ -121,10 +121,14 @@ impl AtelierApp {
         }
         sep(ui);
         self.resample_dropdown(ui);
-        ui_kit::checkbox(ui, &mut self.fit_canvas, &t!("options-fit-canvas"))
-            .on_hover_text(t!("options-fit-canvas-tip"));
+        // The quick mask is the canvas's size whatever its transform.
+        if self.doc.as_ref().is_none_or(|d| d.quick_mask().is_none()) {
+            ui_kit::checkbox(ui, &mut self.fit_canvas, &t!("options-fit-canvas"))
+                .on_hover_text(t!("options-fit-canvas-tip"));
+        }
         self.warp_switch(ui);
-        let (apply, cancel) = apply_cancel(ui, true);
+        // The same ✕ ✓ as Free Transform's.
+        let (apply, cancel) = apply_cancel_icons(ui, true);
         if apply {
             self.apply_transform();
         }

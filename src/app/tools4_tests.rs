@@ -181,12 +181,23 @@ fn big_pending(top: bool) -> Harness<'static, AtelierApp> {
     h
 }
 
+/// Frames until the transform applied aside is in place.
+fn until_transformed(h: &mut Harness<'static, AtelierApp>) {
+    let start = std::time::Instant::now();
+    while h.state().transform_busy() {
+        assert!(start.elapsed().as_secs() < 60, "never applied");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.run_steps(1);
+    }
+}
+
 #[test]
 fn deleting_the_layer_of_a_large_pending_distort_does_not_crash() {
     let mut h = big_pending(true);
     let steps0 = steps(&h);
     h.state_mut().run(Action::Delete);
-    assert!(!h.state().transform_busy(), "applied before the delete");
+    // Applied aside (its indicator showing), then the delete.
+    until_transformed(&mut h);
     h.run_steps(3);
     let d = doc(&h);
     assert_eq!(d.layers.len(), 1);
@@ -199,7 +210,8 @@ fn a_large_pending_distort_is_applied_before_the_next_command() {
     let mut h = big_pending(false);
     let steps0 = steps(&h);
     h.state_mut().run(Action::MergeDown);
-    assert!(!h.state().transform_busy());
+    assert!(h.state().transform_busy(), "applied aside, the window free");
+    until_transformed(&mut h);
     h.run_steps(3);
     let d = doc(&h);
     let (names, done) = d.history();
@@ -208,6 +220,45 @@ fn a_large_pending_distort_is_applied_before_the_next_command() {
     // Merged as distorted: the narrowed bottom shows the background.
     assert_eq!(d.flatten().get_pixel(150, 2440).0, RED.0);
     assert_eq!(d.flatten().get_pixel(1400, 1000).0, BLUE.0);
+}
+
+/// Another tool chosen with a large transform pending: the tool at once,
+/// the transform applied aside (the window not frozen), in one step.
+#[test]
+fn a_tool_chosen_applies_a_large_pending_distort_aside() {
+    let mut h = big_pending(false);
+    let steps0 = steps(&h);
+    h.state_mut().set_tool(Tool::Brush);
+    assert_eq!(h.state().tool, Tool::Brush);
+    assert!(h.state().transform_busy(), "applied aside");
+    until_transformed(&mut h);
+    h.run_steps(2);
+    let d = doc(&h);
+    assert_eq!(d.history().1, steps0 + 1);
+    assert_eq!(d.flatten().get_pixel(150, 2440).0, RED.0);
+    assert_eq!(h.state().tool, Tool::Brush);
+    assert!(h.state().transform_rect.is_none());
+}
+
+/// A layer clicked with a large transform pending: the click once it is
+/// applied aside; a command right after waits for both, in order.
+#[test]
+fn a_layer_click_and_a_command_follow_a_large_pending_distort() {
+    let mut h = big_pending(false);
+    let steps0 = steps(&h);
+    h.state_mut().click_layer(2, Modifiers::NONE);
+    assert!(h.state().transform_busy(), "applied aside");
+    assert_eq!(doc(&h).active, 1, "the click waits");
+    h.state_mut().run(Action::Delete);
+    assert!(!h.state().transform_busy());
+    let d = doc(&h);
+    let (names, done) = d.history();
+    assert_eq!(done, steps0 + 2, "{names:?}");
+    assert_eq!(names[steps0 + 1], t!("menu-layer-delete"));
+    // The top layer was deleted (the one clicked), the distort kept.
+    assert_eq!(d.layers.len(), 2);
+    assert_eq!(d.layers[1].name, "Big");
+    assert_eq!(d.flatten().get_pixel(150, 2440).0, RED.0);
 }
 
 #[test]
