@@ -70,6 +70,11 @@
     <display_length compare="ge">768</display_length>
   </requires>
   <releases>
+    <release version="0.4.3" date="2026-10-25">
+      <description>
+        <p>A third review pass: crop asks before any command applies it, nothing typed or painted is lost during background work, locked groups lock their layers, Layer › Align and Distribute, opacity and blend for all selected layers, new layer shortcuts, safer handling of large and unusual files, and many fixes to selections, Quick Mask, filters and smart objects.</p>
+      </description>
+    </release>
     <release version="0.4.2" date="2026-10-24">
       <description>
         <p>In Quick Mask mode, the Move tool, the arrow keys, Free Transform and Edit › Transform now move and transform the mask.</p>
