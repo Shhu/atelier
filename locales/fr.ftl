@@ -2449,7 +2449,7 @@ ui3-why-not-now = Indisponible pour le calque actif ou dans l'état actuel
 # Other words a command is found by (space-separated, never shown)
 ui3-palette-keywords-image-size = redimensionner agrandir réduire rééchantillonner échelle dimensions résolution dpi ppp
 ui3-palette-keywords-canvas-size = agrandir étendre bordure marge
-ui3-palette-keywords-rotate = pivoter tourner rotation retourner miroir symétrie
+ui3-palette-keywords-rotate = pivoter tourner rotation zone de travail
 ui3-palette-keywords-crop = recadrer recadrage rogner sélection
 ui3-palette-keywords-move = déplacer déplacement
 ui3-palette-keywords-type = texte police écrire
@@ -3028,3 +3028,6 @@ input6-status-locked-left = { $count ->
     [one] { $count } calque verrouillé laissé tel quel
    *[other] { $count } calques verrouillés laissés tels quels
 }
+
+## Command palette: Image › Image Rotation flips
+ui7-palette-keywords-flip = retourner miroir symétrie zone de travail

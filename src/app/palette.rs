@@ -629,9 +629,8 @@ fn keywords(action: Action) -> String {
     match action {
         Action::ImageSize => t!("ui3-palette-keywords-image-size"),
         Action::CanvasSize => t!("ui3-palette-keywords-canvas-size"),
-        Action::RotateCanvas(_) | Action::RotateArbitrary | Action::FlipCanvas(_) => {
-            t!("ui3-palette-keywords-rotate")
-        }
+        Action::RotateCanvas(_) | Action::RotateArbitrary => t!("ui3-palette-keywords-rotate"),
+        Action::FlipCanvas(_) => t!("ui7-palette-keywords-flip"),
         Action::Tool(Tool::Canvas) => format!(
             "{} {}",
             t!("ui3-palette-keywords-crop"),
@@ -1534,6 +1533,54 @@ mod tests {
         ] {
             let got = format!("{:?}", first(lang, q));
             assert!(got.contains(want), "{q}: {got}");
+        }
+    }
+
+    /// Image › Image Rotation is found by its older name too, and its
+    /// canvas flips by "symmetry".
+    #[test]
+    fn image_rotation_and_canvas_flips() {
+        let first = |lang: Lang, q: &str| {
+            let h = app(true, lang);
+            let first = found(&h, q).first().map(|(_, a)| *a);
+            i18n::set_lang(Lang::En);
+            first
+        };
+        // The older name lists the whole submenu, turns and flips.
+        let h = app(true, Lang::Fr);
+        let top: Vec<Action> = found(&h, "rotation de la zone de travail")
+            .into_iter()
+            .take(6)
+            .map(|(_, a)| a)
+            .collect();
+        i18n::set_lang(Lang::En);
+        assert!(top.iter().any(|a| matches!(a, Action::RotateCanvas(90))), "{top:?}");
+        assert!(top.iter().any(|a| matches!(a, Action::RotateArbitrary)), "{top:?}");
+        assert!(top.iter().any(|a| matches!(a, Action::FlipCanvas(true))), "{top:?}");
+        for (lang, q) in [
+            (Lang::Fr, "rotation de l'image"),
+            (Lang::En, "image rotation"),
+            (Lang::En, "rotate canvas"),
+        ] {
+            assert!(
+                matches!(
+                    first(lang, q),
+                    Some(Action::RotateCanvas(_) | Action::RotateArbitrary)
+                ),
+                "{q}: {:?}",
+                first(lang, q)
+            );
+        }
+        for (lang, q) in [
+            (Lang::Fr, "symétrie horizontale"),
+            (Lang::Fr, "symetrie zone de travail"),
+            (Lang::En, "flip canvas horizontal"),
+        ] {
+            assert!(
+                matches!(first(lang, q), Some(Action::FlipCanvas(_))),
+                "{q}: {:?}",
+                first(lang, q)
+            );
         }
     }
 

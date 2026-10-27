@@ -2447,7 +2447,7 @@ ui3-why-not-now = Not available for the active layer or in the current state
 # Other words a command is found by (space-separated, never shown)
 ui3-palette-keywords-image-size = resize scale resample dimensions enlarge shrink resolution dpi ppi
 ui3-palette-keywords-canvas-size = extend expand border margin
-ui3-palette-keywords-rotate = rotate turn flip mirror
+ui3-palette-keywords-rotate = rotate turn rotation canvas
 ui3-palette-keywords-crop = crop trim cut selection
 ui3-palette-keywords-move = move
 ui3-palette-keywords-type = text type font write
@@ -3023,3 +3023,6 @@ input6-status-locked-left = { $count ->
     [one] { $count } locked layer left as it is
    *[other] { $count } locked layers left as they are
 }
+
+## Command palette: Image › Image Rotation flips
+ui7-palette-keywords-flip = flip mirror symmetry canvas
