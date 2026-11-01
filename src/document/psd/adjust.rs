@@ -7,18 +7,21 @@ use crate::compose::gradient::GradientFill;
 use crate::document::{Fill, LayerKind};
 use crate::paint::gradient::{ColorStop, Gradient, OpacityStop, Shape, StopColor};
 use crate::pixel_ops::{
-    Adjustment, BlackWhite, BrightnessContrast, ColorBalance, Curve, Curves, GradientMap,
-    HueSaturation, Levels, LevelsChannel, MAX_CURVE_POINTS, PhotoFilter, Posterize, Threshold,
-    Vibrance,
+    Adjustment, BlackWhite, BrightnessContrast, ChannelMixer, ColorBalance, Curve, Curves,
+    Exposure, GradientMap, HueSaturation, Levels, LevelsChannel, MAX_CURVE_POINTS, PhotoFilter,
+    Posterize, SELECTIVE_RANGES, SelectiveColor, Threshold, Vibrance,
 };
 
 /// Keys of the adjustment and fill layers Atelier doesn't have.
-const UNSUPPORTED: [&[u8; 4]; 5] = [b"selc", b"mixr", b"expA", b"clrL", b"PtFl"];
+const UNSUPPORTED: [&[u8; 4]; 1] = [b"clrL"];
 
 /// The kind of an adjustment or fill layer from its blocks: `None` for
 /// other layers, `Some(Err(()))` for those Atelier doesn't have.
 #[allow(clippy::result_unit_err)]
-pub fn read(blocks: &[([u8; 4], &[u8])]) -> Option<std::result::Result<LayerKind, ()>> {
+pub fn read(
+    blocks: &[([u8; 4], &[u8])],
+    patterns: &super::pattern::Patterns,
+) -> Option<std::result::Result<LayerKind, ()>> {
     let get = |key: &[u8; 4]| blocks.iter().find(|(k, _)| k == key).map(|(_, d)| *d);
     let adjustment = |a: Option<Adjustment>| Some(a.map(LayerKind::Adjustment).ok_or(()));
     let fill = |f: Option<Fill>| Some(f.map(LayerKind::Fill).ok_or(()));
@@ -37,6 +40,9 @@ pub fn read(blocks: &[([u8; 4], &[u8])]) -> Option<std::result::Result<LayerKind
             b"blnc" => return adjustment(color_balance(d).ok()),
             b"brit" => return adjustment(legacy_brightness_contrast(d).ok()),
             b"vibA" => return adjustment(vibrance(d).ok()),
+            b"expA" => return adjustment(exposure(d).ok()),
+            b"mixr" => return adjustment(channel_mixer(d).ok()),
+            b"selc" => return adjustment(selective_color(d).ok()),
             b"blwh" => return adjustment(black_white(d).ok()),
             b"nvrt" => return adjustment(Some(Adjustment::Invert)),
             b"post" => {
@@ -62,6 +68,14 @@ pub fn read(blocks: &[([u8; 4], &[u8])]) -> Option<std::result::Result<LayerKind
                         .ok()
                         .and_then(|d| gradient_fill(&d))
                         .map(Fill::Gradient),
+                );
+            }
+            b"PtFl" => {
+                return fill(
+                    versioned(d)
+                        .ok()
+                        .and_then(|d| super::pattern::fill_of(&d, patterns))
+                        .map(Fill::Pattern),
                 );
             }
             k if UNSUPPORTED.contains(&k) => return Some(Err(())),
@@ -223,6 +237,59 @@ fn brightness_contrast(d: &[u8]) -> Result<Adjustment> {
 fn legacy_brightness_contrast(d: &[u8]) -> Result<Adjustment> {
     let mut r = Reader::new(d);
     Ok(bc(r.i16()? as f64, r.i16()? as f64))
+}
+
+/// Version, then exposure, offset and gamma as big-endian floats.
+fn exposure(d: &[u8]) -> Result<Adjustment> {
+    let mut r = Reader::new(d);
+    r.u16()?;
+    let mut float = || r.u32().map(f32::from_bits);
+    let (exposure, offset, gamma) = (float()?, float()?, float()?);
+    let finite = |v: f32, or: f32| if v.is_finite() { v } else { or };
+    Ok(Adjustment::Exposure(Exposure {
+        exposure: finite(exposure, 0.0).clamp(-Exposure::EXPOSURE, Exposure::EXPOSURE),
+        offset: finite(offset, 0.0).clamp(-Exposure::OFFSET, Exposure::OFFSET),
+        gamma: finite(gamma, 1.0).clamp(*Exposure::GAMMA.start(), *Exposure::GAMMA.end()),
+    }))
+}
+
+/// Version, monochrome, then per channel the percentages of red, green,
+/// blue, a fourth color and the constant. The fourth channel's row is there
+/// for CMYK.
+fn channel_mixer(d: &[u8]) -> Result<Adjustment> {
+    let mut r = Reader::new(d);
+    r.u16()?;
+    let monochrome = r.u16()? != 0;
+    let mut rows = [[0.0; 4]; 3];
+    for row in &mut rows {
+        let [red, green, blue, _, constant] =
+            [r.i16()?, r.i16()?, r.i16()?, r.i16()?, r.i16()?];
+        *row = [red, green, blue, constant].map(|v| {
+            (v as f32 / 100.0).clamp(-ChannelMixer::LIMIT, ChannelMixer::LIMIT)
+        });
+    }
+    if monochrome {
+        rows = [rows[0]; 3];
+    }
+    Ok(Adjustment::ChannelMixer(ChannelMixer { rows, monochrome }))
+}
+
+/// Version, method (1 absolute), then the cyan, magenta, yellow and black
+/// percentages of a reserved record followed by the ranges.
+fn selective_color(d: &[u8]) -> Result<Adjustment> {
+    let mut r = Reader::new(d);
+    r.u16()?;
+    let absolute = r.u16()? != 0;
+    for _ in 0..4 {
+        r.i16()?;
+    }
+    let mut ranges = [[0.0; 4]; SELECTIVE_RANGES];
+    for range in &mut ranges {
+        for v in range {
+            *v = (r.i16()? as f32 / 100.0).clamp(-1.0, 1.0);
+        }
+    }
+    Ok(Adjustment::SelectiveColor(SelectiveColor { ranges, absolute }))
 }
 
 fn vibrance(d: &[u8]) -> Result<Adjustment> {
@@ -531,6 +598,9 @@ pub fn write(kind: &LayerKind, w: &mut Writer) {
         LayerKind::Fill(Fill::Gradient(g)) => w.tagged(b"GdFl", |w| {
             versioned_block(w, &gradient_fill_items(g, Descriptor::new(b"null")));
         }),
+        LayerKind::Fill(Fill::Pattern(p)) => w.tagged(b"PtFl", |w| {
+            versioned_block(w, &super::pattern::fill_items(p, Descriptor::new(b"null")));
+        }),
         LayerKind::Adjustment(a) => write_adjustment(a, w),
         LayerKind::Pixels | LayerKind::Group { .. } => {}
     }
@@ -636,6 +706,32 @@ fn write_adjustment(a: &Adjustment, w: &mut Writer) {
                 versioned_block(w, &d);
             });
         }
+        Adjustment::Exposure(e) => w.tagged(b"expA", |w| {
+            w.u16(1);
+            for v in [e.exposure, e.offset, e.gamma] {
+                w.u32(v.to_bits());
+            }
+        }),
+        Adjustment::ChannelMixer(m) => w.tagged(b"mixr", |w| {
+            w.u16(1);
+            w.u16(u16::from(m.monochrome));
+            let percent = |v: f32| (v * 100.0).round() as i16;
+            for row in &m.rows {
+                for v in [row[0], row[1], row[2], 0.0, row[3]] {
+                    w.i16(percent(v));
+                }
+            }
+            // The row of the channel RGB doesn't have.
+            w.zeros(10);
+        }),
+        Adjustment::SelectiveColor(c) => w.tagged(b"selc", |w| {
+            w.u16(1);
+            w.u16(u16::from(c.absolute));
+            w.zeros(8);
+            for v in c.ranges.as_flattened() {
+                w.i16((v * 100.0).round() as i16);
+            }
+        }),
         Adjustment::Vibrance(v) => w.tagged(b"vibA", |w| {
             let d = Descriptor::new(b"null")
                 .with(b"vibrance", Value::Integer(pct(v.vibrance) as i32))
@@ -733,7 +829,7 @@ mod tests {
             assert_eq!(n % 4, 0, "padded to 4");
             blocks.push((key, r.bytes(n).unwrap()));
         }
-        read(&blocks).unwrap().unwrap()
+        read(&blocks, &super::super::pattern::Patterns::new()).unwrap().unwrap()
     }
 
     #[test]
@@ -769,6 +865,32 @@ mod tests {
             Adjustment::BrightnessContrast(BrightnessContrast {
                 brightness: 0.4,
                 contrast: -0.3,
+            }),
+            Adjustment::Exposure(Exposure {
+                exposure: 1.5,
+                offset: -0.125,
+                gamma: 1.25,
+            }),
+            Adjustment::ChannelMixer(ChannelMixer {
+                rows: [
+                    [1.2, -0.2, 0.0, 0.05],
+                    [0.1, 0.8, 0.1, 0.0],
+                    [0.0, 0.3, 0.7, -0.1],
+                ],
+                monochrome: false,
+            }),
+            Adjustment::ChannelMixer(ChannelMixer {
+                rows: [ChannelMixer::GRAY; 3],
+                monochrome: true,
+            }),
+            Adjustment::SelectiveColor({
+                let mut s = SelectiveColor {
+                    absolute: true,
+                    ..Default::default()
+                };
+                s.ranges[0] = [0.1, -0.2, 0.3, -0.4];
+                s.ranges[8] = [0.0, 0.0, 0.0, 1.0];
+                s
             }),
             Adjustment::Vibrance(Vibrance {
                 vibrance: 0.5,

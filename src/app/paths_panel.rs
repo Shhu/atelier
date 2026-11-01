@@ -46,6 +46,8 @@ pub(super) struct SelectionSettings {
 /// Fill Path.
 #[derive(Clone, Copy)]
 pub(super) struct FillSettings {
+    /// For Pattern: which one of the library.
+    pattern: u64,
     content: FillContent,
     color: Color32,
     opacity: f32,
@@ -95,6 +97,7 @@ impl Default for PathsPanel {
             },
             fill: FillSettings {
                 content: FillContent::Foreground,
+                pattern: 0,
                 color: Color32::BLACK,
                 opacity: 1.0,
                 preserve: false,
@@ -259,8 +262,22 @@ impl AtelierApp {
         let Some(sel) = path_selection(&path, doc.full_rect(), s.feather, s.antialias) else {
             return;
         };
+        if s.content == FillContent::Pattern {
+            let library = &self.patterns.library;
+            let pattern = match library.get(s.pattern) {
+                Some(p) => p.clone(),
+                None => self.last_pattern(),
+            };
+            let Some(doc) = &mut self.doc else { return };
+            if !doc.fill_active_pattern(&pattern, Some(&sel), s.opacity, s.preserve) {
+                self.status = self.nothing_to_paint();
+            }
+            return;
+        }
         let color = match s.content {
-            FillContent::Foreground | FillContent::ContentAware => self.primary,
+            FillContent::Foreground | FillContent::ContentAware | FillContent::Pattern => {
+                self.primary
+            }
             FillContent::Background => self.secondary,
             FillContent::Color => s.color,
             FillContent::Black => Color32::BLACK,
@@ -588,6 +605,9 @@ impl AtelierApp {
                                     ui.selectable_value(&mut f.content, c, c.label());
                                 }
                             });
+                            if f.content == FillContent::Pattern {
+                                patterns_ui::pattern_choice(ui, &mut f.pattern);
+                            }
                             if f.content == FillContent::Color {
                                 ui_kit::swatch(
                                     ui,

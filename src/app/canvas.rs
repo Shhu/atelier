@@ -6,7 +6,7 @@ use crate::i18n::t;
 
 /// A crop box drawn by a drag of this many screen pixels, at least: a slip
 /// of the hand while clicking draws none (a thin banner can be drawn).
-const CROP_SLIP: f32 = 8.0;
+pub(super) const CROP_SLIP: f32 = 8.0;
 
 /// What was going to happen when "Crop the image?" was asked.
 pub(super) enum CropThen {
@@ -45,6 +45,16 @@ impl AtelierApp {
     /// the active layer (inside the selection), without touching the
     /// document.
     pub(super) fn sync_layer_preview(&mut self) {
+        if let Some(dialog) = &self.filters.fade {
+            if dialog.preview {
+                let preview = LayerPreview::Fade(dialog.fade.clone());
+                self.adjust_preview(preview);
+            } else {
+                self.forget_adjust_preview();
+                self.end_layer_preview();
+            }
+            return;
+        }
         let preview = match (self.transparency, &self.adjust) {
             (Some(t), _) if t.preview => LayerPreview::Transparency(t),
             (None, Some(dialog)) if dialog.preview => {
@@ -93,11 +103,23 @@ impl AtelierApp {
 
     pub(super) fn canvas(&mut self, ui: &mut egui::Ui) {
         let whole = ui.available_rect_before_wrap();
-        let (strip, area) = whole.split_top_bottom_at_y(whole.top() + TAB_STRIP_HEIGHT);
+        // The full screen modes go without the document tabs.
+        let screen = self.workspace.screen;
+        let strip_height = match screen {
+            workspace::ScreenMode::Standard => TAB_STRIP_HEIGHT,
+            _ => 0.0,
+        };
+        let (strip, area) = whole.split_top_bottom_at_y(whole.top() + strip_height);
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new(files::DROP_AREA), area));
-        self.document_tabs(ui, strip);
-        paint_backdrop(&ui.painter_at(area), area);
+        if screen == workspace::ScreenMode::Standard {
+            self.document_tabs(ui, strip);
+        }
+        if screen == workspace::ScreenMode::Full {
+            ui.painter_at(area).rect_filled(area, 0.0, Color32::BLACK);
+        } else {
+            paint_backdrop(&ui.painter_at(area), area);
+        }
         let Some(full) = self.full_rect() else {
             self.rulers.forget_area();
             self.welcome(ui, area);
@@ -105,26 +127,41 @@ impl AtelierApp {
         };
         let area = self.rulers.layout(area);
         let response = ui.allocate_rect(area, Sense::click_and_drag());
-        let painter = ui.painter_at(area);
+        // Everything below works upright; the view turns at the end.
+        let ctx = ui.ctx().clone();
+        self.set_view_center(area, ctx.pixels_per_point());
+        let turn = self.view_turn;
+        let screen_clip = ui.painter_at(area).clip_rect();
+        let upright = turn.upright_bounds(area);
+        let painter = if upright == area {
+            ui.painter_at(area)
+        } else {
+            Painter::new(ctx.clone(), ui.layer_id(), upright)
+        };
+        let first_shape = ctx.graphics_mut(|g| g.entry(ui.layer_id()).next_idx());
 
         if let Some(max_zoom) = self.fit_pending
             && area.width() > 0.0
         {
             // An artboard (double-click on its thumbnail), or the canvas.
             let target = self.artboards.fit_to.take().map_or(full, to_rect);
-            let fit = ((area.width() - 40.0) / target.width())
-                .min((area.height() - 40.0) / target.height());
+            let target_size = turn.turned_size(target.size());
+            let fit = ((area.width() - 40.0) / target_size.x)
+                .min((area.height() - 40.0) / target_size.y);
             let ppp = ui.ctx().pixels_per_point();
             self.zoom = (fit * ppp).clamp(MIN_ZOOM, max_zoom);
             self.pan = (full.center() - target.center()) * self.zoom / ppp;
             self.fit_pending = None;
         }
 
-        let ctx = ui.ctx().clone();
-        let pointer = ctx.input(|i| i.pointer.latest_pos());
+        let screen_pointer = ctx.input(|i| i.pointer.latest_pos());
+        let pointer = screen_pointer.map(|p| turn.to_upright(p));
         // The floating zoom bar covers the canvas: no tool under it.
         let (bar, ..) = zoom_bar_geometry(ui, area);
-        let hovered = response.hovered() && !pointer.is_some_and(|p| bar.contains(p));
+        // (None in Full Screen.)
+        let bar_shown = screen != workspace::ScreenMode::Full;
+        let hovered =
+            response.hovered() && !(bar_shown && screen_pointer.is_some_and(|p| bar.contains(p)));
 
         // Mouse wheel, like Photoshop: scrolling (Shift: horizontal), zoom with
         // Alt; Ctrl+wheel or pinch zoom too. Centered on the cursor.
@@ -137,7 +174,7 @@ impl AtelierApp {
                 self.set_zoom_around(self.zoom * factor, pos, area.center());
             }
             if !alt {
-                self.pan += scroll;
+                self.pan += turn.vec_to_upright(scroll);
             }
         }
 
@@ -167,7 +204,7 @@ impl AtelierApp {
         let panning = response.dragged_by(PointerButton::Middle)
             || (self.space_pan && response.dragged_by(PointerButton::Primary));
         if panning && !(space_key && (zoom_keys.0 || zoom_keys.1)) {
-            self.pan += response.drag_delta();
+            self.pan += turn.vec_to_upright(response.drag_delta());
         }
 
         // On the grid of physical pixels: at 100 %, one image pixel is
@@ -229,6 +266,16 @@ impl AtelierApp {
         // (Ctrl+Alt: the Move tool for a moment, dragging a copy.)
         let picks = (self.tool == Tool::Eyedropper && !self.snap_off)
             || (alt && !ctrl && matches!(self.tool, Tool::Brush | Tool::Bucket));
+        // Shift + click with the Eyedropper: a Color Sampler point.
+        if start
+            && self.tool == Tool::Eyedropper
+            && shift
+            && !self.snap_off
+            && let Some(p) = pointer
+        {
+            self.add_sampler(view.to_image(p));
+            start = false;
+        }
         if start
             && picks
             && let Some(p) = pointer
@@ -365,11 +412,20 @@ impl AtelierApp {
                 self.gradient_input(view, pointer, start, down, released, shift);
             }
             Tool::Eyedropper => cursor = Some(CursorIcon::Crosshair),
+            Tool::ColorSampler => {
+                cursor = Some(self.sampler_input(view, tool_pointer, start, down, alt));
+            }
+            Tool::Ruler => {
+                cursor = Some(self.ruler_input(view, tool_pointer, start, down, shift, alt));
+            }
             Tool::Artboard => {
                 cursor = Some(self.artboard_input(view, tool_pointer, start, down, shift, alt));
             }
             // The hand goes through view panning (like Space).
             Tool::Hand => {}
+            Tool::RotateView => {
+                cursor = Some(self.rotate_view_input(screen_pointer, start, down, shift));
+            }
             Tool::Zoom => {
                 cursor = Some(if alt {
                     CursorIcon::ZoomOut
@@ -579,7 +635,10 @@ impl AtelierApp {
                     Action::Delete,
                 ),
                 (
-                    if self.active_locked() {
+                    if self.doc.as_ref().is_some_and(|d| {
+                        let l = d.active_layer();
+                        l.locked || l.locks.any()
+                    }) {
                         format!("{} {}", icon::LOCK_SIMPLE_OPEN, t!("canvas-menu-unlock"))
                     } else {
                         format!("{} {}", icon::LOCK_SIMPLE, t!("canvas-menu-lock"))
@@ -647,7 +706,7 @@ impl AtelierApp {
         }
 
         self.sync_layer_preview();
-        self.draw_canvas(&ctx, &painter, area, view, full, canvas_screen);
+        self.draw_canvas(&ctx, &painter, upright, view, full);
         if self.split_open
             && let Some(boxes) = self.split_boxes()
         {
@@ -668,14 +727,20 @@ impl AtelierApp {
         self.draw_guides(&painter, view, full);
         let guide = UiStroke::new(1.0, ui_kit::color::GUIDE);
         if let Some(x) = self.guides.guide_x {
-            painter.vline(view.to_screen(pos2(x, 0.0)).x, area.y_range(), guide);
+            painter.vline(view.to_screen(pos2(x, 0.0)).x, upright.y_range(), guide);
         }
         if let Some(y) = self.guides.guide_y {
-            painter.hline(area.x_range(), view.to_screen(pos2(0.0, y)).y, guide);
+            painter.hline(upright.x_range(), view.to_screen(pos2(0.0, y)).y, guide);
         }
         self.draw_type_overlay(&painter, view);
+        self.draw_measures(&painter, view);
+        turn.apply(&ctx, ui.layer_id(), first_shape, screen_clip, upright);
+        self.draw_view_compass(&ui.painter_at(area));
 
-        self.zoom_bar(ui, area);
+        if bar_shown {
+            self.zoom_bar(ui, area);
+        }
+        self.draw_full_screen_notice(&ctx, &ui.painter_at(area), area);
         self.draw_rulers(ui.painter(), view);
 
         // Cursor.
@@ -698,16 +763,19 @@ impl AtelierApp {
                 // Said before the click, like the refusal after it.
                 ctx.set_cursor_icon(CursorIcon::NotAllowed);
             } else if let Some(icon) = cursor {
-                ctx.set_cursor_icon(icon);
+                ctx.set_cursor_icon(turn.cursor(icon));
             } else {
+                let first = ctx.graphics_mut(|g| g.entry(ui.layer_id()).next_idx());
                 ctx.set_cursor_icon(if self.draw_brush_cursor(&painter, pos, view) {
                     CursorIcon::None
                 } else {
                     CursorIcon::Crosshair
                 });
+                turn.apply(&ctx, ui.layer_id(), first, screen_clip, upright);
             }
         }
 
+        self.rotate_spring_release(&ctx);
         if self.stroke.is_some()
             || self.drag.is_some()
             || self.layer_drag.is_some()
@@ -725,7 +793,6 @@ impl AtelierApp {
         area: Rect,
         view: View,
         full: Rect,
-        canvas_screen: Rect,
     ) {
         let full_uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
 
@@ -740,7 +807,7 @@ impl AtelierApp {
 
         // Frame of the final image as it will be after applying.
         let frame = match (self.tool, transform) {
-            (Tool::Canvas, _) => self.canvas_rect.unwrap_or(full),
+            (Tool::Canvas, _) => self.crop_view_frame(full),
             (Tool::Transform, Some((_, t))) if self.fit_canvas && !self.in_quick_mask() => {
                 self.transform_reach().unwrap_or_else(|| {
                     let (w, h) = rotated_size(t.width(), t.height(), angle);
@@ -815,12 +882,12 @@ impl AtelierApp {
                 .then_some(active)
         });
         let Some(i) = grabbed else {
-            return self.draw_frames(painter, view, transform, frame, full, canvas_screen);
+            return self.draw_frames(painter, view, transform, frame, full);
         };
         // Out of its artboard, or of the frame.
         let hole = self.ghost_hole(i, view).unwrap_or(frame_screen);
         let Some((gpu, rect)) = self.lifted(ctx, i) else {
-            return self.draw_frames(painter, view, transform, frame, full, canvas_screen);
+            return self.draw_frames(painter, view, transform, frame, full);
         };
         // Moved, scaled and turned with the element being transformed.
         let (place, pivot, layer_angle) = match transform {
@@ -840,7 +907,7 @@ impl AtelierApp {
                 gpu.paint(&clipped, dest, full_uv, ghost, layer_angle, pivot);
             }
         }
-        self.draw_frames(painter, view, transform, frame, full, canvas_screen);
+        self.draw_frames(painter, view, transform, frame, full);
     }
 
     /// Frame of the crop or of the transform being prepared.
@@ -851,19 +918,11 @@ impl AtelierApp {
         transform: Option<(Rect, Rect)>,
         frame: Rect,
         full: Rect,
-        canvas_screen: Rect,
     ) {
-        let frame_screen = view.rect_to_screen(frame);
         let angle = self.transform_angle;
         match (self.tool, transform) {
             (Tool::Canvas, _) => {
-                if frame != full {
-                    // Current frame, faint.
-                    let faint = UiStroke::new(1.0, ui_kit::color::LINE_HOVER);
-                    painter.rect_stroke(canvas_screen, 0.0, faint, StrokeKind::Outside);
-                }
-                let dims = (frame.width() as u32, frame.height() as u32);
-                draw_frame(painter, frame_screen, 0.0, false, dims);
+                self.draw_crop(painter, view, frame, full);
             }
             (Tool::Transform, Some((_, t))) if self.move_controls() => {
                 if let Some(frame) = self.selection_frame() {
@@ -912,7 +971,11 @@ impl AtelierApp {
                 .unwrap_or(full)
         };
         // Handles are hit-tested in the element's unrotated frame.
-        let angle = if is_canvas { 0.0 } else { self.transform_angle };
+        let angle = if is_canvas {
+            self.crop.angle
+        } else {
+            self.transform_angle
+        };
         let rect_screen = view.rect_to_screen(rect);
         let local = |p: Pos2| rotate_around(p, rect_screen.center(), -angle);
         let locked = !is_canvas && self.transform_locked();
@@ -941,7 +1004,16 @@ impl AtelierApp {
             && (self.free_transform || self.transform_angle != 0.0)
             && hover.is_none()
             && self.drag.is_none();
-        let on_rotate_handle = on_rotate_handle || outside;
+        // The Crop tool: outside the box (or the canvas, before one is
+        // drawn), a drag turns it.
+        let crop_turn = is_canvas
+            && hover.is_none()
+            && self.drag.is_none()
+            && self.crop_draw.is_none()
+            && (self.rotate_drag.is_some()
+                || self.crop_box_drawn(full)
+                || pointer.is_some_and(|p| !full.contains(view.to_image(p))));
+        let on_rotate_handle = on_rotate_handle || outside || crop_turn;
         if on_rotate_handle {
             hover = None;
         }
@@ -949,7 +1021,10 @@ impl AtelierApp {
         // frame itself from inside once drawn; a drag elsewhere draws a new
         // one (never moves a layer).
         if is_canvas {
-            let drawn = self.canvas_rect.is_some_and(|r| r != full);
+            let drawn = self.crop_box_drawn(full);
+            if self.crop.straighten && self.drag.is_none() && self.rotate_drag.is_none() {
+                return Some(self.crop_straighten_input(view, full, pointer, start, down));
+            }
             if hover == Some(Handle::Move) && !drawn {
                 hover = None;
             }
@@ -959,11 +1034,15 @@ impl AtelierApp {
                 .input(|i| i.pointer.button_double_clicked(PointerButton::Primary));
             if double && drawn && hover == Some(Handle::Move) {
                 self.drag = None;
-                self.record_crop();
-                self.apply_canvas();
+                self.apply_crop_box();
                 return Some(CursorIcon::Default);
             }
-            if self.crop_draw.is_some() || (hover.is_none() && self.drag.is_none()) {
+            if self.crop_draw.is_some()
+                || (hover.is_none()
+                    && self.drag.is_none()
+                    && !on_rotate_handle
+                    && self.rotate_drag.is_none())
+            {
                 return Some(self.crop_box_input(view, pointer, start, down, shift));
             }
         }
@@ -1001,7 +1080,7 @@ impl AtelierApp {
             && !self.in_quick_mask()
             && self.doc.as_ref().is_some_and(|d| !d.shown(d.active));
         if (locked || hidden) && picked.is_none() && self.drag.is_none() && pointer.is_some() {
-            if start && !self.refuse_if_locked() {
+            if start && !self.refuse_position_locked() {
                 self.refuse_hidden_layer();
             }
             return Some(CursorIcon::NotAllowed);
@@ -1010,7 +1089,11 @@ impl AtelierApp {
         if start && let Some(p) = pointer {
             if on_rotate_handle {
                 self.rotate_drag = Some((pointer_angle(p, rect_screen.center()), angle));
-                self.free_transform = true;
+                if is_canvas {
+                    self.crop_turn_starts(rect);
+                } else {
+                    self.free_transform = true;
+                }
             } else if let Some(doc) = &self.doc {
                 let mut angle = angle;
                 let target = picked.unwrap_or(doc.active);
@@ -1057,6 +1140,9 @@ impl AtelierApp {
                     }
                     return Some(CursorIcon::Grabbing);
                 }
+                if is_canvas {
+                    rect = self.crop_start_rect(rect);
+                }
                 let ip = rotate_around(view.to_image(p), rect.center(), -angle);
                 self.drag = hover.map(|h| RectDrag::new(h, rect, ip));
                 if !is_canvas && hover.is_some_and(|h| h != Handle::Move) {
@@ -1089,7 +1175,9 @@ impl AtelierApp {
             }
             let a = normalize_angle(a);
             // Turned, the element must still fit in a layer.
-            if fits_max_dimension(rect.size(), a) {
+            if is_canvas {
+                self.crop_turn_to(a, full);
+            } else if fits_max_dimension(rect.size(), a) {
                 self.transform_angle = a;
                 self.transform_rect = Some(rect);
             }
@@ -1098,7 +1186,7 @@ impl AtelierApp {
             let mut ip = rotate_around(view.to_image(p), drag.start_center(), -angle);
             // Move: proportions kept by default, Shift inverts. Canvas: free, Shift constrains.
             let keep_ratio = if is_canvas {
-                shift
+                shift || self.crop.ratio().is_some()
             } else {
                 self.keep_ratio != shift
             };
@@ -1122,7 +1210,7 @@ impl AtelierApp {
                 let (w, h) = rotated_size(rect.width(), rect.height(), angle);
                 let bbox = Rect::from_center_size(rect.center(), vec2(w, h));
                 rect = rect.translate(self.snap_offset(bbox, axes));
-            } else if is_canvas && !keep_ratio && !alt {
+            } else if is_canvas && !keep_ratio && !alt && angle == 0.0 {
                 // The edges dragged snap.
                 let h = drag.handle;
                 let x = match h {
@@ -1195,7 +1283,10 @@ impl AtelierApp {
         }
         if let (Some(from), Some(p), true) = (self.crop_draw, pointer, down) {
             let mut d = view.to_image(p) - from;
-            if shift {
+            if let Some(ratio) = self.crop.ratio() {
+                let w = d.x.abs().max(d.y.abs() * ratio);
+                d = vec2(w.copysign(d.x), (w / ratio).copysign(d.y));
+            } else if shift {
                 let side = d.x.abs().max(d.y.abs());
                 d = vec2(side.copysign(d.x), side.copysign(d.y));
             } else {
@@ -1230,7 +1321,7 @@ impl AtelierApp {
     pub(super) fn crop_box_pending(&self) -> bool {
         self.tool == Tool::Canvas
             && self.doc.is_some()
-            && self.canvas_rect.is_some_and(|r| Some(r) != self.full_rect())
+            && self.canvas_rect.is_some_and(|r| Some(r) != self.full_rect() || self.crop.angle != 0.0)
     }
 
     /// Before `then` (another tool, tab, a save…) with a crop box drawn:
@@ -1300,8 +1391,7 @@ impl AtelierApp {
             return;
         };
         if crop {
-            self.record_crop();
-            self.apply_canvas();
+            self.apply_crop_box();
         }
         self.reset_pending();
         then.resume(self);
@@ -1310,12 +1400,13 @@ impl AtelierApp {
     /// Whether the Move tool shows the frame and handles of what it moves:
     /// with Show Transform Controls, or once transforming.
     pub(super) fn move_controls(&self) -> bool {
-        self.show_transform_controls
-            || self.free_transform
-            || self.transform_rect.is_some()
-            || self.transform_angle != 0.0
-            || self.drag.is_some()
-            || self.rotate_drag.is_some()
+        !self.transform_frozen()
+            && (self.show_transform_controls
+                || self.free_transform
+                || self.transform_rect.is_some()
+                || self.transform_angle != 0.0
+                || self.drag.is_some()
+                || self.rotate_drag.is_some())
     }
 
     /// Offset that aligns `bbox` with the nearest target (and remembers
@@ -1372,6 +1463,12 @@ impl AtelierApp {
             doc.pick_layer(px, py).or(in_active.then_some(doc.active))?
         };
         if start {
+            if !self.doc.as_ref()?.can_move(target) {
+                self.layer_set.clear();
+                self.select_layer(target);
+                self.refuse_position_locked();
+                return Some(CursorIcon::NotAllowed);
+            }
             self.start_layer_drag(target, ip, !text_only);
         }
         Some(CursorIcon::Move)
@@ -1412,7 +1509,8 @@ impl AtelierApp {
             if target != doc.active {
                 self.layer_set.clear();
                 self.select_layer(target);
-            } else if self.refuse_if_locked() {
+            }
+            if self.refuse_position_locked() {
                 return Some(CursorIcon::NotAllowed);
             }
             self.start_layer_drag(target, ip, true);
@@ -1435,13 +1533,13 @@ impl AtelierApp {
             let others = self.selected_indices().into_iter().filter(|&i| i != target);
             let doc = self.doc.as_ref().expect("checked above");
             // Selected but locked or hidden: left where it is.
-            moved.extend(others.filter(|&i| !doc.is_locked(i) && doc.shown(i)));
+            moved.extend(others.filter(|&i| doc.can_move(i) && doc.shown(i)));
         }
         let Some(doc) = &self.doc else { return };
         // A group moves with its layers, a layer with those linked to it
         // (the grabbed one stays first).
         let mut all: Vec<usize> = moved.iter().flat_map(|&i| doc.moving_with(i)).collect();
-        all.retain(|&i| i != target && !doc.is_locked(i));
+        all.retain(|&i| i != target && doc.can_move(i));
         all.sort_unstable();
         all.dedup();
         let moved: Vec<usize> = [target].into_iter().chain(all).collect();
@@ -1497,7 +1595,7 @@ impl AtelierApp {
         let mut copied: Vec<usize> = selected
             .iter()
             .copied()
-            .filter(|&i| !inside(i) && (i == target || !doc.is_locked(i)))
+            .filter(|&i| !inside(i) && (i == target || doc.can_move(i)))
             .collect();
         // From the top: a copy goes above its original, the indices below
         // stay.

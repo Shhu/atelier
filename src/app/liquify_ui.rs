@@ -736,6 +736,7 @@ impl AtelierApp {
                 Ok(Some(image)) => {
                     doc.active_layer_mut().replace_pixels(image);
                     doc.end_paint();
+                    doc.mark_fade();
                     self.status = t!("filter-applied", name = name.as_str());
                     self.liquify_applied(a.mesh);
                 }

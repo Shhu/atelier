@@ -120,7 +120,6 @@ options-opacity = Opacité
 
 ## Crop tool options
 
-options-canvas-origin = Origine { $x }, { $y }
 options-fit-visible-pixels = Ajuster aux pixels visibles
 options-fit-visible-pixels-tip = Cadre exactement le contenu de tous les calques visibles.
 
@@ -492,7 +491,6 @@ side-layer-count = { $count ->
     [one] { $count } calque
    *[other] { $count } calques
 }
-side-lock-tip = Verrouiller / déverrouiller
 
 ## Document tabs
 
@@ -3031,3 +3029,285 @@ input6-status-locked-left = { $count ->
 
 ## Command palette: Image › Image Rotation flips
 ui7-palette-keywords-flip = retourner miroir symétrie zone de travail
+
+## Image: auto commands
+adjust8-auto-tone = Tonalité automatique
+adjust8-auto-contrast = Contraste automatique
+adjust8-auto-color = Couleur automatique
+## Edit: Fade
+adjust8-menu-fade = Estomper { $name }…
+adjust8-menu-fade-none = Estomper…
+adjust8-fade-title = Estomper
+adjust8-hist-fade = Estomper { $name }
+adjust8-mode = Mode
+adjust8-why-no-fade = Disponible uniquement juste après un filtre, un réglage ou un tracé
+## Edit: Stroke
+adjust8-menu-stroke = Contour…
+adjust8-stroke-title = Contour
+adjust8-stroke-section = Contour
+adjust8-stroke-width = Épaisseur
+adjust8-stroke-color-tip = Couleur du contour
+adjust8-stroke-location = Position
+adjust8-stroke-inside = Intérieur
+adjust8-stroke-center = Centre
+adjust8-stroke-outside = Extérieur
+## Adjustments: Exposure, Channel Mixer, Selective Color
+adjust8-exposure = Exposition
+adjust8-offset = Décalage
+adjust8-gamma = Correction gamma
+adjust8-channel-mixer = Mélangeur de couches
+adjust8-output-channel = Couche de sortie
+adjust8-total = Total
+adjust8-constant = Constante
+adjust8-monochrome = Monochrome
+adjust8-selective-color = Correction sélective
+adjust8-colors = Couleurs
+adjust8-whites = Blancs
+adjust8-neutrals = Neutres
+adjust8-blacks = Noirs
+adjust8-black = Noir
+adjust8-method = Méthode
+adjust8-relative = Relative
+adjust8-absolute = Absolue
+## Command palette: other words these commands are looked for by
+adjust8-keywords-auto = automatique niveaux améliorer corriger
+adjust8-keywords-fade = estomper atténuer fondu opacité dernier filtre
+adjust8-keywords-stroke = contour bordure bord sélection
+adjust8-keywords-exposure = exposition diaphragme gamma décalage
+adjust8-keywords-mixer = mélange couches monochrome niveaux de gris
+adjust8-keywords-selective = sélective cmjn encre correction couleur
+
+## Layer locks (Layers panel, Layer menu)
+layers8-lock-label = Verrou :
+layers8-lock-transparent = Verrouiller les pixels transparents
+layers8-lock-pixels = Verrouiller les pixels de l'image
+layers8-lock-position = Verrouiller la position
+layers8-lock-all = Tout verrouiller
+layers8-menu-lock = Verrouiller les calques
+layers8-lock-unavailable = { $lock } : indisponible sur ce calque
+layers8-partial-unlock-tip = Verrouillé en partie : cliquez pour déverrouiller
+layers8-why-lock = Ce verrou est indisponible sur ce calque, ou posé par son groupe
+layers8-palette-keywords-lock = verrou verrouiller déverrouiller protéger transparence alpha pixels position lock unlock
+layers8-status-pixels-locked = « { $name } » a ses pixels verrouillés : désactivez ce verrou dans le panneau Calques.
+layers8-status-transparent-locked = « { $name } » a ses pixels transparents verrouillés : désactivez ce verrou dans le panneau Calques.
+layers8-status-position-locked = « { $name } » a sa position verrouillée : désactivez ce verrou dans le panneau Calques.
+
+## Patterns: built-in names
+
+pattern8-builtin-checker = Damier
+pattern8-builtin-lines = Lignes diagonales
+pattern8-builtin-dots = Points
+pattern8-builtin-grid = Grille
+pattern8-builtin-bricks = Briques
+pattern8-builtin-canvas = Toile
+
+## Patterns: Define Pattern, library
+
+pattern8-menu-define = Utiliser comme motif…
+pattern8-define-title = Nom du motif
+pattern8-rename-title = Renommer le motif
+pattern8-name = Nom
+pattern8-size = Taille
+pattern8-default-name = Motif { $number }
+pattern8-status-defined = Motif « { $name } » défini
+pattern8-status-empty = Impossible de définir le motif : la zone est vide.
+pattern8-why-rectangle = Nécessite une sélection rectangulaire sans contour progressif
+pattern8-why-quick-mask = Quittez d'abord le masque rapide
+pattern8-why-missing = Ce motif n'est plus dans la bibliothèque.
+pattern8-rename = Renommer le motif…
+pattern8-delete = Supprimer le motif
+pattern8-palette-keywords = motif texture tuile pattern
+
+## Patterns: fill, fill layer, overlay
+
+pattern8-pattern = Motif
+pattern8-fill-name = Remplissage de motif { $number }
+pattern8-style-overlay = Incrustation de motif
+pattern8-link = Lier au calque
+pattern8-link-tip = Le motif suit le calque
+pattern8-snap = Aligner sur l'origine
+pattern8-snap-tip = Retour au coin supérieur gauche du calque, ou du document s'il n'est pas lié
+
+## Tools
+panels8-tool-color-sampler = Échantillonnage de couleur
+panels8-tool-ruler = Règle
+panels8-sample-size = Taille de l'échantillon
+panels8-sample-point = Point échantillonné
+panels8-sample-average = Moyenne { $size } x { $size }
+panels8-clear-all = Tout effacer
+panels8-clear = Effacer
+panels8-straighten-layer = Redresser le calque
+panels8-straighten-tip = Fait pivoter le calque pour mettre la ligne à niveau et recadre la zone de travail. Alt : sans recadrer.
+panels8-why-no-samplers = Aucun point d'échantillonnage à effacer.
+panels8-why-no-line = Tracez d'abord une ligne avec la Règle.
+panels8-sampler-hint = Clic : ajouter un point. { $alt_click } : en retirer un.
+panels8-status-samplers-full = Un document contient { $count } points d'échantillonnage au plus.
+panels8-status-straighten-quick-mask = Pas en mode Masque.
+panels8-hint-add-sampler = ajouter un point
+panels8-hint-move-sampler = déplacer un point
+panels8-hint-delete-sampler = retirer un point
+panels8-hint-measure = mesurer
+panels8-hint-protractor = depuis une extrémité : rapporteur
+
+## History steps
+panels8-hist-add-sampler = Échantillonnage de couleur
+panels8-hist-move-sampler = Déplacer l'échantillonnage de couleur
+panels8-hist-delete-sampler = Supprimer l'échantillonnage de couleur
+panels8-hist-clear-samplers = Effacer les échantillonnages de couleur
+
+## Short names of values
+panels8-short-x = X :
+panels8-short-y = Y :
+panels8-short-w = L :
+panels8-short-h = H :
+panels8-short-angle = A :
+panels8-short-l1 = L1 :
+panels8-short-l2 = L2 :
+panels8-short-r = R :
+panels8-short-g = V :
+panels8-short-b = B :
+panels8-short-c = C :
+panels8-short-m = M :
+panels8-short-y-ink = J :
+panels8-short-k = N :
+
+## Info panel
+panels8-menu-info = Informations
+panels8-info-title = Informations
+panels8-info-document = Doc. :
+panels8-info-size = { $width } × { $height } px
+
+## Histogram panel
+panels8-menu-histogram = Histogramme
+panels8-histogram-title = Histogramme
+panels8-histogram-channel = Couche
+panels8-histogram-source = Source
+panels8-source-image = Image entière
+panels8-source-layer = Calque sélectionné
+panels8-channel-rgb = RVB
+panels8-channel-red = Rouge
+panels8-channel-green = Vert
+panels8-channel-blue = Bleu
+panels8-channel-luminosity = Luminosité
+panels8-channel-colors = Couleurs
+panels8-histogram-mean = Moyenne :
+panels8-histogram-deviation = Écart type :
+panels8-histogram-median = Médiane :
+panels8-histogram-pixels = Pixels :
+panels8-histogram-level = Niveau :
+panels8-histogram-count = Nombre :
+panels8-histogram-percentile = Percentile :
+panels8-histogram-computing = Mise à jour…
+
+## Navigator panel
+panels8-menu-navigator = Navigation
+panels8-navigator-title = Navigation
+panels8-navigator-zoom = Zoom
+
+## Screen modes
+panels8-menu-screen-mode = Mode d'affichage
+panels8-screen-standard = Mode d'affichage standard
+panels8-screen-full-menu = Mode plein écran avec barre des menus
+panels8-screen-full = Mode plein écran
+panels8-screen-notice = Appuyez sur F ou Échap pour quitter le plein écran. Tab affiche les panneaux.
+panels8-shortcut-screen-mode = Mode d'affichage suivant
+
+## Command palette keywords
+panels8-keywords-sampler = échantillonnage couleur point valeurs mesure informations
+panels8-keywords-ruler = règle mesure distance angle redresser niveau rapporteur
+panels8-keywords-info = informations valeurs curseur rvb cmjn position taille
+panels8-keywords-histogram = histogramme niveaux statistiques couches moyenne
+panels8-keywords-navigator = navigation vignette aperçu zoom vue
+panels8-keywords-screen-mode = mode affichage plein écran barre des menus présentation
+
+## Crop tool: options bar
+crop8-preset-ratio = Proportions
+crop8-preset-size = L x H x Résolution
+crop8-preset-original = Proportions d'origine
+crop8-preset-square = carré
+crop8-swap = Intervertir la largeur et la hauteur
+crop8-clear = Effacer
+crop8-clear-tip = Vide la largeur, la hauteur et la résolution
+crop8-resolution = Rés.
+crop8-resolution-tip = Résolution donnée à l'image recadrée ; vide, elle ne change pas
+crop8-straighten-tip = Redresser : tracez une ligne le long de ce qui doit être droit
+crop8-overlay = Superposition
+crop8-overlay-thirds = Règle des tiers
+crop8-overlay-grid = Grille
+crop8-overlay-none = Aucune
+crop8-shield = Opacité
+crop8-shield-tip = Assombrissement de la zone recadrée
+crop8-delete-cropped = Supprimer les pixels recadrés
+crop8-delete-cropped-tip = Désactivé, les pixels hors du cadre restent dans les calques et peuvent être révélés plus tard
+## Crop tool: status bar hint
+crop8-hint-turn = hors du cadre : le faire pivoter
+
+## Rotate View tool and View › Flip Horizontal
+
+view8-tool-rotate-view = Rotation de l'affichage
+view8-rotation-angle = Angle de rotation
+view8-reset-view = Réinitialiser l'affichage
+view8-rotate-all-windows = Faire pivoter toutes les fenêtres
+view8-flip-horizontal = Retournement horizontal de l'affichage
+view8-hint-rotate = Faire pivoter l'affichage
+view8-hint-steps = Par pas de 15°
+view8-hint-reset = Réinitialiser l'affichage
+view8-palette-keywords-rotate-view = tourner incliner angle pivoter vue rotation
+view8-palette-keywords-flip = miroir retourner inverser vue vérifier composition
+
+## Filter menu: Distort group and filter names
+
+distort8-group = Déformation
+distort8-pinch = Contraction
+distort8-polar = Coordonnées polaires
+distort8-ripple = Ondulation
+distort8-shear = Cisaillement
+distort8-spherize = Sphérisation
+distort8-twirl = Tourbillon
+distort8-wave = Onde
+distort8-zigzag = Zigzag
+
+## Distort filters: settings
+
+distort8-size = Taille
+distort8-size-small = Petite
+distort8-size-medium = Moyenne
+distort8-size-large = Grande
+distort8-generators = Nombre de générateurs
+distort8-wavelength-min = Longueur d'onde min.
+distort8-wavelength-max = Longueur d'onde max.
+distort8-amplitude-min = Amplitude min.
+distort8-amplitude-max = Amplitude max.
+distort8-scale-horizontal = Échelle horiz.
+distort8-scale-vertical = Échelle vert.
+distort8-type = Type
+distort8-type-sine = Sinusoïde
+distort8-type-triangle = Triangle
+distort8-type-square = Carré
+distort8-randomize = Au hasard
+distort8-mode = Mode
+distort8-mode-normal = Normal
+distort8-mode-horizontal = Horizontal seulement
+distort8-mode-vertical = Vertical seulement
+distort8-conversion = Conversion
+distort8-rectangular-to-polar = Rectangulaires à polaires
+distort8-polar-to-rectangular = Polaires à rectangulaires
+distort8-ridges = Crêtes
+distort8-style = Style
+distort8-around-center = Autour du centre
+distort8-out-from-center = En partant du centre
+distort8-pond-ripples = Ondes concentriques
+distort8-shear-curve = Courbe de cisaillement
+distort8-shear-default = Par défaut
+distort8-shear-tip = Faites glisser un point ou la ligne pour la courber. Faites glisser un point hors de la grille pour le supprimer.
+
+## Distort filters: command palette keywords
+
+distort8-keywords-pinch = déformer déformation pincer gonfler
+distort8-keywords-polar = déformer déformation polaire cercle planète
+distort8-keywords-ripple = déformer déformation eau vagues
+distort8-keywords-shear = déformer déformation courber incliner courbe
+distort8-keywords-spherize = déformer déformation sphère bombé fisheye
+distort8-keywords-twirl = déformer déformation spirale torsion
+distort8-keywords-wave = déformer déformation sinusoïde vagues
+distort8-keywords-zigzag = déformer déformation étang anneaux

@@ -2,10 +2,15 @@
 //! they take up to a second (distance fields, blurs), so the view keeps
 //! showing the former ones until the new ones are ready.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{Layer, StylesCache, next_rev};
+use image::RgbaImage;
+
+use super::{Layer, LayerKind, PixelRect, StylesCache, intersect, next_rev};
+use crate::compose;
 use crate::compose::styles::{Effects, Styles, render_styles};
 
 /// Below this many pixels, styles are drawn at once (quick enough).
@@ -65,13 +70,38 @@ impl Layer {
         {
             return Some(self.placed_styles(c));
         }
+        let (image, mask, offset) = (
+            self.shared_image(),
+            self.active_mask().cloned(),
+            self.offset,
+        );
+        let make = move |fx: &Effects| {
+            let shape = match mask {
+                Some(m) => Arc::new(m.apply_to(&image, offset)),
+                None => image,
+            };
+            render_styles(&shape, fx)
+        };
+        match self.draw_aside(key, make) {
+            Ok(styles) => styles,
+            Err(()) => self.styles(held),
+        }
+    }
+
+    /// The styles for `key` once `make` drew them on a worker thread, the
+    /// former ones meanwhile. `Err`: no thread to draw them.
+    fn draw_aside(
+        &self,
+        key: Key,
+        make: impl FnOnce(&Effects) -> Styles + Send + 'static,
+    ) -> Result<Option<Arc<Styles>>, ()> {
         let mut slot = self.styles_job.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(job) = slot.as_ref() {
             let done = job.done.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let Some(styles) = done else {
                 // Still drawing (for these settings or older ones): the
                 // former styles meanwhile.
-                return self.styles_cached();
+                return Ok(self.styles_cached());
             };
             *self.styles_cache.borrow_mut() = Some(StylesCache {
                 rev: job.key.rev,
@@ -82,7 +112,7 @@ impl Layer {
                 moved: Default::default(),
             });
             if job.key == key {
-                return Some(styles);
+                return Ok(Some(styles));
             }
         }
         let job = Arc::new(Job {
@@ -90,11 +120,6 @@ impl Layer {
             offset: self.offset,
             done: Mutex::new(None),
         });
-        let (image, mask, offset) = (
-            self.shared_image(),
-            self.active_mask().cloned(),
-            self.offset,
-        );
         let work = Arc::clone(&job);
         RUNNING.fetch_add(1, Ordering::Relaxed);
         let spawned = std::thread::Builder::new()
@@ -108,24 +133,19 @@ impl Layer {
                     }
                 }
                 let _running = Running;
-                let shape = match mask {
-                    Some(m) => Arc::new(m.apply_to(&image, offset)),
-                    None => image,
-                };
                 let styles = Arc::new(Styles {
                     version: next_rev(),
-                    ..render_styles(&shape, &work.key.effects)
+                    ..make(&work.key.effects)
                 });
                 *work.done.lock().unwrap_or_else(|e| e.into_inner()) = Some(styles);
             });
         if spawned.is_err() {
             RUNNING.fetch_sub(1, Ordering::Relaxed);
-            drop(slot);
-            return self.styles(held);
+            return Err(());
         }
         *slot = Some(job);
         drop(slot);
-        self.styles_cached()
+        Ok(self.styles_cached())
     }
 
     /// Its pixels are about to change: the styles drawn for them stay
@@ -158,7 +178,7 @@ impl Layer {
     /// The last styles drawn for the layer, whatever its pixels and
     /// settings since.
     pub fn styles_cached(&self) -> Option<Arc<Styles>> {
-        if !self.has_pixels() || !self.effects.rendered() {
+        if !self.effects.rendered() {
             return None;
         }
         let cache = self.styles_cache.borrow();
@@ -194,10 +214,322 @@ impl Layer {
     }
 }
 
+/// Beyond the canvas, what is left of a shape to draw styles from: enough
+/// for what reaches into it.
+const SHAPE_MARGIN: u32 = 512;
+
+/// The canvas area the shape of layer `i`, without pixels of its own, can
+/// take: a group's layers, or what its mask leaves of the canvas.
+pub fn styles_area(layers: &[Layer], i: usize, canvas: PixelRect) -> Option<PixelRect> {
+    let l = &layers[i];
+    if l.is_group() {
+        let mut j = i;
+        let mut area: Option<PixelRect> = None;
+        while j > 0 && layers[j - 1].depth > l.depth {
+            j -= 1;
+            let c = &layers[j];
+            if c.is_group() {
+                continue;
+            }
+            let e = c.extent_with(c.styles_cached().as_deref()).unwrap_or(canvas);
+            area = Some(area.map_or(e, |a| a.union(e)));
+        }
+        let m = SHAPE_MARGIN as i64;
+        let grown = PixelRect {
+            x: canvas.x - m,
+            y: canvas.y - m,
+            w: canvas.w + 2 * SHAPE_MARGIN,
+            h: canvas.h + 2 * SHAPE_MARGIN,
+        };
+        let area = intersect(area?, grown)?;
+        return match l.active_mask().filter(|m| m.default == 0) {
+            Some(m) => intersect(area, m.rect(l.offset)),
+            None => Some(area),
+        };
+    }
+    match l.active_mask().filter(|m| m.default == 0) {
+        Some(m) => intersect(m.rect(l.offset), canvas),
+        None => Some(canvas),
+    }
+}
+
+/// Fingerprint of what the shape of layer `i` is drawn from.
+fn shape_key(layers: &[Layer], i: usize, canvas: PixelRect) -> u64 {
+    let mut h = DefaultHasher::new();
+    let l = &layers[i];
+    (canvas, l.offset, l.mask_key()).hash(&mut h);
+    if let LayerKind::Fill(_) = &l.kind {
+        format!("{:?}", l.kind).hash(&mut h);
+    }
+    if l.is_group() {
+        let mut j = i;
+        while j > 0 && layers[j - 1].depth > l.depth {
+            j -= 1;
+            let c = &layers[j];
+            (c.id, c.rev, c.offset, c.visible, c.clipped, c.depth, c.mask_key()).hash(&mut h);
+            (c.opacity.to_bits(), c.fill.to_bits(), c.blend).hash(&mut h);
+            if !c.is_group() {
+                format!("{:?}", c.kind).hash(&mut h);
+            }
+            format!("{:?}", c.effects).hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// The shape of layer `i` over `area`: what it shows, whole and in Normal
+/// mode, an adjustment layer its mask.
+fn draw_shape(layers: &[Layer], i: usize, canvas: PixelRect, area: PixelRect) -> RgbaImage {
+    let options = compose::Options {
+        only: Some(i),
+        no_styles: Some(i),
+        ..Default::default()
+    };
+    let mut plan = compose::plan(layers, canvas, &mut compose::FullSize, &options);
+    for node in &mut plan.nodes {
+        match node {
+            compose::Node::Layer(n) => {
+                (n.opacity, n.fill) = (1.0, 1.0);
+                if let compose::Content::Adjust(_) = n.content {
+                    n.content = compose::Content::Solid([1.0; 3]);
+                }
+            }
+            compose::Node::Group(g) => (g.opacity, g.fill) = (1.0, 1.0),
+        }
+    }
+    plan.render(area)
+}
+
+/// Styles drawn from a shape over `area`, placed relative to the layer.
+fn styles_from(shape: &RgbaImage, area: PixelRect, offset: (i64, i64), fx: &Effects) -> Styles {
+    let mut styles = render_styles(shape, fx);
+    let (dx, dy) = (area.x - offset.0, area.y - offset.1);
+    for f in styles.exterior.iter_mut().chain(&mut styles.interior) {
+        f.offset = (f.offset.0 + dx, f.offset.1 + dy);
+    }
+    styles
+}
+
+/// The styles of layer `i` as shown, whatever its kind: a group draws them
+/// from what its layers show, a fill or adjustment layer from its content
+/// through its mask. `later`: see [`Layer::styles_later`].
+pub fn styles_of(
+    layers: &[Layer],
+    i: usize,
+    canvas: PixelRect,
+    held: bool,
+    later: bool,
+) -> Option<Arc<Styles>> {
+    let l = &layers[i];
+    if l.has_pixels() {
+        return l.styles_shown(held, later);
+    }
+    if !l.styleable() || !l.effects.rendered() {
+        return None;
+    }
+    let key = Key {
+        rev: shape_key(layers, i, canvas),
+        mask: 0,
+        effects: l.effects.clone(),
+    };
+    if let Some(c) = l.styles_cache.borrow().as_ref()
+        && c.effects == key.effects
+        && (held || c.rev == key.rev)
+    {
+        return Some(l.placed_styles(c));
+    }
+    let Some(area) = styles_area(layers, i, canvas) else {
+        return l.styles_cached();
+    };
+    if later && u64::from(area.w) * u64::from(area.h) > AT_ONCE {
+        // The layer and those it shows, on their own.
+        let held_below = (0..i).rev().take_while(|&j| layers[j].depth > l.depth);
+        let start = i - if l.is_group() { held_below.count() } else { 0 };
+        let part: Vec<Layer> = layers[start..=i].to_vec();
+        let (at, offset) = (i - start, l.offset);
+        let make = move |fx: &Effects| {
+            styles_from(&draw_shape(&part, at, canvas, area), area, offset, fx)
+        };
+        if let Ok(styles) = l.draw_aside(key.clone(), make) {
+            return styles;
+        }
+    }
+    let shape = draw_shape(layers, i, canvas, area);
+    let styles = Arc::new(Styles {
+        version: next_rev(),
+        ..styles_from(&shape, area, l.offset, &l.effects)
+    });
+    *l.styles_cache.borrow_mut() = Some(StylesCache {
+        rev: key.rev,
+        mask: 0,
+        effects: key.effects,
+        styles: Arc::clone(&styles),
+        offset: l.offset.into(),
+        moved: Default::default(),
+    });
+    Some(styles)
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::document::Document;
+    use crate::compose::styles::StrokeFx;
+    use crate::document::{Document, Fill, NewMask, PixelRect, Selection};
+    use crate::pixel_ops::Adjustment;
     use image::{Rgba, RgbaImage};
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+
+    /// White 40 × 40, a group over it holding a red square at (15, 15), 10
+    /// wide (the group active).
+    fn group_doc() -> Document {
+        let mut doc = Document::new(RgbaImage::from_pixel(40, 40, Rgba([255; 4])), None);
+        doc.add_group();
+        doc.add_layer(
+            "square".into(),
+            RgbaImage::from_pixel(10, 10, Rgba(RED)),
+            (15, 15),
+        );
+        doc.active = 2;
+        assert!(doc.active_layer().is_group());
+        doc
+    }
+
+    fn stroke() -> StrokeFx {
+        StrokeFx {
+            enabled: true,
+            color: GREEN,
+            width: 2.0,
+            opacity: 1.0,
+            blend: crate::compose::BlendMode::Normal,
+        }
+    }
+
+    #[test]
+    fn group_styles_follow_what_its_layers_show() {
+        let mut doc = group_doc();
+        doc.active_layer_mut().effects.stroke = stroke();
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(14, 20).0, GREEN, "stroke around the layers");
+        assert_eq!(flat.get_pixel(20, 20).0, RED);
+        assert_eq!(flat.get_pixel(5, 5).0, [255; 4]);
+        // A color overlay covers the group's shape only.
+        doc.active_layer_mut().effects.color_overlay.enabled = true;
+        doc.active_layer_mut().effects.color_overlay.color = [0, 0, 255, 255];
+        doc.active_layer_mut().effects.color_overlay.opacity = 1.0;
+        doc.active_layer_mut().effects.color_overlay.blend = crate::compose::BlendMode::Normal;
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(20, 20).0, [0, 0, 255, 255]);
+        assert_eq!(flat.get_pixel(5, 5).0, [255; 4]);
+        // The styles follow when a layer of the group changes.
+        doc.layers[1].offset = (25, 15);
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(24, 20).0, GREEN);
+        assert_eq!(flat.get_pixel(14, 20).0, [255; 4]);
+    }
+
+    /// Fill opacity fades the layers, not the styles; opacity both.
+    #[test]
+    fn group_fill_keeps_styles() {
+        let mut doc = group_doc();
+        doc.active_layer_mut().effects.stroke = stroke();
+        doc.active_layer_mut().fill = 0.0;
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(14, 20).0, GREEN);
+        assert_eq!(flat.get_pixel(20, 20).0, [255; 4], "the content is gone");
+        doc.active_layer_mut().fill = 1.0;
+        doc.active_layer_mut().opacity = 0.0;
+        assert_eq!(doc.flatten().get_pixel(14, 20).0, [255; 4]);
+    }
+
+    /// Pass Through with styles: drawn apart, in Normal.
+    #[test]
+    fn pass_through_group_with_styles_composites_apart() {
+        let mut doc = group_doc();
+        assert_eq!(doc.active_layer().blend, crate::compose::BlendMode::PassThrough);
+        doc.active_layer_mut().effects.stroke = stroke();
+        assert_eq!(doc.flatten().get_pixel(20, 20).0, RED);
+    }
+
+    /// A fill's styles draw from its mask.
+    #[test]
+    fn fill_layer_styles_use_its_mask() {
+        let mut doc = Document::new(RgbaImage::from_pixel(40, 40, Rgba([255; 4])), None);
+        let area: Selection = PixelRect {
+            x: 15,
+            y: 15,
+            w: 10,
+            h: 10,
+        }
+        .into();
+        doc.add_fill_layer(Fill::Solid([255, 0, 0]), Some(&area));
+        assert!(doc.active_layer().mask.is_some());
+        doc.active_layer_mut().effects.stroke = stroke();
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(20, 20).0, RED);
+        assert_eq!(flat.get_pixel(14, 20).0, GREEN);
+        assert_eq!(flat.get_pixel(5, 5).0, [255; 4]);
+    }
+
+    /// An adjustment layer keeps adjusting; its styles draw at its mask.
+    #[test]
+    fn adjustment_layer_styles_use_its_mask() {
+        let mut doc = Document::new(RgbaImage::from_pixel(40, 40, Rgba([0, 0, 0, 255])), None);
+        let area: Selection = PixelRect {
+            x: 15,
+            y: 15,
+            w: 10,
+            h: 10,
+        }
+        .into();
+        doc.add_adjustment_layer(Adjustment::Invert, Some(&area));
+        doc.active_layer_mut().effects.stroke = stroke();
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(20, 20).0, [255; 4], "inverted");
+        assert_eq!(flat.get_pixel(14, 20).0, GREEN);
+        assert_eq!(flat.get_pixel(5, 5).0, [0, 0, 0, 255]);
+    }
+
+    /// The display's styles, drawn aside on a large group, end up the same
+    /// as drawn at once; the extent includes them.
+    #[test]
+    fn large_group_styles_are_drawn_aside() {
+        let mut doc = Document::new(RgbaImage::from_pixel(2000, 1000, Rgba([255; 4])), None);
+        doc.add_group();
+        doc.add_layer(
+            "square".into(),
+            RgbaImage::from_pixel(10, 10, Rgba(RED)),
+            (15, 15),
+        );
+        doc.layers[1].replace_pixels(RgbaImage::from_pixel(1800, 800, Rgba(RED)));
+        doc.active = 2;
+        doc.active_layer_mut().effects.stroke = stroke();
+        let canvas = doc.full_rect();
+        assert!(super::styles_of(&doc.layers, 2, canvas, false, true).is_none());
+        let mut styles = None;
+        for _ in 0..2000 {
+            styles = super::styles_of(&doc.layers, 2, canvas, false, true);
+            if styles.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let styles = styles.expect("drawn");
+        let at_once = super::styles_of(&doc.layers, 2, canvas, false, false).unwrap();
+        assert_eq!(styles.extent(), at_once.extent());
+        assert!(!doc.active_layer().effects.color_overlay.enabled);
+    }
+
+    /// A mask on the group shapes its styles.
+    #[test]
+    fn group_mask_shapes_its_styles() {
+        let mut doc = group_doc();
+        doc.active_layer_mut().effects.color_overlay.enabled = true;
+        doc.active_layer_mut().effects.color_overlay.opacity = 1.0;
+        doc.active_layer_mut().effects.color_overlay.color = [0, 0, 255, 255];
+        assert!(doc.add_mask(NewMask::HideAll, None));
+        assert_eq!(doc.flatten().get_pixel(20, 20).0, [255; 4]);
+    }
 
     /// The styles of a large layer are drawn in the background: none at
     /// first, then the same as drawn at once; after a change, the former

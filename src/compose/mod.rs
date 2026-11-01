@@ -7,6 +7,7 @@ pub mod blend;
 mod build;
 pub mod gradient;
 pub mod levels;
+pub mod pattern;
 pub mod styles;
 
 use std::ops::Range;
@@ -47,8 +48,14 @@ pub struct GroupNode {
     pub children: Vec<Node>,
     pub blend: BlendMode,
     pub opacity: f32,
+    /// Fill opacity: its layers fade, its styles stay.
+    pub fill: f32,
     pub mask: Option<MaskSrc>,
     pub board: Option<Board>,
+    /// Drawn under it, on what is below.
+    pub exterior: Vec<FxSrc>,
+    /// Drawn over its layers, within their shape.
+    pub interior: Vec<Interior>,
 }
 
 /// An artboard: its layers show only within its rectangle (pixels of the
@@ -76,6 +83,7 @@ pub enum Content {
     Pixels(Src<Rgba<u8>>),
     Solid([f32; 3]),
     Gradient(Box<Ramp>),
+    Pattern(Box<pattern::Sampler>),
     Adjust(Box<Adjustment>),
 }
 
@@ -120,6 +128,11 @@ pub enum Interior {
         ramp: Box<Ramp>,
         /// Box of the layer's content, in canvas pixels.
         bounds: [f32; 4],
+        opacity: f32,
+        blend: BlendMode,
+    },
+    Pattern {
+        sampler: Box<pattern::Sampler>,
         opacity: f32,
         blend: BlendMode,
     },
@@ -314,6 +327,11 @@ fn content_at(content: &Content, ctx: &Ctx, x: i64, y: i64) -> ([f32; 3], f32) {
             let [r, gr, b, a] = g.at(cx, cy, ctx.canvas);
             ([r, gr, b], a)
         }
+        Content::Pattern(s) => {
+            let (cx, cy) = ctx.canvas_point(x, y);
+            let [r, g, b, a] = s.at(cx, cy);
+            ([r, g, b], a)
+        }
         Content::Adjust(_) => ([0.0; 3], 0.0),
     }
 }
@@ -342,7 +360,24 @@ fn draw_fx(fx: &FxSrc, opacity: f32, buf: &mut Buf, clip: bool) {
 
 fn draw_layer(n: &LayerNode, ctx: &Ctx, buf: &mut Buf, clip: bool) {
     if let Content::Adjust(adj) = &n.content {
-        return adjust(n, adj, buf);
+        for fx in &n.exterior {
+            draw_fx(fx, n.opacity, buf, clip);
+        }
+        adjust(n, adj, buf);
+        if !n.interior.is_empty() {
+            // Its shape is its mask's.
+            let mut layer = Buf::transparent(buf.rect);
+            let w = buf.rect.w as usize;
+            let shape: Vec<f32> = (0..layer.px.len())
+                .map(|i| {
+                    let (x, y) = (buf.rect.x + (i % w) as i64, buf.rect.y + (i / w) as i64);
+                    n.mask.as_ref().map_or(1.0, |m| m.at(x, y))
+                })
+                .collect();
+            draw_interior(&n.interior, &shape, &mut layer, ctx);
+            composite_onto(buf, &layer, n.opacity, None, BlendMode::Normal, clip);
+        }
+        return;
     }
     for fx in &n.exterior {
         draw_fx(fx, n.opacity, buf, clip);
@@ -388,10 +423,20 @@ fn draw_layer(n: &LayerNode, ctx: &Ctx, buf: &mut Buf, clip: bool) {
             layer.px[i] = [c[0] * f, c[1] * f, c[2] * f, f];
         }
     }
-    for fx in &n.interior {
+    draw_interior(&n.interior, &shape, &mut layer, ctx);
+    for c in &n.clipped {
+        draw_layer(c, ctx, &mut layer, true);
+    }
+    composite_onto(buf, &layer, n.opacity, None, n.blend, clip);
+}
+
+/// What is drawn within a shape (per pixel of `layer`), from the bottom up.
+fn draw_interior(interior: &[Interior], shape: &[f32], layer: &mut Buf, ctx: &Ctx) {
+    let (w, rect) = (layer.rect.w as usize, layer.rect);
+    for fx in interior {
         match fx {
             Interior::Fx(f) => {
-                let Some([fx0, fy0, fx1, fy1]) = overlap(&layer, &f.coverage) else {
+                let Some([fx0, fy0, fx1, fy1]) = overlap(layer, &f.coverage) else {
                     continue;
                 };
                 let cw = f.coverage.image.width() as i64;
@@ -411,7 +456,7 @@ fn draw_layer(n: &LayerNode, ctx: &Ctx, buf: &mut Buf, clip: bool) {
                 opacity,
                 blend,
             } => {
-                for (p, s) in layer.px.iter_mut().zip(&shape) {
+                for (p, s) in layer.px.iter_mut().zip(shape) {
                     over(p, *color, s * opacity, *blend);
                 }
             }
@@ -421,7 +466,7 @@ fn draw_layer(n: &LayerNode, ctx: &Ctx, buf: &mut Buf, clip: bool) {
                 opacity,
                 blend,
             } => {
-                for (i, (p, s)) in layer.px.iter_mut().zip(&shape).enumerate() {
+                for (i, (p, s)) in layer.px.iter_mut().zip(shape).enumerate() {
                     if *s > 0.0 {
                         let (x, y) = (rect.x + (i % w) as i64, rect.y + (i / w) as i64);
                         let (cx, cy) = ctx.canvas_point(x, y);
@@ -430,12 +475,22 @@ fn draw_layer(n: &LayerNode, ctx: &Ctx, buf: &mut Buf, clip: bool) {
                     }
                 }
             }
+            Interior::Pattern {
+                sampler,
+                opacity,
+                blend,
+            } => {
+                for (i, (p, s)) in layer.px.iter_mut().zip(shape).enumerate() {
+                    if *s > 0.0 {
+                        let (x, y) = (rect.x + (i % w) as i64, rect.y + (i / w) as i64);
+                        let (cx, cy) = ctx.canvas_point(x, y);
+                        let [r, g, b, a] = sampler.at(cx, cy);
+                        over(p, [r, g, b], s * opacity * a, *blend);
+                    }
+                }
+            }
         }
     }
-    for c in &n.clipped {
-        draw_layer(c, ctx, &mut layer, true);
-    }
-    composite_onto(buf, &layer, n.opacity, None, n.blend, clip);
 }
 
 /// Composites `top` (same area as `buf`) onto it, with `opacity` (and a
@@ -500,6 +555,9 @@ fn draw_group(g: &GroupNode, ctx: &Ctx, buf: &mut Buf) {
     if let Some(board) = &g.board {
         return draw_board(g, board, ctx, buf);
     }
+    if !g.exterior.is_empty() || !g.interior.is_empty() {
+        return draw_styled_group(g, ctx, buf);
+    }
     if g.blend == BlendMode::PassThrough {
         if g.opacity >= 1.0 && g.mask.is_none() {
             for c in &g.children {
@@ -530,6 +588,35 @@ fn draw_group(g: &GroupNode, ctx: &Ctx, buf: &mut Buf) {
         draw_node(c, ctx, &mut own, false);
     }
     composite_onto(buf, &own, g.opacity, g.mask.as_ref(), g.blend, false);
+}
+
+/// A group with styles: drawn apart (even in Pass Through, its layers then
+/// don't act on what is below), its shape being what they show.
+fn draw_styled_group(g: &GroupNode, ctx: &Ctx, buf: &mut Buf) {
+    let mut own = Buf::transparent(buf.rect);
+    for c in &g.children {
+        draw_node(c, ctx, &mut own, false);
+    }
+    for fx in &g.exterior {
+        draw_fx(fx, g.opacity, buf, false);
+    }
+    let w = buf.rect.w as usize;
+    let mut shape = vec![0.0f32; own.px.len()];
+    for (i, (p, s)) in own.px.iter_mut().zip(&mut shape).enumerate() {
+        if p[3] <= 0.0 {
+            continue;
+        }
+        let (x, y) = (buf.rect.x + (i % w) as i64, buf.rect.y + (i / w) as i64);
+        let m = g.mask.as_ref().map_or(1.0, |m| m.at(x, y));
+        *s = p[3] * m;
+        *p = p.map(|v| v * m * g.fill);
+    }
+    draw_interior(&g.interior, &shape, &mut own, ctx);
+    let mode = match g.blend {
+        BlendMode::PassThrough => BlendMode::Normal,
+        m => m,
+    };
+    composite_onto(buf, &own, g.opacity, None, mode, false);
 }
 
 /// An artboard: its background, then its layers (Pass Through: acting on

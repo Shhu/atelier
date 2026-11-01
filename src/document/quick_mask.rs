@@ -190,6 +190,7 @@ impl Document {
             artboard: None,
             smart: None,
             locked: false,
+            locks: Default::default(),
             visible: true,
             ..real.clone()
         }

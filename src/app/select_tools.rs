@@ -418,7 +418,7 @@ impl AtelierApp {
     /// Ctrl+drag: the active layer's pixels can be lifted (otherwise says
     /// why not).
     pub(super) fn can_lift(&mut self) -> bool {
-        if self.refuse_if_locked() {
+        if self.refuse_position_locked() || self.refuse_pixels_locked() || self.refuse_alpha_locked() {
             return false;
         }
         let Some(layer) = self.doc.as_ref().map(Document::active_layer) else {

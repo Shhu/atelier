@@ -628,7 +628,9 @@ fn crop_box_gestures() {
         h.state().canvas_rect,
         Some(Rect::from_min_max(pos2(150.0, 120.0), pos2(250.0, 180.0)))
     );
-    // Snapped to the canvas edge.
+    // Snapped to the canvas edge (a new box: outside this one, a drag
+    // turns it).
+    key(&mut h, Key::Escape, Modifiers::NONE);
     h.state_mut().rulers.settings.snap = true;
     drag(
         &mut h,

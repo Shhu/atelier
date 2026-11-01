@@ -196,6 +196,11 @@ fn extra_modifiers_are_other_shortcuts() {
         h.key_press_modifiers(Modifiers::COMMAND.plus(Modifiers::SHIFT), k);
         h.run_steps(2);
         assert!(h.state().adjust.is_none(), "{k:?}");
+        // The Auto commands compute on another thread.
+        while h.state().filters.busy() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            h.run_steps(1);
+        }
     }
     h.key_press_modifiers(Modifiers::COMMAND, Key::U);
     h.run_steps(2);

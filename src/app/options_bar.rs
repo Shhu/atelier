@@ -10,6 +10,8 @@ use egui::text::LayoutJob;
 use ui_kit::color;
 
 mod artboard_options;
+mod measure_options;
+mod crop_options;
 mod paint_options;
 mod retouch_options;
 mod transform_options;
@@ -120,9 +122,12 @@ impl AtelierApp {
             | Tool::RedEye => self.retouch_options(ui),
             Tool::Bucket => self.bucket_options(ui),
             Tool::Eyedropper => self.eyedropper_options(ui),
+            Tool::ColorSampler => self.sampler_options(ui),
+            Tool::Ruler => self.ruler_options(ui),
             Tool::Text => self.text_options(ui),
             Tool::Canvas => self.canvas_options(ui),
             Tool::Hand | Tool::Zoom => self.view_options(ui),
+            Tool::RotateView => self.rotate_view_options(ui),
             Tool::Pen(_) | Tool::PathSelect | Tool::DirectSelect | Tool::Shape(_) => {
                 self.vector_options(ui)
             }
@@ -665,57 +670,6 @@ impl AtelierApp {
         }
         let alt_click = keys::click(ui.ctx(), Modifiers::ALT);
         trailing_hint(ui, &t!("input3-eyedropper-hint", alt_click = alt_click));
-    }
-
-    fn canvas_options(&mut self, ui: &mut egui::Ui) {
-        let Some(full) = self.full_rect() else { return };
-        let mut r = self.canvas_rect.unwrap_or(full);
-
-        let mut w = r.width() as u32;
-        let mut h = r.height() as u32;
-        let w_changed = size_field(ui, &t!("optbar-width-short"), &t!("options-width"), &mut w);
-        let h_changed = size_field(
-            ui,
-            &t!("optbar-height-short"),
-            &t!("options-height"),
-            &mut h,
-        );
-        if w_changed || h_changed {
-            // Typed in: the area grows or shrinks around its center.
-            r = round_rect(Rect::from_center_size(r.center(), vec2(w as f32, h as f32)));
-            self.canvas_rect = Some(r);
-        }
-        let (x, y) = (signed(r.min.x), signed(r.min.y));
-        ui.label(
-            egui::RichText::new(t!("options-canvas-origin", x = x, y = y))
-                .font(ui_kit::mono(12.0))
-                .color(color::LABEL),
-        );
-        sep(ui);
-        if ui_kit::button(
-            ui,
-            &t!("options-fit-visible-pixels"),
-            Kind::Normal,
-            None,
-            true,
-        )
-        .on_hover_text(t!("options-fit-visible-pixels-tip"))
-        .clicked()
-            && let Some(b) = self.doc.as_ref().and_then(Document::content_bounds)
-        {
-            r = to_rect(b);
-            self.canvas_rect = Some(r);
-        }
-
-        // Icons, like the transform bars: the row doesn't wrap for them.
-        let (apply, cancel) = apply_cancel_icons(ui, r != full);
-        if apply {
-            self.canvas_rect = Some(r);
-            self.apply_canvas();
-        }
-        if cancel {
-            self.reset_pending();
-        }
     }
 
     /// Hand and Zoom tools: zoom presets and Fit on Screen.

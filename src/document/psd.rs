@@ -26,6 +26,7 @@ mod artboard;
 mod bytes;
 mod descriptor;
 mod effects;
+mod pattern;
 mod read;
 mod vector;
 mod write;
@@ -256,6 +257,77 @@ mod tests {
         doc
     }
 
+    /// The Color Sampler points; a later version's data or a damaged block
+    /// costs the points, not the file.
+    #[test]
+    fn color_samplers_round_trip() {
+        let mut doc = sample();
+        doc.samplers = vec![
+            crate::document::ColorSampler { x: 3.5, y: 7.5 },
+            crate::document::ColorSampler { x: 39.5, y: 0.5 },
+        ];
+        let (back, notes) = write_read(&doc);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(back.doc.samplers, doc.samplers);
+        assert!(back.notes.is_empty(), "{:?}", back.notes);
+        // Saved again: only one block of them.
+        let (again, _) = write_read(&back.doc);
+        assert_eq!(again.doc.samplers, doc.samplers);
+    }
+
+    /// Each lock comes back by itself; Lock All stays apart from them.
+    #[test]
+    fn partial_locks_round_trip() {
+        let mut doc = Document::new(RgbaImage::new(8, 8), None);
+        for (t, p, q, all) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, true, true, false),
+            (false, false, false, true),
+        ] {
+            doc.add_layer("l".into(), RgbaImage::new(4, 4), (0, 0));
+            let l = doc.active_layer_mut();
+            l.locks = crate::document::Locks {
+                transparent: t,
+                pixels: p,
+                position: q,
+            };
+            l.locked = all;
+        }
+        let (back, _) = write_read(&doc);
+        for (x, y) in back.doc.layers.iter().zip(&doc.layers) {
+            assert_eq!((x.locks, x.locked), (y.locks, y.locked));
+        }
+    }
+
+    /// Styles on a group, a fill and an adjustment layer come back, without
+    /// a note; a styled group keeps its fill opacity.
+    #[test]
+    fn styles_on_groups_fills_and_adjustments_round_trip() {
+        let mut doc = Document::new(RgbaImage::from_pixel(16, 16, Rgba([9, 9, 9, 255])), None);
+        doc.add_fill_layer(crate::document::Fill::Solid([200, 10, 10]), None);
+        doc.active_layer_mut().effects.color_overlay.enabled = true;
+        doc.add_adjustment_layer(
+            crate::pixel_ops::Adjustment::Invert,
+            None,
+        );
+        doc.active_layer_mut().effects.inner_glow.enabled = true;
+        doc.active = 0;
+        doc.add_group();
+        doc.active_layer_mut().effects.stroke.enabled = true;
+        doc.active_layer_mut().fill = 0.5;
+        let (back, notes) = write_read(&doc);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(back.notes.is_empty(), "{:?}", back.notes);
+        for (x, y) in back.doc.layers.iter().zip(&doc.layers) {
+            assert_eq!(x.effects.any(), y.effects.any(), "{}", x.name);
+        }
+        let group = back.doc.layers.iter().find(|l| l.is_group()).unwrap();
+        assert!(group.effects.stroke.enabled);
+        assert!((group.fill - 0.5).abs() < 0.01);
+    }
+
     #[test]
     fn documents_round_trip() {
         let doc = sample();
@@ -341,6 +413,9 @@ mod tests {
             AdjustKind::Posterize,
             AdjustKind::Threshold,
             AdjustKind::GradientMap,
+            AdjustKind::Exposure,
+            AdjustKind::ChannelMixer,
+            AdjustKind::SelectiveColor,
         ];
         for kind in kinds {
             doc.add_adjustment_layer(kind.initial(), None);

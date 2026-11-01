@@ -865,6 +865,7 @@ impl AtelierApp {
                         Some(image) => {
                             doc.active_layer_mut().replace_pixels(image);
                             doc.end_paint();
+                            doc.mark_fade();
                             self.status = t!("filter-applied", name = name.as_str());
                             if rasterized {
                                 let layer = doc.active_layer().name.as_str();

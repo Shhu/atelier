@@ -7,10 +7,11 @@
 //! is a group, and as deep otherwise.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use image::RgbaImage;
 
-use super::{Document, Fill, Layer, LayerKind, MergeError, NewMask, PixelRect, Selection};
+use super::{Document, Fill, Layer, LayerKind, Locks, MergeError, NewMask, PixelRect, Selection};
 use crate::compose::{self, BlendMode, FullSize, Options};
 use crate::i18n::t;
 use crate::pixel_ops::Adjustment;
@@ -62,6 +63,88 @@ impl Document {
     /// Locked: itself, or by a group that holds it.
     pub fn is_locked(&self, i: usize) -> bool {
         self.layers.get(i).is_some_and(|l| l.locked) || self.locking_group(i).is_some()
+    }
+
+    /// The locks that apply to layer `i`: its own and those of the groups
+    /// that hold it, Lock All implying them all.
+    pub fn locks(&self, i: usize) -> Locks {
+        let Some(l) = self.layers.get(i) else {
+            return Locks::default();
+        };
+        let mut locks = if l.locked { Locks::ALL } else { l.locks };
+        let mut at = self.parent(i);
+        while let Some(j) = at {
+            let g = &self.layers[j];
+            locks = locks.union(if g.locked { Locks::ALL } else { g.locks });
+            at = self.parent(j);
+        }
+        locks
+    }
+
+    /// The group whose lock layer `i` inherits, if any (the innermost).
+    pub fn lock_group(&self, i: usize) -> Option<usize> {
+        let mut at = self.parent(i);
+        while let Some(j) = at {
+            if self.layers[j].locked || self.layers[j].locks.any() {
+                return Some(j);
+            }
+            at = self.parent(j);
+        }
+        None
+    }
+
+    /// Whether layer `i` may move (Lock Position, Lock All).
+    pub fn can_move(&self, i: usize) -> bool {
+        !self.locks(i).position
+    }
+
+    /// Whether layer `i` may be transformed: its pixels stay what they are
+    /// under Lock Image Pixels.
+    pub fn can_transform(&self, i: usize) -> bool {
+        let l = self.locks(i);
+        !l.position && !l.pixels
+    }
+
+    /// The active layer's own pixels are the target, and may not be changed.
+    /// (A targeted mask isn't under the partial locks.)
+    pub fn pixels_locked(&self) -> bool {
+        !self.mask_targeted() && self.swapped.is_none() && self.locks(self.active).pixels
+    }
+
+    /// The active layer's own pixels are the target, and keep their opacity.
+    pub fn alpha_locked(&self) -> bool {
+        !self.mask_targeted() && self.swapped.is_none() && self.locks(self.active).transparent
+    }
+
+    /// The pixels whose opacity an edit about to start must leave as it is.
+    pub(super) fn alpha_to_keep(&self) -> Option<Arc<RgbaImage>> {
+        self.alpha_locked().then(|| self.layers[self.active].shared_image())
+    }
+
+    /// See [`Self::alpha_to_keep`]; `rect`: area changed (layer pixels).
+    pub(super) fn keep_alpha_of(&mut self, kept: Option<&Arc<RgbaImage>>, rect: Option<[u32; 4]>) {
+        if let Some(kept) = kept {
+            self.layers[self.active].keep_alpha_of(kept, rect);
+        }
+    }
+
+    /// During a brush stroke: the area `rect` (layer pixels) just painted
+    /// gets back the opacity it had under Lock Transparent Pixels.
+    pub fn keep_locked_alpha(&mut self, rect: [u32; 4]) {
+        if let Some((id, kept)) = self.alpha_guard.clone()
+            && self.layers[self.active].id == id
+        {
+            self.layers[self.active].keep_alpha_of(&kept, Some(rect));
+        }
+    }
+
+    /// Whether layer `i` can have Lock Transparent Pixels and Lock Image
+    /// Pixels: pixels of its own, or a group's layers to pass them on to.
+    pub fn lockable_pixels(&self, i: usize) -> bool {
+        self.layers.get(i).is_some_and(|l| {
+            l.is_group()
+                || (l.has_pixels() && l.text.is_none() && l.shape.is_none() && l.smart.is_none())
+        })
     }
 
     /// Whether a group above layer `i` is closed in the Layers panel.
@@ -144,6 +227,7 @@ impl Document {
         let name = match fill {
             Fill::Solid(_) => self.unused_name(|n| t!("core-solid-fill-name", number = n)),
             Fill::Gradient(_) => self.unused_name(|n| t!("core-gradient-fill-name", number = n)),
+            Fill::Pattern(_) => self.unused_name(|n| t!("pattern8-fill-name", number = n)),
         };
         let layer = self.empty_layer(name, LayerKind::Fill(fill));
         self.add_without_pixels(t!("core-menu-new-fill-layer"), layer, selection);
@@ -582,7 +666,7 @@ impl Document {
         if !below.visible || !above.visible || !below.has_pixels() {
             return Err(MergeError::Nothing);
         }
-        if self.is_locked(lower) || self.is_locked(upper) {
+        if self.is_locked(lower) || self.is_locked(upper) || self.locks(lower).pixels {
             return Err(MergeError::Locked);
         }
         let region = self.merge_region([lower, upper])?;
@@ -910,5 +994,114 @@ mod tests {
         assert_eq!(doc.layers.len(), 3);
         assert_eq!(doc.active_layer().name, name);
         assert_eq!(doc.flatten(), before);
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use crate::pixel_ops::BucketStyle;
+    use image::Rgba;
+
+    /// A layer half opaque red, half transparent, active.
+    fn doc() -> Document {
+        let mut doc = Document::new(RgbaImage::from_pixel(20, 20, Rgba([255; 4])), None);
+        let image = RgbaImage::from_fn(20, 20, |x, _| match x < 10 {
+            true => Rgba([255, 0, 0, 128]),
+            false => Rgba([0; 4]),
+        });
+        doc.add_layer("half".into(), image, (0, 0));
+        doc.active_layer_mut().locks.transparent = true;
+        doc
+    }
+
+    fn alphas(doc: &Document) -> [u8; 2] {
+        let image = doc.active_layer().image();
+        [image.get_pixel(5, 5).0[3], image.get_pixel(15, 5).0[3]]
+    }
+
+    #[test]
+    fn locks_apply_through_lock_all_and_groups() {
+        let mut d = doc();
+        d.active_layer_mut().locks = Locks::default();
+        assert_eq!(d.locks(1), Locks::default());
+        d.layers[1].locked = true;
+        assert_eq!(d.locks(1), Locks::ALL);
+        assert!(!d.can_move(1) && !d.can_transform(1));
+        d.layers[1].locked = false;
+        d.group_layers(&[1]);
+        d.layers[2].locks.position = true;
+        assert!(!d.can_move(1), "inherited");
+        assert_eq!(d.lock_group(1), Some(2));
+        assert!(!d.is_locked(1));
+        d.layers[2].locks = Locks::default();
+        d.layers[2].locks.pixels = true;
+        d.active = 1;
+        assert!(d.pixels_locked() && d.can_move(1) && !d.can_transform(1));
+    }
+
+    #[test]
+    fn fill_keeps_opacity() {
+        let mut d = doc();
+        assert!(d.fill_active([0, 255, 0, 255], None, 1.0, false));
+        assert_eq!(alphas(&d), [128, 0]);
+        assert_eq!(d.active_layer().image().get_pixel(5, 5).0[1], 255);
+    }
+
+    #[test]
+    fn bucket_keeps_opacity() {
+        let mut d = doc();
+        let blend = |d: [u8; 4], s: [u8; 4], _: i64, _: i64| crate::pixel_ops::over(d, s);
+        let style = BucketStyle {
+            sample: None,
+            anti_alias: false,
+            opacity: 1.0,
+            blend: &blend,
+        };
+        assert!(d.fill_at_with(15, 5, [0, 255, 0, 255], 0, None, true, &style, false));
+        assert_eq!(alphas(&d), [128, 0]);
+    }
+
+    /// Whatever replaces the pixels between begin_paint and end_paint (a
+    /// filter's result) leaves their opacity.
+    #[test]
+    fn paint_session_keeps_opacity() {
+        let mut d = doc();
+        assert!(d.begin_paint());
+        let opaque = RgbaImage::from_pixel(20, 20, Rgba([1, 2, 3, 255]));
+        d.active_layer_mut().replace_pixels(opaque);
+        d.end_paint();
+        assert_eq!(alphas(&d), [128, 0]);
+        assert_eq!(d.active_layer().image().get_pixel(15, 5).0[..3], [1, 2, 3]);
+    }
+
+    /// A targeted mask isn't under the partial locks.
+    #[test]
+    fn a_mask_is_not_under_partial_locks() {
+        let mut d = doc();
+        d.active_layer_mut().locks.pixels = true;
+        assert!(d.add_mask(NewMask::RevealAll, None));
+        assert!(d.mask_targeted());
+        assert!(!d.pixels_locked() && !d.alpha_locked());
+        assert!(d.begin_paint());
+        assert!(!d.alpha_locked());
+        d.end_paint();
+    }
+
+    #[test]
+    fn merge_down_refuses_pixels_locked_below() {
+        let mut d = doc();
+        d.active_layer_mut().locks = Locks::default();
+        d.layers[0].locks.pixels = true;
+        assert!(matches!(d.merge_down(), Err(MergeError::Locked)));
+    }
+
+    #[test]
+    fn align_leaves_position_locked_layers() {
+        let mut d = Document::new(RgbaImage::new(20, 20), None);
+        d.add_layer("a".into(), RgbaImage::from_pixel(4, 4, Rgba([255; 4])), (3, 3));
+        d.active_layer_mut().locks.position = true;
+        assert!(!d.align(&[1], crate::document::AlignOp::Left, None));
+        assert_eq!(d.layers[1].offset, (3, 3));
     }
 }

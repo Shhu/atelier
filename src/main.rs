@@ -21,6 +21,7 @@ mod i18n;
 mod liquify;
 mod mask_ops;
 mod paint;
+mod patterns;
 mod pixel_ops;
 mod recent;
 mod retouch;

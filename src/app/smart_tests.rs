@@ -246,8 +246,10 @@ fn smart_filters_apply_then_reedit_and_rearrange() {
     assert_eq!(smart(&h).filters.len(), 1);
     let mut expected = original.clone();
     small.apply(&mut expected, doc(&h).active_layer().offset);
+    settle(&mut h, |app| !app.smart.busy());
     assert_eq!(*doc(&h).active_layer().image(), expected);
     h.state_mut().run(Action::Smart(Command::ToggleFilters));
+    settle(&mut h, |app| !app.smart.busy());
     assert_eq!(*doc(&h).active_layer().image(), original);
     h.run_steps(2);
 }
@@ -909,4 +911,28 @@ fn update_modified_content_during_a_focus_read() {
     drop(held);
     h.run_steps(2);
     assert!(!h.state().smart.network_read_waits(uid));
+}
+
+#[test]
+fn distort_filter_applies_as_a_smart_filter_and_survives_re_edit() {
+    let mut h = app();
+    h.state_mut()
+        .run(Action::Smart(Command::ConvertForFilters));
+    settle(&mut h, |app| !app.smart.busy());
+    let original = doc(&h).active_layer().image().clone();
+    h.state_mut().run(Action::Filter(FilterKind::Twirl));
+    settle(&mut h, |app| {
+        matches!(
+            app.preview_shown.as_ref().map(|p| &p.preview),
+            Some(LayerPreview::Filter(_))
+        )
+    });
+    h.key_press(egui::Key::Enter);
+    settle(&mut h, |app| !app.filters.busy() && !app.smart.busy());
+    let twirl = FilterKind::Twirl.initial();
+    assert_eq!(smart(&h).filters.len(), 1);
+    assert_eq!(smart(&h).filters[0].filter, twirl.into());
+    assert!(doc(&h).active_layer().is_smart());
+    assert_ne!(*doc(&h).active_layer().image(), original);
+    assert_eq!(h.state().filters.last, Some(twirl));
 }

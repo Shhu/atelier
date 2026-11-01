@@ -661,6 +661,33 @@ impl Mask {
         self.set_from_rgba(&image, origin, layer_offset);
     }
 
+    /// Only what lies within `area` (canvas) stays, the feathered edge's
+    /// reach kept. Unlinked: Delete Cropped Pixels (see `Layer::edit_mask`).
+    pub(super) fn cut_to(&mut self, area: PixelRect) {
+        let m = self.margin();
+        let area = PixelRect {
+            x: area.x - m,
+            y: area.y - m,
+            w: area.w + 2 * m as u32,
+            h: area.h + 2 * m as u32,
+        };
+        let (x, y) = self.origin((0, 0));
+        let own = PixelRect {
+            x,
+            y,
+            w: self.image.width(),
+            h: self.image.height(),
+        };
+        let Some(k) = super::intersect(own, area) else {
+            return self.replace(GrayImage::new(0, 0), (x, y), (0, 0));
+        };
+        if k != own {
+            let (dx, dy) = ((k.x - x) as u32, (k.y - y) as u32);
+            let image = image::imageops::crop_imm(&*self.image, dx, dy, k.w, k.h).to_image();
+            self.replace(image, (k.x, k.y), (0, 0));
+        }
+    }
+
     /// Resized from `from` to `to` (canvas boxes), the way a transform
     /// moves a layer's pixels.
     pub(super) fn map(
@@ -952,12 +979,20 @@ impl Document {
             return false;
         }
         self.expand_active_to_canvas();
+        let id = self.layers[self.active].id;
+        self.alpha_guard = self.alpha_to_keep().map(|kept| (id, kept));
         true
     }
 
-    /// The painting is over: the mask gets back its place.
+    /// The painting is over: the mask gets back its place; under Lock
+    /// Transparent Pixels, the pixels their opacity from before it.
     pub fn end_paint(&mut self) {
         self.swap_out_mask();
+        if let Some((id, kept)) = self.alpha_guard.take()
+            && self.layers[self.active].id == id
+        {
+            self.layers[self.active].keep_alpha_of(&kept, None);
+        }
     }
 
     /// Copies area `area` (canvas) of the painted stand-in into the mask
@@ -1214,6 +1249,7 @@ fn stand_in_shell(layer: &Layer) -> Layer {
         styles_cache: RefCell::new(None),
         styles_job: Default::default(),
         effects: Default::default(),
+        locks: Default::default(),
         mask: None,
         text: None,
         shape: None,

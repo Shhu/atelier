@@ -2,6 +2,7 @@
 //! of a kind) both ways, for the styles Atelier has.
 
 use super::adjust::{gradient_fill, gradient_fill_items};
+use super::pattern::{Patterns, fill_items, fill_of};
 use super::descriptor::{Descriptor, Value, angle, color_of, enumerated, percent, pixels, rgb};
 use super::{descriptor_blend_key, descriptor_blend_of};
 use crate::compose::styles::{Effects, GlowFx, ShadowFx};
@@ -45,7 +46,7 @@ fn opacity(d: &Descriptor, key: &[u8], default: f32) -> f32 {
 /// The styles of a layer from its effects descriptor (`global`: the
 /// document's light angle); and whether some had to be simplified or left
 /// out.
-pub fn read(fx: &Descriptor, global: f64) -> (Effects, bool) {
+pub fn read(fx: &Descriptor, global: f64, patterns: &Patterns) -> (Effects, bool) {
     let mut e = Effects::default();
     if !fx.bool(b"masterFXSwitch").unwrap_or(true) {
         return (e, false);
@@ -159,10 +160,20 @@ pub fn read(fx: &Descriptor, global: f64) -> (Effects, bool) {
         b.shadow_blend = mode(d, b"sdwM", b.shadow_blend);
         simplified |= d.enumerated(b"bvlS").is_some_and(|s| s != b"InrB");
     }
-    // Satin, pattern overlay: not in Atelier.
-    for key in [&b"ChFX"[..], b"patternFill"] {
-        simplified |= on(fx.object(key)).is_some();
+    if let Some(d) = on(fx.object(b"patternFill")) {
+        let p = &mut e.pattern_overlay;
+        match fill_of(d, patterns) {
+            Some(fill) => {
+                p.enabled = true;
+                p.fill = fill;
+                p.opacity = opacity(d, b"Opct", p.opacity);
+                p.blend = mode(d, b"Md  ", p.blend);
+            }
+            None => simplified = true,
+        }
     }
+    // Satin: not in Atelier.
+    simplified |= on(fx.object(b"ChFX")).is_some();
     (e, simplified)
 }
 
@@ -314,6 +325,11 @@ pub fn write(e: &Effects) -> Option<Descriptor> {
         let d = base(b"GrFl", g.blend).with(b"Opct", percent(g.opacity as f64 * 100.0));
         fx = fx.with(b"GrFl", Value::Object(gradient_fill_items(&g.fill, d)));
     }
+    let p = &e.pattern_overlay;
+    if p.enabled {
+        let d = base(b"patternFill", p.blend).with(b"Opct", percent(p.opacity as f64 * 100.0));
+        fx = fx.with(b"patternFill", Value::Object(fill_items(&p.fill, d)));
+    }
     let s = &e.stroke;
     if s.enabled {
         let d = base(b"FrFX", s.blend)
@@ -374,7 +390,7 @@ mod tests {
         let mut w = super::super::bytes::Writer::default();
         fx.write(&mut w);
         let fx = Descriptor::read(&mut super::super::bytes::Reader::new(&w.data)).unwrap();
-        let (back, simplified) = read(&fx, 30.0);
+        let (back, simplified) = read(&fx, 30.0, &Patterns::new());
         assert!(!simplified);
         assert!((back.shadow.dx - 3.0).abs() < 0.01 && (back.shadow.dy - 4.0).abs() < 0.01);
         assert_eq!(

@@ -411,6 +411,7 @@ fn fill_dialog_on_a_shape_layer_asks_to_rasterize_it() {
         opacity: 1.0,
         preserve_transparency: false,
         adapt: true,
+        pattern: 0,
     };
     let mut h = shape_app();
     let n = steps(&h);

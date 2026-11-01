@@ -9,7 +9,12 @@ use image::{GrayImage, Rgba, RgbaImage};
 
 use crate::i18n::t;
 
+mod mixers;
 mod tones;
+pub use mixers::{
+    AutoMode, ChannelMixer, Exposure, Fade, SELECTIVE_RANGES, SelectiveColor, StrokeLocation,
+    StrokeSettings, auto_levels, stroke,
+};
 pub use tones::{BlackWhite, GradientMap, PhotoFilter, Posterize, Threshold};
 
 /// Distance between two colors: the largest difference on one channel (alpha
@@ -1075,15 +1080,18 @@ pub enum AdjustKind {
     BrightnessContrast,
     Levels,
     Curves,
+    Exposure,
     Vibrance,
     HueSaturation,
     ColorBalance,
     BlackWhite,
     PhotoFilter,
+    ChannelMixer,
     Invert,
     Posterize,
     Threshold,
     GradientMap,
+    SelectiveColor,
 }
 
 impl AdjustKind {
@@ -1101,6 +1109,9 @@ impl AdjustKind {
             AdjustKind::Posterize => t!("core-adjust-posterize"),
             AdjustKind::Threshold => t!("core-adjust-threshold"),
             AdjustKind::GradientMap => t!("core-adjust-gradient-map"),
+            AdjustKind::Exposure => t!("adjust8-exposure"),
+            AdjustKind::ChannelMixer => t!("adjust8-channel-mixer"),
+            AdjustKind::SelectiveColor => t!("adjust8-selective-color"),
         }
     }
 
@@ -1120,6 +1131,9 @@ impl AdjustKind {
             AdjustKind::Posterize => Adjustment::Posterize(Default::default()),
             AdjustKind::Threshold => Adjustment::Threshold(Default::default()),
             AdjustKind::GradientMap => Adjustment::GradientMap(Default::default()),
+            AdjustKind::Exposure => Adjustment::Exposure(Default::default()),
+            AdjustKind::ChannelMixer => Adjustment::ChannelMixer(Default::default()),
+            AdjustKind::SelectiveColor => Adjustment::SelectiveColor(Default::default()),
         }
     }
 }
@@ -1141,6 +1155,9 @@ pub enum Adjustment {
     Posterize(Posterize),
     Threshold(Threshold),
     GradientMap(GradientMap),
+    Exposure(Exposure),
+    ChannelMixer(ChannelMixer),
+    SelectiveColor(SelectiveColor),
 }
 
 impl Adjustment {
@@ -1158,6 +1175,9 @@ impl Adjustment {
             Adjustment::Posterize(_) => AdjustKind::Posterize,
             Adjustment::Threshold(_) => AdjustKind::Threshold,
             Adjustment::GradientMap(_) => AdjustKind::GradientMap,
+            Adjustment::Exposure(_) => AdjustKind::Exposure,
+            Adjustment::ChannelMixer(_) => AdjustKind::ChannelMixer,
+            Adjustment::SelectiveColor(_) => AdjustKind::SelectiveColor,
         }
     }
 
@@ -1176,6 +1196,9 @@ impl Adjustment {
             Adjustment::HueSaturation(hs) => hs.is_neutral(),
             Adjustment::Vibrance(v) => v.vibrance == 0.0 && v.saturation == 0.0,
             Adjustment::PhotoFilter(f) => f.density == 0.0,
+            Adjustment::Exposure(e) => *e == Exposure::default(),
+            Adjustment::ChannelMixer(m) => *m == ChannelMixer::default(),
+            Adjustment::SelectiveColor(s) => s.ranges == [[0.0; 4]; SELECTIVE_RANGES],
             Adjustment::BlackWhite(_)
             | Adjustment::Invert
             | Adjustment::Posterize(_)
@@ -1203,6 +1226,9 @@ impl Adjustment {
             Adjustment::Posterize(p) => tones::posterize(image, p.levels),
             Adjustment::Threshold(t) => tones::threshold(image, t.level),
             Adjustment::GradientMap(g) => tones::gradient_map(image, g),
+            Adjustment::Exposure(e) => mixers::exposure(image, e),
+            Adjustment::ChannelMixer(m) => mixers::channel_mixer(image, m),
+            Adjustment::SelectiveColor(s) => mixers::selective_color(image, s),
         }
     }
 }

@@ -16,6 +16,8 @@ mod type_sections;
 const HEADING_HEIGHT: f32 = 42.0;
 /// Blend mode and opacity of the active layer, under the Layers heading.
 const BLEND_ROW: f32 = 36.0;
+/// The row of locks, under the blend mode and opacity.
+const LOCK_ROW: f32 = 30.0;
 /// Row of the layers list.
 const ROW_HEIGHT: f32 = 44.0;
 const ROW_GAP: f32 = 2.0;
@@ -55,7 +57,7 @@ impl AtelierApp {
         };
         // A low panel lists fewer rows before scrolling, for the Properties;
         // a tall one more, as many as the Properties leave room for.
-        let fixed = HEADING_HEIGHT + BLEND_ROW + 6.0 + FOOTER_HEIGHT;
+        let fixed = HEADING_HEIGHT + BLEND_ROW + LOCK_ROW + 6.0 + FOOTER_HEIGHT;
         let visible = if full.height() < SHORT_PANEL {
             SHORT_VISIBLE_ROWS
         } else {
@@ -171,6 +173,7 @@ impl AtelierApp {
         let mut content = layer.kind.clone();
         let mut mask = layer.mask.as_ref().map(|m| (m.density, m.feather));
         let (group, pixels) = (layer.is_group(), layer.has_pixels());
+        let styleable = layer.styleable();
         let artboard = layer.artboard.is_some();
         let mut fill = None;
         let mut action = None;
@@ -240,7 +243,7 @@ impl AtelierApp {
                         });
                     });
                 }
-                if pixels {
+                if styleable {
                     section(ui, Some(&t!("panel-effects")), |ui| {
                         ui.add_enabled_ui(!locked, |ui| {
                             if let Some(style) = effect_fields(ui, &mut effects) {
@@ -248,6 +251,8 @@ impl AtelierApp {
                             }
                         });
                     });
+                }
+                if pixels {
                     let (primary, secondary) = (self.primary, self.secondary);
                     section(ui, Some(&t!("side-fill-layer")), |ui| {
                         ui.add_enabled_ui(!locked, |ui| {
@@ -545,6 +550,10 @@ impl AtelierApp {
                 layer.offset.1 += dy;
             }
         } else {
+            // A new size or angle resamples.
+            if self.refuse_pixels_locked() {
+                return;
+            }
             // Applied in place: the canvas never follows here.
             let fit = std::mem::replace(&mut self.fit_canvas, false);
             self.transform_rect = Some(target);
@@ -560,31 +569,29 @@ impl AtelierApp {
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, color::LAYERS);
         ui.painter().hline(rect.x_range(), rect.top() + 0.5, line());
-        let Some((n, locked)) = self
-            .doc
-            .as_ref()
-            .map(|d| (d.layers.len(), d.active_layer().locked))
-        else {
+        let Some(n) = self.doc.as_ref().map(|d| d.layers.len()) else {
             return;
         };
-        let mut lock = locked;
         heading_bar(ui, &t!("panel-layers"), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            ui_kit::icon_toggle(ui, icon::LOCK_SIMPLE, &t!("side-lock-tip"), &mut lock);
             ui.label(
                 egui::RichText::new(t!("side-layer-count", count = n))
                     .font(ui_kit::mono(12.0))
                     .color(color::LABEL),
             );
         });
-        if lock != locked {
-            self.run(Action::ToggleLock);
-        }
         // Right under the heading (not after its spacing): the list starts
         // below it.
-        let top = rect.top() + HEADING_HEIGHT + BLEND_ROW;
-        let blend = Rect::from_x_y_ranges(rect.x_range(), rect.top() + HEADING_HEIGHT..=top);
+        let locks = rect.top() + HEADING_HEIGHT + BLEND_ROW;
+        let top = locks + LOCK_ROW;
+        let blend = Rect::from_x_y_ranges(rect.x_range(), rect.top() + HEADING_HEIGHT..=locks);
         self.blend_row(&mut ui.new_child(UiBuilder::new().max_rect(blend)));
+        let row = Rect::from_x_y_ranges(rect.x_range(), locks..=top).shrink2(vec2(14.0, 1.0));
+        self.lock_row(&mut ui.new_child(
+            UiBuilder::new()
+                .max_rect(row)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        ));
         let footer = Rect::from_min_max(pos2(rect.left(), rect.bottom() - FOOTER_HEIGHT), rect.max);
         let list = Rect::from_min_max(
             pos2(rect.left() + 6.0, top),
@@ -853,19 +860,24 @@ impl AtelierApp {
 
                     // Lock (shown when locked: a click unlocks), styles.
                     let mut right = rect.right() - 6.0;
-                    if layer.locked {
+                    if layer.locked || layer.locks.any() {
                         let lock = Rect::from_min_size(
                             pos2(right - 24.0, rect.center().y - 12.0),
                             Vec2::splat(24.0),
                         );
-                        let tip = t!("panel-unlock-tip");
+                        // A partial lock shows dimmer than Lock All.
+                        let (tip, tint) = if layer.locked {
+                            (t!("panel-unlock-tip"), color::MUTED)
+                        } else {
+                            (t!("layers8-partial-unlock-tip"), color::LABEL)
+                        };
                         let glyph = icon::LOCK_SIMPLE;
                         if row_icon(
                             ui,
                             lock,
                             Id::new(("side_lock", layer.id)),
                             glyph,
-                            color::MUTED,
+                            tint,
                             &tip,
                         )
                         .clicked()
@@ -873,7 +885,7 @@ impl AtelierApp {
                             unlock = Some(i);
                         }
                         right = lock.left() - 4.0;
-                    } else if let Some(g) = doc.locking_group(i) {
+                    } else if let Some(g) = doc.lock_group(i) {
                         // Locked with its group: dimmed, the group unlocks.
                         let lock = Rect::from_min_size(
                             pos2(right - 24.0, rect.center().y - 12.0),
@@ -891,7 +903,7 @@ impl AtelierApp {
                             .on_hover_text(tip);
                         right = lock.left() - 4.0;
                     }
-                    if layer.has_pixels() && layer.effects.any() {
+                    if layer.effects.any() {
                         let fx = painter.text(
                             pos2(right - 2.0, rect.center().y),
                             Align2::RIGHT_CENTER,
@@ -1006,7 +1018,7 @@ impl AtelierApp {
                             // The mask, in Properties (its density and
                             // feather), not the layer's style.
                             click = Some((i, RowPart::Mask, Modifiers::NONE));
-                        } else if layer.has_pixels() {
+                        } else if layer.styleable() {
                             menu_action = Some(Action::LayerStyle(None));
                         }
                     } else if row.clicked() {
@@ -1160,17 +1172,7 @@ impl AtelierApp {
             self.focus_name = true;
         }
         if let Some(i) = unlock {
-            self.record_change(t!("xchg-hist-unlock-layer"), None);
-            if let Some(doc) = &mut self.doc {
-                let layer = &mut doc.layers[i];
-                layer.locked = false;
-                let name = layer.name.as_str();
-                self.status = format!(
-                    "{} {}",
-                    icon::LOCK_SIMPLE_OPEN,
-                    t!("status-layer-unlocked", name = name)
-                );
-            }
+            self.unlock_layer(i);
         }
         // What is pending is applied first (an empty new text goes away):
         // the layers are found again by id, and the drop is given up if
@@ -1494,6 +1496,9 @@ fn draw_thumb(painter: &egui::Painter, thumb: Rect, layer: &Layer, tex: Option<e
         LayerKind::Fill(Fill::Gradient(g)) => {
             super::gradient_editor::paint_ramp(painter, thumb, &g.gradient, [0; 3], [255; 3], true);
         }
+        LayerKind::Fill(Fill::Pattern(p)) => {
+            super::patterns_ui::paint_tile(painter, thumb, &p.pattern, 4.0);
+        }
     }
 }
 
@@ -1766,6 +1771,7 @@ fn fill_content_fields(ui: &mut Ui, fill: &mut Fill) {
             });
         }
         Fill::Gradient(g) => gradient_fill_fields(ui, g),
+        Fill::Pattern(p) => super::patterns_ui::pattern_fill_fields(ui, p),
     }
 }
 

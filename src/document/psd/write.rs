@@ -7,7 +7,7 @@ use std::sync::Arc;
 use image::{GrayImage, RgbaImage};
 
 use super::bytes::{Writer, pack_row};
-use super::{adjust, artboard, blend_key, effects};
+use super::{adjust, artboard, blend_key, effects, pattern};
 use crate::cms::Conversion;
 use crate::document::native::{check_layer, par_map};
 use crate::document::{BlendMode, Document, FileError, Layer, LayerKind, PixelRect};
@@ -123,6 +123,7 @@ pub(super) fn document(
         });
         // Global layer mask info: none.
         s.u32(0);
+        pattern::write_block(s, &pattern::used(&layers));
     });
     merged(&mut out, &flat, transparent, channels, cmyk);
     if overflow || out.data.len() > u32::MAX as usize {
@@ -348,6 +349,18 @@ fn resources(
             }
         });
     }
+    if !doc.samplers.is_empty() {
+        resource(r, 1038, &|r| {
+            r.u32(1);
+            r.u32(doc.samplers.len() as u32);
+            for s in &doc.samplers {
+                r.i32((s.y * 65536.0).round() as i32);
+                r.i32((s.x * 65536.0).round() as i32);
+                // The color space shown: as the document.
+                r.i16(-1);
+            }
+        });
+    }
     if !channels.is_empty() {
         resource(r, 1006, &|r| {
             for c in channels {
@@ -545,8 +558,12 @@ fn record(layer: Option<&Layer>, rect: PixelRect, channels: Vec<(i16, Vec<u8>)>)
                 x.u8((l.fill.clamp(0.0, 1.0) * 255.0).round() as u8)
             });
         }
-        if l.locked {
-            x.tagged(b"lspf", |x| x.u32(0x8000_0000));
+        if l.locked || l.locks.any() {
+            let bits = u32::from(l.locks.transparent)
+                | u32::from(l.locks.pixels) << 1
+                | u32::from(l.locks.position) << 2
+                | u32::from(l.locked) << 31;
+            x.tagged(b"lspf", |x| x.u32(bits));
         }
         match &l.kind {
             LayerKind::Group { expanded } => {
@@ -559,7 +576,7 @@ fn record(layer: Option<&Layer>, rect: PixelRect, channels: Vec<(i16, Vec<u8>)>)
             }
             kind => adjust::write(kind, x),
         }
-        if l.has_pixels()
+        if l.styleable()
             && let Some(fx) = effects::write(&l.effects)
         {
             x.tagged(b"lfx2", |x| {

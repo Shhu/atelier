@@ -121,7 +121,6 @@ options-opacity = Opacity
 
 ## Crop tool options
 
-options-canvas-origin = Origin { $x }, { $y }
 options-fit-visible-pixels = Fit to Visible Pixels
 options-fit-visible-pixels-tip = Frames exactly the content of all visible layers.
 
@@ -493,7 +492,6 @@ side-layer-count = { $count ->
     [one] { $count } layer
    *[other] { $count } layers
 }
-side-lock-tip = Lock / unlock
 
 ## Document tabs
 
@@ -3026,3 +3024,285 @@ input6-status-locked-left = { $count ->
 
 ## Command palette: Image › Image Rotation flips
 ui7-palette-keywords-flip = flip mirror symmetry canvas
+
+## Image: auto commands
+adjust8-auto-tone = Auto Tone
+adjust8-auto-contrast = Auto Contrast
+adjust8-auto-color = Auto Color
+## Edit: Fade
+adjust8-menu-fade = Fade { $name }…
+adjust8-menu-fade-none = Fade…
+adjust8-fade-title = Fade
+adjust8-hist-fade = Fade { $name }
+adjust8-mode = Mode
+adjust8-why-no-fade = Available only right after a filter, an adjustment or a stroke
+## Edit: Stroke
+adjust8-menu-stroke = Stroke…
+adjust8-stroke-title = Stroke
+adjust8-stroke-section = Stroke
+adjust8-stroke-width = Width
+adjust8-stroke-color-tip = Stroke color
+adjust8-stroke-location = Location
+adjust8-stroke-inside = Inside
+adjust8-stroke-center = Center
+adjust8-stroke-outside = Outside
+## Adjustments: Exposure, Channel Mixer, Selective Color
+adjust8-exposure = Exposure
+adjust8-offset = Offset
+adjust8-gamma = Gamma Correction
+adjust8-channel-mixer = Channel Mixer
+adjust8-output-channel = Output Channel
+adjust8-total = Total
+adjust8-constant = Constant
+adjust8-monochrome = Monochrome
+adjust8-selective-color = Selective Color
+adjust8-colors = Colors
+adjust8-whites = Whites
+adjust8-neutrals = Neutrals
+adjust8-blacks = Blacks
+adjust8-black = Black
+adjust8-method = Method
+adjust8-relative = Relative
+adjust8-absolute = Absolute
+## Command palette: other words these commands are looked for by
+adjust8-keywords-auto = auto levels enhance correct
+adjust8-keywords-fade = fade reduce blend opacity last filter
+adjust8-keywords-stroke = outline border edge selection
+adjust8-keywords-exposure = exposure stops gamma offset
+adjust8-keywords-mixer = channel mix monochrome grayscale
+adjust8-keywords-selective = selective cmyk ink color correction
+
+## Layer locks (Layers panel, Layer menu)
+layers8-lock-label = Lock:
+layers8-lock-transparent = Lock Transparent Pixels
+layers8-lock-pixels = Lock Image Pixels
+layers8-lock-position = Lock Position
+layers8-lock-all = Lock All
+layers8-menu-lock = Lock Layers
+layers8-lock-unavailable = { $lock }: unavailable on this layer
+layers8-partial-unlock-tip = Partially locked: click to unlock
+layers8-why-lock = This lock is unavailable on this layer, or set by its group
+layers8-palette-keywords-lock = lock unlock protect transparency alpha pixels position
+layers8-status-pixels-locked = "{ $name }" has Lock Image Pixels on: turn it off in the Layers panel.
+layers8-status-transparent-locked = "{ $name }" has Lock Transparent Pixels on: turn it off in the Layers panel.
+layers8-status-position-locked = "{ $name }" has Lock Position on: turn it off in the Layers panel.
+
+## Patterns: built-in names
+
+pattern8-builtin-checker = Checkerboard
+pattern8-builtin-lines = Diagonal Lines
+pattern8-builtin-dots = Dots
+pattern8-builtin-grid = Grid
+pattern8-builtin-bricks = Bricks
+pattern8-builtin-canvas = Canvas
+
+## Patterns: Define Pattern, library
+
+pattern8-menu-define = Define Pattern…
+pattern8-define-title = Pattern Name
+pattern8-rename-title = Rename Pattern
+pattern8-name = Name
+pattern8-size = Size
+pattern8-default-name = Pattern { $number }
+pattern8-status-defined = Pattern "{ $name }" defined
+pattern8-status-empty = Could not define the pattern: the area is empty.
+pattern8-why-rectangle = Needs a rectangular selection without feather
+pattern8-why-quick-mask = Leave Quick Mask first
+pattern8-why-missing = This pattern is no longer in the library.
+pattern8-rename = Rename Pattern…
+pattern8-delete = Delete Pattern
+pattern8-palette-keywords = pattern texture tile
+
+## Patterns: fill, fill layer, overlay
+
+pattern8-pattern = Pattern
+pattern8-fill-name = Pattern Fill { $number }
+pattern8-style-overlay = Pattern Overlay
+pattern8-link = Link with Layer
+pattern8-link-tip = The pattern moves with the layer
+pattern8-snap = Snap to Origin
+pattern8-snap-tip = Back to the top left corner of the layer, or of the document when not linked
+
+## Tools
+panels8-tool-color-sampler = Color Sampler
+panels8-tool-ruler = Ruler
+panels8-sample-size = Sample Size
+panels8-sample-point = Point Sample
+panels8-sample-average = { $size } by { $size } Average
+panels8-clear-all = Clear All
+panels8-clear = Clear
+panels8-straighten-layer = Straighten Layer
+panels8-straighten-tip = Turns the layer so that the line is level, and crops the canvas. Alt: without cropping.
+panels8-why-no-samplers = No sampling point to clear.
+panels8-why-no-line = Draw a line with the Ruler first.
+panels8-sampler-hint = Click: add a point. { $alt_click }: remove one.
+panels8-status-samplers-full = A document holds { $count } sampling points at most.
+panels8-status-straighten-quick-mask = Not in Quick Mask Mode.
+panels8-hint-add-sampler = add a point
+panels8-hint-move-sampler = move a point
+panels8-hint-delete-sampler = remove a point
+panels8-hint-measure = measure
+panels8-hint-protractor = from an end: protractor
+
+## History steps
+panels8-hist-add-sampler = Color Sampler
+panels8-hist-move-sampler = Move Color Sampler
+panels8-hist-delete-sampler = Delete Color Sampler
+panels8-hist-clear-samplers = Clear Color Samplers
+
+## Short names of values
+panels8-short-x = X:
+panels8-short-y = Y:
+panels8-short-w = W:
+panels8-short-h = H:
+panels8-short-angle = A:
+panels8-short-l1 = L1:
+panels8-short-l2 = L2:
+panels8-short-r = R:
+panels8-short-g = G:
+panels8-short-b = B:
+panels8-short-c = C:
+panels8-short-m = M:
+panels8-short-y-ink = Y:
+panels8-short-k = K:
+
+## Info panel
+panels8-menu-info = Info
+panels8-info-title = Info
+panels8-info-document = Doc:
+panels8-info-size = { $width } × { $height } px
+
+## Histogram panel
+panels8-menu-histogram = Histogram
+panels8-histogram-title = Histogram
+panels8-histogram-channel = Channel
+panels8-histogram-source = Source
+panels8-source-image = Entire Image
+panels8-source-layer = Selected Layer
+panels8-channel-rgb = RGB
+panels8-channel-red = Red
+panels8-channel-green = Green
+panels8-channel-blue = Blue
+panels8-channel-luminosity = Luminosity
+panels8-channel-colors = Colors
+panels8-histogram-mean = Mean:
+panels8-histogram-deviation = Std Dev:
+panels8-histogram-median = Median:
+panels8-histogram-pixels = Pixels:
+panels8-histogram-level = Level:
+panels8-histogram-count = Count:
+panels8-histogram-percentile = Percentile:
+panels8-histogram-computing = Updating…
+
+## Navigator panel
+panels8-menu-navigator = Navigator
+panels8-navigator-title = Navigator
+panels8-navigator-zoom = Zoom
+
+## Screen modes
+panels8-menu-screen-mode = Screen Mode
+panels8-screen-standard = Standard Screen Mode
+panels8-screen-full-menu = Full Screen Mode With Menu Bar
+panels8-screen-full = Full Screen Mode
+panels8-screen-notice = Press F or Esc to leave full screen. Tab shows the panels.
+panels8-shortcut-screen-mode = Next screen mode
+
+## Command palette keywords
+panels8-keywords-sampler = color sampler sampling point values measure info
+panels8-keywords-ruler = ruler measure distance angle straighten level protractor
+panels8-keywords-info = info values cursor rgb cmyk position size
+panels8-keywords-histogram = histogram levels statistics channels mean
+panels8-keywords-navigator = navigator thumbnail overview zoom view
+panels8-keywords-screen-mode = screen mode full screen menu bar present
+
+## Crop tool: options bar
+crop8-preset-ratio = Ratio
+crop8-preset-size = W x H x Resolution
+crop8-preset-original = Original Ratio
+crop8-preset-square = Square
+crop8-swap = Swap width and height
+crop8-clear = Clear
+crop8-clear-tip = Empties the width, height and resolution
+crop8-resolution = Res.
+crop8-resolution-tip = Resolution given to the cropped image; empty keeps it
+crop8-straighten-tip = Straighten: draw a line along what should be level
+crop8-overlay = Overlay
+crop8-overlay-thirds = Rule of Thirds
+crop8-overlay-grid = Grid
+crop8-overlay-none = None
+crop8-shield = Opacity
+crop8-shield-tip = How dark the cropped area is shown
+crop8-delete-cropped = Delete Cropped Pixels
+crop8-delete-cropped-tip = When off, the pixels outside the box stay in the layers and can be revealed later
+## Crop tool: status bar hint
+crop8-hint-turn = outside the box: rotate it
+
+## Rotate View tool and View › Flip Horizontal
+
+view8-tool-rotate-view = Rotate View
+view8-rotation-angle = Rotation Angle
+view8-reset-view = Reset View
+view8-rotate-all-windows = Rotate All Windows
+view8-flip-horizontal = Flip Horizontal
+view8-hint-rotate = Rotate the view
+view8-hint-steps = By 15° steps
+view8-hint-reset = Reset the view
+view8-palette-keywords-rotate-view = turn tilt angle canvas view rotation
+view8-palette-keywords-flip = mirror view reverse check composition
+
+## Filter menu: Distort group and filter names
+
+distort8-group = Distort
+distort8-pinch = Pinch
+distort8-polar = Polar Coordinates
+distort8-ripple = Ripple
+distort8-shear = Shear
+distort8-spherize = Spherize
+distort8-twirl = Twirl
+distort8-wave = Wave
+distort8-zigzag = ZigZag
+
+## Distort filters: settings
+
+distort8-size = Size
+distort8-size-small = Small
+distort8-size-medium = Medium
+distort8-size-large = Large
+distort8-generators = Number of Generators
+distort8-wavelength-min = Wavelength Min.
+distort8-wavelength-max = Wavelength Max.
+distort8-amplitude-min = Amplitude Min.
+distort8-amplitude-max = Amplitude Max.
+distort8-scale-horizontal = Scale Horiz.
+distort8-scale-vertical = Scale Vert.
+distort8-type = Type
+distort8-type-sine = Sine
+distort8-type-triangle = Triangle
+distort8-type-square = Square
+distort8-randomize = Randomize
+distort8-mode = Mode
+distort8-mode-normal = Normal
+distort8-mode-horizontal = Horizontal Only
+distort8-mode-vertical = Vertical Only
+distort8-conversion = Conversion
+distort8-rectangular-to-polar = Rectangular to Polar
+distort8-polar-to-rectangular = Polar to Rectangular
+distort8-ridges = Ridges
+distort8-style = Style
+distort8-around-center = Around Center
+distort8-out-from-center = Out From Center
+distort8-pond-ripples = Pond Ripples
+distort8-shear-curve = Shear curve
+distort8-shear-default = Default
+distort8-shear-tip = Drag a point or the line to bend it. Drag a point out of the grid to remove it.
+
+## Distort filters: command palette keywords
+
+distort8-keywords-pinch = distort squeeze bulge
+distort8-keywords-polar = distort polar circle planet
+distort8-keywords-ripple = distort water
+distort8-keywords-shear = distort bend skew curve
+distort8-keywords-spherize = distort sphere bulge fisheye
+distort8-keywords-twirl = distort swirl spiral whirl
+distort8-keywords-wave = distort sine undulate
+distort8-keywords-zigzag = distort pond rings

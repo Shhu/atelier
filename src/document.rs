@@ -24,10 +24,13 @@ use crate::vector::{Path as VectorPath, Shape};
 mod artboards;
 mod channels;
 mod clipboard;
+mod fade;
 mod color;
+mod crop;
 mod file_io;
 mod layers;
 mod masks;
+mod measures;
 mod native;
 mod psd;
 mod quick_mask;
@@ -41,6 +44,7 @@ pub use artboards::{
     artboard_file_stem, artboard_path, existing_artboard_files, windows_device,
 };
 pub use color::{ProofSetup, to_cmyk};
+pub use measures::{ColorSampler, MAX_SAMPLERS, Measure, inner_size};
 pub use file_io::MemoryUse;
 #[cfg(test)]
 pub use file_io::set_test_free_memory;
@@ -62,7 +66,7 @@ pub use smart::{
     SmartFilterKind,
     SmartObject, SmartRender,
 };
-pub use styles_jobs::styles_pending;
+pub use styles_jobs::{styles_area, styles_of, styles_pending};
 pub use transform::{Target as TransformTarget, Transformed, transformed_selection};
 pub use vectors::{PathRef, SavedPath};
 
@@ -149,6 +153,7 @@ pub enum LayerKind {
 pub enum Fill {
     Solid([u8; 3]),
     Gradient(GradientFill),
+    Pattern(crate::compose::pattern::PatternFill),
 }
 
 /// Styles drawn for a revision of the pixels and of the mask (its
@@ -165,6 +170,38 @@ struct StylesCache {
     /// Part of a move of its shape since then not yet in `offset`, under
     /// a pixel (see `Layer::carry_styles`).
     moved: std::cell::Cell<(f32, f32)>,
+}
+
+/// The partial locks of a layer (Layers panel). Lock All is `Layer::locked`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Locks {
+    /// Lock Transparent Pixels: what is painted keeps the pixels' opacity.
+    pub transparent: bool,
+    /// Lock Image Pixels: not painted on, not transformed; it still moves.
+    pub pixels: bool,
+    /// Lock Position: not moved nor transformed; it can still be painted.
+    pub position: bool,
+}
+
+impl Locks {
+    pub fn any(self) -> bool {
+        self.transparent || self.pixels || self.position
+    }
+
+    /// Everything Lock All implies.
+    pub const ALL: Self = Self {
+        transparent: true,
+        pixels: true,
+        position: true,
+    };
+
+    pub fn union(self, o: Self) -> Self {
+        Self {
+            transparent: self.transparent || o.transparent,
+            pixels: self.pixels || o.pixels,
+            position: self.position || o.position,
+        }
+    }
 }
 
 /// An element of the composition. Its pixels may extend beyond the canvas:
@@ -192,8 +229,11 @@ pub struct Layer {
     pub opacity: f32,
     /// Fill opacity: like the opacity, but the styles keep theirs.
     pub fill: f32,
-    /// Locked: neither editable nor movable, and ignored by clicks on the image.
+    /// Lock All: neither editable nor movable, and ignored by clicks on the
+    /// image.
     pub locked: bool,
+    /// The partial locks (see [`Document::locks`] for what applies).
+    pub locks: Locks,
     pub blend: BlendMode,
     /// Layer styles (shadow, stroke, glows…), non-destructive.
     pub effects: Effects,
@@ -242,6 +282,11 @@ impl Layer {
     /// fills.
     pub fn has_pixels(&self) -> bool {
         self.kind == LayerKind::Pixels
+    }
+
+    /// Layer styles apply to it: every layer but an artboard.
+    pub fn styleable(&self) -> bool {
+        self.artboard.is_none()
     }
 
     /// The mask, if it is on.
@@ -293,9 +338,52 @@ impl Layer {
         }
     }
 
+    /// `area` and what `styles` cover beyond it.
+    pub fn with_styles_extent(&self, area: PixelRect, styles: Option<&Styles>) -> PixelRect {
+        match styles.and_then(|s| s.extent()) {
+            Some([x0, y0, x1, y1]) => area.union(PixelRect {
+                x: self.offset.0 + x0,
+                y: self.offset.1 + y0,
+                w: (x1 - x0) as u32,
+                h: (y1 - y0) as u32,
+            }),
+            None => area,
+        }
+    }
+
     /// Fingerprint of what the mask does to the layer's shape.
     fn mask_key(&self) -> u64 {
         self.active_mask().map_or(0, |m| m.key(self.offset))
+    }
+
+    /// Gives the pixels of `rect` (the whole image without one) the opacity
+    /// they have in `before`, an earlier state of the same size (see
+    /// [`Locks::transparent`]).
+    pub(crate) fn keep_alpha_of(&mut self, before: &RgbaImage, rect: Option<[u32; 4]>) {
+        if before.dimensions() != self.image.dimensions() || std::ptr::eq(before, &*self.image) {
+            return;
+        }
+        let w = before.width() as usize;
+        let [x0, y0, x1, y1] = rect.unwrap_or([0, 0, before.width(), before.height()]);
+        let (x1, y1) = (x1.min(before.width()) as usize, y1.min(before.height()) as usize);
+        let (x0, y0) = (x0 as usize, y0 as usize);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        use rayon::prelude::*;
+        let from = before.as_raw();
+        let image = Arc::make_mut(&mut self.image);
+        image
+            .par_chunks_exact_mut(w * 4)
+            .enumerate()
+            .skip(y0)
+            .take(y1 - y0)
+            .for_each(|(y, row)| {
+                let line = &from[y * w * 4..(y + 1) * w * 4];
+                for x in x0..x1 {
+                    row[x * 4 + 3] = line[x * 4 + 3];
+                }
+            });
     }
 
     /// The shared pixels (without copy), to keep as they are while the layer
@@ -433,7 +521,7 @@ impl Layer {
             (Some(m), Some(r)) => {
                 Some(intersect(r, m.rect(self.offset)).unwrap_or(PixelRect { w: 0, h: 0, ..r }))
             }
-            (Some(m), None) => Some(m.rect(self.offset)),
+            (Some(m), None) => Some(self.with_styles_extent(m.rect(self.offset), styles)),
             (None, own) => own,
         }
     }
@@ -610,6 +698,7 @@ struct State {
     active: usize,
     canvas: (u32, u32),
     guides: Vec<Guide>,
+    samplers: Vec<ColorSampler>,
     channels: Vec<Channel>,
     paths: Vec<SavedPath>,
     work_path: Option<VectorPath>,
@@ -672,6 +761,10 @@ pub struct Document {
     pub proof: ProofSetup,
     /// Ruler guides (View menu), in the history like the layers.
     pub guides: Vec<Guide>,
+    /// Color Sampler points, in the history like the layers.
+    pub samplers: Vec<ColorSampler>,
+    /// The Ruler tool's line: neither saved nor in the history.
+    pub ruler: Option<Measure>,
     /// Selections saved with Select › Save Selection (Photoshop's alpha
     /// channels), in order: canvas-sized coverages, in the history like the
     /// layers. They follow the canvas (crop, rotation, size).
@@ -708,6 +801,8 @@ pub struct Document {
     /// The redo list a step's recording dropped, with that step's number:
     /// given back if the step is discarded (it changed nothing).
     dropped_redo: Option<(u64, Vec<Step>)>,
+    /// What Edit › Fade can fade (see [`fade`]).
+    fade_mark: Option<fade::FadeMark>,
     /// Identifies the current state (see `State::id`), and the one saved.
     state_id: u64,
     saved_id: Option<u64>,
@@ -728,6 +823,9 @@ pub struct Document {
     /// The active layer, set aside while an RGBA stand-in of its mask takes
     /// its place (see `masks.rs`).
     swapped: Option<Box<Layer>>,
+    /// Pixels being painted under Lock Transparent Pixels: the layer and
+    /// what it keeps its opacity from (see [`Self::begin_paint`]).
+    alpha_guard: Option<(u64, Arc<RgbaImage>)>,
     /// The last RGBA stand-in of a targeted mask made (see
     /// `Document::target_layer`), for what it was made from.
     stand_in: std::cell::RefCell<Option<masks::StandIn>>,
@@ -756,6 +854,8 @@ impl Document {
             icc_profile: None,
             proof: ProofSetup::default(),
             guides: Vec::new(),
+            samplers: Vec::new(),
+            ruler: None,
             channels: Vec::new(),
             paths: Vec::new(),
             work_path: None,
@@ -771,6 +871,7 @@ impl Document {
             evicted: None,
             forgotten: false,
             dropped_redo: None,
+            fade_mark: None,
             state_id: 0,
             saved_id: Some(0),
             selection: None,
@@ -780,6 +881,7 @@ impl Document {
             uid: next_rev(),
             mask_target: None,
             swapped: None,
+            alpha_guard: None,
             stand_in: Default::default(),
             filter_mask_target: false,
             embedded_in: None,
@@ -932,6 +1034,8 @@ impl Document {
             icc_profile: self.icc_profile.clone(),
             proof: self.proof.clone(),
             guides: self.guides.clone(),
+            samplers: self.samplers.clone(),
+            ruler: self.ruler,
             channels: self.channels.clone(),
             paths: self.paths.clone(),
             work_path: self.work_path.clone(),
@@ -947,6 +1051,7 @@ impl Document {
             evicted: None,
             forgotten: false,
             dropped_redo: None,
+            fade_mark: None,
             state_id: 0,
             saved_id: (!self.modified).then_some(0),
             selection: self.selection.clone(),
@@ -956,6 +1061,7 @@ impl Document {
             uid: next_rev(),
             mask_target: self.mask_target,
             swapped: self.swapped.clone(),
+            alpha_guard: None,
             stand_in: Default::default(),
             filter_mask_target: self.filter_mask_target,
             // Never gives contents back to a smart object.
@@ -1069,6 +1175,7 @@ impl Document {
             active: self.active,
             canvas: self.canvas,
             guides: self.guides.clone(),
+            samplers: self.samplers.clone(),
             channels: self.channels.clone(),
             paths: self.paths.clone(),
             work_path: self.work_path.clone(),
@@ -1102,6 +1209,7 @@ impl Document {
             active: self.active,
             canvas: self.canvas,
             guides: std::mem::replace(&mut self.guides, s.guides),
+            samplers: std::mem::replace(&mut self.samplers, s.samplers),
             channels: std::mem::replace(&mut self.channels, s.channels),
             paths: std::mem::replace(&mut self.paths, s.paths),
             work_path: std::mem::replace(&mut self.work_path, s.work_path),
@@ -1507,6 +1615,7 @@ impl Document {
             opacity: 1.0,
             fill: 1.0,
             locked: false,
+            locks: Locks::default(),
             blend: BlendMode::Normal,
             effects: Effects::default(),
             mask: None,
@@ -1683,6 +1792,7 @@ impl Document {
             layer.visible = src.visible;
             layer.opacity = src.opacity;
             layer.locked = src.locked;
+            layer.locks = src.locks;
             layer.blend = src.blend;
             layer.effects = src.effects.clone();
             new_layers.push(layer);
@@ -1786,6 +1896,7 @@ impl Document {
         }
         let before = self.state();
         self.expand_active_to_canvas();
+        let kept = self.alpha_to_keep();
         let visible = all_layers.then(|| self.composite(self.layers[self.active].rect(), None));
         let layer = &mut self.layers[self.active];
         let (lx, ly) = ((x - layer.offset.0) as u32, (y - layer.offset.1) as u32);
@@ -1811,6 +1922,7 @@ impl Document {
             self.restore(before);
             return false;
         }
+        self.keep_alpha_of(kept.as_ref(), None);
         self.push_state(before, t!("tool-bucket"));
         true
     }
@@ -1881,8 +1993,12 @@ impl Document {
         adjustment: &crate::pixel_ops::Adjustment,
         within: Option<&Selection>,
     ) -> bool {
-        !adjustment.is_neutral()
-            && self.replace_active(adjustment.title(), within, |image| adjustment.apply(image))
+        let done = !adjustment.is_neutral()
+            && self.replace_active(adjustment.title(), within, |image| adjustment.apply(image));
+        if done {
+            self.mark_fade();
+        }
+        done
     }
 
     /// Records the step `name` and puts `image`, what
@@ -1895,7 +2011,9 @@ impl Document {
                 return false;
             }
             doc.checkpoint(name);
+            let kept = doc.alpha_to_keep();
             doc.active_layer_mut().replace_pixels(image);
+            doc.keep_alpha_of(kept.as_ref(), None);
             true
         })
         .unwrap_or(false)
@@ -1914,7 +2032,9 @@ impl Document {
                 return false;
             };
             doc.checkpoint(name);
+            let kept = doc.alpha_to_keep();
             doc.active_layer_mut().replace_pixels(image);
+            doc.keep_alpha_of(kept.as_ref(), None);
             true
         })
         .unwrap_or(false)
@@ -1944,7 +2064,7 @@ impl Document {
     pub fn align(&mut self, indices: &[usize], op: AlignOp, to: Option<PixelRect>) -> bool {
         let items: Vec<(usize, PixelRect)> = indices
             .iter()
-            .filter(|&&i| i < self.layers.len() && !self.is_locked(i))
+            .filter(|&&i| i < self.layers.len() && self.can_move(i))
             .filter_map(|&i| self.element_bounds(i).map(|b| (i, b)))
             .collect();
         if items.is_empty() {
@@ -2081,6 +2201,7 @@ impl Document {
             return false;
         };
         self.push_state(before, t!("xchg-hist-fill"));
+        let preserve_transparency = preserve_transparency || self.alpha_locked();
         let layer = &mut self.layers[self.active];
         let alpha = (color[3] as f32 * opacity.clamp(0.0, 1.0)).round() as u8;
         let src = [color[0], color[1], color[2], alpha];
@@ -2091,6 +2212,80 @@ impl Document {
                 *p = [r, g, b, p[3]];
             } else {
                 *p = over(*p, src);
+            }
+        });
+        true
+    }
+
+    /// Fills the active layer with a pattern repeated from the canvas origin
+    /// (in a targeted mask: its grays), inside the selection if there is one.
+    pub fn fill_active_pattern(
+        &mut self,
+        pattern: &crate::compose::pattern::Pattern,
+        within: Option<&Selection>,
+        opacity: f32,
+        preserve_transparency: bool,
+    ) -> bool {
+        self.with_target(|doc| {
+            doc.fill_target_pattern(pattern, within, opacity, preserve_transparency)
+        })
+        .unwrap_or(false)
+    }
+
+    fn fill_target_pattern(
+        &mut self,
+        pattern: &crate::compose::pattern::Pattern,
+        within: Option<&Selection>,
+        opacity: f32,
+        preserve_transparency: bool,
+    ) -> bool {
+        use rayon::prelude::*;
+        let canvas = self.full_rect();
+        let selection = within.cloned().unwrap_or(canvas.into());
+        if selection.bounds(canvas).is_none() {
+            return false;
+        }
+        let before = self.state();
+        self.expand_active_to_canvas();
+        let layer = &mut self.layers[self.active];
+        let Some(clip) = selection.clip(layer, canvas) else {
+            self.restore(before);
+            return false;
+        };
+        self.push_state(before, t!("xchg-hist-fill"));
+        let preserve_transparency = preserve_transparency || self.alpha_locked();
+        let layer = &mut self.layers[self.active];
+        let (ox, oy) = layer.offset;
+        let opacity = opacity.clamp(0.0, 1.0);
+        let [x0, y0, x1, y1] = clip.rect;
+        let image = layer.pixels_mut();
+        let row = image.width() as usize * 4;
+        if row == 0 || y1 <= y0 {
+            return true;
+        }
+        let rows = image
+            .par_chunks_exact_mut(row)
+            .skip(y0 as usize)
+            .take((y1 - y0) as usize);
+        rows.enumerate().for_each(|(j, line)| {
+            let y = y0 + j as u32;
+            for x in x0..x1 {
+                let coverage = clip.coverage(x, y);
+                if coverage == 0 {
+                    continue;
+                }
+                let [r, g, b, a] = pattern.repeated(ox + x as i64, oy + y as i64);
+                let alpha = (a as f32 * opacity).round() as u8;
+                let src = [r, g, b, scale(alpha, coverage)];
+                let p: &mut [u8; 4] = (&mut line[x as usize * 4..x as usize * 4 + 4])
+                    .try_into()
+                    .expect("four bytes");
+                if preserve_transparency {
+                    let [r, g, b, _] = over([p[0], p[1], p[2], 255], src);
+                    *p = [r, g, b, p[3]];
+                } else {
+                    *p = over(*p, src);
+                }
             }
         });
         true
@@ -2350,6 +2545,7 @@ impl Document {
             1.0, 0.0, -x as f32, 0.0, 1.0, -y as f32,
         ]));
         guides::shift(&mut self.guides, -x as f32, -y as f32);
+        self.follow_measures((width, height), |px, py| (px - x as f32, py - y as f32));
         self.map_canvas_masks(|m| mask_ops::recanvas(m, x, y, width, height));
         self.canvas = (width, height);
     }
@@ -2415,6 +2611,7 @@ impl Document {
             });
         }
         guides::rotate(&mut self.guides, degrees, self.canvas, canvas);
+        self.follow_measures(canvas, measures::turned(degrees, self.canvas, canvas));
         self.map_canvas_masks(|m| mask_ops::rotate_canvas(m, degrees, canvas));
         self.canvas = canvas;
         true
@@ -2429,6 +2626,11 @@ impl Document {
             t!("menu-image-flip-vertical")
         });
         guides::flip(&mut self.guides, horizontal, self.canvas);
+        let (cw, ch) = (self.canvas.0 as f32, self.canvas.1 as f32);
+        self.follow_measures(self.canvas, |x, y| match horizontal {
+            true => (cw - x, y),
+            false => (x, ch - y),
+        });
         self.map_canvas_masks(|m| mask_ops::flip(m, horizontal));
         let (w, h) = (self.canvas.0 as i64, self.canvas.1 as i64);
         let map = mask_ops::Affine(if horizontal {
@@ -2539,8 +2741,14 @@ impl Document {
             layer.text = text;
             layer.edit_mask(old, |m| m.scale((sx, sy), filter, (0, 0)));
             layer.effects.scale(s, sx as f32, sy as f32);
+            if let LayerKind::Fill(Fill::Pattern(p)) = &mut layer.kind {
+                use crate::compose::pattern::SCALE_RANGE;
+                p.scale = (p.scale * s).clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end());
+                p.phase = (p.phase.0 * sx as f32, p.phase.1 * sy as f32);
+            }
         }
         guides::scale(&mut self.guides, sx as f32, sy as f32);
+        self.follow_measures((width, height), |x, y| (x * sx as f32, y * sy as f32));
         self.map_canvas_masks(|m| mask_ops::resize(m, width, height));
         self.canvas = (width, height);
         true
@@ -2705,6 +2913,7 @@ impl Document {
             -r.y as f32,
         ]));
         guides::shift(&mut self.guides, -r.x as f32, -r.y as f32);
+        self.follow_measures((r.w, r.h), |x, y| (x - r.x as f32, y - r.y as f32));
         self.map_canvas_masks(|m| mask_ops::recanvas(m, r.x, r.y, r.w, r.h));
         self.canvas = (r.w, r.h);
     }

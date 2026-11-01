@@ -259,6 +259,9 @@ impl AtelierApp {
             m.insert(key.to_owned(), value);
         };
         put("tool", json!(tool_name(self.tool)));
+        put("sampler_size", name(self.measure.sample));
+        put("histogram_channel", name(self.hist_panel.channel));
+        put("histogram_source", name(self.hist_panel.source));
         put("brush_size", json!(self.brush_size));
         put("hardness", json!(self.hardness));
         put("brushes", brushes.into());
@@ -306,7 +309,20 @@ impl AtelierApp {
         put("lasso_width", json!(self.lasso_width));
         put("lasso_frequency", json!(self.lasso_frequency));
         put("edges", edges.into());
+        put(
+            "crop",
+            json!({
+                "preset": name(self.crop.preset),
+                "w": self.crop.w,
+                "h": self.crop.h,
+                "resolution": self.crop.resolution,
+                "overlay": name(self.crop.overlay),
+                "shield": self.crop.shield,
+                "delete_cropped": self.crop.delete_cropped,
+            }),
+        );
         put("auto_select", json!(self.auto_select));
+        put("last_lock", json!(self.last_lock.to_bits()));
         put(
             "show_transform_controls",
             json!(self.show_transform_controls),
@@ -356,6 +372,18 @@ impl AtelierApp {
                 "align": name(t.paragraph.align),
             }),
         );
+        let o = &self.filters.stroke_options;
+        put(
+            "stroke",
+            json!({
+                "width": o.width,
+                "color": o.color,
+                "location": name(o.location),
+                "mode": name(o.mode),
+                "opacity": o.opacity,
+                "preserve_transparency": o.preserve_transparency,
+            }),
+        );
         let v = &self.vector;
         let mut shapes = Map::new();
         let mut keep = |key: &str, value: Value| {
@@ -382,6 +410,7 @@ impl AtelierApp {
         keep("arrows", json!(v.arrows));
         keep("custom", name(v.custom));
         put("shapes", shapes.into());
+        put("pattern", json!(format!("{:x}", self.patterns.last)));
         Value::Object(m)
     }
 
@@ -450,6 +479,9 @@ impl AtelierApp {
         set!(p.blur_strength, s.number("blur_strength", 0.01..=1.0));
         set!(p.sharpen_strength, s.number("sharpen_strength", 0.01..=1.0));
         set!(p.smudge_strength, s.fraction("smudge_strength"));
+        set!(self.measure.sample, s.choice("sampler_size", &measure_tools::SampleSize::ALL));
+        set!(self.hist_panel.channel, s.choice("histogram_channel", &histogram_panel::Channel::ALL));
+        set!(self.hist_panel.source, s.choice("histogram_source", &histogram_panel::Source::ALL));
         set!(p.sample_all, s.flag("sample_all"));
         set!(p.finger_painting, s.flag("finger_painting"));
         set!(p.gradient.opacity, s.number("gradient_opacity", 0.01..=1.0));
@@ -486,7 +518,20 @@ impl AtelierApp {
             set!(edges.feather, e.number("feather", 0.0..=1000.0));
             set!(edges.antialias, e.flag("antialias"));
         }
+        if let Some(c) = s.object("crop") {
+            use super::crop_tool::{CropOverlay, CropPreset};
+            set!(self.crop.preset, c.choice("preset", &CropPreset::ALL));
+            set!(self.crop.w, c.number("w", 0.0..=MAX_DIMENSION as f32));
+            set!(self.crop.h, c.number("h", 0.0..=MAX_DIMENSION as f32));
+            set!(self.crop.resolution, c.number("resolution", 0.0..=100_000.0));
+            set!(self.crop.overlay, c.choice("overlay", &CropOverlay::ALL));
+            set!(self.crop.shield, c.fraction("shield"));
+            set!(self.crop.delete_cropped, c.flag("delete_cropped"));
+        }
         set!(self.auto_select, s.flag("auto_select"));
+        if let Some(bits) = s.0.get("last_lock").and_then(|v| v.as_u64()) {
+            self.last_lock = layer_locks::LastLock::from_bits(bits);
+        }
         set!(
             self.show_transform_controls,
             s.flag("show_transform_controls")
@@ -508,6 +553,10 @@ impl AtelierApp {
         let modes = blend_modes();
         let p = &mut self.paint;
         set!(p.tip, s.text("tip").as_deref().and_then(tip_named));
+        set!(
+            self.patterns.last,
+            s.text("pattern").and_then(|t| u64::from_str_radix(&t, 16).ok())
+        );
         set!(
             p.range,
             s.choice("tone_range", &crate::paint::ToneRange::ALL)
@@ -609,6 +658,20 @@ impl AtelierApp {
             set!(tool.antialias, t.choice("antialias", &ANTI_ALIASES));
             set!(tool.paragraph.align, t.choice("align", &ALIGNS));
         }
+        if let Some(st) = s.object("stroke") {
+            use crate::pixel_ops::StrokeLocation as L;
+            let o = &mut self.filters.stroke_options;
+            let max = crate::pixel_ops::StrokeSettings::MAX_WIDTH;
+            set!(o.width, st.whole("width", 1..=max));
+            o.color = st.color("color").map(|c| [c.r(), c.g(), c.b()]);
+            set!(
+                o.location,
+                st.choice("location", &[L::Inside, L::Center, L::Outside])
+            );
+            set!(o.mode, st.choice("mode", &blend_modes()));
+            set!(o.opacity, st.number("opacity", 0.0..=1.0));
+            set!(o.preserve_transparency, st.flag("preserve_transparency"));
+        }
         if let Some(sh) = s.object("shapes") {
             use super::vector_tools::ToolMode;
             use crate::vector::{Align, Cap, Custom, Join};
@@ -676,6 +739,7 @@ impl AtelierApp {
             self.restore_session(&saved);
         }
         self.session_saved = Some(self.session_settings());
+        self.load_patterns();
     }
 
     /// Writes the settings when they changed, once the pointer is up (not

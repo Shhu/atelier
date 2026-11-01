@@ -24,6 +24,42 @@ pub(super) const SHORTCUT_PANELS: KeyboardShortcut =
 pub(super) const SHORTCUT_SIDE_PANEL: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::SHIFT, Key::Tab);
 
+/// Window › Info.
+pub(super) const SHORTCUT_INFO: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::NONE, Key::F8);
+
+/// How long Full Screen says how to leave it (s).
+const NOTICE: f64 = 4.0;
+
+/// F cycles them, Shift+F the other way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ScreenMode {
+    #[default]
+    Standard,
+    /// The menus and panels around the image, on the whole screen.
+    FullWithMenu,
+    /// Only the image; Tab shows the panels.
+    Full,
+}
+
+impl ScreenMode {
+    fn next(self, back: bool) -> Self {
+        match (self, back) {
+            (ScreenMode::Standard, false) | (ScreenMode::Full, true) => ScreenMode::FullWithMenu,
+            (ScreenMode::FullWithMenu, false) | (ScreenMode::Standard, true) => ScreenMode::Full,
+            (ScreenMode::Full, false) | (ScreenMode::FullWithMenu, true) => ScreenMode::Standard,
+        }
+    }
+}
+
+/// F typed: `Some(back)`, Shift+F going the other way.
+pub(super) fn screen_mode_key(i: &egui::InputState) -> Option<bool> {
+    [(Modifiers::NONE, false), (Modifiers::SHIFT, true)]
+        .into_iter()
+        .find(|&(m, _)| key_typed(i, m, Key::F))
+        .map(|(_, back)| back)
+}
+
 const WEBSITE: &str = "https://shu-app.com/atelier/";
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 /// Where problems are reported (Help › Report a Problem, then Diagnostics'
@@ -86,6 +122,11 @@ pub(super) struct Workspace {
     pub hide_all: bool,
     /// Shift+Tab, Window › Layers or Properties: the side panel is hidden.
     pub hide_side: bool,
+    /// View › Screen Mode.
+    pub screen: ScreenMode,
+    /// Tab's state before Full Screen hid the panels; since when it is on.
+    before_full: bool,
+    full_since: Option<f64>,
     /// Help › Keyboard Shortcuts open, and its filter.
     pub shortcuts: Option<String>,
     about: bool,
@@ -103,6 +144,9 @@ impl Default for Workspace {
             layout: Layout::load(),
             hide_all: false,
             hide_side: false,
+            screen: ScreenMode::Standard,
+            before_full: false,
+            full_since: None,
             shortcuts: None,
             about: false,
             clear_recent: false,
@@ -134,6 +178,14 @@ pub(super) enum Command {
     TogglePanels,
     /// Shift+Tab, Window › Layers / Properties: the side panel.
     ToggleSidePanel,
+    /// Window › Info, Histogram, Navigator.
+    Info,
+    Histogram,
+    Navigator,
+    /// View › Screen Mode.
+    ScreenMode(ScreenMode),
+    /// F, or Shift+F (`true`).
+    CycleScreenMode(bool),
     ResetWorkspace,
     Shortcuts,
     Website,
@@ -179,7 +231,15 @@ impl AtelierApp {
                     ws.hide_side = !ws.hide_side;
                 }
             }
+            Command::Info => toggle_panel(&mut self.workspace, &mut self.info.open),
+            Command::Histogram => toggle_panel(&mut self.workspace, &mut self.hist_panel.open),
+            Command::Navigator => toggle_panel(&mut self.workspace, &mut self.navigator.open),
+            Command::ScreenMode(mode) => self.set_screen_mode(mode),
+            Command::CycleScreenMode(back) => {
+                self.set_screen_mode(self.workspace.screen.next(back));
+            }
             Command::ResetWorkspace => {
+                self.set_screen_mode(ScreenMode::Standard);
                 let ws = &mut self.workspace;
                 ws.hide_all = false;
                 ws.hide_side = false;
@@ -196,6 +256,94 @@ impl AtelierApp {
             Command::Diagnostics => self.open_diagnostics(),
             Command::About => self.workspace.about = true,
         }
+    }
+
+    /// Full Screen hides the panels (Tab shows them) until it is left, when
+    /// they are as they were.
+    pub(super) fn set_screen_mode(&mut self, mode: ScreenMode) {
+        let ws = &mut self.workspace;
+        if ws.screen == mode {
+            return;
+        }
+        if ws.screen == ScreenMode::Full {
+            ws.hide_all = ws.before_full;
+            ws.full_since = None;
+        }
+        if mode == ScreenMode::Full {
+            ws.before_full = ws.hide_all;
+            ws.hide_all = true;
+            ws.full_since = Some(self.ctx.input(|i| i.time));
+        }
+        let was_standard = ws.screen == ScreenMode::Standard;
+        ws.screen = mode;
+        let standard = mode == ScreenMode::Standard;
+        if was_standard != standard {
+            self.ctx
+                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(!standard));
+        }
+    }
+
+    /// Esc, with nothing else to give up, leaves Full Screen.
+    pub(super) fn esc_leaves_full_screen(&self) -> bool {
+        self.workspace.screen == ScreenMode::Full
+            && !self.transform_pending()
+            && self.canvas_rect.is_none()
+    }
+
+    /// View › Screen Mode.
+    pub(super) fn screen_mode_entries(&self) -> Vec<MenuEntry> {
+        let entry = |label: String, mode: ScreenMode| {
+            MenuEntry::Choice(
+                label,
+                self.workspace.screen == mode,
+                Action::Workspace(Command::ScreenMode(mode)),
+            )
+        };
+        vec![
+            MenuEntry::Separator,
+            MenuEntry::Submenu(
+                t!("panels8-menu-screen-mode"),
+                vec![
+                    entry(t!("panels8-screen-standard"), ScreenMode::Standard),
+                    entry(t!("panels8-screen-full-menu"), ScreenMode::FullWithMenu),
+                    entry(t!("panels8-screen-full"), ScreenMode::Full),
+                ],
+            ),
+        ]
+    }
+
+    /// In Full Screen, for a moment on entering it, how to leave it; and the
+    /// messages the hidden status bar would show.
+    pub(super) fn draw_full_screen_notice(
+        &self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        area: Rect,
+    ) {
+        if self.workspace.screen != ScreenMode::Full {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        let fresh = self.workspace.full_since.is_some_and(|t| now - t < NOTICE);
+        let error = self.workspace.error_status.as_deref();
+        let message = match (fresh, error) {
+            (_, Some(error)) => error.to_owned(),
+            (true, None) => t!("panels8-screen-notice"),
+            (false, None) => return,
+        };
+        if fresh {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(NOTICE));
+        }
+        let at = pos2(area.center().x, area.top() + 24.0);
+        let font = ui_kit::medium(ui_kit::TEXT_SIZE);
+        let galley = painter.layout_no_wrap(message, font, ui_kit::color::TEXT);
+        let r = Rect::from_center_size(at, galley.size() + vec2(24.0, 12.0));
+        painter.rect_filled(r, 6.0, Color32::from_black_alpha(190));
+        painter.galley(
+            r.center() - galley.size() / 2.0,
+            galley,
+            ui_kit::color::TEXT,
+        );
     }
 
     /// The tool bar and options bar are shown.
@@ -221,7 +369,7 @@ impl AtelierApp {
             .doc
             .as_ref()
             .filter(|d| paints && d.quick_mask().is_none())?;
-        if doc.is_locked(doc.active) {
+        if doc.is_locked(doc.active) || doc.pixels_locked() {
             Some(PaintBlock::Locked)
         } else if !doc.shown(doc.active) {
             Some(PaintBlock::Hidden)
@@ -357,6 +505,27 @@ impl AtelierApp {
                 self.history.open,
                 None,
                 Action::History,
+            ),
+            Check(
+                t!("panels8-menu-histogram"),
+                true,
+                self.hist_panel.open,
+                None,
+                Action::Workspace(Command::Histogram),
+            ),
+            Check(
+                t!("panels8-menu-info"),
+                true,
+                self.info.open,
+                Some(&SHORTCUT_INFO),
+                Action::Workspace(Command::Info),
+            ),
+            Check(
+                t!("panels8-menu-navigator"),
+                true,
+                self.navigator.open,
+                None,
+                Action::Workspace(Command::Navigator),
             ),
             // One side panel holds both: one item, named for both.
             Check(
@@ -666,6 +835,7 @@ impl AtelierApp {
                 t!("ui3-shortcuts-hide-side"),
                 keys::shortcut(ctx, &SHORTCUT_SIDE_PANEL),
             ),
+            (t!("panels8-shortcut-screen-mode"), "F".to_owned()),
             (t!("panel-swap-colors"), "X".to_owned()),
             (t!("panel-default-colors"), "D".to_owned()),
             (t!("ui3-shortcuts-brush-size"), "[ ]".to_owned()),
@@ -895,7 +1065,7 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(labels.len(), 6);
+            assert_eq!(labels.len(), 9);
             assert!(labels.contains(&t!("ui4-menu-layers-properties")));
             let mut sorted = labels.clone();
             sorted.sort_by_key(|l| super::super::palette::fold(l));

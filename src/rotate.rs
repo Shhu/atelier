@@ -30,17 +30,26 @@ pub fn rotate(image: &RgbaImage, degrees: f32, nearest: bool) -> RgbaImage {
     let (src_cx, src_cy) = (w / 2.0, h / 2.0);
     let (dst_cx, dst_cy) = (out_w as f32 / 2.0, out_h as f32 / 2.0);
 
-    RgbaImage::from_fn(out_w, out_h, |x, y| {
-        // Inverse rotation from the destination pixel center to the source.
-        let (dx, dy) = (x as f32 + 0.5 - dst_cx, y as f32 + 0.5 - dst_cy);
-        let sx = c * dx + s * dy + src_cx;
-        let sy = -s * dx + c * dy + src_cy;
-        if nearest {
-            sample_nearest(image, sx, sy)
-        } else {
-            sample_bilinear(image, sx, sy)
+    let mut out = RgbaImage::new(out_w, out_h);
+    let row = out_w as usize * 4;
+    crate::mask_ops::par_rows(out.as_mut(), row, |first, band| {
+        for (j, line) in band.chunks_exact_mut(row).enumerate() {
+            let y = first + j;
+            for (x, px) in line.chunks_exact_mut(4).enumerate() {
+                // Inverse rotation from the destination pixel center to the source.
+                let (dx, dy) = (x as f32 + 0.5 - dst_cx, y as f32 + 0.5 - dst_cy);
+                let sx = c * dx + s * dy + src_cx;
+                let sy = -s * dx + c * dy + src_cy;
+                let value = if nearest {
+                    sample_nearest(image, sx, sy)
+                } else {
+                    sample_bilinear(image, sx, sy)
+                };
+                px.copy_from_slice(&value.0);
+            }
         }
-    })
+    });
+    out
 }
 
 fn sample_nearest(image: &RgbaImage, x: f32, y: f32) -> Rgba<u8> {

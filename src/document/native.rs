@@ -31,7 +31,9 @@
 //! opens them as pixels). Version 3 added artboards (older versions would
 //! open them as plain groups, their layout lost) and smart objects (see
 //! `native/smart.rs`; older versions would open them as pixels, their
-//! contents, transform and smart filters lost).
+//! contents, transform and smart filters lost). Version 4 added pattern
+//! fill layers and contents, and the Exposure, Channel Mixer and Selective
+//! Color adjustment layers (older versions would call the file damaged).
 
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
@@ -50,7 +52,10 @@ use super::{
     Artboard, ArtboardBackground, BlendMode, Channel, Document, FileError, Fill, LayerKind, Mask,
 };
 use crate::compose::gradient::GradientFill;
-use crate::compose::styles::{BevelFx, Effects, GlowFx, GradientFx, OverlayFx, ShadowFx, StrokeFx};
+use crate::compose::pattern::{Pattern, PatternFill, SCALE_RANGE};
+use crate::compose::styles::{
+    BevelFx, Effects, GlowFx, GradientFx, OverlayFx, PatternFx, ShadowFx, StrokeFx,
+};
 use crate::guides::{Guide, Orientation};
 use crate::paint::gradient::{ColorStop, Gradient, OpacityStop, Shape, StopColor};
 use crate::pixel_ops::{
@@ -69,7 +74,7 @@ pub const EXTENSION: &str = "atelier";
 
 const FORMAT: &str = "atelier";
 /// Current format version, the newest this Atelier reads.
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const MIMETYPE: &str = "image/x-atelier";
 const MANIFEST: &str = "document.json";
 const THUMBNAIL: &str = "thumbnail.png";
@@ -110,9 +115,15 @@ struct Manifest {
     /// Ruler guides.
     #[serde(default)]
     guides: Vec<GuideEntry>,
+    /// Color Sampler points.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    color_samplers: Vec<SamplerEntry>,
     /// Saved selections (alpha channels), canvas-sized.
     #[serde(default)]
     channels: Vec<ChannelEntry>,
+    /// The tiles the layers use (`patterns/<id>.png`), once each.
+    #[serde(default)]
+    patterns: Vec<PatternEntry>,
     /// Paths panel: the saved paths, the Work Path (canvas coordinates).
     #[serde(default)]
     paths: Vec<vectors::SavedPathEntry>,
@@ -147,6 +158,12 @@ struct ProofEntry {
     black_point_compensation: bool,
     paper_color: bool,
     black_ink: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SamplerEntry {
+    x: f32,
+    y: f32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -193,6 +210,13 @@ struct LayerEntry {
     #[serde(default = "one")]
     fill: f32,
     locked: bool,
+    /// Lock Transparent Pixels, Lock Image Pixels, Lock Position.
+    #[serde(default)]
+    lock_transparent: bool,
+    #[serde(default)]
+    lock_pixels: bool,
+    #[serde(default)]
+    lock_position: bool,
     blend: Blend,
     /// Number of groups it is in (its group is the first layer above it
     /// that is less deep).
@@ -218,6 +242,8 @@ struct LayerEntry {
     color_overlay: Option<OverlayEntry>,
     #[serde(default)]
     gradient_overlay: Option<GradientFxEntry>,
+    #[serde(default)]
+    pattern_overlay: Option<PatternFxEntry>,
     #[serde(default)]
     bevel: Option<BevelEntry>,
     /// Editable text the pixels are the rendering of.
@@ -480,11 +506,64 @@ struct GradientFillEntry {
     reverse: bool,
 }
 
+/// A tile of the document.
+#[derive(Serialize, Deserialize)]
+struct PatternEntry {
+    /// As the layers refer to it.
+    id: String,
+    name: String,
+    image: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PatternFillEntry {
+    pattern: String,
+    scale: f32,
+    angle: f32,
+    linked: bool,
+    phase: (f32, f32),
+}
+
+#[derive(Serialize, Deserialize)]
+struct PatternFxEntry {
+    enabled: bool,
+    fill: PatternFillEntry,
+    opacity: f32,
+    blend: Blend,
+}
+
+fn pattern_fill_entry(f: &PatternFill) -> PatternFillEntry {
+    PatternFillEntry {
+        pattern: format!("{:016x}", f.pattern.id),
+        scale: f.scale,
+        angle: f.angle,
+        linked: f.linked,
+        phase: f.phase,
+    }
+}
+
+/// The use of a tile: damage if the document doesn't have it.
+fn pattern_fill_of(
+    e: &PatternFillEntry,
+    patterns: &std::collections::HashMap<String, Arc<Pattern>>,
+) -> Result<PatternFill, FileError> {
+    Ok(PatternFill {
+        pattern: patterns.get(&e.pattern).ok_or(FileError::Damaged)?.clone(),
+        scale: finite_or(e.scale, 1.0).clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end()),
+        angle: finite_or(e.angle, 0.0),
+        linked: e.linked,
+        phase: (finite_or(e.phase.0, 0.0), finite_or(e.phase.1, 0.0)),
+    })
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum FillEntry {
     Solid { color: [u8; 3] },
     Gradient(GradientFillEntry),
+    Pattern(PatternFillEntry),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -511,6 +590,19 @@ enum AdjustmentEntry {
     Curves {
         rgb: Vec<[f32; 2]>,
         channels: [Vec<[f32; 2]>; 3],
+    },
+    Exposure {
+        exposure: f32,
+        offset: f32,
+        gamma: f32,
+    },
+    ChannelMixer {
+        rows: [[f32; 4]; 3],
+        monochrome: bool,
+    },
+    SelectiveColor {
+        ranges: [[f32; 4]; crate::pixel_ops::SELECTIVE_RANGES],
+        absolute: bool,
     },
     Vibrance {
         vibrance: f32,
@@ -943,6 +1035,29 @@ pub(super) fn write(
         }
     }
     smart::write_all(&layers, &mut entries, &mut files, folder)?;
+    let mut patterns: Vec<PatternEntry> = Vec::new();
+    for layer in layers.iter() {
+        let kind = match &layer.kind {
+            LayerKind::Fill(Fill::Pattern(f)) => Some(f),
+            _ => None,
+        };
+        let fx = &layer.effects.pattern_overlay;
+        for f in kind.into_iter().chain(fx.enabled.then_some(&fx.fill)) {
+            let id = format!("{:016x}", f.pattern.id);
+            if patterns.iter().all(|p| p.id != id) {
+                let image = format!("patterns/{id}.png");
+                files.push((image.clone(), encode_png(&f.pattern.image)?));
+                let (width, height) = f.pattern.image.dimensions();
+                patterns.push(PatternEntry {
+                    id,
+                    name: f.pattern.name.clone(),
+                    image,
+                    width,
+                    height,
+                });
+            }
+        }
+    }
     let manifest = Manifest {
         format: FORMAT.into(),
         version: VERSION,
@@ -950,6 +1065,7 @@ pub(super) fn write(
         height: doc.height(),
         active: doc.active,
         layers: entries,
+        patterns,
         guides: doc
             .guides
             .iter()
@@ -960,6 +1076,11 @@ pub(super) fn write(
                 },
                 position: g.position,
             })
+            .collect(),
+        color_samplers: doc
+            .samplers
+            .iter()
+            .map(|s| SamplerEntry { x: s.x, y: s.y })
             .collect(),
         channels,
         paths: doc.paths.iter().map(vectors::saved_path_entry).collect(),
@@ -1160,6 +1281,19 @@ fn adjustment_entry(a: &Adjustment) -> AdjustmentEntry {
             rgb: cv.rgb.points().to_vec(),
             channels: cv.channels.each_ref().map(|c| c.points().to_vec()),
         },
+        Adjustment::Exposure(e) => AdjustmentEntry::Exposure {
+            exposure: e.exposure,
+            offset: e.offset,
+            gamma: e.gamma,
+        },
+        Adjustment::ChannelMixer(m) => AdjustmentEntry::ChannelMixer {
+            rows: m.rows,
+            monochrome: m.monochrome,
+        },
+        Adjustment::SelectiveColor(c) => AdjustmentEntry::SelectiveColor {
+            ranges: c.ranges,
+            absolute: c.absolute,
+        },
         Adjustment::Vibrance(v) => AdjustmentEntry::Vibrance {
             vibrance: v.vibrance,
             saturation: v.saturation,
@@ -1220,6 +1354,31 @@ fn adjustment_of(e: &AdjustmentEntry) -> Result<Adjustment, FileError> {
                 curve(&channels[2])?,
             ],
         }),
+        AdjustmentEntry::Exposure {
+            exposure,
+            offset,
+            gamma,
+        } => {
+            use crate::pixel_ops::Exposure as E;
+            Adjustment::Exposure(E {
+                exposure: f(*exposure, -E::EXPOSURE, E::EXPOSURE),
+                offset: f(*offset, -E::OFFSET, E::OFFSET),
+                gamma: finite_or(*gamma, 1.0).clamp(*E::GAMMA.start(), *E::GAMMA.end()),
+            })
+        }
+        AdjustmentEntry::ChannelMixer { rows, monochrome } => {
+            use crate::pixel_ops::ChannelMixer as M;
+            Adjustment::ChannelMixer(M {
+                rows: rows.map(|r| r.map(|v| f(v, -M::LIMIT, M::LIMIT))),
+                monochrome: *monochrome,
+            })
+        }
+        AdjustmentEntry::SelectiveColor { ranges, absolute } => {
+            Adjustment::SelectiveColor(crate::pixel_ops::SelectiveColor {
+                ranges: ranges.map(|r| r.map(|v| f(v, -1.0, 1.0))),
+                absolute: *absolute,
+            })
+        }
         AdjustmentEntry::Vibrance {
             vibrance,
             saturation,
@@ -1335,6 +1494,9 @@ fn layer_entry(layer: &super::Layer, image: Option<String>) -> LayerEntry {
         LayerKind::Fill(Fill::Gradient(g)) => KindEntry::Fill {
             fill: FillEntry::Gradient(gradient_fill_entry(g)),
         },
+        LayerKind::Fill(Fill::Pattern(p)) => KindEntry::Fill {
+            fill: FillEntry::Pattern(pattern_fill_entry(p)),
+        },
     };
     let mask = layer
         .mask
@@ -1353,6 +1515,9 @@ fn layer_entry(layer: &super::Layer, image: Option<String>) -> LayerEntry {
         opacity: layer.opacity,
         fill: layer.fill,
         locked: layer.locked,
+        lock_transparent: layer.locks.transparent,
+        lock_pixels: layer.locks.pixels,
+        lock_position: layer.locks.position,
         blend: blend_entry(layer.blend),
         depth: layer.depth,
         clipped: layer.clipped,
@@ -1374,6 +1539,13 @@ fn layer_entry(layer: &super::Layer, image: Option<String>) -> LayerEntry {
             color: fx.color_overlay.color,
             opacity: fx.color_overlay.opacity,
             blend: blend_entry(fx.color_overlay.blend),
+        }),
+        // The default, unused one needs no tile in the file.
+        pattern_overlay: fx.pattern_overlay.enabled.then(|| PatternFxEntry {
+            enabled: true,
+            fill: pattern_fill_entry(&fx.pattern_overlay.fill),
+            opacity: fx.pattern_overlay.opacity,
+            blend: blend_entry(fx.pattern_overlay.blend),
         }),
         gradient_overlay: Some(GradientFxEntry {
             enabled: fx.gradient_overlay.enabled,
@@ -1596,6 +1768,16 @@ fn read_archive(
             channels: l.channels.clone(),
         });
 
+    // The tiles, before the layers using them.
+    let mut patterns = std::collections::HashMap::new();
+    for p in &manifest.patterns {
+        if p.width == 0 || p.height == 0 || !layer_fits(p.width, p.height) {
+            return Err(FileError::Damaged);
+        }
+        let png = claims.pixels(zip, &p.image, (p.width, p.height), 4)?;
+        let image = decode_png(&png, (p.width, p.height))?;
+        patterns.insert(p.id.clone(), Pattern::new(p.name.clone(), image));
+    }
     let mut doc = Document::new(RgbaImage::new(0, 0), path.map(Path::to_path_buf));
     let folder = path.and_then(Path::parent);
     let mut contents = std::collections::HashMap::new();
@@ -1619,7 +1801,15 @@ fn read_archive(
         if far(entry.x, entry.y) || entry.mask.as_ref().is_some_and(|m| far(m.x, m.y)) {
             return Err(FileError::Damaged);
         }
-        let fx = effects(&entry);
+        let mut fx = effects(&entry);
+        if let Some(p) = &entry.pattern_overlay {
+            fx.pattern_overlay = PatternFx {
+                enabled: p.enabled,
+                fill: pattern_fill_of(&p.fill, &patterns)?,
+                opacity: finite_or(p.opacity, 1.0).clamp(0.0, 1.0),
+                blend: blend_mode(p.blend),
+            };
+        }
         let mut layer = doc.make_layer(entry.name, image, (entry.x, entry.y));
         layer.kind = match entry.kind {
             KindEntry::Pixels => LayerKind::Pixels,
@@ -1633,11 +1823,19 @@ fn read_archive(
             KindEntry::Fill {
                 fill: FillEntry::Gradient(g),
             } => LayerKind::Fill(Fill::Gradient(gradient_fill_of(&g))),
+            KindEntry::Fill {
+                fill: FillEntry::Pattern(p),
+            } => LayerKind::Fill(Fill::Pattern(pattern_fill_of(&p, &patterns)?)),
         };
         layer.visible = entry.visible;
         layer.opacity = finite_or(entry.opacity, 1.0).clamp(0.0, 1.0);
         layer.fill = finite_or(entry.fill, 1.0).clamp(0.0, 1.0);
         layer.locked = entry.locked;
+        layer.locks = crate::document::Locks {
+            transparent: entry.lock_transparent,
+            pixels: entry.lock_pixels,
+            position: entry.lock_position,
+        };
         layer.blend = blend_mode(entry.blend);
         if layer.blend == BlendMode::PassThrough && !layer.is_group() {
             layer.blend = BlendMode::Normal;
@@ -1684,6 +1882,13 @@ fn read_archive(
             };
             Guide::new(orientation, g.position)
         })
+        .collect();
+    doc.samplers = manifest
+        .color_samplers
+        .iter()
+        .filter(|s| s.x.is_finite() && s.y.is_finite())
+        .take(super::MAX_SAMPLERS)
+        .map(|s| super::ColorSampler { x: s.x, y: s.y })
         .collect();
     let canvas = (manifest.width, manifest.height);
     for c in &manifest.channels {
@@ -1736,6 +1941,7 @@ fn effects(e: &LayerEntry) -> Effects {
         None => d,
     };
     Effects {
+        pattern_overlay: d.pattern_overlay.clone(),
         stroke: StrokeFx {
             enabled: e.stroke.enabled,
             color: e.stroke.color,
@@ -2018,6 +2224,8 @@ mod tests {
             layer.blend = BlendMode::Multiply;
             layer.visible = false;
             layer.locked = true;
+            layer.locks.pixels = true;
+            layer.locks.position = true;
             layer.effects.stroke.enabled = true;
             layer.effects.stroke.color = [1, 2, 3, 4];
             layer.effects.stroke.width = 7.5;
@@ -2124,6 +2332,44 @@ mod tests {
         doc
     }
 
+    /// Styles on what has no pixels, and partial locks, come back.
+    #[test]
+    fn styles_on_groups_and_fills_and_partial_locks_round_trip() {
+        let path = temp("styles-groups");
+        let mut doc = Document::new(RgbaImage::new(20, 20), None);
+        doc.add_fill_layer(crate::document::Fill::Solid([1, 2, 3]), None);
+        doc.active_layer_mut().effects.color_overlay.enabled = true;
+        doc.add_group();
+        let group = doc.active_layer_mut();
+        group.effects.shadow.enabled = true;
+        group.fill = 0.5;
+        group.locks.transparent = true;
+        doc.save(&path).unwrap();
+        let back = Document::open(&path).unwrap().doc;
+        let (fill, group) = (&back.layers[1], &back.layers[2]);
+        assert!(fill.effects.color_overlay.enabled);
+        assert!(group.effects.shadow.enabled);
+        assert_eq!(group.fill, 0.5);
+        assert!(group.locks.transparent && !group.locks.pixels);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn color_samplers_round_trip() {
+        let path = temp("samplers");
+        let mut doc = sample();
+        doc.samplers = vec![crate::document::ColorSampler { x: 3.5, y: 7.5 }];
+        doc.ruler = Some(crate::document::Measure {
+            vertex: (0.0, 0.0),
+            first: (1.0, 1.0),
+            second: None,
+        });
+        doc.save(&path).unwrap();
+        let back = Document::open(&path).unwrap().doc;
+        assert_eq!(back.samplers, doc.samplers);
+        assert!(back.ruler.is_none(), "a measure of the moment");
+    }
+
     #[test]
     fn round_trip_keeps_everything() {
         let path = temp("round-trip");
@@ -2151,6 +2397,7 @@ mod tests {
             assert_eq!(a.opacity, b.opacity);
             assert_eq!(a.fill, b.fill);
             assert_eq!(a.locked, b.locked);
+            assert_eq!(a.locks, b.locks);
             assert_eq!(a.blend, b.blend);
             assert_eq!((a.depth, a.clipped, a.link), (b.depth, b.clipped, b.link));
             assert_eq!(a.effects, b.effects);
@@ -2238,6 +2485,45 @@ mod tests {
         assert_eq!(layer.effects.shadow.blend, BlendMode::Normal);
         assert_eq!(layer.effects.stroke.opacity, 1.0);
         assert!(!layer.effects.bevel.enabled);
+    }
+
+    /// A version 3 file (before pattern fills and the new adjustments) opens
+    /// as it was saved, its own version number being all that's older.
+    #[test]
+    fn version_3_documents_still_open() {
+        let path = temp("version-3");
+        let mut doc = Document::new(RgbaImage::from_pixel(8, 8, Rgba([200, 100, 0, 255])), None);
+        doc.add_layer(
+            "A".into(),
+            RgbaImage::from_pixel(2, 2, Rgba([0, 0, 255, 255])),
+            (3, 3),
+        );
+        doc.active_layer_mut().effects.shadow.enabled = true;
+        doc.add_adjustment_layer(Adjustment::Invert, None);
+        let look = doc.flatten();
+        doc.save(&path).unwrap();
+        let mut zip = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let manifest = read_entry(&mut zip, MANIFEST, MAX_SMALL_ENTRY).unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        json["version"] = 3.into();
+        let old = path.with_file_name("old-3.atelier");
+        let mut out = ZipWriter::new(File::create(&old).unwrap());
+        let names: Vec<String> = zip.file_names().map(str::to_owned).collect();
+        for name in names {
+            let data = if name == MANIFEST {
+                json.to_string().into_bytes()
+            } else {
+                read_entry(&mut zip, &name, 1 << 30).unwrap()
+            };
+            out.start_file(name, SimpleFileOptions::default()).unwrap();
+            out.write_all(&data).unwrap();
+        }
+        out.finish().unwrap();
+        let back = Document::open(&old).unwrap().doc;
+        assert_eq!(back.layers.len(), 3);
+        assert!(matches!(back.layers[2].kind, LayerKind::Adjustment(Adjustment::Invert)));
+        assert!(back.layers[1].effects.shadow.enabled);
+        assert_eq!(back.flatten(), look);
     }
 
     /// A text of the first version 2 files, with a single style, opens with

@@ -379,6 +379,7 @@ impl AtelierApp {
         let opts = crate::compose::Options {
             held: doc.effects_held(),
             later_styles: true,
+            canvas: Some(doc.full_rect()),
             ..Default::default()
         };
         let sigs = crate::compose::signatures(&layers, &opts);

@@ -14,7 +14,8 @@ use super::dialogs::{
 };
 use super::*;
 use crate::filters::{
-    Filter, FilterKind, Morphology, Remove, SmartSharpen, Target, ToneFade, Undefined,
+    Filter, FilterKind, Morphology, PolarConversion, Remove, RippleSize, Shear, SmartSharpen,
+    SpherizeMode, Target, ToneFade, Undefined, WaveType, ZigZagStyle,
 };
 use crate::i18n::{Message, t};
 use ui_kit::color;
@@ -24,7 +25,7 @@ pub(super) const SHORTCUT_LAST_FILTER: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::F);
 
 /// Submenus of the Filter menu, in Photoshop's order.
-const GROUPS: [(Group, &[FilterKind]); 7] = [
+const GROUPS: [(Group, &[FilterKind]); 8] = [
     (
         Group::Blur,
         &[
@@ -32,6 +33,19 @@ const GROUPS: [(Group, &[FilterKind]); 7] = [
             FilterKind::GaussianBlur,
             FilterKind::MotionBlur,
             FilterKind::SurfaceBlur,
+        ],
+    ),
+    (
+        Group::Distort,
+        &[
+            FilterKind::Pinch,
+            FilterKind::PolarCoordinates,
+            FilterKind::Ripple,
+            FilterKind::Shear,
+            FilterKind::Spherize,
+            FilterKind::Twirl,
+            FilterKind::Wave,
+            FilterKind::ZigZag,
         ],
     ),
     (
@@ -64,6 +78,7 @@ const GROUPS: [(Group, &[FilterKind]); 7] = [
 #[derive(Clone, Copy)]
 enum Group {
     Blur,
+    Distort,
     Noise,
     Pixelate,
     Render,
@@ -76,6 +91,7 @@ impl Group {
     fn label(self) -> String {
         match self {
             Group::Blur => t!("filter-group-blur"),
+            Group::Distort => t!("distort8-group"),
             Group::Noise => t!("filter-group-noise"),
             Group::Pixelate => t!("filter-group-pixelate"),
             Group::Render => t!("filter-group-render"),
@@ -101,6 +117,14 @@ pub(super) fn title(kind: FilterKind) -> String {
         FilterKind::GaussianBlur => t!("filter-gaussian-blur"),
         FilterKind::MotionBlur => t!("filter-motion-blur"),
         FilterKind::SurfaceBlur => t!("filter-surface-blur"),
+        FilterKind::Pinch => t!("distort8-pinch"),
+        FilterKind::PolarCoordinates => t!("distort8-polar"),
+        FilterKind::Ripple => t!("distort8-ripple"),
+        FilterKind::Shear => t!("distort8-shear"),
+        FilterKind::Spherize => t!("distort8-spherize"),
+        FilterKind::Twirl => t!("distort8-twirl"),
+        FilterKind::Wave => t!("distort8-wave"),
+        FilterKind::ZigZag => t!("distort8-zigzag"),
         FilterKind::AddNoise => t!("filter-add-noise"),
         FilterKind::DustAndScratches => t!("filter-dust-and-scratches"),
         FilterKind::Median => t!("filter-median"),
@@ -115,6 +139,21 @@ pub(super) fn title(kind: FilterKind) -> String {
         FilterKind::Maximum => t!("filter-maximum"),
         FilterKind::Minimum => t!("filter-minimum"),
         FilterKind::Offset => t!("filter-offset"),
+    }
+}
+
+/// What the command palette also finds a filter by.
+pub(super) fn keywords(kind: FilterKind) -> String {
+    match kind {
+        FilterKind::Pinch => t!("distort8-keywords-pinch"),
+        FilterKind::PolarCoordinates => t!("distort8-keywords-polar"),
+        FilterKind::Ripple => t!("distort8-keywords-ripple"),
+        FilterKind::Shear => t!("distort8-keywords-shear"),
+        FilterKind::Spherize => t!("distort8-keywords-spherize"),
+        FilterKind::Twirl => t!("distort8-keywords-twirl"),
+        FilterKind::Wave => t!("distort8-keywords-wave"),
+        FilterKind::ZigZag => t!("distort8-keywords-zigzag"),
+        _ => String::new(),
     }
 }
 
@@ -149,6 +188,13 @@ pub(super) struct Filters {
     adjust_failed: Option<(LayerPreview, u64, u64)>,
     /// An adjustment's OK being computed.
     adjusting: Option<AdjustApplying>,
+    /// The Fade window.
+    pub(super) fade: Option<fade_stroke::FadeDialog>,
+    /// The Stroke window is open, and what it opens with.
+    pub(super) stroke_open: bool,
+    pub(super) stroke_options: fade_stroke::StrokeOptions,
+    /// Fade, Stroke or an Auto command being computed.
+    pub(super) processing: Option<fade_stroke::Processing>,
 }
 
 /// An adjustment applied (its dialog's OK), computed on another thread:
@@ -175,7 +221,12 @@ struct Enlarged {
 impl Filters {
     /// A dialog or a filter being applied keeps the keyboard and the image.
     pub(super) fn busy(&self) -> bool {
-        self.dialog.is_some() || self.applying.is_some() || self.adjusting.is_some()
+        self.dialog.is_some()
+            || self.applying.is_some()
+            || self.adjusting.is_some()
+            || self.fade.is_some()
+            || self.stroke_open
+            || self.processing.is_some()
     }
 
     /// The settings a filter's dialog opens with (an action's step).
@@ -614,6 +665,7 @@ impl AtelierApp {
                 Some(image) => {
                     doc.active_layer_mut().replace_pixels(image);
                     doc.end_paint();
+                    doc.mark_fade();
                     self.status = t!("filter-applied", name = name.as_str());
                     if a.rasterized {
                         let layer = doc.active_layer().name.as_str();
@@ -673,7 +725,9 @@ impl AtelierApp {
                                 let name = Message::of(|| t!("dialog-transparency-title"));
                                 tm!("fx4-preview-failed", name = name)
                             }
-                            LayerPreview::Filter(_) => tm!("fx4-preview-failed-any"),
+                            LayerPreview::Fade(_) | LayerPreview::Filter(_) => {
+                                tm!("fx4-preview-failed-any")
+                            }
                         };
                         self.filters.adjust_failed = Some((failed, layer, rev));
                         self.status_failed(text);
@@ -693,14 +747,18 @@ impl AtelierApp {
             return;
         }
         let Some(doc) = &self.doc else { return };
-        // Like the result: only inside the selection.
-        let Some(target) = active_target(doc, self.selection.as_ref()) else {
+        // Like the result: only inside the selection (Fade: what it faded
+        // was).
+        let selection = self.selection.as_ref();
+        let selection = selection.filter(|_| !matches!(preview, LayerPreview::Fade(_)));
+        let Some(target) = active_target(doc, selection) else {
             return self.end_layer_preview();
         };
         let wanted = preview.clone();
         let name = match &preview {
             LayerPreview::Adjust(a) => format!("Adjustment preview: {:?}", a.kind()),
             LayerPreview::Transparency(_) => "Make Transparent preview".to_owned(),
+            LayerPreview::Fade(_) => "Fade preview".to_owned(),
             LayerPreview::Filter(_) => "Layer preview".to_owned(),
         };
         let job = Job::spawn(&self.ctx, 0, [0; 4], Some(name), move || {
@@ -764,6 +822,7 @@ impl AtelierApp {
         if doc.put_processed_active(adjustment.title(), image)
             || doc.adjust_active(&adjustment, self.selection.as_ref())
         {
+            doc.mark_fade();
             self.status = t!("dialog-adjust-applied", name = adjustment.title());
         }
         self.record(crate::actions::Recorded::Adjust { adjustment });
@@ -1411,9 +1470,339 @@ fn settings(ui: &mut egui::Ui, filter: &mut Filter, tones: &mut bool, size: (u32
             let square = format!(" {}", t!("filter-unit-square"));
             wide(ui, &t!("filter-cell-size"), cell, 2.0..=200.0, &square, d);
         }
+        (Filter::Ripple { amount: a, size }, Filter::Ripple { amount: d, .. }) => {
+            whole(ui, &amount, a, -999.0..=999.0, &percent, d);
+            gap_between_blocks(ui);
+            block(ui, |ui| {
+                ui_kit::field_label(ui, &t!("distort8-size"));
+                let (s, m, l) = (
+                    t!("distort8-size-small"),
+                    t!("distort8-size-medium"),
+                    t!("distort8-size-large"),
+                );
+                full_segmented(
+                    ui,
+                    size,
+                    &[
+                        (RippleSize::Small, &s),
+                        (RippleSize::Medium, &m),
+                        (RippleSize::Large, &l),
+                    ],
+                );
+            });
+        }
+        (Filter::Wave(w), Filter::Wave(d)) => wave_settings(ui, w, &d),
+        (Filter::Twirl { angle: a }, Filter::Twirl { angle: d }) => {
+            whole(ui, &angle, a, -999.0..=999.0, "°", d);
+        }
+        (Filter::Spherize { amount: a, mode }, Filter::Spherize { amount: d, .. }) => {
+            whole(ui, &amount, a, -100.0..=100.0, &percent, d);
+            gap_between_blocks(ui);
+            choice(
+                ui,
+                "distort8_mode",
+                &t!("distort8-mode"),
+                mode,
+                &[
+                    (SpherizeMode::Normal, t!("distort8-mode-normal")),
+                    (SpherizeMode::HorizontalOnly, t!("distort8-mode-horizontal")),
+                    (SpherizeMode::VerticalOnly, t!("distort8-mode-vertical")),
+                ],
+            );
+        }
+        (Filter::PolarCoordinates { conversion }, _) => {
+            choice(
+                ui,
+                "distort8_conversion",
+                &t!("distort8-conversion"),
+                conversion,
+                &[
+                    (
+                        PolarConversion::RectangularToPolar,
+                        t!("distort8-rectangular-to-polar"),
+                    ),
+                    (
+                        PolarConversion::PolarToRectangular,
+                        t!("distort8-polar-to-rectangular"),
+                    ),
+                ],
+            );
+        }
+        (Filter::Pinch { amount: a }, Filter::Pinch { amount: d }) => {
+            whole(ui, &amount, a, -100.0..=100.0, &percent, d);
+        }
+        (
+            Filter::ZigZag {
+                amount: a,
+                ridges,
+                style,
+            },
+            Filter::ZigZag {
+                amount: da,
+                ridges: dr,
+                ..
+            },
+        ) => {
+            whole(ui, &amount, a, -100.0..=100.0, &percent, da);
+            gap_between_blocks(ui);
+            whole(ui, &t!("distort8-ridges"), ridges, 1.0..=20.0, "", dr);
+            gap_between_blocks(ui);
+            choice(
+                ui,
+                "distort8_style",
+                &t!("distort8-style"),
+                style,
+                &[
+                    (ZigZagStyle::AroundCenter, t!("distort8-around-center")),
+                    (ZigZagStyle::OutFromCenter, t!("distort8-out-from-center")),
+                    (ZigZagStyle::PondRipples, t!("distort8-pond-ripples")),
+                ],
+            );
+        }
+        (Filter::Shear(s), _) => {
+            shear_curve(ui, s);
+            gap_between_blocks(ui);
+            if ui_kit::button(
+                ui,
+                &t!("distort8-shear-default"),
+                ui_kit::Kind::Normal,
+                None,
+                true,
+            )
+            .clicked()
+            {
+                *s = Shear::straight(s.undefined);
+            }
+            gap_between_blocks(ui);
+            undefined_choice(ui, &mut s.undefined);
+        }
         // Without settings, or the settings of another kind (never).
         _ => {}
     }
+}
+
+/// A drop-down under its label.
+fn choice<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    value: &mut T,
+    options: &[(T, String)],
+) {
+    block(ui, |ui| {
+        ui_kit::field_label(ui, label);
+        let width = ui.available_width();
+        let chosen = options
+            .iter()
+            .find(|(v, _)| v == value)
+            .map_or("", |(_, name)| name.as_str());
+        ui_kit::combo(ui, id, None, chosen, width, |ui| {
+            for (v, name) in options {
+                ui.selectable_value(value, *v, name);
+            }
+        });
+    });
+}
+
+/// Undefined areas of Wave and Shear.
+fn undefined_choice(ui: &mut egui::Ui, undefined: &mut Undefined) {
+    choice(
+        ui,
+        "distort8_undefined",
+        &t!("filter-undefined-areas"),
+        undefined,
+        &[
+            (Undefined::WrapAround, t!("filter-wrap-around")),
+            (Undefined::RepeatEdges, t!("filter-repeat-edges")),
+        ],
+    );
+}
+
+/// Wave: generators, lengths (a minimum stays below its maximum), scales,
+/// type, undefined areas, Randomize.
+fn wave_settings(ui: &mut egui::Ui, w: &mut crate::filters::Wave, d: &crate::filters::Wave) {
+    let percent = i18n::percent("");
+    let row = |ui: &mut egui::Ui, label: String, value: &mut f32, unit: &str, default: f32| {
+        wide(ui, &label, value, 1.0..=999.0, unit, default);
+        gap_between_blocks(ui);
+    };
+    row(
+        ui,
+        t!("distort8-generators"),
+        &mut w.generators,
+        "",
+        d.generators,
+    );
+    let min = w.wavelength_min;
+    row(
+        ui,
+        t!("distort8-wavelength-min"),
+        &mut w.wavelength_min,
+        " px",
+        d.wavelength_min,
+    );
+    row(
+        ui,
+        t!("distort8-wavelength-max"),
+        &mut w.wavelength_max,
+        " px",
+        d.wavelength_max,
+    );
+    keep_ordered(&mut w.wavelength_min, &mut w.wavelength_max, min);
+    let min = w.amplitude_min;
+    row(
+        ui,
+        t!("distort8-amplitude-min"),
+        &mut w.amplitude_min,
+        " px",
+        d.amplitude_min,
+    );
+    row(
+        ui,
+        t!("distort8-amplitude-max"),
+        &mut w.amplitude_max,
+        " px",
+        d.amplitude_max,
+    );
+    keep_ordered(&mut w.amplitude_min, &mut w.amplitude_max, min);
+    for (label, value, default) in [
+        (
+            t!("distort8-scale-horizontal"),
+            &mut w.scale_horizontal,
+            d.scale_horizontal,
+        ),
+        (
+            t!("distort8-scale-vertical"),
+            &mut w.scale_vertical,
+            d.scale_vertical,
+        ),
+    ] {
+        whole(ui, &label, value, 1.0..=100.0, &percent, default);
+        gap_between_blocks(ui);
+    }
+    block(ui, |ui| {
+        ui_kit::field_label(ui, &t!("distort8-type"));
+        let (sine, triangle, square) = (
+            t!("distort8-type-sine"),
+            t!("distort8-type-triangle"),
+            t!("distort8-type-square"),
+        );
+        full_segmented(
+            ui,
+            &mut w.wave_type,
+            &[
+                (WaveType::Sine, &sine),
+                (WaveType::Triangle, &triangle),
+                (WaveType::Square, &square),
+            ],
+        );
+    });
+    gap_between_blocks(ui);
+    undefined_choice(ui, &mut w.undefined);
+    gap_between_blocks(ui);
+    if ui_kit::button(
+        ui,
+        &t!("distort8-randomize"),
+        ui_kit::Kind::Normal,
+        None,
+        true,
+    )
+    .clicked()
+    {
+        w.seed = fresh_seed();
+    }
+}
+
+/// A minimum moved above its maximum pushes it up, and the other way round.
+fn keep_ordered(min: &mut f32, max: &mut f32, min_before: f32) {
+    if *min > *max {
+        if *min != min_before {
+            *max = *min;
+        } else {
+            *min = *max;
+        }
+    }
+}
+
+/// The curve of Shear: drag a point, or the line for a new point; a point
+/// dragged out of the grid is removed.
+fn shear_curve(ui: &mut egui::Ui, s: &mut Shear) {
+    let width = ui.available_width().min(SQUARE);
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 160.0), Sense::click_and_drag());
+    let name = t!("distort8-shear-curve");
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, &name));
+    let to_screen = |p: [f32; 2]| {
+        pos2(
+            rect.center().x + p[0] * rect.width() / 2.0,
+            rect.top() + p[1] * rect.height(),
+        )
+    };
+    let from_screen = |p: Pos2| {
+        (
+            (p.x - rect.center().x) / (rect.width() / 2.0),
+            ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0),
+        )
+    };
+    let id = response.id.with("point");
+    let mut held: Option<usize> = ui.data(|d| d.get_temp(id)).flatten();
+    // From where it was pressed: a drag only starts once the pointer moved.
+    if response.drag_started()
+        && let Some(at) = ui
+            .input(|i| i.pointer.press_origin())
+            .or(response.interact_pointer_pos())
+    {
+        let near = s
+            .used()
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| (i, to_screen(p).distance(at)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .filter(|&(_, d)| d <= 10.0)
+            .map(|(i, _)| i);
+        let (shift, height) = from_screen(at);
+        held = near.or_else(|| s.insert(shift, height));
+    }
+    if let Some(i) = held
+        && let Some(at) = response.interact_pointer_pos()
+    {
+        let (shift, height) = from_screen(at);
+        if response.dragged() {
+            s.place(i, shift, height);
+        }
+        if response.drag_stopped() {
+            if !rect.expand(8.0).contains(at) {
+                s.remove(i);
+            }
+            held = None;
+        }
+    }
+    if !response.dragged() && !response.drag_stopped() {
+        held = None;
+    }
+    ui.data_mut(|d| d.insert_temp(id, held));
+
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, color::BG0);
+    let grid = UiStroke::new(1.0, color::LINE);
+    for i in 1..4 {
+        let f = i as f32 / 4.0;
+        let x = rect.left() + rect.width() * f;
+        let y = rect.top() + rect.height() * f;
+        painter.vline(x, rect.y_range(), grid);
+        painter.hline(rect.x_range(), y, grid);
+    }
+    let line: Vec<Pos2> = (0..=64)
+        .map(|i| {
+            let height = i as f32 / 64.0;
+            to_screen([s.shift_at(height), height])
+        })
+        .collect();
+    painter.add(egui::Shape::line(line, UiStroke::new(1.5, color::ACCENT)));
+    for &p in s.used() {
+        painter.circle_filled(to_screen(p), 3.5, color::ACCENT);
+    }
+    painter.rect_stroke(rect, 0.0, grid, StrokeKind::Inside);
+    response.on_hover_text(t!("distort8-shear-tip"));
 }
 
 /// Smart Sharpen: amount, radius, noise, blur to remove; shadows and
@@ -1705,6 +2094,293 @@ mod tests {
         app.filters.applying.is_none()
     }
 
+    /// Runs a dialog of `kind` to its result: only in one step, then Last
+    /// Filter and the recorded settings have it.
+    fn distort_applies(h: &mut Harness<'static, AtelierApp>, kind: FilterKind) {
+        let original = pixels(h);
+        let steps = h.state().doc.as_ref().unwrap().history_step();
+        h.state_mut().run(Action::Filter(kind));
+        assert!(h.state().modal_open(), "{kind:?}: a dialog");
+        settle(h, |app| {
+            matches!(
+                app.preview_shown.as_ref().map(|p| &p.preview),
+                Some(LayerPreview::Filter(_))
+            ) && app
+                .filters
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.square.shown.is_some())
+        });
+        assert_eq!(pixels(h), original, "{kind:?}: only previewed");
+        h.key_press(egui::Key::Enter);
+        settle(h, applied);
+        assert!(h.state().filters.dialog.is_none());
+        assert_eq!(
+            h.state().doc.as_ref().unwrap().history_step(),
+            steps + 1,
+            "{kind:?}: one step"
+        );
+        assert_eq!(h.state().filters.last, Some(kind.initial()));
+    }
+
+    #[test]
+    fn distort_filters_preview_apply_and_repeat() {
+        let mut h = app();
+        for kind in [
+            FilterKind::Pinch,
+            FilterKind::PolarCoordinates,
+            FilterKind::Ripple,
+            FilterKind::Shear,
+            FilterKind::Spherize,
+            FilterKind::Twirl,
+            FilterKind::Wave,
+            FilterKind::ZigZag,
+        ] {
+            distort_applies(&mut h, kind);
+        }
+        // The result is what the filter gives, and Last Filter does it again.
+        let before = pixels(&h);
+        h.state_mut().run(Action::LastFilter);
+        settle(&mut h, applied);
+        let mut expected = before;
+        FilterKind::ZigZag.initial().apply(&mut expected, (0, 0));
+        assert_eq!(pixels(&h), expected);
+    }
+
+    #[test]
+    fn distort_group_comes_after_blur_with_its_dialogs() {
+        let h = app();
+        let menus = h.state().menus();
+        let (_, entries) = menus
+            .iter()
+            .find(|(t, _)| *t == t!("filter-menu"))
+            .expect("menu");
+        let names: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| match e {
+                MenuEntry::Submenu(name, _) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let group = t!("distort8-group");
+        let at = names.iter().position(|n| *n == group).expect("group");
+        assert_eq!(names[at - 1], t!("filter-group-blur"));
+        assert_eq!(names[at + 1], t!("filter-group-noise"));
+    }
+
+    #[test]
+    fn distort_dialog_settings_change_the_filter_and_cancel_restores() {
+        let mut h = app();
+        let original = pixels(&h);
+        h.state_mut().run(Action::Filter(FilterKind::Twirl));
+        for _ in 0..3 {
+            h.run_steps(1);
+        }
+        let dialog = h.state_mut().filters.dialog.as_mut().unwrap();
+        dialog.filter = Filter::Twirl { angle: 300.0 };
+        settle(&mut h, |app| {
+            let key = hash_of((
+                app.doc.as_ref().unwrap().active_layer().id,
+                app.doc.as_ref().unwrap().active_layer().rev(),
+                hash_of(format!("{:?}", Filter::Twirl { angle: 300.0 })),
+            ));
+            matches!(
+                app.preview_shown.as_ref().map(|p| &p.preview),
+                Some(LayerPreview::Filter(k)) if *k == key
+            )
+        });
+        let step = h.state().doc.as_ref().unwrap().history_step();
+        h.key_press(egui::Key::Escape);
+        for _ in 0..3 {
+            h.run_steps(1);
+        }
+        assert!(h.state().filters.dialog.is_none());
+        assert!(h.state().preview_shown.is_none());
+        assert_eq!(pixels(&h), original);
+        assert_eq!(h.state().doc.as_ref().unwrap().history_step(), step);
+    }
+
+    #[test]
+    fn distort_applies_inside_the_selection() {
+        let mut h = app();
+        let original = pixels(&h);
+        h.state_mut().selection = Some(Selection {
+            rect: PixelRect {
+                x: 12,
+                y: 12,
+                w: 40,
+                h: 40,
+            },
+            mask: None,
+            inverted: false,
+        });
+        h.state_mut().start_filter(Filter::Twirl { angle: 200.0 });
+        settle(&mut h, applied);
+        let out = pixels(&h);
+        for (x, y, p) in out.enumerate_pixels() {
+            if !(12..52).contains(&x) || !(12..52).contains(&y) {
+                assert_eq!(p, original.get_pixel(x, y), "outside the selection");
+            }
+        }
+        assert_ne!(out, original);
+    }
+
+    #[test]
+    fn distort_dialog_opens_on_shear_and_wave_with_every_row_in_french_too() {
+        for lang in [Lang::En, Lang::Fr] {
+            let mut h = app();
+            i18n::set_lang(lang);
+            for kind in [FilterKind::Wave, FilterKind::Shear, FilterKind::ZigZag] {
+                h.state_mut().run(Action::Filter(kind));
+                h.run_steps(3);
+                assert!(h.state().filters.dialog.is_some());
+                h.key_press(egui::Key::Escape);
+                h.run_steps(3);
+            }
+        }
+        i18n::set_lang(Lang::En);
+    }
+
+    use egui_kittest::kittest::Queryable as _;
+
+    const DISTORTS: [FilterKind; 8] = [
+        FilterKind::Ripple,
+        FilterKind::Wave,
+        FilterKind::Twirl,
+        FilterKind::Spherize,
+        FilterKind::PolarCoordinates,
+        FilterKind::Pinch,
+        FilterKind::ZigZag,
+        FilterKind::Shear,
+    ];
+
+    /// At the smallest window: all of each dialog can be reached, OK and
+    /// Cancel on screen and working.
+    #[test]
+    fn distort_dialogs_fit_a_small_window_with_ok_and_cancel_reachable() {
+        for lang in [Lang::En, Lang::Fr] {
+            i18n::set_lang(lang);
+            for kind in DISTORTS {
+                let mut h = app();
+                h.set_size(egui::vec2(660.0, 500.0));
+                h.run_steps(3);
+                h.state_mut().run(Action::Filter(kind));
+                h.run_steps(4);
+                let what = format!("{lang:?} {kind:?}");
+                let window = h.ctx.content_rect();
+                for name in [t!("dialog-ok"), t!("dialog-cancel")] {
+                    let r = h.get_by_label(&name).rect();
+                    assert!(window.contains_rect(r), "{what} {name}: {r:?}");
+                }
+                // The rows below the preview come up by scrolling, Wave's last
+                // one too, above the buttons.
+                if kind == FilterKind::Wave {
+                    let ok = h.get_by_label(&t!("dialog-ok")).rect();
+                    let below = h.get_by_label(&t!("distort8-randomize")).rect();
+                    assert!(below.top() >= ok.top(), "{what}: {below:?}");
+                    h.hover_at(pos2(ok.left() - 150.0, ok.top() - 150.0));
+                    h.run_steps(1);
+                    h.event(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -3000.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                    });
+                    h.run_steps(30);
+                    let below = h.get_by_label(&t!("distort8-randomize")).rect();
+                    assert!(below.bottom() <= ok.top(), "{what}: {below:?} scrolled");
+                }
+                // Cancel, then OK, both by the pointer.
+                h.get_by_label(&t!("dialog-cancel")).click();
+                h.run_steps(3);
+                assert!(h.state().filters.dialog.is_none(), "{what}: cancelled");
+                h.state_mut().run(Action::Filter(kind));
+                h.run_steps(3);
+                let steps = h.state().doc.as_ref().unwrap().history_step();
+                h.get_by_label(&t!("dialog-ok")).click();
+                settle(&mut h, |a| a.filters.dialog.is_none() && applied(a));
+                assert_eq!(h.state().doc.as_ref().unwrap().history_step(), steps + 1, "{what}");
+            }
+        }
+        i18n::set_lang(Lang::En);
+    }
+
+    /// A distort dialog at the smallest window, to look at:
+    /// `ATELIER_CAPTURE=out.png ATELIER_LANG=fr ATELIER_FILTER=Wave`.
+    #[test]
+    #[ignore = "needs a graphics renderer"]
+    fn capture_distort_dialog() {
+        let name = std::env::var("ATELIER_FILTER").unwrap_or_else(|_| "Wave".into());
+        let kind = DISTORTS
+            .into_iter()
+            .find(|k| format!("{k:?}") == name)
+            .expect("a distort filter");
+        if std::env::var("ATELIER_LANG").as_deref() == Ok("fr") {
+            i18n::set_lang(Lang::Fr);
+        }
+        let mut h = app();
+        h.set_size(egui::vec2(660.0, 500.0));
+        h.run_steps(3);
+        h.state_mut().run(Action::Filter(kind));
+        settle(&mut h, |a| a.filters.dialog.as_ref().is_some_and(|d| d.square.shown.is_some()));
+        h.run_steps(3);
+        let out = std::env::var("ATELIER_CAPTURE").unwrap_or_else(|_| "capture.png".into());
+        h.render().expect("a renderer").save(out).expect("written");
+    }
+
+    /// A drag on the Shear curve: a new point under the pointer, then that
+    /// point moved; off the grid, it goes.
+    #[test]
+    fn a_drag_on_the_shear_curve_changes_it() {
+        let mut h = app();
+        h.state_mut().run(Action::Filter(FilterKind::Shear));
+        h.run_steps(3);
+        let curve = |h: &Harness<'static, AtelierApp>| -> Shear {
+            match h.state().filters.dialog.as_ref().expect("the dialog").filter {
+                Filter::Shear(s) => s,
+                ref other => panic!("{other:?}"),
+            }
+        };
+        let straight = curve(&h);
+        assert_eq!(straight.used().len(), 2);
+        let r = h.get_by_label(&t!("distort8-shear-curve")).rect();
+        let drag = |h: &mut Harness<'static, AtelierApp>, from: Pos2, to: Pos2| {
+            h.hover_at(from);
+            h.run_steps(1);
+            h.drag_at(from);
+            h.run_steps(1);
+            for i in 1..=4 {
+                h.hover_at(from.lerp(to, i as f32 / 4.0));
+                h.run_steps(1);
+            }
+            h.drop_at(to);
+            h.run_steps(2);
+        };
+        let at = |x: f32, y: f32| pos2(r.center().x + x * r.width() / 2.0, r.top() + y * r.height());
+        // On the line, in the middle, pulled to the right.
+        drag(&mut h, at(0.0, 0.5), at(0.5, 0.5));
+        let s = curve(&h);
+        assert_eq!(s.used().len(), 3, "a point added");
+        assert!((s.shift_at(0.5) - 0.5).abs() < 0.03, "{}", s.shift_at(0.5));
+        assert!(s.shift_at(0.0).abs() < 1e-3 && s.shift_at(1.0).abs() < 1e-3, "the ends stay");
+        // That point again, lower and to the left.
+        drag(&mut h, at(0.5, 0.5), at(-0.4, 0.75));
+        let s = curve(&h);
+        assert_eq!(s.used().len(), 3, "the same one moved");
+        assert!((s.shift_at(0.75) + 0.4).abs() < 0.03, "{}", s.shift_at(0.75));
+        // Out of the grid: gone, and the line is straight.
+        drag(&mut h, at(-0.4, 0.75), pos2(r.right() + 60.0, r.center().y));
+        assert_eq!(curve(&h).used().len(), 2, "removed");
+        assert!(curve(&h).shift_at(0.5).abs() < 1e-3);
+        // Applied, the image follows the curve in the middle rows only.
+        drag(&mut h, at(0.0, 0.5), at(0.5, 0.5));
+        let before = pixels(&h);
+        h.key_press(egui::Key::Enter);
+        settle(&mut h, |a| a.filters.dialog.is_none() && applied(a));
+        let after = pixels(&h);
+        assert_ne!(after, before);
+    }
+
     #[test]
     fn filter_menu_sits_between_select_and_view() {
         let h = app();
@@ -1726,7 +2402,7 @@ mod tests {
         let n = kinds.len();
         kinds.dedup();
         assert_eq!(kinds.len(), n);
-        assert_eq!(n, 18);
+        assert_eq!(n, 26);
     }
 
     #[test]

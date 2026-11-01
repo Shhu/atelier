@@ -403,6 +403,8 @@ impl AtelierApp {
             (self.liquify.busy(), "Liquify"),
             (self.smart.busy(), "Smart Filter"),
             (self.fill_dialog.is_some(), "Fill"),
+            (self.patterns.define.is_some(), "Define Pattern"),
+            (self.patterns.rename.is_some(), "Rename Pattern"),
             (self.retouch.dialog.is_some(), "Content-Aware Fill"),
             (self.image_size.is_some(), "Image Size"),
             (self.canvas_size.is_some(), "Canvas Size"),
@@ -1984,7 +1986,6 @@ mod tests {
         h.state_mut().run(Action::NewLayer);
         diag::record("Filter: GaussianBlur", Duration::from_millis(380));
         diag::record("Stroke end: Canvas", Duration::from_millis(12));
-        diag::error(tm!("status-open-failed", path = "plage.psd", error = "x"));
         let names = h.state().names();
         assert_eq!(names.operation("NewLayer"), "Nouveau calque");
         assert_eq!(
@@ -1992,6 +1993,11 @@ mod tests {
             "Filtre\u{a0}: Flou gaussien"
         );
         assert!(names.operation("Stroke end: Canvas").contains("Recadrage"));
+        // The measures and the log are shared with the tests running
+        // alongside: long enough to stay in the report's rows, logged right
+        // before it.
+        diag::record("NewLayer", Duration::from_secs(3600));
+        diag::error(tm!("status-open-failed", path = "plage.psd", error = "x"));
         let report = h.state().diagnostics_report();
         i18n::set_lang(Lang::En);
         assert!(report.contains("| New Layer (`NewLayer`)"), "{report}");

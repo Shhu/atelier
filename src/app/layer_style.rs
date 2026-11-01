@@ -30,6 +30,7 @@ impl AtelierApp {
         });
         // From the foreground to the background color.
         let fg_to_bg = Preset::ForegroundToBackground.gradient().resolved(fg, bg);
+        let pattern = self.last_pattern();
         let Some(doc) = &mut self.doc else { return };
         let mask = doc
             .active_layer()
@@ -67,6 +68,11 @@ impl AtelierApp {
                 doc.add_fill_layer(fill, selection.as_ref());
                 true
             }
+            Action::NewPatternFill => {
+                let fill = Fill::Pattern(crate::compose::pattern::PatternFill::of(pattern));
+                doc.add_fill_layer(fill, selection.as_ref());
+                true
+            }
             Action::AddMask(kind) => doc.add_mask(kind, selection.as_ref()),
             Action::DeleteMask => doc.delete_mask(),
             Action::ApplyMask => doc.apply_mask(),
@@ -81,7 +87,7 @@ impl AtelierApp {
             }
             Action::LayerStyle(page) => {
                 let layer = doc.active_layer();
-                if layer.has_pixels() {
+                if layer.styleable() {
                     let before = (
                         layer.effects.clone(),
                         layer.blend,
@@ -209,7 +215,7 @@ impl AtelierApp {
         let pixels = self
             .doc
             .as_ref()
-            .is_some_and(|d| d.active_layer().has_pixels());
+            .is_some_and(|d| d.active_layer().styleable());
         let styled = self
             .doc
             .as_ref()
@@ -241,6 +247,20 @@ impl AtelierApp {
         entries
     }
 
+    /// Layer › Lock: the locks of the Layers panel.
+    pub(super) fn lock_menu(&self) -> Vec<MenuEntry> {
+        let Some(doc) = &self.doc else {
+            return Vec::new();
+        };
+        layer_locks::LockKind::ROW
+            .into_iter()
+            .map(|kind| {
+                let (on, free) = kind.state(doc, doc.active);
+                MenuEntry::Check(kind.label(), free, on, None, Action::Lock(kind))
+            })
+            .collect()
+    }
+
     /// The fill and adjustment layers (Layer › New Fill Layer / New
     /// Adjustment Layer, and the panel's button).
     pub(super) fn new_fill_or_adjustment_menu(&self) -> Vec<MenuEntry> {
@@ -264,6 +284,12 @@ impl AtelierApp {
                 has_doc,
                 None,
                 Action::NewFillLayer(true),
+            ),
+            MenuEntry::Item(
+                format!("{}…", t!("pattern8-pattern")),
+                has_doc,
+                None,
+                Action::NewPatternFill,
             ),
         ]
     }
@@ -296,6 +322,7 @@ impl AtelierApp {
             self.layer_style = None;
             return;
         }
+        let group = layer.is_group();
         let (mut fx, mut blend, mut opacity, mut fill) = (
             layer.effects.clone(),
             layer.blend,
@@ -331,7 +358,8 @@ impl AtelierApp {
                         ui_kit::section(ui, &title);
                         match dialog.page {
                             None => {
-                                hovered = blending_options(ui, &mut blend, &mut opacity, &mut fill);
+                                hovered =
+                                    blending_options(ui, &mut blend, &mut opacity, &mut fill, group);
                             }
                             Some(style) => style_page(ui, style, &mut fx),
                         }
@@ -430,9 +458,10 @@ fn blending_options(
     blend: &mut BlendMode,
     opacity: &mut f32,
     fill: &mut f32,
+    group: bool,
 ) -> Option<BlendMode> {
     let hovered = labeled(ui, &t!("panel-blend-mode"), |ui, w| {
-        blend_combo(ui, "style_blend", blend, false, w)
+        blend_combo(ui, "style_blend", blend, group, w)
     });
     gap_between_blocks(ui);
     percent(ui, &t!("panel-opacity"), opacity, 100.0);
@@ -596,6 +625,16 @@ fn style_page(ui: &mut egui::Ui, style: Style, fx: &mut Effects) {
             mode_and_color(ui, "overlay_blend", &mut o.blend, &mut o.color);
             gap_between_blocks(ui);
             percent(ui, &t!("panel-opacity"), &mut o.opacity, 100.0);
+        }
+        Style::PatternOverlay => {
+            let p = &mut fx.pattern_overlay;
+            labeled(ui, &t!("panel-blend-mode"), |ui, w| {
+                blend_combo(ui, "pattern_overlay_blend", &mut p.blend, false, w)
+            });
+            gap_between_blocks(ui);
+            percent(ui, &t!("panel-opacity"), &mut p.opacity, 100.0);
+            gap_between_blocks(ui);
+            super::patterns_ui::pattern_fill_fields(ui, &mut p.fill);
         }
         Style::GradientOverlay => {
             let g = &mut fx.gradient_overlay;

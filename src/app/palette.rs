@@ -419,6 +419,10 @@ fn flatten(ctx: &egui::Context, entries: &[MenuEntry], path: &str, out: &mut Vec
 /// draw (the menus can't borrow the app while they run).
 #[derive(Clone, Copy, Default)]
 pub(super) struct Facts {
+    /// Define Pattern can't run: in Quick Mask, or the selection isn't a
+    /// plain rectangle.
+    quick_mask_on: bool,
+    shaped_selection: bool,
     doc: bool,
     selection: bool,
     last_selection: bool,
@@ -433,6 +437,7 @@ pub(super) struct Facts {
     artboard: bool,
     artboards: bool,
     styled: bool,
+    styleable: bool,
     guides: bool,
     saved_selections: bool,
     last_filter: bool,
@@ -448,6 +453,11 @@ impl AtelierApp {
         let doc = self.doc.as_ref();
         let layer = doc.map(Document::active_layer);
         Facts {
+            quick_mask_on: self.in_quick_mask(),
+            shaped_selection: self
+                .selection
+                .as_ref()
+                .is_some_and(|s| s.mask.is_some() || s.inverted),
             doc: doc.is_some(),
             selection: self.selection.is_some(),
             last_selection: self.last_selection.is_some(),
@@ -463,6 +473,7 @@ impl AtelierApp {
             group: layer.is_some_and(Layer::is_group),
             artboard: layer.is_some_and(|l| l.artboard.is_some()),
             artboards: doc.is_some_and(Document::has_artboards),
+            styleable: layer.is_some_and(Layer::styleable),
             styled: layer.is_some_and(|l| l.effects.any()),
             guides: doc.is_some_and(|d| !d.guides.is_empty()),
             saved_selections: doc.is_some_and(|d| !d.channels.is_empty()),
@@ -536,7 +547,11 @@ pub(super) fn unavailable_reason(f: &Facts, action: Action) -> String {
                 | Smart::EmbedLinked
         )
     );
-    if matches!(action, Action::AddMask(_)) && f.mask {
+    if matches!(action, Action::DefinePattern) && f.quick_mask_on {
+        t!("pattern8-why-quick-mask")
+    } else if matches!(action, Action::DefinePattern) && f.shaped_selection {
+        t!("pattern8-why-rectangle")
+    } else if matches!(action, Action::AddMask(_)) && f.mask {
         t!("ui4-why-has-mask")
     } else if needs_selection && !f.selection {
         t!("ui3-why-no-selection")
@@ -558,7 +573,11 @@ pub(super) fn unavailable_reason(f: &Facts, action: Action) -> String {
         t!("ui4-why-not-linked")
     } else if matches!(action, Action::Rasterize) && !f.live {
         t!("ui4-why-not-live")
-    } else if matches!(action, Action::Adjust(_)) && f.smart_pixels {
+    } else if matches!(action, Action::Fade) {
+        t!("adjust8-why-no-fade")
+    } else if matches!(action, Action::Adjust(_) | Action::AutoAdjust(_) | Action::Stroke)
+        && f.smart_pixels
+    {
         t!("ui4-why-smart-adjust")
     } else if matches!(action, Action::MergeDown) && !f.layer_below {
         t!("ui4-why-no-layer-below")
@@ -574,7 +593,9 @@ pub(super) fn unavailable_reason(f: &Facts, action: Action) -> String {
         t!("ui4-why-no-artboards")
     } else if matches!(action, Action::ClearLayerStyle) && !f.styled {
         t!("ui4-why-no-style")
-    } else if matches!(action, Action::LayerStyle(_)) && !f.pixels {
+    } else if matches!(action, Action::Lock(_)) {
+        t!("layers8-why-lock")
+    } else if matches!(action, Action::LayerStyle(_)) && !f.styleable {
         t!("ui4-why-no-pixels")
     } else if matches!(action, Action::View(rulers::Command::ClearGuides)) && !f.guides {
         t!("ui4-why-no-guides")
@@ -639,12 +660,24 @@ fn keywords(action: Action) -> String {
         Action::CropToSelection | Action::CropToContent => t!("ui3-palette-keywords-crop"),
         Action::NewDocument => t!("ui5-palette-keywords-new"),
         Action::ToggleVisibility => t!("ui5-palette-keywords-visibility"),
+        Action::ToggleLock | Action::Lock(_) => t!("layers8-palette-keywords-lock"),
         Action::Tool(Tool::ObjectSelect) => t!("ui5-palette-keywords-object-select"),
         Action::Automate(actions_panel::Command::Panel) => t!("ui5-palette-keywords-actions"),
         Action::Undo => t!("ui5-palette-keywords-undo"),
         Action::SetLanguage(Lang::En) => t!("ui6-palette-keywords-english"),
         Action::SetLanguage(Lang::Fr) => t!("ui6-palette-keywords-french"),
         Action::Adjust(AdjustKind::HueSaturation) => t!("ui5-palette-keywords-desaturate"),
+        Action::AutoAdjust(_) => t!("adjust8-keywords-auto"),
+        Action::Fade => t!("adjust8-keywords-fade"),
+        Action::Stroke => t!("adjust8-keywords-stroke"),
+        Action::Adjust(AdjustKind::Exposure)
+        | Action::NewAdjustmentLayer(AdjustKind::Exposure) => t!("adjust8-keywords-exposure"),
+        Action::Adjust(AdjustKind::ChannelMixer)
+        | Action::NewAdjustmentLayer(AdjustKind::ChannelMixer) => t!("adjust8-keywords-mixer"),
+        Action::Adjust(AdjustKind::SelectiveColor)
+        | Action::NewAdjustmentLayer(AdjustKind::SelectiveColor) => {
+            t!("adjust8-keywords-selective")
+        }
         Action::Transform(transform::Command::Mode(transform::Mode::Scale)) => {
             t!("ui5-palette-keywords-scale")
         }
@@ -681,6 +714,7 @@ fn keywords(action: Action) -> String {
             t!("ui6-palette-keywords-invert")
         }
         Action::LayerStyle(None) => t!("ui6-palette-keywords-blending"),
+        Action::DefinePattern | Action::NewPatternFill => t!("pattern8-palette-keywords"),
         Action::Adjust(AdjustKind::Levels | AdjustKind::Curves) => {
             t!("ui6-palette-keywords-exposure")
         }
@@ -688,11 +722,20 @@ fn keywords(action: Action) -> String {
             t!("ui6-palette-keywords-full-screen")
         }
         Action::Tool(Tool::Brush) => t!("ui6-palette-keywords-brush"),
+        Action::Tool(Tool::RotateView) => t!("view8-palette-keywords-rotate-view"),
+        Action::View(rulers::Command::FlipHorizontal) => t!("view8-palette-keywords-flip"),
         Action::Tool(Tool::Eyedropper) => t!("ui6-palette-keywords-eyedropper"),
+        Action::Tool(Tool::ColorSampler) => t!("panels8-keywords-sampler"),
+        Action::Tool(Tool::Ruler) => t!("panels8-keywords-ruler"),
+        Action::Workspace(workspace::Command::Info) => t!("panels8-keywords-info"),
+        Action::Workspace(workspace::Command::Histogram) => t!("panels8-keywords-histogram"),
+        Action::Workspace(workspace::Command::Navigator) => t!("panels8-keywords-navigator"),
+        Action::Workspace(workspace::Command::ScreenMode(_)) => t!("panels8-keywords-screen-mode"),
         Action::Workspace(workspace::Command::Shortcuts) => t!("ui3-palette-keywords-shortcuts"),
         Action::Workspace(workspace::Command::About) => t!("ui3-palette-keywords-about"),
         Action::Workspace(workspace::Command::Diagnostics) => t!("diag-palette-keywords"),
         Action::Workspace(workspace::Command::OpenRecent(_)) => t!("ui3-palette-keywords-recent"),
+        Action::Filter(kind) => filters_ui::keywords(kind),
         _ => String::new(),
     }
 }
@@ -1424,7 +1467,6 @@ mod tests {
         }
         for (query, not) in [
             ("cut", Action::RemoveBackground),
-            ("sel", Action::CropToElement),
             (
                 "select and mask",
                 Action::Select(select_menu::Command::QuickMask),
@@ -1436,6 +1478,12 @@ mod tests {
             assert!(!row.2, "{query}: the greyed best match stays: {row:?}");
             assert_ne!(format!("{:?}", row.1), format!("{not:?}"), "{query}");
         }
+        // A label starting with the word typed may be available.
+        let row = highlighted(&mut h, "sel");
+        assert_ne!(
+            format!("{:?}", row.1),
+            format!("{:?}", Action::CropToElement)
+        );
         // Enter on a greyed row does nothing.
         h.state_mut().palette.open();
         h.run_steps(2);

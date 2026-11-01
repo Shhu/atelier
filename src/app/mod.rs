@@ -5,6 +5,7 @@ mod artboard_tool;
 mod batch;
 mod camera_raw_ui;
 mod canvas;
+mod crop_tool;
 mod channels_panel;
 mod color_picker;
 mod color_range;
@@ -13,6 +14,9 @@ mod color_tests;
 mod color_ui;
 mod diagnostics;
 mod dialogs;
+mod fade_stroke;
+#[cfg(test)]
+mod fade_stroke_tests;
 mod downloads;
 #[cfg(test)]
 mod exchange_tests;
@@ -20,21 +24,31 @@ mod export_as;
 mod files;
 mod filters_ui;
 mod gradient_editor;
+mod histogram_panel;
 mod history_panel;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]
 mod input_tests;
+mod info_panel;
 mod keys;
+mod layer_locks;
+#[cfg(test)]
+mod layer_locks_tests;
 mod layer_style;
 #[cfg(test)]
 mod layers_tests;
 mod liquify_ui;
+mod measure_tools;
+#[cfg(test)]
+mod measure_tests;
 mod menus;
 mod models_window;
+mod navigator;
 mod new_document;
 mod object_select;
 mod options_bar;
+mod patterns_ui;
 #[cfg(test)]
 mod paint_tests;
 mod paint_tools;
@@ -53,6 +67,7 @@ mod retouch_tests;
 mod retouch_tools;
 mod right_panel;
 mod rulers;
+mod view_turn;
 #[cfg(test)]
 mod rulers_tests;
 mod select_mask;
@@ -75,6 +90,10 @@ mod tools4_tests;
 #[cfg(test)]
 mod tools5_tests;
 #[cfg(test)]
+mod crop_tests;
+#[cfg(test)]
+mod cross_tests;
+#[cfg(test)]
 mod tools6_tests;
 #[cfg(test)]
 mod tools_tests;
@@ -88,6 +107,8 @@ mod type_tool;
 mod ui_tests;
 #[cfg(test)]
 mod vector_tests;
+#[cfg(test)]
+mod view_tests;
 mod vector_tools;
 mod welcome;
 mod workspace;
@@ -321,6 +342,10 @@ enum Tool {
     Text,
     Bucket,
     Eyedropper,
+    /// With the Eyedropper (I): points whose values the Info panel shows.
+    ColorSampler,
+    /// With the Eyedropper (I): distance and angle.
+    Ruler,
     Select,
     Ellipse,
     FreeLasso,
@@ -329,6 +354,8 @@ enum Tool {
     ObjectSelect,
     MagicWand,
     Hand,
+    /// Turns the view (R), never the image.
+    RotateView,
     Zoom,
     /// Pen, Freeform Pen, Add / Delete Anchor Point, Convert Point (P).
     Pen(vector_tools::PenTool),
@@ -340,7 +367,7 @@ enum Tool {
 }
 
 impl Tool {
-    const ALL: [Tool; 42] = [
+    const ALL: [Tool; 45] = [
         Tool::Transform,
         Tool::Artboard,
         Tool::Select,
@@ -366,6 +393,8 @@ impl Tool {
         Tool::Burn,
         Tool::Sponge,
         Tool::Eyedropper,
+        Tool::ColorSampler,
+        Tool::Ruler,
         Tool::Pen(vector_tools::PenTool::Pen),
         Tool::Pen(vector_tools::PenTool::Freeform),
         Tool::Pen(vector_tools::PenTool::AddAnchor),
@@ -382,6 +411,7 @@ impl Tool {
         Tool::Shape(vector_tools::ShapeTool::Custom),
         Tool::Canvas,
         Tool::Hand,
+        Tool::RotateView,
         Tool::Zoom,
     ];
 
@@ -394,7 +424,7 @@ impl Tool {
         &[Tool::FreeLasso, Tool::PolyLasso, Tool::Lasso],
         &[Tool::ObjectSelect, Tool::MagicWand],
         &[Tool::Canvas],
-        &[Tool::Eyedropper],
+        &[Tool::Eyedropper, Tool::ColorSampler, Tool::Ruler],
         &[
             Tool::SpotHealing,
             Tool::HealingBrush,
@@ -424,7 +454,7 @@ impl Tool {
             Tool::Shape(vector_tools::ShapeTool::Line),
             Tool::Shape(vector_tools::ShapeTool::Custom),
         ],
-        &[Tool::Hand],
+        &[Tool::Hand, Tool::RotateView],
         &[Tool::Zoom],
     ];
 
@@ -458,6 +488,8 @@ impl Tool {
             Tool::Canvas => icon::CROP,
             Tool::Bucket => icon::PAINT_BUCKET,
             Tool::Eyedropper => icon::EYEDROPPER,
+            Tool::ColorSampler => icon::CROSSHAIR,
+            Tool::Ruler => icon::RULER,
             Tool::Select => icon::SELECTION,
             Tool::Ellipse => icon::CIRCLE_DASHED,
             Tool::FreeLasso => icon::LASSO,
@@ -466,6 +498,7 @@ impl Tool {
             Tool::ObjectSelect => icon::CUBE_FOCUS,
             Tool::MagicWand => icon::MAGIC_WAND,
             Tool::Hand => icon::HAND,
+            Tool::RotateView => icon::ARROW_CLOCKWISE,
             Tool::Zoom => icon::MAGNIFYING_GLASS,
             Tool::Pen(p) => p.glyph(),
             Tool::PathSelect => icon::NAVIGATION_ARROW,
@@ -496,6 +529,8 @@ impl Tool {
             Tool::Canvas => t!("tool-canvas"),
             Tool::Bucket => t!("tool-bucket"),
             Tool::Eyedropper => t!("tool-eyedropper"),
+            Tool::ColorSampler => t!("panels8-tool-color-sampler"),
+            Tool::Ruler => t!("panels8-tool-ruler"),
             Tool::Select => t!("tool-select"),
             Tool::Ellipse => t!("sel-tool-ellipse"),
             Tool::FreeLasso => t!("sel-tool-lasso"),
@@ -504,6 +539,7 @@ impl Tool {
             Tool::ObjectSelect => t!("objsel-tool"),
             Tool::MagicWand => t!("tool-magic-wand"),
             Tool::Hand => t!("tool-hand"),
+            Tool::RotateView => t!("view8-tool-rotate-view"),
             Tool::Zoom => t!("tool-zoom"),
             Tool::Pen(p) => p.name(),
             Tool::PathSelect => t!("vector-tool-path-selection"),
@@ -526,11 +562,12 @@ impl Tool {
             Tool::Gradient | Tool::Bucket => Key::G,
             Tool::Dodge | Tool::Burn | Tool::Sponge => Key::O,
             Tool::Blur | Tool::Sharpen | Tool::Smudge => return None,
-            Tool::Eyedropper => Key::I,
+            Tool::Eyedropper | Tool::ColorSampler | Tool::Ruler => Key::I,
             Tool::Select | Tool::Ellipse => Key::M,
             Tool::FreeLasso | Tool::PolyLasso | Tool::Lasso => Key::L,
             Tool::ObjectSelect | Tool::MagicWand => Key::W,
             Tool::Hand => Key::H,
+            Tool::RotateView => Key::R,
             Tool::Zoom => Key::Z,
             Tool::Pen(vector_tools::PenTool::Pen | vector_tools::PenTool::Freeform) => Key::P,
             Tool::Pen(_) => return None,
@@ -642,7 +679,10 @@ enum Action {
     CenterElement,
     BringToFront,
     SendToBack,
+    /// Ctrl+/: the last lock used on or off.
     ToggleLock,
+    /// One of the Layers panel's locks on or off.
+    Lock(layer_locks::LockKind),
     /// Layer › Hide Layers / Show Layers: the selected layers.
     ToggleVisibility,
     MakeTransparent,
@@ -676,6 +716,12 @@ enum Action {
     StampVisible,
     /// Image › Adjustments › Desaturate (Shift+Ctrl+U).
     Desaturate,
+    /// Image › Auto Tone, Auto Contrast, Auto Color.
+    AutoAdjust(crate::pixel_ops::AutoMode),
+    /// Edit › Fade (Shift+Ctrl+F).
+    Fade,
+    /// Edit › Stroke.
+    Stroke,
     CropToSelection,
     Align(AlignOp),
     FillPrimary,
@@ -722,6 +768,10 @@ enum Action {
     NewAdjustmentLayer(AdjustKind),
     /// Layer › New Fill Layer: solid color (`false`) or gradient.
     NewFillLayer(bool),
+    /// Layer › New Fill Layer › Pattern.
+    NewPatternFill,
+    /// Edit › Define Pattern…
+    DefinePattern,
     /// Layer › Layer Mask.
     AddMask(NewMask),
     DeleteMask,
@@ -809,6 +859,9 @@ pub struct AtelierApp {
     wand_all_layers: bool,
     /// Canvas view at the last frame.
     last_view: Option<View>,
+    /// Rotation and mirror of the active document's view.
+    view_turn: view_turn::ViewTurn,
+    rotate_view: view_turn::RotateView,
     /// Magnetic lasso in progress, detection width (px), frequency (0..100).
     lasso: Option<select_tools::Lasso>,
     lasso_width: f32,
@@ -837,6 +890,8 @@ pub struct AtelierApp {
     tool_brushes: Vec<(Tool, f32, f32)>,
     /// Fill… window open (Shift+F5).
     fill_dialog: Option<FillDialog>,
+    /// The pattern library, Define Pattern…
+    patterns: patterns_ui::PatternState,
     /// Image Size window open (Ctrl+Alt+I).
     image_size: Option<ImageSizeDialog>,
     /// Canvas Size window open (Ctrl+Alt+C).
@@ -852,6 +907,8 @@ pub struct AtelierApp {
     /// End of the last brush stroke (canvas coordinates): Shift + click draws
     /// a straight line from this point.
     last_paint: Option<Pos2>,
+    /// What Ctrl+/ locks.
+    last_lock: layer_locks::LastLock,
     /// Opacity digit just typed, and when (for 4 then 5: 45%).
     last_digit: Option<(u32, f64)>,
     /// Give focus to the layer Name field (double-click in the list).
@@ -927,6 +984,8 @@ pub struct AtelierApp {
     crop_draw: Option<Pos2>,
     /// "Crop the image?" asked, and what was going to happen.
     crop_confirm: Option<canvas::CropThen>,
+    /// Crop tool: its options, and the box's turn.
+    crop: crop_tool::CropTool,
     /// Alt+arrows: the layer was duplicated for this series (Alt held).
     alt_nudge_copied: bool,
     /// Layers under the pointer at the right click (Move tool's menu).
@@ -1007,6 +1066,12 @@ pub struct AtelierApp {
     layer_style: Option<layer_style::StyleDialog>,
     /// History panel.
     history: history_panel::HistoryPanel,
+    /// Color Sampler and Ruler tools.
+    measure: measure_tools::MeasureTools,
+    /// Window › Info, Histogram, Navigator.
+    info: info_panel::InfoPanel,
+    hist_panel: histogram_panel::HistogramPanel,
+    navigator: navigator::Navigator,
     /// Channels panel, and what the canvas shows of the channels.
     channels: channels_panel::ChannelsPanel,
     /// Free Transform distorted or warped, its mode, Transform Again.
@@ -1035,6 +1100,8 @@ pub struct AtelierApp {
 enum LayerPreview {
     Transparency(Transparency),
     Adjust(Adjustment),
+    /// Edit › Fade.
+    Fade(crate::pixel_ops::Fade),
     /// A filter, computed in the background (see `filters_ui`): the
     /// fingerprint of the layer and settings.
     Filter(u64),
@@ -1048,6 +1115,7 @@ impl LayerPreview {
                 crate::pixel_ops::color_to_alpha(image, [r, g, b], t.tolerance, t.softness);
             }
             LayerPreview::Adjust(adjustment) => adjustment.apply(image),
+            LayerPreview::Fade(fade) => fade.apply(image),
             // Shown once computed, never applied here.
             LayerPreview::Filter(_) => {}
         }
@@ -1064,17 +1132,19 @@ enum FillContent {
     Background,
     Color,
     ContentAware,
+    Pattern,
     Black,
     Gray,
     White,
 }
 
 impl FillContent {
-    const ALL: [FillContent; 7] = [
+    const ALL: [FillContent; 8] = [
         FillContent::Foreground,
         FillContent::Background,
         FillContent::Color,
         FillContent::ContentAware,
+        FillContent::Pattern,
         FillContent::Black,
         FillContent::Gray,
         FillContent::White,
@@ -1086,6 +1156,7 @@ impl FillContent {
             FillContent::Background => t!("app-fill-background"),
             FillContent::Color => t!("app-fill-color"),
             FillContent::ContentAware => t!("retouch-content-aware"),
+            FillContent::Pattern => t!("pattern8-pattern"),
             FillContent::Black => t!("app-fill-black"),
             FillContent::Gray => t!("app-fill-gray"),
             FillContent::White => t!("app-fill-white"),
@@ -1103,6 +1174,8 @@ struct FillDialog {
     preserve_transparency: bool,
     /// Content-Aware: Color Adaptation.
     adapt: bool,
+    /// Pattern: which one of the library.
+    pattern: u64,
 }
 
 /// Settings of the Image Size window.
@@ -1202,6 +1275,7 @@ impl Action {
                 | Action::ContentAwareFill
                 | Action::MakeTransparent
                 | Action::Adjust(_)
+                | Action::AutoAdjust(_)
                 | Action::Desaturate
                 | Action::ClearSelection
                 | Action::Cut
@@ -1241,6 +1315,9 @@ impl Action {
                 | Action::FillSecondary
                 | Action::MakeTransparent
                 | Action::Adjust(_)
+                | Action::AutoAdjust(_)
+                | Action::Fade
+                | Action::Stroke
                 | Action::Filter(_)
                 | Action::LastFilter
                 | Action::CameraRawFilter
@@ -1278,6 +1355,9 @@ impl Action {
                 | Action::FillSecondary
                 | Action::MakeTransparent
                 | Action::Adjust(_)
+                | Action::AutoAdjust(_)
+                | Action::Fade
+                | Action::Stroke
                 | Action::Filter(_)
                 | Action::LastFilter
                 | Action::CameraRawFilter
@@ -1348,7 +1428,7 @@ impl AdjustEntry {
 }
 
 /// The adjustments, in the order of Photoshop's Adjustments menu.
-const ADJUSTMENTS: [AdjustEntry; 12] = [
+const ADJUSTMENTS: [AdjustEntry; 15] = [
     AdjustEntry {
         kind: AdjustKind::BrightnessContrast,
         icon: icon::SUN,
@@ -1363,6 +1443,11 @@ const ADJUSTMENTS: [AdjustEntry; 12] = [
         kind: AdjustKind::Curves,
         icon: icon::WAVE_SINE,
         shortcut: Some(&SHORTCUT_CURVES),
+    },
+    AdjustEntry {
+        kind: AdjustKind::Exposure,
+        icon: icon::APERTURE,
+        shortcut: None,
     },
     AdjustEntry {
         kind: AdjustKind::Vibrance,
@@ -1390,6 +1475,11 @@ const ADJUSTMENTS: [AdjustEntry; 12] = [
         shortcut: None,
     },
     AdjustEntry {
+        kind: AdjustKind::ChannelMixer,
+        icon: icon::FADERS,
+        shortcut: None,
+    },
+    AdjustEntry {
         kind: AdjustKind::Invert,
         icon: icon::SWAP,
         shortcut: Some(&SHORTCUT_INVERT),
@@ -1407,6 +1497,11 @@ const ADJUSTMENTS: [AdjustEntry; 12] = [
     AdjustEntry {
         kind: AdjustKind::GradientMap,
         icon: icon::GRADIENT,
+        shortcut: None,
+    },
+    AdjustEntry {
+        kind: AdjustKind::SelectiveColor,
+        icon: icon::PALETTE,
         shortcut: None,
     },
 ];
@@ -1482,6 +1577,8 @@ impl AtelierApp {
             wand_all_layers: false,
             lasso: None,
             last_view: None,
+            view_turn: Default::default(),
+            rotate_view: Default::default(),
             lasso_width: 10.0,
             lasso_frequency: 57.0,
             edges: Default::default(),
@@ -1496,11 +1593,13 @@ impl AtelierApp {
             select_move: None,
             selection_outline: None,
             fill_dialog: None,
+            patterns: Default::default(),
             image_size: None,
             canvas_size: None,
             rotate_dialog: None,
             last_selection: None,
             last_paint: None,
+            last_lock: Default::default(),
             last_digit: None,
             focus_name: false,
             typing: false,
@@ -1536,6 +1635,7 @@ impl AtelierApp {
             show_transform_controls: false,
             crop_draw: None,
             crop_confirm: None,
+            crop: Default::default(),
             alt_nudge_copied: false,
             menu_layers: Vec::new(),
             prop_session: None,
@@ -1585,6 +1685,10 @@ impl AtelierApp {
             workspace: Default::default(),
             diagnostics: Default::default(),
             history: Default::default(),
+            measure: Default::default(),
+            info: Default::default(),
+            hist_panel: Default::default(),
+            navigator: Default::default(),
             channels: Default::default(),
         };
         app.load_session();
@@ -1690,8 +1794,10 @@ impl AtelierApp {
     /// [`Self::reset_pending`], a crop box kept.
     fn reset_pending_but_crop(&mut self) {
         let crop = self.canvas_rect.filter(|_| self.crop_box_pending());
+        let angle = self.crop.angle;
         self.reset_pending();
         self.canvas_rect = crop;
+        self.crop.angle = crop.map_or(0.0, |_| angle);
     }
 
     /// Enter: applies what is being prepared; a large transform may still
@@ -1700,10 +1806,7 @@ impl AtelierApp {
     fn apply_pending(&mut self, wait: bool) {
         self.commit_text();
         self.finish_stroke();
-        if self.canvas_rect.is_some() {
-            self.record_crop();
-            self.apply_canvas();
-        }
+        self.apply_crop_box();
         if self.transform_rect.is_some() {
             self.apply_transform();
         }
@@ -1718,6 +1821,7 @@ impl AtelierApp {
     /// Drops what is being prepared.
     fn reset_pending(&mut self) {
         self.canvas_rect = None;
+        self.crop.reset_box();
         self.sel.transform = None;
         self.reset_transform();
         self.layer_drag = None;
@@ -1858,7 +1962,7 @@ impl AtelierApp {
         if self.in_quick_mask() {
             return self.nudge_quick_mask((dx, dy));
         }
-        if self.doc.is_none() || self.refuse_if_locked() {
+        if self.doc.is_none() || self.refuse_position_locked() {
             return;
         }
         // Nothing seen moves (several layers selected: the others do).
@@ -1897,9 +2001,9 @@ impl AtelierApp {
         moved.dedup();
         let ids: Vec<u64> = moved.iter().map(|&i| doc.layers[i].id).collect();
         for i in moved {
-            let locked = doc.is_locked(i);
+            let free = doc.can_move(i);
             let layer = &mut doc.layers[i];
-            if !locked {
+            if free {
                 layer.offset.0 += dx;
                 layer.offset.1 += dy;
             }
@@ -1982,6 +2086,7 @@ impl AtelierApp {
         let Some(doc) = &mut self.doc else { return };
         let selection = self.selection.as_ref();
         if doc.fill_active(color.to_srgba_unmultiplied(), selection, opacity, preserve) {
+            doc.mark_fade();
             self.status = t!(
                 "status-filled",
                 name = doc.active_layer().name.as_str(),
@@ -2091,7 +2196,7 @@ impl AtelierApp {
     /// is locked; in Quick Mask Mode they move the mask, which the lock
     /// doesn't protect.
     fn transform_locked(&self) -> bool {
-        self.active_locked() && !self.in_quick_mask()
+        !self.in_quick_mask() && self.doc.as_ref().is_some_and(|d| !d.can_move(d.active))
     }
 
     /// Before an edit of the target (see `Document::target_layer`): in
@@ -2101,7 +2206,7 @@ impl AtelierApp {
         if self.doc.as_ref().is_some_and(|d| d.quick_mask().is_some()) {
             return false;
         }
-        self.refuse_if_locked()
+        self.refuse_if_locked() || self.refuse_pixels_locked()
     }
 
     /// If the active layer is locked, says so and returns `true`, Quick
@@ -2245,7 +2350,9 @@ impl AtelierApp {
             let changed = stroke.painted() && stroke.changes(doc.active_layer().image(), margin);
             // A targeted mask gets its place back.
             doc.end_paint();
-            if !changed {
+            if changed {
+                doc.mark_fade();
+            } else {
                 doc.discard_step();
                 self.stroke_dirty = None;
                 if stroke.painted() && self.tool.clones() {
@@ -2289,6 +2396,9 @@ impl AtelierApp {
             false => app.refuse_if_locked(),
         };
         if action.modifies_active() && refused(self) {
+            return;
+        }
+        if action.modifies_active() && self.locks_refuse(action) {
             return;
         }
         if action.paints_active() && self.refuse_hidden_layer() {
@@ -2343,7 +2453,15 @@ impl AtelierApp {
             Action::Cut => {
                 // Part of the Cut: not recorded on its own.
                 if self.selection.is_some() && self.copy_to_clipboard() {
-                    self.muted(|app| app.run(Action::ClearSelection));
+                    // Under Lock Transparent Pixels, the background color
+                    // takes their place.
+                    let alpha = self.doc.as_ref().is_some_and(Document::alpha_locked);
+                    let clear = if alpha {
+                        Action::FillSecondaryKeep
+                    } else {
+                        Action::ClearSelection
+                    };
+                    self.muted(|app| app.run(clear));
                 }
             }
             Action::SelectAll => {
@@ -2401,6 +2519,9 @@ impl AtelierApp {
                     self.reset_pending();
                 }
             }
+            Action::AutoAdjust(mode) => self.start_auto(mode),
+            Action::Fade => self.open_fade(),
+            Action::Stroke => self.open_stroke(),
             Action::LayerFromSelection if self.selection.is_none() => self.run(Action::Duplicate),
             Action::LayerFromSelection => {
                 if let (Some(sel), Some(doc)) = (&self.selection, &mut self.doc) {
@@ -2413,8 +2534,7 @@ impl AtelierApp {
             }
             Action::CropToSelection => {
                 if let Some(sel) = self.selection.clone().filter(|s| !s.inverted) {
-                    self.canvas_rect = Some(to_rect(sel.rect));
-                    self.apply_canvas();
+                    self.apply_crop(crop_tool::CropPlan::plain(sel.rect));
                 }
             }
             Action::Paste => self.paste_from_clipboard(files::PasteMode::Centered),
@@ -2453,34 +2573,8 @@ impl AtelierApp {
                 }
             }
             Action::ToggleVisibility => self.toggle_visibility(),
-            Action::ToggleLock => {
-                // An undo step, like a visibility change.
-                let locked = self.doc.as_ref().is_some_and(|d| d.active_layer().locked);
-                let step = if locked {
-                    t!("xchg-hist-unlock-layer")
-                } else {
-                    t!("xchg-hist-lock-layer")
-                };
-                self.record_change(step, None);
-                if let Some(doc) = &mut self.doc {
-                    let layer = doc.active_layer_mut();
-                    layer.locked = !layer.locked;
-                    let name = layer.name.as_str();
-                    self.status = if layer.locked {
-                        format!(
-                            "{} {}",
-                            icon::LOCK_SIMPLE,
-                            t!("status-layer-locked", name = name)
-                        )
-                    } else {
-                        format!(
-                            "{} {}",
-                            icon::LOCK_SIMPLE_OPEN,
-                            t!("status-layer-unlocked", name = name)
-                        )
-                    };
-                }
-            }
+            Action::ToggleLock => self.toggle_last_lock(),
+            Action::Lock(kind) => self.toggle_lock_kind(kind),
             Action::Open => {
                 if let Some(path) = self.pick_image(&t!("app-dialog-open-image")) {
                     self.open_path(&path);
@@ -2567,10 +2661,12 @@ impl AtelierApp {
                         opacity: 1.0,
                         preserve_transparency: false,
                         adapt: true,
+                        pattern: self.last_pattern().id,
                     });
                 }
             }
             Action::ContentAwareFill => self.open_content_aware(),
+            Action::DefinePattern => self.open_define_pattern(),
             Action::InvertSelection => {
                 if let (Some(sel), Some(doc)) = (self.selection.take(), &self.doc) {
                     self.selection = Selection {
@@ -2604,9 +2700,15 @@ impl AtelierApp {
             }
             Action::RotateArbitrary => {
                 if self.doc.is_some() {
+                    // The Ruler's line says by how much.
+                    let turn = self
+                        .doc
+                        .as_ref()
+                        .and_then(|d| d.ruler)
+                        .map_or(0.0, |m| m.straighten_angle());
                     self.rotate_dialog = Some(RotateDialog {
-                        angle: 0.0,
-                        clockwise: true,
+                        angle: turn.abs(),
+                        clockwise: turn >= 0.0,
                     });
                 }
             }
@@ -2643,10 +2745,7 @@ impl AtelierApp {
                             t!("status-content-fills-canvas")
                         };
                     }
-                    Some(b) => {
-                        self.canvas_rect = Some(to_rect(b));
-                        self.apply_canvas();
-                    }
+                    Some(b) => self.apply_crop(crop_tool::CropPlan::plain(b)),
                     None => self.status = t!("status-nothing-to-crop"),
                 }
             }
@@ -2667,6 +2766,7 @@ impl AtelierApp {
             | Action::ToggleClipping
             | Action::NewAdjustmentLayer(_)
             | Action::NewFillLayer(_)
+            | Action::NewPatternFill
             | Action::AddMask(_)
             | Action::DeleteMask
             | Action::ApplyMask
@@ -2734,28 +2834,6 @@ impl AtelierApp {
             Action::Color(command) => self.color_command(command),
             Action::Workspace(command) => self.workspace_command(command),
         }
-    }
-
-    fn apply_canvas(&mut self) {
-        let (Some(r), Some(doc)) = (self.canvas_rect.take(), &mut self.doc) else {
-            return;
-        };
-        let r = round_rect(r);
-        let (w, h) = (r.width() as u32, r.height() as u32);
-        if w == 0 || h == 0 {
-            return;
-        }
-        let old_center = pos2(doc.width() as f32, doc.height() as f32) / 2.0;
-        doc.crop(PixelRect {
-            x: r.min.x as i64,
-            y: r.min.y as i64,
-            w,
-            h,
-        });
-        self.status = t!("status-canvas-resized", width = w, height = h);
-        // The selection's coordinates no longer make sense.
-        self.forget_selection();
-        self.after_geometry_change(r.center() - old_center);
     }
 
     fn apply_transform(&mut self) {
@@ -2931,6 +3009,8 @@ impl AtelierApp {
             || self.paint.rasterize_confirm.is_some()
             || self.crop_confirm.is_some()
             || self.fill_dialog.is_some()
+            || self.patterns.define.is_some()
+            || self.patterns.rename.is_some()
             || self.retouch.busy()
             || self.retouch.dialog.is_some()
             || self.image_size.is_some()
@@ -3057,6 +3137,19 @@ impl AtelierApp {
                 (SHORTCUT_STAMP_VISIBLE, Action::StampVisible),
                 (SHORTCUT_TOGGLE_LOCK, Action::ToggleLock),
                 (SHORTCUT_DESATURATE, Action::Desaturate),
+                (fade_stroke::SHORTCUT_FADE, Action::Fade),
+                (
+                    fade_stroke::SHORTCUT_AUTO_CONTRAST,
+                    Action::AutoAdjust(crate::pixel_ops::AutoMode::Contrast),
+                ),
+                (
+                    fade_stroke::SHORTCUT_AUTO_TONE,
+                    Action::AutoAdjust(crate::pixel_ops::AutoMode::Tone),
+                ),
+                (
+                    fade_stroke::SHORTCUT_AUTO_COLOR,
+                    Action::AutoAdjust(crate::pixel_ops::AutoMode::Color),
+                ),
                 (SHORTCUT_NEW_LAYER, Action::NewLayer),
                 (SHORTCUT_MERGE_VISIBLE, Action::MergeVisible),
                 (SHORTCUT_MERGE_DOWN, Action::MergeDown),
@@ -3076,6 +3169,10 @@ impl AtelierApp {
                 (
                     actions_panel::SHORTCUT_ACTIONS,
                     Action::Automate(actions_panel::Command::Panel),
+                ),
+                (
+                    workspace::SHORTCUT_INFO,
+                    Action::Workspace(workspace::Command::Info),
                 ),
                 (
                     export_as::SHORTCUT_QUICK_EXPORT,
@@ -3099,7 +3196,19 @@ impl AtelierApp {
                 .or_else(|| clipboard_action(i, paste))
         });
         if let Some(action) = action {
-            self.run(action);
+            // An action given F8 keeps it over the Info panel.
+            let f8 = crate::actions::FnKey {
+                number: 8,
+                shift: false,
+                ctrl: false,
+            };
+            if matches!(action, Action::Workspace(workspace::Command::Info))
+                && self.actions.library.with_key(f8).is_some()
+            {
+                self.play_key(f8);
+            } else {
+                self.run(action);
+            }
         }
         if let Some(action) = ctx.input(|i| self.blend_shortcut(i)) {
             self.run(action);
@@ -3202,7 +3311,14 @@ impl AtelierApp {
             )
         });
         if let Some((tool, shift)) = tool {
+            let from = self.tool;
             self.set_tool(self.tool_for_key(tool, shift));
+            if self.tool == Tool::RotateView {
+                self.arm_rotate_spring(from);
+            }
+        }
+        if let Some(back) = ctx.input(workspace::screen_mode_key) {
+            self.run(Action::Workspace(workspace::Command::CycleScreenMode(back)));
         }
         if let Some((up, modifiers)) = bracket {
             self.bracket(up, modifiers);
@@ -3233,9 +3349,21 @@ impl AtelierApp {
             Some(ToolWindow::ColorRange) => self.close_color_range(enter),
             Some(ToolWindow::SelectMask) => self.close_select_mask(enter),
             None if enter => self.apply_pending(false),
+            // Nothing being prepared: Esc leaves Full Screen.
+            None if self.esc_leaves_full_screen() => {
+                self.run(Action::Workspace(workspace::Command::ScreenMode(
+                    workspace::ScreenMode::Standard,
+                )));
+            }
             // Never a deselect (Ctrl+D): a reflex Esc mustn't lose a
             // selection built with care.
-            None => self.reset_pending(),
+            None => {
+                self.reset_pending();
+                // The Rotate View tool: Esc straightens the view.
+                if self.tool == Tool::RotateView {
+                    self.set_view_angle(0.0);
+                }
+            }
         }
     }
 
@@ -4021,6 +4149,7 @@ impl eframe::App for AtelierApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let start = std::time::Instant::now();
         self.read_gpu(frame);
+        self.patterns_frame(ui.ctx());
         self.frame_ui(ui);
         self.end_frame(start);
     }
@@ -4126,7 +4255,8 @@ impl AtelierApp {
 
         use ui_kit::color;
         // Panels draw their own separator line on their inner edge.
-        let title_bar = egui::Panel::top("title_bar")
+        let full_screen = self.workspace.screen == workspace::ScreenMode::Full;
+        let title_bar = (!full_screen).then(|| egui::Panel::top("title_bar")
             .exact_size(40.0)
             .frame(
                 egui::Frame::new()
@@ -4140,8 +4270,8 @@ impl AtelierApp {
             )
             .show(ui, |ui| self.title_bar(ui))
             .response
-            .rect;
-        ctx.data_mut(|d| d.insert_temp(title_bar_id(), title_bar));
+            .rect);
+        ctx.data_mut(|d| d.insert_temp(title_bar_id(), title_bar.unwrap_or(Rect::NOTHING)));
         // Tab hides the bars and panels around the canvas, floating ones too.
         let chrome = self.chrome_shown();
         dialogs::set_panels_hidden(&ctx, !chrome);
@@ -4154,14 +4284,16 @@ impl AtelierApp {
                 )
                 .show(ui, |ui| self.options_bar_rows(ui));
         }
-        egui::Panel::bottom("status_bar")
-            .exact_size(28.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(color::TITLE)
-                    .inner_margin(egui::Margin::symmetric(12, 0)),
-            )
-            .show(ui, |ui| self.status_bar(ui));
+        if !full_screen {
+            egui::Panel::bottom("status_bar")
+                .exact_size(28.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(color::TITLE)
+                        .inner_margin(egui::Margin::symmetric(12, 0)),
+                )
+                .show(ui, |ui| self.status_bar(ui));
+        }
         // Two columns of tools when one doesn't fit.
         let tool_columns = toolbar::columns(ui.available_height());
         if chrome {
@@ -4216,6 +4348,9 @@ impl AtelierApp {
             self.confirm = Some(Confirm::Close);
         }
         self.transparency_window(&ctx);
+        self.processing_window(&ctx);
+        self.fade_window(&ctx);
+        self.stroke_window(&ctx);
         self.adjust_window(&ctx);
         self.layer_style_window(&ctx);
         self.filter_window(&ctx);
@@ -4224,6 +4359,7 @@ impl AtelierApp {
         self.liquify_window(&ctx);
         self.transform_window(&ctx);
         self.fill_window(&ctx);
+        self.pattern_windows(&ctx);
         self.retouch_windows(&ctx);
         self.image_size_window(&ctx);
         self.canvas_size_window(&ctx);
@@ -4242,6 +4378,9 @@ impl AtelierApp {
         self.gradient_editor_window(&ctx);
         self.swatches_window(&ctx);
         self.history_window(&ctx);
+        self.info_window(&ctx);
+        self.histogram_window(&ctx);
+        self.navigator_window(&ctx);
         self.actions_windows(&ctx);
         self.automate_windows(&ctx);
         self.channels_window(&ctx);
@@ -4302,7 +4441,10 @@ mod tests {
             Ok("smudge") => Tool::Smudge,
             Ok("bucket") => Tool::Bucket,
             Ok("eyedropper") => Tool::Eyedropper,
+            Ok("sampler") => Tool::ColorSampler,
+            Ok("ruler") => Tool::Ruler,
             Ok("hand") => Tool::Hand,
+            Ok("rotate-view") => Tool::RotateView,
             _ => Tool::Canvas,
         };
         // Window size (`ATELIER_WIDTH` × `ATELIER_HEIGHT`, 1600 × 1250 by default).
@@ -4454,6 +4596,22 @@ mod tests {
                     Ok("new-guide") => app.run(Action::View(rulers::Command::NewGuide)),
                     Ok("guides-grid") => app.run(Action::View(rulers::Command::Preferences)),
                     Ok("swatches") => app.run(Action::Swatches),
+                    Ok("measure-panels") => {
+                        app.run(Action::Workspace(workspace::Command::Info));
+                        app.run(Action::Workspace(workspace::Command::Histogram));
+                        app.run(Action::Workspace(workspace::Command::Navigator));
+                        if let Some(doc) = &mut app.doc {
+                            doc.samplers = vec![
+                                crate::document::ColorSampler { x: 100.5, y: 80.5 },
+                                crate::document::ColorSampler { x: 300.5, y: 200.5 },
+                            ];
+                            doc.ruler = Some(crate::document::Measure {
+                                vertex: (60.0, 240.0),
+                                first: (360.0, 150.0),
+                                second: Some((300.0, 280.0)),
+                            });
+                        }
+                    }
                     Ok("history-channels") => {
                         app.run(Action::NewLayer);
                         app.run(Action::Duplicate);
@@ -4490,6 +4648,13 @@ mod tests {
                 // (`ATELIER_LAYERS`; `style`: the Layer Style window).
                 if let Ok(what) = std::env::var("ATELIER_LAYERS") {
                     layer_style::capture_layers(&mut app, &what);
+                }
+                // A turned view, in degrees.
+                if let Some(angle) = std::env::var("ATELIER_VIEW_ANGLE")
+                    .ok()
+                    .and_then(|a| a.parse().ok())
+                {
+                    app.view_turn.angle = angle;
                 }
                 // Rulers, two guides and the grid.
                 if std::env::var("ATELIER_RULERS").is_ok()

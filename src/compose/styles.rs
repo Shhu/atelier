@@ -9,6 +9,7 @@ use image::{GrayImage, RgbaImage};
 
 use super::BlendMode;
 use super::gradient::GradientFill;
+use super::pattern::{PatternFill, SCALE_RANGE};
 use crate::i18n::t;
 use crate::pixel_ops::{blur, content_box, distance_field};
 
@@ -68,6 +69,15 @@ pub struct GradientFx {
     pub blend: BlendMode,
 }
 
+/// Pattern overlay.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PatternFx {
+    pub enabled: bool,
+    pub fill: PatternFill,
+    pub opacity: f32,
+    pub blend: BlendMode,
+}
+
 /// Bevel & Emboss (inner bevel, smooth): highlights and shadows of a
 /// relief lit from `angle` (degrees) at `altitude` (degrees).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -100,6 +110,7 @@ pub struct Effects {
     pub inner_glow: GlowFx,
     pub color_overlay: OverlayFx,
     pub gradient_overlay: GradientFx,
+    pub pattern_overlay: PatternFx,
     pub bevel: BevelFx,
 }
 
@@ -154,6 +165,12 @@ impl Default for Effects {
                 opacity: 1.0,
                 blend: BlendMode::Normal,
             },
+            pattern_overlay: PatternFx {
+                enabled: false,
+                fill: PatternFill::default(),
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+            },
             bevel: BevelFx {
                 enabled: false,
                 depth: 1.0,
@@ -182,18 +199,20 @@ pub enum Style {
     InnerGlow,
     ColorOverlay,
     GradientOverlay,
+    PatternOverlay,
     OuterGlow,
     DropShadow,
 }
 
 impl Style {
-    pub const ALL: [Style; 8] = [
+    pub const ALL: [Style; 9] = [
         Style::Bevel,
         Style::Stroke,
         Style::InnerShadow,
         Style::InnerGlow,
         Style::ColorOverlay,
         Style::GradientOverlay,
+        Style::PatternOverlay,
         Style::OuterGlow,
         Style::DropShadow,
     ];
@@ -206,6 +225,7 @@ impl Style {
             Style::InnerGlow => t!("core-style-inner-glow"),
             Style::ColorOverlay => t!("core-style-color-overlay"),
             Style::GradientOverlay => t!("core-style-gradient-overlay"),
+            Style::PatternOverlay => t!("pattern8-style-overlay"),
             Style::OuterGlow => t!("core-style-outer-glow"),
             Style::DropShadow => t!("panel-drop-shadow"),
         }
@@ -225,6 +245,7 @@ impl Effects {
             Style::InnerGlow => self.inner_glow.enabled,
             Style::ColorOverlay => self.color_overlay.enabled,
             Style::GradientOverlay => self.gradient_overlay.enabled,
+            Style::PatternOverlay => self.pattern_overlay.enabled,
             Style::OuterGlow => self.outer_glow.enabled,
             Style::DropShadow => self.shadow.enabled,
         }
@@ -238,6 +259,7 @@ impl Effects {
             Style::InnerGlow => &mut self.inner_glow.enabled,
             Style::ColorOverlay => &mut self.color_overlay.enabled,
             Style::GradientOverlay => &mut self.gradient_overlay.enabled,
+            Style::PatternOverlay => &mut self.pattern_overlay.enabled,
             Style::OuterGlow => &mut self.outer_glow.enabled,
             Style::DropShadow => &mut self.shadow.enabled,
         }
@@ -266,6 +288,9 @@ impl Effects {
         self.inner_glow.size *= s;
         self.bevel.size *= s;
         self.bevel.soften *= s;
+        let p = &mut self.pattern_overlay.fill;
+        p.scale = (p.scale * s).clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end());
+        p.phase = (p.phase.0 * sx, p.phase.1 * sy);
     }
 
     /// Offsets and light direction transformed by `f` (canvas rotation,
@@ -277,6 +302,11 @@ impl Effects {
         let (s, c) = self.bevel.angle.to_radians().sin_cos();
         let (x, y) = f(c, -s);
         self.bevel.angle = (-y).atan2(x).to_degrees();
+        let p = &mut self.pattern_overlay.fill;
+        p.phase = f(p.phase.0, p.phase.1);
+        let (s, c) = p.angle.to_radians().sin_cos();
+        let (x, y) = f(c, -s);
+        p.angle = (-y).atan2(x).to_degrees();
     }
 }
 

@@ -307,7 +307,7 @@ pub(super) struct Transforming {
     drag: Option<Drag>,
     lift: Option<Lift>,
     /// History name of the commit (a command applied at once).
-    step: Option<String>,
+    pub(super) step: Option<String>,
     last: Option<Last>,
     /// Box of the active mask's pixels, for a mask fingerprint.
     mask_bounds: Cell<Option<(u64, Option<PixelRect>)>>,
@@ -731,10 +731,12 @@ impl AtelierApp {
     /// Free Transform starts (Ctrl+T): with a selection, its pixels are
     /// lifted from the layer first. Returns `false` if there is nothing to
     /// transform.
-    fn enter_transform(&mut self) -> bool {
+    pub(super) fn enter_transform(&mut self) -> bool {
         // The quick mask: the layer's lock doesn't protect it.
         let quick = self.in_quick_mask();
-        if self.doc.is_none() || (!quick && self.refuse_if_locked()) {
+        if self.doc.is_none()
+            || (!quick && (self.refuse_position_locked() || self.refuse_pixels_locked()))
+        {
             return false;
         }
         self.set_tool(Tool::Transform);
@@ -1057,7 +1059,7 @@ impl AtelierApp {
         selected
             .iter()
             .copied()
-            .filter(|&i| !doc.is_locked(i) && !inside(i))
+            .filter(|&i| doc.can_transform(i) && !inside(i))
             .collect()
     }
 

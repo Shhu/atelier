@@ -354,8 +354,9 @@ impl AtelierApp {
         if start && let Some(doc) = &self.doc {
             let on_mask = doc.mask_targeted();
             let (mut mode, mut settings) = self.stroke_setup(alt);
-            // On a mask, like Photoshop, the eraser paints the background color.
-            if on_mask && mode == StrokeMode::Erase {
+            // On a mask, like Photoshop, the eraser paints the background
+            // color; likewise on pixels that must keep their opacity.
+            if (on_mask || doc.alpha_locked()) && mode == StrokeMode::Erase {
                 mode = StrokeMode::Paint;
                 settings.color = self.secondary.to_srgba_unmultiplied();
             }
@@ -439,6 +440,7 @@ impl AtelierApp {
             {
                 self.stroke_dirty = Some(self.stroke_dirty.map_or(r, |d| d.union(r)));
                 let offset = doc.active_layer().offset;
+                doc.keep_locked_alpha([r.x, r.y, r.x + r.w, r.y + r.h]);
                 sync_paint(doc, offset, r);
             }
         }
@@ -461,6 +463,7 @@ impl AtelierApp {
         if let Some(r) = layer.paint(|px| stroke.add_point(px, lx, ly, pressure)) {
             self.stroke_dirty = Some(self.stroke_dirty.map_or(r, |d| d.union(r)));
             self.retouch.dabbed(r);
+            doc.keep_locked_alpha([r.x, r.y, r.x + r.w, r.y + r.h]);
             sync_paint(doc, offset, r);
         }
     }

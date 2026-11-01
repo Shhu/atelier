@@ -214,6 +214,11 @@ fn convert_layer(layer: &mut Layer, c: &Prepared) {
             }
         }
     };
+    let pattern = |f: &mut crate::compose::pattern::PatternFill| {
+        let mut image = (*f.pattern.image).clone();
+        c.pixels(&mut image);
+        f.pattern = crate::compose::pattern::Pattern::new(f.pattern.name.clone(), image);
+    };
     let paint = |p: &mut Paint| match p {
         Paint::Color(v) => rgb(v),
         Paint::Gradient(g) => gradient(g),
@@ -229,6 +234,7 @@ fn convert_layer(layer: &mut Layer, c: &Prepared) {
     match &mut layer.kind {
         LayerKind::Fill(Fill::Solid(v)) => rgb(v),
         LayerKind::Fill(Fill::Gradient(g)) => gradient(g),
+        LayerKind::Fill(Fill::Pattern(p)) => pattern(p),
         LayerKind::Adjustment(a) => match a {
             Adjustment::PhotoFilter(f) => rgb(&mut f.color),
             Adjustment::GradientMap(g) => stops(&mut g.gradient),
@@ -245,6 +251,9 @@ fn convert_layer(layer: &mut Layer, c: &Prepared) {
                 (h.hue, h.saturation) = (0.0, 0.0);
             }
             Adjustment::BlackWhite(b) if c.grays() => b.tint = false,
+            // They mix or tint by color: a gray image has none.
+            Adjustment::ChannelMixer(m) if c.grays() => *m = Default::default(),
+            Adjustment::SelectiveColor(s) if c.grays() => *s = Default::default(),
             // Per-channel corrections tint: only the composite one stays.
             Adjustment::Curves(curves) if c.grays() => {
                 curves.channels = Default::default();
@@ -279,6 +288,9 @@ fn convert_layer(layer: &mut Layer, c: &Prepared) {
         rgba(color);
     }
     gradient(&mut fx.gradient_overlay.fill);
+    if fx.pattern_overlay.enabled {
+        pattern(&mut fx.pattern_overlay.fill);
+    }
     if let Some(board) = &mut layer.artboard
         && let super::ArtboardBackground::Custom(v) = &mut board.background
     {

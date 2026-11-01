@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::pixel_ops::{Clip, mix, threads};
 
+mod distort;
+pub use distort::{
+    PolarConversion, RippleSize, Shear, SpherizeMode, Wave, WaveType, ZigZagStyle,
+};
+
 /// A filter and its settings, in Photoshop's units: radii, distances and
 /// heights in pixels, amounts in %, thresholds in levels (0 to 255), angles
 /// in degrees (counterclockwise, 0 pointing right). Serialized for the
@@ -69,6 +74,34 @@ pub enum Filter {
     Mosaic {
         cell: f32,
     },
+    /// Amount in %.
+    Ripple {
+        amount: f32,
+        size: RippleSize,
+    },
+    Wave(Wave),
+    Twirl {
+        angle: f32,
+    },
+    /// Amount in %.
+    Spherize {
+        amount: f32,
+        mode: SpherizeMode,
+    },
+    PolarCoordinates {
+        conversion: PolarConversion,
+    },
+    /// Amount in %.
+    Pinch {
+        amount: f32,
+    },
+    /// Amount in %.
+    ZigZag {
+        amount: f32,
+        ridges: f32,
+        style: ZigZagStyle,
+    },
+    Shear(Shear),
 }
 
 /// Smart Sharpen.
@@ -165,6 +198,14 @@ pub enum FilterKind {
     GaussianBlur,
     MotionBlur,
     SurfaceBlur,
+    Pinch,
+    PolarCoordinates,
+    Ripple,
+    Shear,
+    Spherize,
+    Twirl,
+    Wave,
+    ZigZag,
     AddNoise,
     DustAndScratches,
     Median,
@@ -204,6 +245,37 @@ impl FilterKind {
             FilterKind::SurfaceBlur => Filter::SurfaceBlur {
                 radius: 5.0,
                 threshold: 15.0,
+            },
+            FilterKind::Pinch => Filter::Pinch { amount: 50.0 },
+            FilterKind::PolarCoordinates => Filter::PolarCoordinates {
+                conversion: PolarConversion::RectangularToPolar,
+            },
+            FilterKind::Ripple => Filter::Ripple {
+                amount: 100.0,
+                size: RippleSize::Medium,
+            },
+            FilterKind::Shear => Filter::Shear(Shear::straight(Undefined::RepeatEdges)),
+            FilterKind::Spherize => Filter::Spherize {
+                amount: 100.0,
+                mode: SpherizeMode::Normal,
+            },
+            FilterKind::Twirl => Filter::Twirl { angle: 50.0 },
+            FilterKind::Wave => Filter::Wave(Wave {
+                generators: 5.0,
+                wavelength_min: 10.0,
+                wavelength_max: 120.0,
+                amplitude_min: 5.0,
+                amplitude_max: 35.0,
+                scale_horizontal: 100.0,
+                scale_vertical: 100.0,
+                wave_type: WaveType::Sine,
+                undefined: Undefined::RepeatEdges,
+                seed: 0,
+            }),
+            FilterKind::ZigZag => Filter::ZigZag {
+                amount: 10.0,
+                ridges: 5.0,
+                style: ZigZagStyle::PondRipples,
             },
             FilterKind::AddNoise => Filter::AddNoise(AddNoise {
                 amount: 12.5,
@@ -286,11 +358,19 @@ impl Filter {
             Filter::FindEdges => FilterKind::FindEdges,
             Filter::Clouds(_) => FilterKind::Clouds,
             Filter::Mosaic { .. } => FilterKind::Mosaic,
+            Filter::Ripple { .. } => FilterKind::Ripple,
+            Filter::Wave(_) => FilterKind::Wave,
+            Filter::Twirl { .. } => FilterKind::Twirl,
+            Filter::Spherize { .. } => FilterKind::Spherize,
+            Filter::PolarCoordinates { .. } => FilterKind::PolarCoordinates,
+            Filter::Pinch { .. } => FilterKind::Pinch,
+            Filter::ZigZag { .. } => FilterKind::ZigZag,
+            Filter::Shear(_) => FilterKind::Shear,
         }
     }
 
     /// How far from a pixel the filter looks, in pixels; `None`: anywhere in
-    /// the processed area (Offset).
+    /// the processed area (Offset, the distortions).
     pub fn reach(&self) -> Option<u32> {
         let whole = |r: f32| r.max(0.0).ceil() as u32;
         let passes = |p: &[Pass]| p.iter().map(Pass::reach).sum::<usize>() as u32;
@@ -321,7 +401,15 @@ impl Filter {
             }
             Filter::AddNoise(_) | Filter::Clouds(_) => 0,
             Filter::ReduceNoise(_) => REDUCE_NOISE_HALO as u32,
-            Filter::Offset(_) => return None,
+            Filter::Offset(_)
+            | Filter::Ripple { .. }
+            | Filter::Wave(_)
+            | Filter::Twirl { .. }
+            | Filter::Spherize { .. }
+            | Filter::PolarCoordinates { .. }
+            | Filter::Pinch { .. }
+            | Filter::ZigZag { .. }
+            | Filter::Shear(_) => return None,
             Filter::Emboss { height, .. } => whole(height / 2.0) + 1,
             Filter::FindEdges => 1,
             Filter::Mosaic { cell } => whole(cell),
@@ -394,6 +482,18 @@ impl Filter {
             Filter::FindEdges => by_tiles(image, 1, find_edges_tile),
             Filter::Clouds(c) => clouds(image, &c, origin),
             Filter::Mosaic { cell } => mosaic(image, cell.round().max(1.0) as i64, origin),
+            Filter::Ripple { amount, size } => distort::ripple(image, amount, size, origin),
+            Filter::Wave(w) => distort::wave(image, &w, origin),
+            Filter::Twirl { angle } => distort::twirl(image, angle),
+            Filter::Spherize { amount, mode } => distort::spherize(image, amount, mode),
+            Filter::PolarCoordinates { conversion } => distort::polar(image, conversion),
+            Filter::Pinch { amount } => distort::pinch(image, amount),
+            Filter::ZigZag {
+                amount,
+                ridges,
+                style,
+            } => distort::zigzag(image, amount, ridges, style),
+            Filter::Shear(s) => distort::shear(image, &s),
         }
     }
 }

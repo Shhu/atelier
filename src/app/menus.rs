@@ -144,6 +144,15 @@ impl AtelierApp {
                         Some(&SHORTCUT_REDO),
                         Action::Redo,
                     ),
+                    Item(
+                        match self.doc.as_ref().and_then(Document::fade_name) {
+                            Some(name) => t!("adjust8-menu-fade", name = name),
+                            None => t!("adjust8-menu-fade-none"),
+                        },
+                        self.doc.as_ref().is_some_and(|d| d.fade_name().is_some()),
+                        Some(&fade_stroke::SHORTCUT_FADE),
+                        Action::Fade,
+                    ),
                     Separator,
                     Item(
                         t!("menu-edit-cut"),
@@ -207,10 +216,22 @@ impl AtelierApp {
                         Action::FillDialog,
                     ),
                     Item(
+                        t!("adjust8-menu-stroke"),
+                        has_doc && !self.smart_filters_apply(),
+                        None,
+                        Action::Stroke,
+                    ),
+                    Item(
                         t!("retouch-menu-content-aware-fill"),
                         has_doc && has_sel,
                         None,
                         Action::ContentAwareFill,
+                    ),
+                    Item(
+                        t!("pattern8-menu-define"),
+                        self.define_pattern_refusal().is_none(),
+                        None,
+                        Action::DefinePattern,
                     ),
                     Separator,
                     Item(
@@ -258,8 +279,9 @@ impl AtelierApp {
                         ADJUSTMENTS
                             .iter()
                             .flat_map(|a| {
-                                // Separator before Vibrance, like Photoshop.
-                                let sep = (a.kind == AdjustKind::Vibrance).then_some(Separator);
+                                // Separators where Photoshop has them.
+                                let sep = matches!(a.kind, AdjustKind::Vibrance | AdjustKind::Invert)
+                                    .then_some(Separator);
                                 sep.into_iter().chain([Item(
                                     a.label(),
                                     has_doc && !self.smart_filters_apply(),
@@ -277,6 +299,25 @@ impl AtelierApp {
                                 ),
                             ])
                             .collect(),
+                    ),
+                    Separator,
+                    Item(
+                        t!("adjust8-auto-tone"),
+                        has_doc && !self.smart_filters_apply(),
+                        Some(&fade_stroke::SHORTCUT_AUTO_TONE),
+                        Action::AutoAdjust(crate::pixel_ops::AutoMode::Tone),
+                    ),
+                    Item(
+                        t!("adjust8-auto-contrast"),
+                        has_doc && !self.smart_filters_apply(),
+                        Some(&fade_stroke::SHORTCUT_AUTO_CONTRAST),
+                        Action::AutoAdjust(crate::pixel_ops::AutoMode::Contrast),
+                    ),
+                    Item(
+                        t!("adjust8-auto-color"),
+                        has_doc && !self.smart_filters_apply(),
+                        Some(&fade_stroke::SHORTCUT_AUTO_COLOR),
+                        Action::AutoAdjust(crate::pixel_ops::AutoMode::Color),
                     ),
                     Separator,
                     Item(
@@ -515,6 +556,7 @@ impl AtelierApp {
                         Some(&SHORTCUT_TOGGLE_LOCK),
                         Action::ToggleLock,
                     ),
+                    Submenu(t!("layers8-menu-lock"), self.lock_menu()),
                     Separator,
                     Item(
                         if layer.is_some_and(Layer::is_group) {
@@ -637,6 +679,7 @@ impl AtelierApp {
                         ),
                     ])
                     .chain(self.view_menu_entries())
+                    .chain(self.screen_mode_entries())
                     .collect(),
             ),
             (t!("uip-menu-window"), self.window_menu()),
@@ -727,7 +770,7 @@ impl AtelierApp {
             Separator,
             Item(
                 format!("{}…", t!("core-blending-options")),
-                doc.active_layer().has_pixels(),
+                doc.active_layer().styleable(),
                 None,
                 Action::LayerStyle(None),
             ),

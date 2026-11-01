@@ -38,6 +38,7 @@ impl Document {
     pub fn composite_shared(&self, region: PixelRect) -> Arc<RgbaImage> {
         let options = compose::Options {
             held: self.effects_held,
+            canvas: Some(self.full_rect()),
             ..Default::default()
         };
         let layers = self.render_layers();

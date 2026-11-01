@@ -425,6 +425,7 @@ impl AtelierApp {
         }
         let view = self.last_view?;
         let area = (self.ctx).data(|d| d.get_temp::<Rect>(egui::Id::new(DROP_AREA)))?;
+        let area = self.view_turn.upright_bounds(area);
         let seen = Rect::from_min_max(view.to_image(area.min), view.to_image(area.max));
         let visible = seen.intersect(to_rect(canvas));
         (visible.is_positive()).then(|| (visible.center().x, visible.center().y))

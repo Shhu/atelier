@@ -303,6 +303,16 @@ impl AtelierApp {
                 (click, t!("hint-foreground")),
                 (alt_click, t!("hint-background")),
             ],
+            Tool::ColorSampler => vec![
+                (click, t!("panels8-hint-add-sampler")),
+                (t!("hint-key-drag"), t!("panels8-hint-move-sampler")),
+                (alt_click, t!("panels8-hint-delete-sampler")),
+            ],
+            Tool::Ruler => vec![
+                (t!("hint-key-drag"), t!("panels8-hint-measure")),
+                (shift, t!("paint-hint-45")),
+                (alt, t!("panels8-hint-protractor")),
+            ],
             Tool::Text if self.typing_on_canvas() => vec![
                 (
                     keys::combo(ctx, Modifiers::COMMAND, &keys::key(Key::Enter)),
@@ -331,6 +341,7 @@ impl AtelierApp {
                 (alt_click, t!("artboard-hint-duplicate")),
             ],
             Tool::Canvas => vec![
+                (t!("hint-key-drag"), t!("crop8-hint-turn")),
                 (ctrl, t!("hint-no-snap")),
                 (shift, t!("hint-keep-ratio")),
                 (alt, t!("hint-from-center")),
@@ -340,6 +351,14 @@ impl AtelierApp {
             Tool::Pen(_) | Tool::PathSelect | Tool::DirectSelect | Tool::Shape(_) => {
                 self.vector_hints(ctx)
             }
+            Tool::RotateView => vec![
+                (t!("hint-key-drag"), t!("view8-hint-rotate")),
+                (
+                    keys::combo(ctx, Modifiers::SHIFT, &t!("hint-key-drag")),
+                    t!("view8-hint-steps"),
+                ),
+                (keys::key(Key::Escape), t!("view8-hint-reset")),
+            ],
             Tool::Hand | Tool::Zoom => {
                 let mut hints = Vec::new();
                 if self.tool == Tool::Zoom {

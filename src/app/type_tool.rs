@@ -1040,11 +1040,16 @@ impl AtelierApp {
         // Input methods on, their candidates next to the caret.
         let (x, top, bottom) = layout.caret(edit.caret);
         let cursor_rect = Rect::from_two_pos(screen((x, top)), screen((x, bottom)));
+        // (The system knows nothing of a turned view.)
+        let turn = self.view_turn;
         self.ctx.output_mut(|o| {
             o.ime = Some(egui::output::IMEOutput {
                 purpose: egui::IMEPurpose::Normal,
-                rect: painter.clip_rect(),
-                cursor_rect,
+                rect: self.rulers.canvas_area().unwrap_or(painter.clip_rect()),
+                cursor_rect: Rect::from_two_pos(
+                    turn.to_screen(cursor_rect.min),
+                    turn.to_screen(cursor_rect.max),
+                ),
                 should_interrupt_composition: false,
             });
         });

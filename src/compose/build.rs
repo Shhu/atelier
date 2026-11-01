@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use image::{GrayImage, RgbaImage};
 
+use super::pattern::Sampler;
 use super::*;
 use crate::document::{Fill, Layer, LayerKind, intersect};
 
@@ -39,6 +40,11 @@ pub struct Options<'a> {
     /// A layer's mask shown as this image instead: the transform of the
     /// mask alone being prepared.
     pub placed_mask: Option<PlacedMask<'a>>,
+    /// The canvas, for the fingerprints of the styles of what has no pixels
+    /// of its own (without it, they show as last drawn).
+    pub canvas: Option<PixelRect>,
+    /// Layer drawn without its styles: the shape they are drawn from.
+    pub no_styles: Option<usize>,
 }
 
 /// Pixels shown instead of a layer's (or of its mask's) while a window
@@ -164,6 +170,7 @@ pub fn plan(
     ];
     let mut b = Builder {
         layers,
+        canvas,
         sources,
         opts,
         owner: &mut owner,
@@ -249,6 +256,7 @@ fn nested(layers: &[Layer]) -> impl Iterator<Item = (usize, Option<Range<usize>>
 
 struct Builder<'a, 'o> {
     layers: &'a [Layer],
+    canvas: PixelRect,
     sources: &'a mut dyn Sources,
     opts: &'a Options<'o>,
     owner: &'a mut [Option<usize>],
@@ -338,6 +346,13 @@ impl Builder<'_, '_> {
         let l = &self.layers[i];
         let children = self.level(children, None);
         let level = self.sources.level();
+        let (exterior, interior) = self.styles(i);
+        // Without styles, a group's fill opacity acts as its opacity does.
+        let styled = !exterior.is_empty() || !interior.is_empty();
+        let (opacity, fill) = match styled {
+            true => (l.opacity, l.fill),
+            false => (l.opacity * l.fill, 1.0),
+        };
         let board = l.artboard_rect().map(|r| Board {
             rect: reduced(r, level),
             background: l
@@ -348,9 +363,12 @@ impl Builder<'_, '_> {
         Some(Node::Group(Box::new(GroupNode {
             children,
             blend: self.blend(l),
-            opacity: l.opacity,
+            opacity,
+            fill,
             mask: self.mask(l),
             board,
+            exterior,
+            interior,
         })))
     }
 
@@ -399,6 +417,81 @@ impl Builder<'_, '_> {
         })
     }
 
+    /// The styles of layer `i` (under it, within its shape), of any kind.
+    fn styles(&mut self, i: usize) -> (Vec<FxSrc>, Vec<Interior>) {
+        let l = &self.layers[i];
+        let mut exterior = Vec::new();
+        let mut interior = Vec::new();
+        if self.opts.no_styles == Some(i) || !l.styleable() {
+            return (exterior, interior);
+        }
+        // What an overlay spans: the content's box; without pixels, what
+        // the mask leaves of the canvas.
+        let content_box = match l.has_pixels() {
+            true => l.content_bounds().unwrap_or(l.rect()),
+            false => crate::document::styles_area(self.layers, i, self.canvas)
+                .unwrap_or(self.canvas),
+        };
+        let fx = &l.effects;
+        if fx.gradient_overlay.enabled {
+            let g = &fx.gradient_overlay;
+            let b = content_box;
+            interior.push(Interior::Gradient {
+                ramp: Box::new(Ramp::new(&g.fill)),
+                bounds: [b.x as f32, b.y as f32, b.w as f32, b.h as f32],
+                opacity: g.opacity,
+                blend: g.blend,
+            });
+        }
+        if fx.pattern_overlay.enabled {
+            let p = &fx.pattern_overlay;
+            // Linked: from the top left corner of the layer's content.
+            let origin = if p.fill.linked {
+                let b = content_box;
+                (b.x as f32, b.y as f32)
+            } else {
+                (0.0, 0.0)
+            };
+            let level = self.sources.level();
+            interior.push(Interior::Pattern {
+                sampler: Box::new(Sampler::new(&p.fill, origin, level)),
+                opacity: p.opacity,
+                blend: p.blend,
+            });
+        }
+        if fx.color_overlay.enabled {
+            let c = &fx.color_overlay;
+            interior.push(Interior::Color {
+                color: rgb(c.color),
+                opacity: c.color[3] as f32 / 255.0 * c.opacity,
+                blend: c.blend,
+            });
+        }
+        if let Some(styles) = crate::document::styles_of(
+                self.layers,
+                i,
+                self.canvas,
+                self.opts.held,
+                self.opts.later_styles,
+            ) {
+            let mut slot = 2;
+            let mut src = |s: &mut Self, f: &crate::compose::styles::FxImage| {
+                let key = SourceKey { layer: l.id, slot };
+                slot += 1;
+                let at = (l.offset.0 + f.offset.0, l.offset.1 + f.offset.1);
+                FxSrc {
+                    coverage: s.sources.gray(key, styles.version, &f.coverage, at),
+                    color: f.color.map(|v| v as f32 / 255.0),
+                    opacity: f.opacity,
+                    blend: f.blend,
+                }
+            };
+            exterior = styles.exterior.iter().map(|f| src(self, f)).collect();
+            interior.extend(styles.interior.iter().map(|f| Interior::Fx(src(self, f))));
+        }
+        (exterior, interior)
+    }
+
     fn layer(&mut self, i: usize) -> Option<LayerNode> {
         if let Some(n) = self.placed(i) {
             return Some(n);
@@ -424,48 +517,19 @@ impl Builder<'_, '_> {
             LayerKind::Adjustment(a) => Content::Adjust(Box::new(a.clone())),
             LayerKind::Fill(Fill::Solid(c)) => Content::Solid(c.map(|v| v as f32 / 255.0)),
             LayerKind::Fill(Fill::Gradient(g)) => Content::Gradient(Box::new(Ramp::new(g))),
+            LayerKind::Fill(Fill::Pattern(p)) => {
+                let origin = if p.linked {
+                    (l.offset.0 as f32, l.offset.1 as f32)
+                } else {
+                    (0.0, 0.0)
+                };
+                let level = self.sources.level();
+                Content::Pattern(Box::new(Sampler::new(p, origin, level)))
+            }
             LayerKind::Group { .. } => return None,
         };
         let mask = self.mask(l);
-        let mut exterior = Vec::new();
-        let mut interior = Vec::new();
-        if let Content::Pixels(_) = content {
-            let fx = &l.effects;
-            if fx.gradient_overlay.enabled {
-                let g = &fx.gradient_overlay;
-                let b = l.content_bounds().unwrap_or(l.rect());
-                interior.push(Interior::Gradient {
-                    ramp: Box::new(Ramp::new(&g.fill)),
-                    bounds: [b.x as f32, b.y as f32, b.w as f32, b.h as f32],
-                    opacity: g.opacity,
-                    blend: g.blend,
-                });
-            }
-            if fx.color_overlay.enabled {
-                let c = &fx.color_overlay;
-                interior.push(Interior::Color {
-                    color: rgb(c.color),
-                    opacity: c.color[3] as f32 / 255.0 * c.opacity,
-                    blend: c.blend,
-                });
-            }
-            if let Some(styles) = l.styles_shown(self.opts.held, self.opts.later_styles) {
-                let mut slot = 2;
-                let mut src = |s: &mut Self, f: &crate::compose::styles::FxImage| {
-                    let key = SourceKey { layer: l.id, slot };
-                    slot += 1;
-                    let at = (l.offset.0 + f.offset.0, l.offset.1 + f.offset.1);
-                    FxSrc {
-                        coverage: s.sources.gray(key, styles.version, &f.coverage, at),
-                        color: f.color.map(|v| v as f32 / 255.0),
-                        opacity: f.opacity,
-                        blend: f.blend,
-                    }
-                };
-                exterior = styles.exterior.iter().map(|f| src(self, f)).collect();
-                interior.extend(styles.interior.iter().map(|f| Interior::Fx(src(self, f))));
-            }
-        }
+        let (exterior, interior) = self.styles(i);
         Some(LayerNode {
             content,
             mask,
@@ -573,10 +637,11 @@ pub fn signatures(layers: &[Layer], opts: &Options) -> Vec<Sig> {
             _ => l.blend,
         };
         // The styles shown (a hidden layer: as last drawn).
-        let styles = if shown[i] {
-            l.styles_shown(opts.held, opts.later_styles)
-        } else {
-            l.styles_cached()
+        let styles = match opts.canvas.filter(|_| !l.has_pixels()) {
+            _ if !shown[i] => l.styles_cached(),
+            _ if l.has_pixels() => l.styles_shown(opts.held, opts.later_styles),
+            Some(c) => crate::document::styles_of(layers, i, c, opts.held, opts.later_styles),
+            None => l.styles_cached(),
         };
         let state = hash_of((
             shown[i],
@@ -623,13 +688,15 @@ pub fn signatures(layers: &[Layer], opts: &Options) -> Vec<Sig> {
                 w: 0,
                 h: 0,
             }));
-            match (area, l.active_mask().filter(|m| m.default == 0)) {
+            let shown_area = match (area, l.active_mask().filter(|m| m.default == 0)) {
                 (Some(a), Some(m)) => {
                     intersect(a, m.rect(l.offset)).or(Some(PixelRect { w: 0, h: 0, ..a }))
                 }
                 (None, Some(m)) => Some(m.rect(l.offset)),
                 (a, None) => a,
-            }
+            };
+            // Its styles reach beyond.
+            shown_area.map(|a| l.with_styles_extent(a, styles.as_deref()))
         } else {
             l.extent_with(styles.as_deref())
         };

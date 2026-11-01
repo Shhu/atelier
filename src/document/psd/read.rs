@@ -87,6 +87,8 @@ struct Resources {
     /// Index of the active layer's record.
     target_layer: Option<usize>,
     guides: Vec<Guide>,
+    /// Color Sampler points (canvas coordinates).
+    samplers: Vec<crate::document::ColorSampler>,
     global_angle: Option<f64>,
     /// JPEG preview.
     thumbnail: Option<Vec<u8>>,
@@ -114,9 +116,9 @@ struct Resources {
 /// path, Lightroom workflow, print flags; border, the halftoning and
 /// transfer functions of the other modes, dot range, EPS options, JPEG
 /// quality, watermark, workflow URL, jump to XPEP.
-const KEPT: [u16; 46] = [
+const KEPT: [u16; 45] = [
     1005, 1008, 1010, 1011, 1013, 1016, 1028, 1034, 1035, 1037, 1042, 1043, 1044, 1049, 1050, 1054,
-    1058, 1059, 1060, 1061, 1062, 1064, 1070, 1071, 1073, 1074, 1080, 1082, 1083, 1084, 1085, 2999,
+    1058, 1059, 1060, 1061, 1062, 1064, 1070, 1071, 1074, 1080, 1082, 1083, 1084, 1085, 2999,
     3000, 8000, 10000, 1009, 1012, 1014, 1015, 1017, 1019, 1021, 1030, 1040, 1051, 1052,
 ];
 
@@ -124,10 +126,42 @@ const KEPT: [u16; 46] = [
 /// file as it was (its thumbnail, version, quick mask, layer and channel
 /// bookkeeping, the duotone colors of a mode converted, obsolete ones):
 /// left out without loss.
-const REWRITTEN: [u16; 27] = [
+const REWRITTEN: [u16; 26] = [
     1000, 1001, 1002, 1003, 1004, 1022, 1026, 1033, 1036, 1041, 1046, 1047, 1057, 1066, 1069, 1072,
-    1076, 1078, 1086, 1087, 1088, 1018, 1020, 1023, 1027, 1029, 1038,
+    1076, 1078, 1086, 1087, 1088, 1018, 1020, 1023, 1027, 1029,
 ];
+
+/// The color samplers resource (1038, or 1073 for its version 3): vertical
+/// and horizontal position (fixed-point in version 1, floats after), color
+/// space, depth (after version 1).
+fn color_samplers(raw: &[u8]) -> Result<Vec<crate::document::ColorSampler>> {
+    let mut d = Reader::new(raw);
+    let version = d.u32()?;
+    if !(1..=3).contains(&version) {
+        return Ok(Vec::new());
+    }
+    let n = d.u32()? as usize;
+    let mut out = Vec::new();
+    for _ in 0..n.min(crate::document::MAX_SAMPLERS) {
+        if version == 3 {
+            d.u16()?;
+        }
+        let (v, h) = (d.i32()?, d.i32()?);
+        let at = |bits: i32| match version {
+            1 => bits as f32 / 65536.0,
+            _ => f32::from_bits(bits as u32),
+        };
+        d.i16()?;
+        if version > 1 {
+            d.u16()?;
+        }
+        let (x, y) = (at(h), at(v));
+        if x.is_finite() && y.is_finite() {
+            out.push(crate::document::ColorSampler { x, y });
+        }
+    }
+    Ok(out)
+}
 
 /// The frames of a frame animation (plug-in resource "mani", block
 /// "AnDs": its descriptor's list "FrIn"), when it can be read.
@@ -192,6 +226,8 @@ fn resources(r: &mut Reader) -> Result<Resources> {
                     out.guides.push(Guide::new(orientation, at));
                 }
             }
+            // Damaged or of a later version: no points, not a damaged file.
+            1038 | 1073 => out.samplers = color_samplers(raw).unwrap_or_default(),
             1037 => {
                 out.global_angle = Some(d.i32()? as f64);
                 out.kept.push(kept());
@@ -811,6 +847,8 @@ struct File<'a> {
     records: Vec<Record<'a>>,
     /// The merged image's first alpha channel is its transparency.
     merged_alpha: bool,
+    /// The tiles of the Pattern Fill layers and Pattern Overlays.
+    patterns: super::pattern::Patterns,
     /// The merged image's data (compression first).
     image_data: &'a [u8],
 }
@@ -860,12 +898,18 @@ fn parse(data: &[u8]) -> Result<File<'_>> {
     merged_alpha |= global
         .iter()
         .any(|(k, _)| matches!(k, b"Mtrn" | b"Mt16" | b"Mt32"));
+    let patterns = global
+        .iter()
+        .filter(|(k, _)| k == b"Patt")
+        .flat_map(|(_, block)| super::pattern::read_block(block))
+        .collect();
     Ok(File {
         header,
         resources,
         palette,
         records,
         merged_alpha,
+        patterns,
         image_data,
     })
 }
@@ -1024,7 +1068,7 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
                 layer.artboard = Some(a);
             }
         } else {
-            match adjust::read(&rec.blocks) {
+            match adjust::read(&rec.blocks, &f.patterns) {
                 Some(Ok(kind)) => {
                     layer.kind = kind;
                     layer.replace_pixels(RgbaImage::new(0, 0));
@@ -1047,15 +1091,12 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
             layer.fill = d.u8()? as f32 / 255.0;
         }
         layer.clipped = rec.clipped && !layer.is_group();
-        // A group's fill opacity acts on what it holds, as its opacity
-        // does (without knockout): Atelier's groups only have the latter.
-        if layer.is_group() {
-            layer.opacity *= layer.fill;
-            layer.fill = 1.0;
-        }
         if let Some(mut d) = rec.block(b"lspf").map(Reader::new) {
             let lock = d.u32()?;
-            layer.locked = lock & 0x8000_0000 != 0 || lock & 6 == 6;
+            layer.locked = lock & 0x8000_0000 != 0;
+            layer.locks.transparent = lock & 1 != 0;
+            layer.locks.pixels = lock & 2 != 0;
+            layer.locks.position = lock & 4 != 0;
         }
         // Shape strokes; knockout and Blend If (Blending Options).
         if rec.block(b"vstk").is_some() {
@@ -1078,7 +1119,7 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
                 notes.smart.push(rec.name.clone());
             }
         }
-        // Layer styles: those Atelier has, on the pixel layers.
+        // Layer styles: those Atelier has.
         let fx = rec
             .block(b"lmfx")
             .or_else(|| rec.block(b"lfx2"))
@@ -1090,14 +1131,19 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
             });
         if let Some(fx) = fx {
             let angle = f.resources.global_angle.unwrap_or(120.0);
-            let (effects, simplified) = effects::read(&fx, angle);
-            // Atelier has styles on pixel layers only.
-            if simplified || (!layer.has_pixels() && effects.any()) {
+            let (effects, simplified) = effects::read(&fx, angle, &f.patterns);
+            if simplified || (!layer.styleable() && effects.any()) {
                 notes.styles.push(rec.name.clone());
             }
-            if layer.has_pixels() {
+            if layer.styleable() {
                 layer.effects = effects;
             }
+        }
+        // A group's fill opacity acts on what it holds, as its opacity
+        // does (without knockout), unless styles stay unfaded.
+        if layer.is_group() && !layer.effects.any() {
+            layer.opacity *= layer.fill;
+            layer.fill = 1.0;
         }
         // Masks: the pixel mask and the vector mask rasterized, multiplied.
         let pixel = mask
@@ -1197,6 +1243,7 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
     }
     doc.active = target.unwrap_or(doc.layers.len() - 1);
     doc.guides = f.resources.guides;
+    doc.samplers = f.resources.samplers;
     let path = |data: &[u8]| super::vector::path_of(data, canvas).ok();
     doc.paths = (f.resources.paths.iter())
         .filter_map(|(name, data)| {

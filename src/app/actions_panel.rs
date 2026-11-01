@@ -16,6 +16,7 @@ use std::collections::VecDeque;
 use super::dialogs::{DialogSpec, block, floating_dialog, gap_between_blocks, help};
 use super::select_menu::ModifyKind;
 use super::*;
+use crate::pixel_ops::AutoMode;
 use crate::actions::{
     self as act, Combine, Contents, FnKey, Library, MenuItem, Modify, Recorded, Resample, Sequence,
     Set, Shape, Step,
@@ -301,6 +302,8 @@ fn has_dialog(r: &Recorded) -> bool {
         | Recorded::RotateCanvas { .. }
         | Recorded::Adjust { .. }
         | Recorded::Fill { .. }
+        | Recorded::Fade { .. }
+        | Recorded::Stroke { .. }
         | Recorded::ModifySelection { .. }
         | Recorded::Transform { .. }
         | Recorded::Place { .. }
@@ -359,6 +362,9 @@ impl MenuItem {
             MenuItem::DeleteMask => Action::DeleteMask,
             MenuItem::ApplyMask => Action::ApplyMask,
             MenuItem::Rasterize => Action::Rasterize,
+            MenuItem::AutoTone => Action::AutoAdjust(AutoMode::Tone),
+            MenuItem::AutoContrast => Action::AutoAdjust(AutoMode::Contrast),
+            MenuItem::AutoColor => Action::AutoAdjust(AutoMode::Color),
             MenuItem::Copy => Action::Copy,
             MenuItem::Cut => Action::Cut,
             MenuItem::Paste => Action::Paste,
@@ -395,6 +401,7 @@ impl MenuItem {
             Action::DeleteMask => MenuItem::DeleteMask,
             Action::ApplyMask => MenuItem::ApplyMask,
             Action::Rasterize => MenuItem::Rasterize,
+            // Auto commands are recorded once computed.
             // A cut is recorded as a copy, then the clear it runs.
             Action::Copy | Action::Cut => MenuItem::Copy,
             Action::Paste => MenuItem::Paste,
@@ -442,6 +449,9 @@ impl MenuItem {
             MenuItem::DeleteMask => t!("core-mask-delete"),
             MenuItem::ApplyMask => t!("core-mask-apply"),
             MenuItem::Rasterize => t!("vector-menu-rasterize"),
+            MenuItem::AutoTone => t!("adjust8-auto-tone"),
+            MenuItem::AutoContrast => t!("adjust8-auto-contrast"),
+            MenuItem::AutoColor => t!("adjust8-auto-color"),
             MenuItem::Copy => t!("menu-edit-copy"),
             MenuItem::Cut => t!("menu-edit-cut"),
             MenuItem::Paste => t!("menu-edit-paste"),
@@ -478,6 +488,7 @@ pub(super) fn contents(c: FillContent) -> Contents {
         FillContent::Background => Contents::Background,
         FillContent::Color => Contents::Color,
         FillContent::ContentAware => Contents::ContentAware,
+        FillContent::Pattern => Contents::Pattern,
         FillContent::Black => Contents::Black,
         FillContent::Gray => Contents::Gray,
         FillContent::White => Contents::White,
@@ -490,6 +501,7 @@ fn fill_content(c: Contents) -> FillContent {
         Contents::Background => FillContent::Background,
         Contents::Color => FillContent::Color,
         Contents::ContentAware => FillContent::ContentAware,
+        Contents::Pattern => FillContent::Pattern,
         Contents::Black => FillContent::Black,
         Contents::Gray => FillContent::Gray,
         Contents::White => FillContent::White,
@@ -648,6 +660,7 @@ impl AtelierApp {
                     action,
                     Action::FillPrimaryKeep | Action::FillSecondaryKeep
                 ),
+                pattern: None,
             },
             // Without a selection, it duplicates the layer (recorded so).
             Action::LayerFromSelection if self.selection.is_none() => return None,
@@ -695,14 +708,16 @@ impl AtelierApp {
     }
 
     /// The Crop tool's frame, about to be applied.
-    pub(super) fn record_crop(&mut self) {
-        let (Some(r), Some(doc)) = (self.canvas_rect, &self.doc) else {
-            return;
-        };
-        let r = to_pixel_rect(round_rect(r));
-        if r != doc.full_rect() {
+    pub(super) fn record_crop(&mut self, plan: super::crop_tool::CropPlan) {
+        let Some(doc) = &self.doc else { return };
+        let r = plan.rect;
+        if r != doc.full_rect() || plan.angle != 0.0 || plan.size.is_some() || plan.delete {
             self.record(Recorded::Crop {
                 rect: [r.x, r.y, r.w as i64, r.h as i64],
+                angle: plan.angle,
+                delete: plan.delete,
+                size: plan.size,
+                resolution: plan.resolution,
             });
         }
     }
@@ -1007,7 +1022,7 @@ impl AtelierApp {
     }
 
     /// Runs a step: at once, or its dialog filled with its settings.
-    fn play_step(&mut self, command: &Recorded, dialog: bool) -> Result<(), String> {
+    pub(super) fn play_step(&mut self, command: &Recorded, dialog: bool) -> Result<(), String> {
         if let Recorded::Stop {
             message,
             allow_continue,
@@ -1023,7 +1038,7 @@ impl AtelierApp {
             return Err(t!("actions-error-no-document"));
         };
         let has_selection = self.selection.is_some();
-        let locked = doc.is_locked(doc.active);
+        let locked = doc.is_locked(doc.active) || doc.pixels_locked();
         // A smart object takes filters as smart filters.
         let can_paint = doc.can_paint();
         let filterable = can_paint || self.smart_filters_apply();
@@ -1098,7 +1113,13 @@ impl AtelierApp {
                 }
             }
             Recorded::FlipCanvas { horizontal } => self.run(Action::FlipCanvas(*horizontal)),
-            Recorded::Crop { rect: [x, y, w, h] } => {
+            Recorded::Crop {
+                rect: [x, y, w, h],
+                angle,
+                delete,
+                size,
+                resolution,
+            } => {
                 if *w <= 0 || *h <= 0 {
                     return Err(t!("status-nothing-to-crop"));
                 }
@@ -1111,8 +1132,13 @@ impl AtelierApp {
                 if crate::document::intersect(r, canvas).is_none() {
                     return Err(t!("status-nothing-to-crop"));
                 }
-                self.canvas_rect = Some(to_rect(r));
-                self.apply_canvas();
+                self.apply_crop(super::crop_tool::CropPlan {
+                    rect: r,
+                    angle: *angle,
+                    delete: *delete,
+                    size: *size,
+                    resolution: *resolution,
+                });
             }
             Recorded::Adjust { adjustment } => {
                 if locked {
@@ -1142,6 +1168,67 @@ impl AtelierApp {
                         self.status = t!("dialog-adjust-applied", name = adjustment.title());
                         self.reset_pending();
                     }
+                }
+            }
+            Recorded::Fade { opacity, mode } => {
+                if locked {
+                    return Err(lock_error());
+                }
+                let mode = fade_stroke::blend_named(mode);
+                if dialog {
+                    self.open_fade();
+                    match &mut self.filters.fade {
+                        Some(d) => {
+                            d.fade.opacity = *opacity;
+                            d.fade.mode = mode;
+                        }
+                        None => return Err(t!("adjust8-why-no-fade")),
+                    }
+                } else {
+                    self.fade_with(*opacity, mode)?;
+                }
+            }
+            Recorded::Stroke {
+                width,
+                color,
+                location,
+                mode,
+                opacity,
+                preserve_transparency,
+            } => {
+                if locked {
+                    return Err(lock_error());
+                }
+                if let Some(text) = hidden {
+                    return Err(text);
+                }
+                if !can_paint && self.smart_filters_apply() {
+                    return Err(t!("smart-status-no-adjustments"));
+                }
+                if !can_paint {
+                    return Err(t!("filter-no-pixels"));
+                }
+                let location = fade_stroke::location_named(location);
+                let mode = fade_stroke::blend_named(mode);
+                if dialog {
+                    self.filters.stroke_options = fade_stroke::StrokeOptions {
+                        width: *width,
+                        color: Some(*color),
+                        location,
+                        mode,
+                        opacity: *opacity,
+                        preserve_transparency: *preserve_transparency,
+                    };
+                    self.filters.stroke_open = true;
+                } else {
+                    self.apply_stroke(crate::pixel_ops::StrokeSettings {
+                        width: *width,
+                        color: *color,
+                        location,
+                        mode,
+                        opacity: *opacity,
+                        preserve_transparency: *preserve_transparency,
+                    });
                 }
             }
             Recorded::Filter { filter } => {
@@ -1180,6 +1267,7 @@ impl AtelierApp {
                 color,
                 opacity,
                 preserve_transparency,
+                pattern,
             } => {
                 if locked {
                     return Err(lock_error());
@@ -1190,12 +1278,18 @@ impl AtelierApp {
                 if *contents == Contents::ContentAware && !has_selection {
                     return Err(t!("retouch-needs-selection"));
                 }
+                if *contents == Contents::Pattern
+                    && pattern.is_none_or(|p| self.patterns.library.get(p).is_none())
+                {
+                    return Err(t!("pattern8-why-missing"));
+                }
                 let d = FillDialog {
                     content: fill_content(*contents),
                     color: Color32::from_rgb(color[0], color[1], color[2]),
                     opacity: opacity.clamp(0.0, 1.0),
                     preserve_transparency: *preserve_transparency,
                     adapt: true,
+                    pattern: pattern.unwrap_or(0),
                 };
                 if dialog {
                     self.fill_dialog = Some(d);
@@ -2644,6 +2738,8 @@ pub(super) fn step_title(r: &Recorded) -> String {
         Recorded::Filter { filter } => filters_ui::title(filter.kind()),
         Recorded::CameraRaw { .. } => t!("raw-filter-title"),
         Recorded::Fill { .. } => t!("dialog-fill-title"),
+        Recorded::Fade { .. } => t!("adjust8-fade-title"),
+        Recorded::Stroke { .. } => t!("adjust8-stroke-title"),
         Recorded::Select { .. } => t!("actions-step-select"),
         Recorded::SelectAll => t!("actions-step-select-all"),
         Recorded::Deselect => t!("menu-select-deselect"),
@@ -2733,10 +2829,46 @@ pub(super) fn step_details(r: &Recorded) -> Vec<String> {
         Recorded::RotateCanvas { angle } => {
             vec![line(&t!("dialog-rotate-angle"), deg(f64::from(*angle)))]
         }
-        Recorded::Crop { rect: [x, y, w, h] } => {
-            vec![format!("{x}, {y} · {w} × {h} px")]
+        Recorded::Crop {
+            rect: [x, y, w, h],
+            angle,
+            delete,
+            size,
+            ..
+        } => {
+            let mut lines = vec![format!("{x}, {y} · {w} × {h} px")];
+            if *angle != 0.0 {
+                lines.push(line(&t!("dialog-rotate-angle"), deg(f64::from(*angle))));
+            }
+            if *delete {
+                lines.push(t!("crop8-delete-cropped"));
+            }
+            if let Some((w, h)) = size {
+                lines.push(format!("{w} × {h} px"));
+            }
+            lines
         }
         Recorded::Adjust { adjustment } => adjustment_details(adjustment),
+        Recorded::Fade { opacity, mode } => vec![
+            line(&t!("dialog-fill-opacity"), pct(f64::from(*opacity) * 100.0)),
+            line(
+                &t!("adjust8-mode"),
+                fade_stroke::blend_named(mode).label().to_string(),
+            ),
+        ],
+        Recorded::Stroke {
+            width,
+            mode,
+            opacity,
+            ..
+        } => vec![
+            line(&t!("adjust8-stroke-width"), px(width.to_string())),
+            line(&t!("dialog-fill-opacity"), pct(f64::from(*opacity) * 100.0)),
+            line(
+                &t!("adjust8-mode"),
+                fade_stroke::blend_named(mode).label().to_string(),
+            ),
+        ],
         Recorded::Filter { filter } => filter_details(filter),
         Recorded::Fill {
             contents,
@@ -2864,6 +2996,11 @@ fn adjustment_details(a: &Adjustment) -> Vec<String> {
             line(&t!("dialog-adjust-vibrance"), n(v.vibrance)),
             line(&t!("dialog-adjust-saturation"), n(v.saturation)),
         ],
+        Adjustment::Exposure(e) => vec![
+            line(&t!("adjust8-exposure"), i18n::short_decimal(f64::from(e.exposure))),
+            line(&t!("adjust8-offset"), i18n::short_decimal(f64::from(e.offset))),
+            line(&t!("adjust8-gamma"), i18n::short_decimal(f64::from(e.gamma))),
+        ],
         Adjustment::PhotoFilter(f) => vec![line(
             &t!("core-photo-filter-density"),
             pct(f64::from(f.density) * 100.0),
@@ -2920,7 +3057,27 @@ fn filter_details(f: &crate::filters::Filter) -> Vec<String> {
             amount(a),
         ],
         F::Mosaic { cell } => vec![line(&t!("filter-cell-size"), px(n(cell)))],
-        F::FindEdges | F::Clouds(_) => Vec::new(),
+        F::Ripple { amount: a, .. } | F::Spherize { amount: a, .. } | F::Pinch { amount: a } => {
+            vec![amount(a)]
+        }
+        F::Wave(w) => vec![
+            line(&t!("distort8-generators"), n(w.generators)),
+            line(&t!("distort8-wavelength-max"), px(n(w.wavelength_max))),
+            line(&t!("distort8-amplitude-max"), px(n(w.amplitude_max))),
+        ],
+        F::Twirl { angle } => vec![line(&t!("filter-angle"), deg(f64::from(angle)))],
+        F::PolarCoordinates { conversion } => vec![match conversion {
+            crate::filters::PolarConversion::RectangularToPolar => {
+                t!("distort8-rectangular-to-polar")
+            }
+            crate::filters::PolarConversion::PolarToRectangular => {
+                t!("distort8-polar-to-rectangular")
+            }
+        }],
+        F::ZigZag {
+            amount: a, ridges, ..
+        } => vec![amount(a), line(&t!("distort8-ridges"), n(ridges))],
+        F::FindEdges | F::Clouds(_) | F::Shear(_) => Vec::new(),
     }
 }
 
@@ -3001,6 +3158,29 @@ mod tests {
         !app.actions.playing() && !app.actions_wait()
     }
 
+    /// F8 opens Info, unless an action was given that key.
+    #[test]
+    fn an_action_given_f8_keeps_it_over_the_info_panel() {
+        let mut h = app();
+        h.key_press(egui::Key::F8);
+        h.run_steps(2);
+        assert!(h.state().info.open, "no action on it");
+        h.key_press(egui::Key::F8);
+        h.run_steps(2);
+        assert!(!h.state().info.open);
+        let original = flat(&h);
+        with_action(&mut h, vec![invert()]);
+        h.state_mut().actions.library.sets[0].actions[0].key = Some(FnKey {
+            number: 8,
+            shift: false,
+            ctrl: false,
+        });
+        h.key_press(egui::Key::F8);
+        settle(&mut h, idle);
+        assert!(!h.state().info.open, "the action plays instead");
+        assert_ne!(flat(&h), original);
+    }
+
     /// A filter step cancelled while it computes stops the action (the
     /// next steps don't run on the unfiltered image).
     #[test]
@@ -3055,6 +3235,7 @@ mod tests {
             opacity: 1.0,
             preserve_transparency: false,
             adapt: true,
+            pattern: 0,
         }
     }
 
@@ -3112,6 +3293,7 @@ mod tests {
             color: rgb(Color32::BLACK),
             opacity: 1.0,
             preserve_transparency: false,
+            pattern: None,
         };
         with_action(&mut h, vec![Step::new(fill), invert()]);
         let app = h.state_mut();
@@ -3221,6 +3403,7 @@ mod tests {
                 color: [0; 3],
                 opacity: 1.0,
                 preserve_transparency: false,
+                pattern: None,
             },
         ] {
             let app = h.state_mut();

@@ -64,6 +64,8 @@ pub(super) struct ViewSettings {
     /// A main grid line every `grid_spacing` px, divided into `subdivisions`.
     pub grid_spacing: f32,
     pub subdivisions: u32,
+    /// Rotate View tool: the angle goes to all the open documents.
+    pub rotate_all_windows: bool,
 }
 
 impl Default for ViewSettings {
@@ -80,6 +82,7 @@ impl Default for ViewSettings {
             snap_bounds: true,
             grid_spacing: 100.0,
             subdivisions: 4,
+            rotate_all_windows: false,
         }
     }
 }
@@ -133,6 +136,8 @@ pub(super) enum Command {
     LockGuides,
     ClearGuides,
     NewGuide,
+    /// View › Flip Horizontal: of the view, not of the image.
+    FlipHorizontal,
     /// Preferences › Guides & Grid…
     Preferences,
 }
@@ -178,6 +183,11 @@ pub(super) struct Rulers {
 }
 
 impl Rulers {
+    pub(super) fn set_rotate_all_windows(&mut self, on: bool) {
+        self.settings.rotate_all_windows = on;
+        self.settings.save();
+    }
+
     pub(super) fn load() -> Self {
         Self {
             settings: ViewSettings::load(),
@@ -243,6 +253,7 @@ impl AtelierApp {
                     });
                 }
             }
+            Command::FlipHorizontal => self.flip_view(),
             Command::Preferences => {
                 self.rulers.preferences = Some(GridPreferences {
                     spacing: s.grid_spacing,
@@ -262,6 +273,13 @@ impl AtelierApp {
         let check =
             |label, on, shortcut, command| Check(label, true, on, shortcut, Action::View(command));
         vec![
+            Check(
+                t!("view8-flip-horizontal"),
+                has_doc,
+                self.view_turn.flipped,
+                None,
+                Action::View(Command::FlipHorizontal),
+            ),
             Separator,
             Submenu(
                 t!("uip-menu-show"),
@@ -413,7 +431,8 @@ impl AtelierApp {
                     .unwrap_or_else(|| along.round())
             };
         }
-        let over_canvas = pointer.is_some_and(|p| canvas.contains(p));
+        // The canvas's rectangle is on screen.
+        let over_canvas = pointer.is_some_and(|p| canvas.contains(self.view_turn.to_screen(p)));
         if down {
             self.rulers.drag = Some(drag);
             // Over the rulers too.
@@ -465,9 +484,10 @@ impl AtelierApp {
     /// Grid (inside the canvas) and guides (across the view), the one being
     /// dragged in its new place.
     pub(super) fn draw_guides(&self, painter: &Painter, view: View, full: Rect) {
-        let Some((area, _)) = self.rulers.area else {
+        let Some((screen_area, _)) = self.rulers.area else {
             return;
         };
+        let area = self.view_turn.upright_bounds(screen_area);
         let settings = &self.rulers.settings;
         let Some(doc) = &self.doc else { return };
         // On the pixel grid of the screen, for sharp lines.
@@ -509,7 +529,7 @@ impl AtelierApp {
         // The dragged guide shows over the canvas only.
         let pointer = self.ctx.pointer_latest_pos();
         if let Some(d) = drag
-            && pointer.is_some_and(|p| area.contains(p))
+            && pointer.is_some_and(|p| screen_area.contains(p))
         {
             let alt = self.ctx.input(|i| i.modifiers.alt) && d.index.is_none();
             let orientation = match (d.orientation, alt) {

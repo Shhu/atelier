@@ -321,7 +321,7 @@ impl AtelierApp {
             return;
         };
         if picker.sampling {
-            let ip = view.to_image(p);
+            let ip = view.to_image(self.view_turn.to_upright(p));
             if let Some([r, g, b, _]) = doc.color_at(ip.x.floor() as i64, ip.y.floor() as i64) {
                 picker.picked.set_rgb(color::to_f32([r, g, b]));
             }

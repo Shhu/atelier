@@ -15,6 +15,7 @@ pub(super) struct ParkedDoc {
     prop_session: Option<((u64, &'static str), u64)>,
     pub(super) zoom: f32,
     pan: Vec2,
+    pub(super) turn: view_turn::ViewTurn,
     /// Not shown yet: fit it to the window when it is.
     fit_pending: Option<f32>,
 }
@@ -86,6 +87,7 @@ impl AtelierApp {
             self.active_tab += 1;
         }
         self.doc = Some(doc);
+        self.view_turn = Default::default();
         self.fit_pending = Some(1.0);
     }
 
@@ -146,6 +148,9 @@ impl AtelierApp {
         self.transparency = None;
         self.split_open = false;
         self.fill_dialog = None;
+        self.filters.fade = None;
+        self.filters.stroke_open = false;
+        self.patterns.define = None;
         self.image_size = None;
         self.flatten_confirm = false;
         self.forget_document_jobs();
@@ -164,6 +169,7 @@ impl AtelierApp {
             prop_session: self.prop_session.take(),
             zoom: self.zoom,
             pan: self.pan,
+            turn: self.view_turn,
             fit_pending: self.fit_pending,
         };
         // Caches and gestures of the document that leaves.
@@ -187,6 +193,7 @@ impl AtelierApp {
         self.snap_targets = None;
         self.hover_pixel = None;
         self.last_view = None;
+        self.view_turn = Default::default();
         self.fit_pending = None;
         Some(parked)
     }
@@ -202,6 +209,7 @@ impl AtelierApp {
         self.prop_session = p.prop_session;
         self.zoom = p.zoom;
         self.pan = p.pan;
+        self.view_turn = p.turn;
         self.fit_pending = p.fit_pending;
         self.reset_pending();
     }

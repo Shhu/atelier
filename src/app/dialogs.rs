@@ -361,6 +361,9 @@ impl AtelierApp {
                             );
                         });
                     }
+                    if d.content == FillContent::Pattern {
+                        patterns_ui::pattern_choice(ui, &mut d.pattern);
+                    }
                     if d.content == FillContent::ContentAware {
                         ui_kit::checkbox(ui, &mut d.adapt, &t!("retouch-color-adaptation"))
                             .on_hover_text(t!("retouch-color-adaptation-tip"));
@@ -416,6 +419,7 @@ impl AtelierApp {
             color: actions_panel::rgb(d.color),
             opacity: d.opacity,
             preserve_transparency: d.preserve_transparency,
+            pattern: (d.content == FillContent::Pattern).then_some(d.pattern),
         };
         if d.content == FillContent::ContentAware {
             // The AI model only when it is there: no question here.
@@ -434,6 +438,12 @@ impl AtelierApp {
             }) {
                 self.retouch.record_when_filled(recorded);
             }
+        } else if d.content == FillContent::Pattern {
+            if !self.refuse_if_target_locked()
+                && self.fill_with_pattern(d.pattern, d.opacity, d.preserve_transparency)
+            {
+                self.record(recorded);
+            }
         } else if !self.refuse_if_target_locked() {
             self.record(recorded);
             let (color, which) = match d.content {
@@ -447,7 +457,7 @@ impl AtelierApp {
                 FillContent::Black => (Color32::BLACK, t!("dialog-fill-with-black")),
                 FillContent::Gray => (Color32::from_gray(128), t!("dialog-fill-with-gray")),
                 FillContent::White => (Color32::WHITE, t!("dialog-fill-with-white")),
-                FillContent::ContentAware => unreachable!("filled above"),
+                FillContent::ContentAware | FillContent::Pattern => unreachable!("filled above"),
             };
             self.fill(color, &which, d.opacity, d.preserve_transparency);
         }
@@ -1065,7 +1075,16 @@ const NO_FIRST_FIELD: [&str; 25] = [
 ];
 
 /// The floating panels that Tab hides with the bars and the side panel.
-const HIDDEN_WITH_PANELS: [&str; 5] = ["history", "channels", "actions", "paths", "swatches"];
+const HIDDEN_WITH_PANELS: [&str; 8] = [
+    "history",
+    "channels",
+    "actions",
+    "paths",
+    "swatches",
+    "info",
+    "histogram",
+    "navigator",
+];
 
 fn panels_hidden_id() -> egui::Id {
     egui::Id::new("panels-hidden")
@@ -1088,6 +1107,9 @@ pub(super) fn forget_panel_places(ctx: &egui::Context) {
             "actions",
             "paths",
             "swatches",
+            "info",
+            "histogram",
+            "navigator",
             "shortcuts",
             "diagnostics",
         ] {
@@ -2506,6 +2528,119 @@ pub(super) fn curves_editor(
 /// the Properties panel. `range`: the tonal range or channel shown, `point`:
 /// the selected curve point; `histogram`: of what it adjusts (Levels,
 /// Curves); `primary`: the foreground color (Colorize starts from it).
+fn channel_mixer_editor(
+    ui: &mut egui::Ui,
+    m: &mut crate::pixel_ops::ChannelMixer,
+    range: &mut usize,
+) {
+    use crate::pixel_ops::ChannelMixer as M;
+    let was = m.monochrome;
+    ui_kit::checkbox(ui, &mut m.monochrome, &t!("adjust8-monochrome"));
+    if m.monochrome && !was {
+        m.rows = [M::GRAY; 3];
+    }
+    gap_between_blocks(ui);
+    let output = (*range).min(2);
+    if !m.monochrome {
+        block(ui, |ui| {
+            ui_kit::field_label(ui, &t!("adjust8-output-channel"));
+            let names = [
+                t!("dialog-color-red"),
+                t!("dialog-color-green"),
+                t!("dialog-color-blue"),
+            ];
+            let mut shown = output;
+            full_segmented(
+                ui,
+                &mut shown,
+                &[(0, &names[0]), (1, &names[1]), (2, &names[2])],
+            );
+            *range = shown;
+        });
+        gap_between_blocks(ui);
+    }
+    let output = if m.monochrome { 0 } else { (*range).min(2) };
+    let mut row = m.rows[output];
+    let limit = M::LIMIT * 100.0;
+    let sources = [
+        (t!("dialog-color-red"), RED),
+        (t!("dialog-color-green"), GREEN),
+        (t!("dialog-color-blue"), BLUE),
+    ];
+    for (i, (name, tint)) in sources.iter().enumerate() {
+        let track = Track::Gradient(&[Color32::BLACK, *tint]);
+        scaled_row(ui, name, &mut row[i], 100.0, -limit..=limit, "", track);
+        gap_between_blocks(ui);
+    }
+    let total = (row[0] + row[1] + row[2]) * 100.0;
+    ui_kit::key_value(
+        ui,
+        &t!("adjust8-total"),
+        &i18n::percent(format!("{total:.0}")),
+    );
+    gap_between_blocks(ui);
+    let constant = t!("adjust8-constant");
+    scaled_row(ui, &constant, &mut row[3], 100.0, -limit..=limit, "", Track::Accent);
+    if m.monochrome {
+        m.rows = [row; 3];
+    } else {
+        m.rows[output] = row;
+    }
+}
+
+fn selective_color_editor(
+    ui: &mut egui::Ui,
+    s: &mut crate::pixel_ops::SelectiveColor,
+    range: &mut usize,
+) {
+    use crate::pixel_ops::SELECTIVE_RANGES;
+    let names: [String; SELECTIVE_RANGES] = [
+        t!("core-bw-reds"),
+        t!("core-bw-yellows"),
+        t!("core-bw-greens"),
+        t!("core-bw-cyans"),
+        t!("core-bw-blues"),
+        t!("core-bw-magentas"),
+        t!("adjust8-whites"),
+        t!("adjust8-neutrals"),
+        t!("adjust8-blacks"),
+    ];
+    let current = (*range).min(SELECTIVE_RANGES - 1);
+    block(ui, |ui| {
+        ui_kit::field_label(ui, &t!("adjust8-colors"));
+        let width = ui.available_width();
+        let mut shown = current;
+        ui_kit::combo(ui, "selective_range", None, &names[current], width, |ui| {
+            for (i, name) in names.iter().enumerate() {
+                ui.selectable_value(&mut shown, i, name);
+            }
+        });
+        *range = shown;
+    });
+    let inks = [
+        (t!("dialog-color-cyan"), CYAN),
+        (t!("dialog-color-magenta"), MAGENTA),
+        (t!("dialog-color-yellow"), YELLOW),
+        (t!("adjust8-black"), Color32::BLACK),
+    ];
+    let values = &mut s.ranges[(*range).min(SELECTIVE_RANGES - 1)];
+    for (value, (name, tint)) in values.iter_mut().zip(&inks) {
+        gap_between_blocks(ui);
+        let track = Track::Gradient(&[Color32::WHITE, *tint]);
+        percent_row(ui, name, None, value, track);
+    }
+    gap_between_blocks(ui);
+    block(ui, |ui| {
+        ui_kit::field_label(ui, &t!("adjust8-method"));
+        let (relative, absolute) = (t!("adjust8-relative"), t!("adjust8-absolute"));
+        full_segmented(
+            ui,
+            &mut s.absolute,
+            &[(false, &relative), (true, &absolute)],
+        );
+    });
+}
+
 pub(super) fn adjustment_editor(
     ui: &mut egui::Ui,
     adjustment: &mut Adjustment,
@@ -2641,6 +2776,45 @@ pub(super) fn adjustment_editor(
             );
             help(ui, &hint);
         }
+        Adjustment::Exposure(e) => {
+            use crate::pixel_ops::Exposure as E;
+            let two = Steps {
+                decimals: 2,
+                ..Steps::WHOLE
+            };
+            let exposure_row = |ui: &mut egui::Ui, label: &str, value: &mut f32, range, default| {
+                slider_row_steps(
+                    ui,
+                    label,
+                    None,
+                    value,
+                    range,
+                    "",
+                    Track::Accent,
+                    default,
+                    two,
+                );
+            };
+            exposure_row(
+                ui,
+                &t!("adjust8-exposure"),
+                &mut e.exposure,
+                -E::EXPOSURE..=E::EXPOSURE,
+                0.0,
+            );
+            gap_between_blocks(ui);
+            exposure_row(
+                ui,
+                &t!("adjust8-offset"),
+                &mut e.offset,
+                -E::OFFSET..=E::OFFSET,
+                0.0,
+            );
+            gap_between_blocks(ui);
+            exposure_row(ui, &t!("adjust8-gamma"), &mut e.gamma, E::GAMMA, 1.0);
+        }
+        Adjustment::ChannelMixer(m) => channel_mixer_editor(ui, m, range),
+        Adjustment::SelectiveColor(s) => selective_color_editor(ui, s, range),
         Adjustment::Vibrance(v) => {
             let vibrance = t!("dialog-adjust-vibrance");
             percent_row(ui, &vibrance, None, &mut v.vibrance, Track::Accent);

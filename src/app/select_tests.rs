@@ -336,8 +336,7 @@ fn reselect_forgets_a_selection_from_before_a_crop() {
     let app = h.state_mut();
     app.selection = Some(rect(10, 10, 20, 20).into());
     app.deselect();
-    app.canvas_rect = Some(Rect::from_min_size(pos2(50.0, 50.0), vec2(100.0, 100.0)));
-    app.apply_canvas();
+    app.apply_crop(super::crop_tool::CropPlan::plain(rect(50, 50, 100, 100)));
     app.run(Action::Reselect);
     assert!(app.selection.is_none() && app.last_selection.is_none());
 }

@@ -128,9 +128,18 @@ pub enum Recorded {
     FlipCanvas {
         horizontal: bool,
     },
-    /// The Crop tool: x, y, width, height (canvas pixels).
+    /// The Crop tool: x, y, width, height (canvas pixels); its turn
+    /// (degrees), Delete Cropped Pixels, W × H × Resolution.
     Crop {
         rect: [i64; 4],
+        #[serde(default)]
+        angle: f32,
+        #[serde(default)]
+        delete: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<(u32, u32)>,
+        #[serde(default)]
+        resolution: f32,
     },
     /// Image › Adjustments, on the active layer.
     Adjust {
@@ -150,6 +159,28 @@ pub enum Recorded {
         contents: Contents,
         /// For `Contents::Color`.
         color: [u8; 3],
+        /// 0..1.
+        opacity: f32,
+        preserve_transparency: bool,
+        /// For `Contents::Pattern`: which one of the library.
+        #[serde(default)]
+        pattern: Option<u64>,
+    },
+    /// Edit › Fade, of the step before it.
+    Fade {
+        /// 0..1.
+        opacity: f32,
+        /// A blend mode's name.
+        mode: String,
+    },
+    /// Edit › Stroke.
+    Stroke {
+        width: u32,
+        color: [u8; 3],
+        /// "Inside", "Center" or "Outside".
+        location: String,
+        /// A blend mode's name.
+        mode: String,
         /// 0..1.
         opacity: f32,
         preserve_transparency: bool,
@@ -240,6 +271,7 @@ pub enum Contents {
     Background,
     Color,
     ContentAware,
+    Pattern,
     Black,
     Gray,
     White,
@@ -286,6 +318,9 @@ pub enum Modify {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MenuItem {
+    AutoTone,
+    AutoContrast,
+    AutoColor,
     NewLayer,
     DuplicateLayer,
     DeleteLayer,
@@ -511,7 +546,8 @@ impl Library {
                 color: [0, 0, 0],
                 opacity: 1.0,
                 preserve_transparency: false,
-            }),
+                pattern: None,
+                }),
             Step::new(Recorded::Deselect),
         ];
         let sepia = vec![

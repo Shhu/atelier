@@ -707,6 +707,7 @@ fn view_options<'a>(
     let mut opts = compose::Options {
         held: doc.effects_held(),
         later_styles: true,
+        canvas: Some(doc.full_rect()),
         hidden: skip,
         blend,
         mask_view: mask_view.then_some(doc.active),
@@ -899,6 +900,7 @@ impl AtelierApp {
         let brush: Vec<PixelRect> = strokes.iter().map(|(_, r)| reduced(*r, level)).collect();
         let focus = ctx
             .pointer_hover_pos()
+            .map(|p| self.view_turn.to_upright(p))
             .filter(|p| shown.contains(*p))
             .unwrap_or(shown.center());
         let focus = view.to_image(focus) / tile as f32;
