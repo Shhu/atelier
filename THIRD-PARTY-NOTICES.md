@@ -80,10 +80,12 @@ freely, subject to the following restrictions:
 
 ```
 
-## Geist fonts
+## Inter and Geist Mono fonts
 
-The interface fonts (assets/fonts) are Geist and Geist Mono by Vercel, under
-the SIL Open Font License 1.1: see assets/fonts/OFL.txt.
+The interface fonts (assets/fonts) are Inter by The Inter Project Authors, under
+the SIL Open Font License 1.1 (see assets/fonts/Inter-OFL.txt; its private use
+area is removed, as those code points are the icons'), and Geist Mono
+by Vercel, under the same license (see assets/fonts/OFL.txt).
 
 ## ONNX Runtime and DirectML (Windows build)
 

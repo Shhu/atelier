@@ -83,10 +83,10 @@ pub mod color {
 }
 
 /// Base UI text size.
-pub const TEXT_SIZE: f32 = 13.0;
+pub const TEXT_SIZE: f32 = 14.0;
 
-const MEDIUM: &str = "geist-medium";
-const SEMIBOLD: &str = "geist-semibold";
+const MEDIUM: &str = "inter-medium";
+const SEMIBOLD: &str = "inter-semibold";
 const MONO_MEDIUM: &str = "geist-mono-medium";
 
 /// Semibold: titles, headings.
@@ -118,7 +118,7 @@ pub fn install(ctx: &egui::Context) {
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
 }
 
-/// Geist for the UI and Geist Mono for numbers (assets/fonts, OFL), with
+/// Inter for the UI and Geist Mono for numbers (assets/fonts, OFL), with
 /// Phosphor icons and egui's fonts as fallback.
 fn fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
@@ -127,26 +127,28 @@ fn fonts() -> FontDefinitions {
     let mut mono_fallback = fonts.families[&FontFamily::Monospace].clone();
     // Icons in numbers and keys (kbd) too.
     mono_fallback.push("phosphor".into());
-    let faces: [(&str, &'static [u8]); 5] = [
-        ("geist", include_bytes!("../assets/fonts/Geist-Regular.ttf")),
-        (MEDIUM, include_bytes!("../assets/fonts/Geist-Medium.ttf")),
-        (
-            SEMIBOLD,
-            include_bytes!("../assets/fonts/Geist-SemiBold.ttf"),
-        ),
+    let weight = |font: &'static [u8], wght: f32| {
+        FontData::from_static(font).tweak(egui::FontTweak {
+            coords: egui::epaint::text::VariationCoords::new([("wght", wght)]),
+            ..Default::default()
+        })
+    };
+    let inter: &'static [u8] = include_bytes!("../assets/fonts/Inter-Variable.ttf");
+    let faces = [
+        ("inter", weight(inter, 400.0)),
+        (MEDIUM, weight(inter, 500.0)),
+        (SEMIBOLD, weight(inter, 600.0)),
         (
             "geist-mono",
-            include_bytes!("../assets/fonts/GeistMono-Regular.ttf"),
+            FontData::from_static(include_bytes!("../assets/fonts/GeistMono-Regular.ttf")),
         ),
         (
             MONO_MEDIUM,
-            include_bytes!("../assets/fonts/GeistMono-Medium.ttf"),
+            FontData::from_static(include_bytes!("../assets/fonts/GeistMono-Medium.ttf")),
         ),
     ];
     for (name, data) in faces {
-        fonts
-            .font_data
-            .insert(name.into(), Arc::new(FontData::from_static(data)));
+        fonts.font_data.insert(name.into(), Arc::new(data));
     }
     let family = |first: &str, rest: &[String]| {
         std::iter::once(first.to_owned())
@@ -155,7 +157,7 @@ fn fonts() -> FontDefinitions {
     };
     fonts
         .families
-        .insert(FontFamily::Proportional, family("geist", &fallback));
+        .insert(FontFamily::Proportional, family("inter", &fallback));
     fonts
         .families
         .insert(FontFamily::Name(MEDIUM.into()), family(MEDIUM, &fallback));
@@ -174,6 +176,9 @@ fn fonts() -> FontDefinitions {
 }
 
 fn style(style: &mut egui::Style) {
+    // Fitting the outlines to the pixel grid takes up to a pixel off the
+    // height of small text, which then looks squashed.
+    style.visuals.text_options.font_hinting = false;
     style.text_styles = [
         (TextStyle::Heading, bold(TEXT_SIZE)),
         (TextStyle::Body, FontId::proportional(TEXT_SIZE)),
@@ -1370,6 +1375,44 @@ pub fn pill(painter: &Painter, pos: Pos2, anchor: Align2, text: &str) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    /// Letters come from Inter and icons from Phosphor. Each font has glyphs
+    /// at the other's code points unless removed: Inter's private use area
+    /// is stripped from its file, and Phosphor has to stay after it.
+    #[test]
+    fn letters_and_icons_each_come_from_their_font() {
+        let context = |fonts: FontDefinitions| {
+            let ctx = egui::Context::default();
+            ctx.set_fonts(fonts);
+            let _ = ctx.run_ui(Default::default(), |_| {});
+            ctx
+        };
+        let alone = |name: &str| {
+            let mut only = fonts();
+            only.families
+                .insert(FontFamily::Proportional, vec![name.to_owned()]);
+            context(only)
+        };
+        let width = |c: &egui::Context, text: &str| {
+            c.fonts_mut(|f| {
+                f.layout_no_wrap(text.to_owned(), FontId::proportional(16.0), Color32::WHITE)
+                    .size()
+                    .x
+            })
+        };
+        let (app, inter, phosphor) = (context(fonts()), alone("inter"), alone("phosphor"));
+        let text = "Mgabcdefghijklmnopqrstuvwxyz é…";
+        assert!(width(&app, text) > 100.0);
+        assert_eq!(width(&app, text), width(&inter, text));
+        for icon in [
+            egui_phosphor::regular::EYE,
+            egui_phosphor::regular::ARROW_LEFT,
+            egui_phosphor::regular::PAINT_BRUSH,
+            egui_phosphor::regular::HAND,
+        ] {
+            assert_eq!(width(&app, icon), width(&phosphor, icon), "{icon}");
+        }
+    }
+
     use egui::accesskit::Toggled;
     use egui_kittest::Harness;
     use egui_kittest::kittest::{NodeT, Queryable};
