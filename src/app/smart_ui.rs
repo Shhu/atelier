@@ -297,7 +297,7 @@ impl AtelierApp {
     pub(super) fn smart_command(&mut self, cmd: Command) {
         use Command::*;
         let modifies = !matches!(cmd, PlaceLinked | EditContents | ExportContents | Convert);
-        if self.doc.is_none() || (modifies && self.refuse_if_locked()) {
+        if self.doc.is_none() || (modifies && self.refuse_content_locked()) {
             return;
         }
         match cmd {
@@ -540,6 +540,10 @@ impl AtelierApp {
             return;
         }
         self.commit_pending();
+        // It must be framed: not in a group that won't let it move.
+        if self.refuse_new_layer_stuck() {
+            return;
+        }
         let Some(doc) = &mut self.doc else {
             self.open_path(path);
             return;
@@ -1298,19 +1302,53 @@ impl AtelierApp {
         let doc = self.doc.as_ref()?;
         let layer = doc.active_layer();
         let key = (layer.id, layer.rev(), self.smart.editing);
-        if let Some((k, target)) = &self.smart.input
-            && *k == key
-        {
-            return Some(target.clone());
-        }
-        let image = doc.smart_filter_input(doc.active, self.smart.editing)?;
-        let target = Target {
-            image,
-            clip: None,
-            offset: layer.offset,
+        let mut target = match &self.smart.input {
+            Some((k, target)) if *k == key => target.clone(),
+            _ => {
+                let image = doc.smart_filter_input(doc.active, self.smart.editing)?;
+                let origin = doc.smart_filter_origin(doc.active).unwrap_or(layer.offset);
+                let target = Target {
+                    whole_source: true,
+                    ..Target::of(image, origin)
+                };
+                self.smart.input = Some((key, target.clone()));
+                target
+            }
         };
-        self.smart.input = Some((key, target.clone()));
+        // Shown through the filter mask the selection will give.
+        if self.first_filter_takes_selection()
+            && let Some(selection) = &self.selection
+            && layer.image().dimensions() == target.image.dimensions()
+        {
+            let nothing = crate::pixel_ops::Clip::from([0, 0, 0, 0]);
+            target.clip = Some(selection.clip(layer, doc.full_rect()).unwrap_or(nothing));
+        }
         Some(target)
+    }
+
+    /// The first filter of the active smart object gets its filter mask from
+    /// the selection, if any.
+    fn first_filter_takes_selection(&self) -> bool {
+        self.active_smart()
+            .is_some_and(|s| s.filters.is_empty() && s.filter_mask.is_none())
+    }
+
+    /// The filter mask a first filter gets from the selection.
+    fn filter_mask_of_selection(&self) -> Option<crate::document::Mask> {
+        let doc = self.doc.as_ref()?;
+        let layer = doc.active_layer();
+        let canvas = doc.full_rect();
+        let sel = self
+            .selection
+            .as_ref()
+            .filter(|_| self.first_filter_takes_selection())?;
+        let outside = if sel.inverted { 255 } else { 0 };
+        Some(crate::document::Mask::new(
+            sel.to_mask(canvas),
+            (canvas.x, canvas.y),
+            outside,
+            layer.offset,
+        ))
     }
 
     /// The filters of the active smart object with `filter` applied: in
@@ -1379,7 +1417,14 @@ impl AtelierApp {
             return;
         }
         let Some(doc) = &self.doc else { return };
-        let Some(job) = doc.smart_preview_job(doc.active, move |s| s.filters = filters) else {
+        // As the result will be: through the filter mask of the selection.
+        let mask = self.filter_mask_of_selection();
+        let Some(job) = doc.smart_preview_job(doc.active, move |s| {
+            s.filters = filters;
+            if mask.is_some() {
+                s.filter_mask = mask;
+            }
+        }) else {
             return;
         };
         let label = Some("Smart filter preview".to_owned());
@@ -1407,27 +1452,9 @@ impl AtelierApp {
         let layer = doc.active_layer();
         // As `smart_preview` keys it.
         let key = preview_key(layer, &filters);
-        let first = layer
-            .smart
-            .as_ref()
-            .is_some_and(|s| s.filters.is_empty() && s.filter_mask.is_none());
-        let canvas = doc.full_rect();
-        let mask = self.selection.as_ref().filter(|_| first).map(|sel| {
-            let outside = if sel.inverted { 255 } else { 0 };
-            crate::document::Mask::new(
-                sel.to_mask(canvas),
-                (canvas.x, canvas.y),
-                outside,
-                layer.offset,
-            )
-        });
-        // The dialog's preview of the same filters is the result (not with
-        // a filter mask it didn't have).
-        let ready = if mask.is_some() {
-            None
-        } else {
-            self.preview_of_smart(key)
-        };
+        let mask = self.filter_mask_of_selection();
+        // The dialog's preview of the same filters is the result.
+        let ready = self.preview_of_smart(key);
         self.status = t!("filter-applied", name = name.shown.as_str());
         let change = move |s: &mut SmartObject| {
             s.filters = filters;

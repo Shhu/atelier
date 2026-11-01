@@ -348,7 +348,8 @@ impl Builder<'_, '_> {
         let level = self.sources.level();
         let (exterior, interior) = self.styles(i);
         // Without styles, a group's fill opacity acts as its opacity does.
-        let styled = !exterior.is_empty() || !interior.is_empty();
+        // Those still being drawn count: only their image comes later.
+        let styled = self.opts.no_styles != Some(i) && l.styleable() && l.effects.any();
         let (opacity, fill) = match styled {
             true => (l.opacity, l.fill),
             false => (l.opacity * l.fill, 1.0),
@@ -367,6 +368,7 @@ impl Builder<'_, '_> {
             fill,
             mask: self.mask(l),
             board,
+            styled,
             exterior,
             interior,
         })))
@@ -445,12 +447,13 @@ impl Builder<'_, '_> {
         }
         if fx.pattern_overlay.enabled {
             let p = &fx.pattern_overlay;
-            // Linked: from the top left corner of the layer's content.
-            let origin = if p.fill.linked {
-                let b = content_box;
-                (b.x as f32, b.y as f32)
-            } else {
-                (0.0, 0.0)
+            // Linked: from the top left corner of the layer (see
+            // `Layer::reframe`: painting doesn't move it), of what a group
+            // holds; the phase keeps it where it was.
+            let origin = match (p.fill.linked, l.is_group()) {
+                (false, _) => (0.0, 0.0),
+                (true, true) => (content_box.x as f32, content_box.y as f32),
+                (true, false) => (l.offset.0 as f32, l.offset.1 as f32),
             };
             let level = self.sources.level();
             interior.push(Interior::Pattern {

@@ -574,7 +574,7 @@ pub(super) fn unavailable_reason(f: &Facts, action: Action) -> String {
     } else if matches!(action, Action::Rasterize) && !f.live {
         t!("ui4-why-not-live")
     } else if matches!(action, Action::Fade) {
-        t!("adjust8-why-no-fade")
+        t!("adjust9-why-no-fade")
     } else if matches!(action, Action::Adjust(_) | Action::AutoAdjust(_) | Action::Stroke)
         && f.smart_pixels
     {
@@ -751,6 +751,7 @@ type Rank = (
     u32,
     bool,
     bool,
+    bool,
     std::cmp::Reverse<usize>,
     u32,
     std::cmp::Reverse<usize>,
@@ -770,10 +771,13 @@ fn ranked(
             let depth = e.path.matches('›').count();
             // Clear Recent File List can't be undone: never ahead of
             // anything (the files themselves for "recent").
-            let level = if matches!(e.action, Action::Workspace(workspace::Command::ClearRecent)) {
-                0
-            } else {
-                score / 20
+            let level = match e.action {
+                Action::Workspace(workspace::Command::ClearRecent) => 0,
+                // One click on the whole layer, or only the view: never
+                // ahead of the command with its settings ("contrast") or
+                // the one that changes the image ("flip").
+                Action::AutoAdjust(_) | Action::View(rulers::Command::FlipHorizontal) => (score / 20).min(4),
+                _ => score / 20,
             };
             // A recent file's name matches by chance: commands first.
             let command = !matches!(
@@ -785,11 +789,14 @@ fn ranked(
             // A label starting with the query: the shallower first (Window ›
             // Layers before View › Snap To › Layers).
             let near = std::cmp::Reverse(if level >= 5 { depth } else { 0 });
+            // "Auto Contrast" and "Brightness/Contrast…" match alike.
+            let settings = !matches!(e.action, Action::AutoAdjust(_));
             Some((
                 (
                     level,
                     e.enabled,
                     command,
+                    settings,
                     near,
                     score,
                     std::cmp::Reverse(depth),
@@ -803,7 +810,7 @@ fn ranked(
     scored.sort_by_key(|(key, _)| std::cmp::Reverse(*key));
     let best = scored
         .first()
-        .map_or(0, |((_, _, _, _, score, _, _), _)| *score);
+        .map_or(0, |((_, _, _, _, _, score, _, _), _)| *score);
     let more = scored.len().saturating_sub(max);
     let entries = scored
         .into_iter()
@@ -932,7 +939,9 @@ fn rate(
         let first = words(&keywords)
             .position(|k| wanted.iter().any(|q| matches(k, q)))
             .unwrap_or(usize::MAX);
-        Some(30 + phrase + 4u32.saturating_sub(first.min(4) as u32))
+        // A keyword typed whole before one it only resembles ("fondu", "fond").
+        let whole = wanted.iter().all(|q| words(&keywords).any(|k| k == *q));
+        Some(30 + phrase + 4u32.saturating_sub(first.min(4) as u32) + 5 * u32::from(whole))
     }
 }
 
@@ -1238,6 +1247,23 @@ mod tests {
             .flat_map(|(_, entries, _)| entries)
             .map(|e| (e.label, e.action))
             .collect()
+    }
+
+    /// One-click commands and the view's flip don't come first; a keyword
+    /// typed whole beats one it only resembles.
+    #[test]
+    fn settings_and_image_commands_before_one_click_and_view() {
+        let h = app(true, Lang::En);
+        let first = |q: &str| found(&h, q).into_iter().next().unwrap().1;
+        assert!(matches!(first("contrast"), Action::Adjust(AdjustKind::BrightnessContrast)));
+        assert!(!matches!(first("flip"), Action::View(_)));
+        // Exactly its name still finds it first.
+        assert!(matches!(first("auto contrast"), Action::AutoAdjust(_)));
+        i18n::set_lang(Lang::Fr);
+        assert!(matches!(first("contraste"), Action::Adjust(AdjustKind::BrightnessContrast)));
+        let fondu = |keywords| score("Commande", "Menu", keywords, "fondu");
+        assert!(fondu("estomper fondu") > fondu("fond arrière-plan"));
+        assert!(found(&h, "pincement")[0].0.starts_with(&t!("distort8-pinch")));
     }
 
     #[test]

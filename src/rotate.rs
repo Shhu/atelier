@@ -8,6 +8,19 @@ pub fn rotated_size(w: f32, h: f32, degrees: f32) -> (f32, f32) {
     (w * c.abs() + h * s.abs(), w * s.abs() + h * c.abs())
 }
 
+/// The size of what [`rotate`] gives for an image of `w` × `h`.
+pub fn rotated_dimensions(w: u32, h: u32, degrees: f32) -> (u32, u32) {
+    let quarter = degrees / 90.0;
+    if (quarter - quarter.round()).abs() < 1e-4 {
+        return match (quarter.round() as i64).rem_euclid(2) {
+            0 => (w, h),
+            _ => (h, w),
+        };
+    }
+    let (rw, rh) = rotated_size(w as f32, h as f32, degrees);
+    (rw.ceil().max(1.0) as u32, rh.ceil().max(1.0) as u32)
+}
+
 /// Rotates `image` by `degrees` (clockwise on screen) around its center.
 /// The resulting image contains all the rotated content; the added corners are
 /// transparent. Quarter turns are exact (no resampling);

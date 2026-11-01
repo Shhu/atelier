@@ -180,7 +180,7 @@ impl Names {
 }
 
 /// The operations measured under a fixed English name, as shown.
-fn static_operation(name: &str) -> Option<String> {
+pub(super) fn static_operation(name: &str) -> Option<String> {
     Some(match name {
         "History: record step" => t!("ui4-op-history-record"),
         "History: go to step" => t!("ui4-op-history-go"),
@@ -200,13 +200,17 @@ fn static_operation(name: &str) -> Option<String> {
         "Object Selection: image analysis" => t!("ui4-op-objsel-analysis"),
         "Smart object rendering" => t!("ui5-op-smart-render"),
         "Smart filter preview" => t!("ui5-op-smart-preview"),
+        // F and Shift+F, not in a menu.
+        "Workspace(CycleScreenMode(false))" | "Workspace(CycleScreenMode(true))" => {
+            t!("panels8-menu-screen-mode")
+        }
         "Select Subject" => format!("{} › {}", t!("menu-select"), t!("menu-select-subject")),
         _ => return None,
     })
 }
 
 /// The name of a dialog open during a freeze (see `dialog_name`).
-fn dialog_label(name: &str) -> String {
+pub(super) fn dialog_label(name: &str) -> String {
     let trimmed = |s: String| s.trim_end_matches('…').to_owned();
     match name {
         "Adjustment" => t!("menu-image-adjustments"),
@@ -214,7 +218,11 @@ fn dialog_label(name: &str) -> String {
         "Filter" => t!("filter-menu"),
         "Liquify" => t!("liquify-title"),
         "Smart Filter" => t!("smart-filters"),
+        "Fade" => t!("adjust8-fade-title"),
+        "Stroke" => t!("adjust8-stroke-title"),
         "Fill" => trimmed(t!("menu-edit-fill")),
+        "Define Pattern" => trimmed(t!("pattern8-menu-define")),
+        "Rename Pattern" => t!("pattern8-rename-title"),
         "Content-Aware Fill" => trimmed(t!("retouch-menu-content-aware-fill")),
         "Image Size" => trimmed(t!("menu-image-image-size")),
         "Canvas Size" => trimmed(t!("menu-image-canvas-size")),
@@ -394,10 +402,12 @@ impl AtelierApp {
 
     /// The dialog or workspace open, if any (English, the name it is
     /// measured by; see `dialog_label`).
-    fn dialog_name(&self) -> Option<&'static str> {
+    pub(super) fn dialog_name(&self) -> Option<&'static str> {
         let open = [
             (self.adjust.is_some(), "Adjustment"),
             (self.layer_style.is_some(), "Layer Style"),
+            (self.filters.fade.is_some(), "Fade"),
+            (self.filters.stroke_open, "Stroke"),
             (self.filters.busy(), "Filter"),
             (self.camera_raw.busy(), "Camera Raw"),
             (self.liquify.busy(), "Liquify"),

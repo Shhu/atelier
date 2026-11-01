@@ -573,10 +573,16 @@ impl AtelierApp {
         let tick = step / divisions as f32;
         let font = ui_kit::mono(10.0);
         let tick_stroke = UiStroke::new(1.0, color::SWATCH_LINE);
-        // Ticks of one ruler: positions along it, from `from` to `to` (screen).
-        let ticks = |from: f32, to: f32, origin: f32| {
-            let first = ((from - origin) / view.zoom / tick).floor() as i64;
-            let last = ((to - origin) / view.zoom / tick).ceil() as i64;
+        // On a turned or flipped view, each ruler reads the image axis along it.
+        let turn = self.view_turn;
+        let center = turn.center;
+        let [top_axis, left_axis] = turn.ruler_axes();
+        // Ticks of one ruler: positions along it, from `from` to `to` (screen);
+        // `origin` is where it reads 0, and the values go `sign` way.
+        let ticks = |from: f32, to: f32, origin: f32, sign: f32| {
+            let (a, b) = ((from - origin) * sign, (to - origin) * sign);
+            let first = (a.min(b) / view.zoom / tick).floor() as i64;
+            let last = (a.max(b) / view.zoom / tick).ceil() as i64;
             (first..=last).map(move |i| {
                 let value = i as f32 * tick;
                 let rank = i.rem_euclid(divisions as i64);
@@ -587,11 +593,12 @@ impl AtelierApp {
                 } else {
                     RULER * 0.25
                 };
-                (origin + value * view.zoom, value, rank == 0, length)
+                (origin + sign * value * view.zoom, value, rank == 0, length)
             })
         };
         let top_painter = painter.with_clip_rect(top);
-        for (x, value, numbered, length) in ticks(top.left(), top.right(), view.origin.x) {
+        let origin = top_axis.place(view.origin, center, center.x);
+        for (x, value, numbered, length) in ticks(top.left(), top.right(), origin, top_axis.sign) {
             let x = x.round() + 0.5;
             top_painter.vline(x, top.bottom() - length..=top.bottom(), tick_stroke);
             if numbered {
@@ -605,7 +612,9 @@ impl AtelierApp {
             }
         }
         let left_painter = painter.with_clip_rect(left);
-        for (y, value, numbered, length) in ticks(left.top(), left.bottom(), view.origin.y) {
+        let origin = left_axis.place(view.origin, center, center.y);
+        for (y, value, numbered, length) in ticks(left.top(), left.bottom(), origin, left_axis.sign)
+        {
             let y = y.round() + 0.5;
             left_painter.hline(left.right() - length..=left.right(), y, tick_stroke);
             if numbered {
@@ -625,8 +634,11 @@ impl AtelierApp {
             .filter(|p| canvas.contains(*p))
         {
             let mark = UiStroke::new(1.0, color::TEXT);
-            top_painter.vline(p.x.round() + 0.5, top.y_range(), mark);
-            left_painter.hline(left.x_range(), p.y.round() + 0.5, mark);
+            // Where its true coordinates read (right under it at quarter turns).
+            let p = turn.to_upright(p);
+            let (x, y) = (top_axis.place(p, center, center.x), left_axis.place(p, center, center.y));
+            top_painter.vline(x.round() + 0.5, top.y_range(), mark);
+            left_painter.hline(left.x_range(), y.round() + 0.5, mark);
         }
     }
 

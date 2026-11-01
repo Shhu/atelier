@@ -1,24 +1,122 @@
-//! The Crop tool's cut: the canvas, and what falls outside it if asked.
+//! The Crop tool's cut (the canvas, what falls outside it if asked), and
+//! the changes of the whole document computed on a work copy, off the UI
+//! thread: Image Rotation, the crop turned or resampled. Put in place, they
+//! are one step, whatever they went through.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use image::imageops::FilterType;
 use image::RgbaImage;
 
-use super::{Document, Layer, PixelRect, intersect};
+use super::{Document, Layer, PixelRect, State, guides, intersect, next_rev, vectors};
 use crate::i18n::t;
+use crate::mask_ops::Affine;
+
+/// A crop: the box in the canvas, turned by `angle` (degrees, clockwise),
+/// then what is left resampled to `size`, at `resolution` pixels per inch.
+#[derive(Clone, Copy, Debug)]
+pub struct CropOrder {
+    pub rect: PixelRect,
+    pub angle: f32,
+    pub delete: bool,
+    pub size: Option<(u32, u32)>,
+    pub resolution: f32,
+    pub filter: FilterType,
+}
+
+/// A change of the whole document.
+#[derive(Clone, Copy, Debug)]
+pub enum WholeChange {
+    /// Image Rotation, in degrees, clockwise.
+    Rotate(f32),
+    Crop(CropOrder),
+}
+
+/// The work of a [`WholeChange`], to run on any thread.
+pub struct WholeJob {
+    work: Document,
+    change: WholeChange,
+    cancel: Arc<AtomicBool>,
+}
+
+/// What a [`WholeJob`] made, for [`Document::put_whole`].
+pub struct WholeDone {
+    state: State,
+    changed: bool,
+    /// Where the change takes a canvas point (texts follow it).
+    pub map: Affine,
+    /// The box's size, resampled or not.
+    pub size: (u32, u32),
+    pub resampled: bool,
+}
 
 impl Document {
+    /// The job of `change` on the current state; `cancel` set gives it up.
+    pub fn whole_job(&self, change: WholeChange, cancel: Arc<AtomicBool>) -> WholeJob {
+        let mut work = Document::new(RgbaImage::new(0, 0), None);
+        work.restore(self.state());
+        work.next_id = self.next_id;
+        WholeJob {
+            work,
+            change,
+            cancel,
+        }
+    }
+
+    /// `done` in place, as one step named `name`. Returns whether anything
+    /// changed. The state before is kept whole by that step, whatever the
+    /// history budget: nothing in between counts against it.
+    pub fn put_whole(&mut self, done: WholeDone, name: String) -> bool {
+        if !done.changed {
+            return false;
+        }
+        self.checkpoint(name);
+        let mut state = done.state;
+        state.id = next_rev();
+        self.restore(state);
+        true
+    }
+
     /// Crop to `r`; with `delete`, the layers' pixels and masks beyond the
     /// new canvas go as well. One step.
+    #[cfg(test)]
     pub fn crop_area(&mut self, r: PixelRect, delete: bool) {
+        self.crop_area_shifted(r, delete);
+    }
+
+    /// [`Self::crop_area`]: how much further the canvas's origin went, the
+    /// artboards being kept.
+    fn crop_area_shifted(&mut self, r: PixelRect, delete: bool) -> (i64, i64) {
         let mark = self.history_mark();
         self.crop(r);
+        let shift = self.crop_artboards();
         if delete && self.delete_outside_canvas() {
             self.join_since(mark);
         }
+        shift
+    }
+
+    /// After a crop: the artboards the box touched are cut to it, and the
+    /// others stay as they are; the canvas remains the box of them all.
+    fn crop_artboards(&mut self) -> (i64, i64) {
+        let canvas = self.full_rect();
+        for layer in &mut self.layers {
+            let Some(r) = layer.artboard_rect() else {
+                continue;
+            };
+            if let (Some(k), Some(a)) = (intersect(r, canvas), &mut layer.artboard) {
+                a.size = (k.w, k.h);
+                layer.offset = (k.x, k.y);
+            }
+        }
+        self.fit_artboards().map_or((0, 0), |b| (b.x, b.y))
     }
 
     /// Cuts the plain pixel layers and every mask to the canvas, as its own
     /// step. Texts, shapes, smart objects and artboards are not pixels to
-    /// cut, nor is what a board holds (the board stays as it was): they stay
+    /// cut, nor is what a board holds (the board stays as it was), nor what
+    /// styles are drawn from (they would change on what remains): they stay
     /// whole. Returns whether anything went.
     fn delete_outside_canvas(&mut self) -> bool {
         let canvas = self.full_rect();
@@ -26,7 +124,7 @@ impl Document {
         let cuttable: Vec<usize> = (0..self.layers.len())
             .filter(|&i| {
                 let l = &self.layers[i];
-                if self.artboard_of(i).is_some() {
+                if self.artboard_of(i).is_some() || self.styled(i) {
                     return false;
                 }
                 plain_pixels(l) && overhangs(l.rect())
@@ -57,11 +155,194 @@ impl Document {
                     None => (RgbaImage::new(0, 0), (0, 0)),
                 };
                 layer.replace_pixels(image);
-                layer.offset = offset;
+                layer.reframe(offset);
             }
             layer.edit_mask(old, |m| m.cut_to(canvas));
         }
         true
+    }
+
+    /// Layer `i` or a group holding it draws styles from its shape.
+    fn styled(&self, i: usize) -> bool {
+        let mut at = Some(i);
+        while let Some(j) = at {
+            if self.layers[j].effects.any() {
+                return true;
+            }
+            at = self.parent(j);
+        }
+        false
+    }
+
+    /// The canvas turned by `degrees`: its map, once done.
+    fn turn_for_whole(&mut self, degrees: f32, cancel: &AtomicBool) -> Option<Affine> {
+        let old = self.canvas;
+        self.rotate_canvas_unless(degrees, cancel).then(|| {
+            let new = self.canvas;
+            let (s, c) = vectors::sin_cos(degrees.rem_euclid(360.0));
+            let (ox, oy) = (old.0 as f32 / 2.0, old.1 as f32 / 2.0);
+            let (nx, ny) = (new.0 as f32 / 2.0, new.1 as f32 / 2.0);
+            Affine([c, -s, nx - (c * ox - s * oy), s, c, ny - (s * ox + c * oy)])
+        })
+    }
+}
+
+const IDENTITY: Affine = Affine([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+
+/// `a`, then `b`.
+fn then(Affine(a): Affine, Affine(b): Affine) -> Affine {
+    Affine([
+        b[0] * a[0] + b[1] * a[3],
+        b[0] * a[1] + b[1] * a[4],
+        b[0] * a[2] + b[1] * a[5] + b[2],
+        b[3] * a[0] + b[4] * a[3],
+        b[3] * a[1] + b[4] * a[4],
+        b[3] * a[2] + b[4] * a[5] + b[5],
+    ])
+}
+
+/// `r` around `center` before the canvas turned by `map`, in the turned
+/// canvas: same size, around the new place of its center.
+fn turned_box(r: PixelRect, center: (f32, f32), Affine(m): Affine) -> PixelRect {
+    let x = m[0] * center.0 + m[1] * center.1 + m[2];
+    let y = m[3] * center.0 + m[4] * center.1 + m[5];
+    PixelRect {
+        x: (x - r.w as f32 / 2.0).round() as i64,
+        y: (y - r.h as f32 / 2.0).round() as i64,
+        ..r
+    }
+}
+
+impl WholeJob {
+    /// Number of pixels it computes, about (to run small ones at once).
+    pub fn size(&self) -> u64 {
+        let turning = match self.change {
+            WholeChange::Rotate(_) => true,
+            WholeChange::Crop(c) => c.angle != 0.0 || c.size.is_some() || c.delete,
+        };
+        if !turning {
+            return 0;
+        }
+        let area = |w: u32, h: u32| u64::from(w) * u64::from(h);
+        let d = &self.work;
+        let layers = d.layers.iter().map(|l| {
+            let mask = l.mask.as_ref().map_or(0, |m| {
+                let (w, h) = m.image().dimensions();
+                area(w, h)
+            });
+            area(l.image().width(), l.image().height()) + mask
+        });
+        let channels = d.channels.iter().map(|c| area(c.mask.width(), c.mask.height()));
+        layers.chain(channels).sum()
+    }
+
+    /// A smart object it renders again runs smart filters (whose cost its
+    /// size can't tell).
+    pub fn has_filters(&self) -> bool {
+        let renders = match self.change {
+            WholeChange::Rotate(_) => true,
+            WholeChange::Crop(c) => c.angle != 0.0 || c.size.is_some(),
+        };
+        let filtered = |l: &Layer| l.smart.as_ref().is_some_and(|s| !s.filters.is_empty());
+        renders && self.work.layers.iter().any(filtered)
+    }
+
+    /// The work; `None`: cancelled.
+    pub fn run(self) -> Option<WholeDone> {
+        let Self {
+            mut work,
+            change,
+            cancel,
+        } = self;
+        let mut done = WholeDone {
+            state: work.state(),
+            changed: false,
+            map: IDENTITY,
+            size: work.canvas,
+            resampled: false,
+        };
+        let mut meta_changed = false;
+        match change {
+            WholeChange::Rotate(degrees) => {
+                if let Some(map) = work.turn_for_whole(degrees, &cancel) {
+                    done.map = map;
+                }
+            }
+            WholeChange::Crop(c) => {
+                let center = (
+                    c.rect.x as f32 + c.rect.w as f32 / 2.0,
+                    c.rect.y as f32 + c.rect.h as f32 / 2.0,
+                );
+                let mut r = c.rect;
+                let quarter = (c.angle / 90.0).fract() == 0.0;
+                let upright_guides = work.guides.clone();
+                if c.angle != 0.0
+                    && let Some(map) = work.turn_for_whole(-c.angle, &cancel)
+                {
+                    done.map = map;
+                    r = turned_box(r, center, map);
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let (dx, dy) = work.crop_area_shifted(r, c.delete);
+                let shift = (-r.x - dx, -r.y - dy);
+                done.map = then(
+                    done.map,
+                    Affine([1.0, 0.0, shift.0 as f32, 0.0, 1.0, shift.1 as f32]),
+                );
+                if c.angle != 0.0 && !quarter {
+                    // Guides can't turn: they keep their place on the box.
+                    let to = (
+                        r.w as f32 / 2.0 - dx as f32,
+                        r.h as f32 / 2.0 - dy as f32,
+                    );
+                    work.guides = upright_guides;
+                    guides::shift(&mut work.guides, to.0 - center.0, to.1 - center.1);
+                }
+                done.size = (r.w, r.h);
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if let Some((w, h)) = c.size {
+                    // The box takes that size; artboards outside it follow.
+                    let (sx, sy) = (w as f64 / r.w as f64, h as f64 / r.h as f64);
+                    let target = if work.canvas == (r.w, r.h) {
+                        (w, h)
+                    } else {
+                        (
+                            (work.canvas.0 as f64 * sx).round() as u32,
+                            (work.canvas.1 as f64 * sy).round() as u32,
+                        )
+                    };
+                    if super::check_size(target.0, target.1).is_ok()
+                        && work.resize_image(target.0, target.1, c.filter)
+                    {
+                        done.map = then(
+                            done.map,
+                            Affine([sx as f32, 0.0, 0.0, 0.0, sy as f32, 0.0]),
+                        );
+                        done.resampled = true;
+                        done.size = (w, h);
+                    }
+                }
+                if c.resolution > 0.0 && c.resolution.is_finite() {
+                    let density = f64::from(c.resolution);
+                    let current = work.file_metadata.image.as_ref().and_then(|m| m.density);
+                    if current != Some((density, density)) {
+                        let meta = work.file_metadata.image.get_or_insert_default();
+                        Arc::make_mut(meta).density = Some((density, density));
+                        meta_changed = true;
+                    }
+                }
+            }
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        done.changed = work.can_undo() || meta_changed;
+        done.state = work.state();
+        Some(done)
     }
 }
 

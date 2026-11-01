@@ -13,7 +13,7 @@ impl AtelierApp {
             return;
         };
         let layer = &doc.layers[a];
-        if layer.locked {
+        if !doc.can_move(a) {
             return locked_notice(
                 ui,
                 &t!("options-layer-locked"),

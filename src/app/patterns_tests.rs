@@ -400,20 +400,484 @@ fn the_layer_style_page_and_the_picker_show_and_choose() {
     assert_eq!(doc.flatten().get_pixel(0, 0).0, RED);
 }
 
+/// Right click at the center of `rect`, with the pointer's real events.
+fn right_click(h: &mut Harness<'static, AtelierApp>, rect: egui::Rect) {
+    let pos = rect.center();
+    h.event(egui::Event::PointerMoved(pos));
+    h.run_steps(2);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        });
+        h.run_steps(2);
+    }
+    h.run_steps(2);
+}
+
+/// The picker of Fill… opened, with real clicks.
+fn open_picker(h: &mut Harness<'static, AtelierApp>, id: u64) {
+    h.state_mut().fill_dialog = Some(fill_dialog(id));
+    h.run_steps(3);
+    h.get_by_label(&t!("pattern8-pattern")).click();
+    h.run_steps(3);
+}
+
 #[test]
-fn renaming_and_deleting_go_through_the_library() {
+fn rename_and_delete_are_reached_by_a_right_click_in_the_picker() {
     let mut h = app();
     let id = with_tile(&mut h);
     let count = h.state().patterns.library.items.len();
-    h.run_steps(1);
-    let ctx = h.ctx.clone();
-    ctx.data_mut(|d| d.insert_temp(request_id(), Some(Request::Rename(id))));
-    h.run_steps(2);
+    open_picker(&mut h, id);
+    let rect = h.get_by_label("Tile").rect();
+    right_click(&mut h, rect);
+    h.get_by_label(&t!("pattern8-rename")).click();
+    h.run_steps(4);
     assert_eq!(h.state().patterns.rename.as_ref().unwrap().name(), "Tile");
     h.state_mut().patterns.rename = None;
-    ctx.data_mut(|d| d.insert_temp(request_id(), Some(Request::Delete(id))));
+    h.run_steps(3);
+
+    // Delete asks first; Cancel keeps it.
+    if h.query_by_label("Tile").is_none() {
+        h.get_by_label(&t!("pattern8-pattern")).click();
+        h.run_steps(3);
+    }
+    let rect = h.get_by_label("Tile").rect();
+    right_click(&mut h, rect);
+    h.get_by_label(&t!("pattern8-delete")).click();
+    h.run_steps(4);
+    assert!(h.state().patterns.delete.is_some());
+    assert_eq!(h.state().patterns.library.items.len(), count);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().patterns.delete.is_none());
+    assert_eq!(h.state().patterns.library.items.len(), count);
+
+    h.state_mut().patterns.delete = Some(DeleteDialog {
+        id,
+        name: "Tile".into(),
+    });
     h.run_steps(2);
+    h.get_by_label(&t!("pattern9-delete-ok")).click();
+    h.run_steps(3);
+    assert!(h.state().patterns.delete.is_none());
     assert_eq!(h.state().patterns.library.items.len(), count - 1);
+}
+
+#[test]
+fn a_left_click_on_a_tile_chooses_it_and_closes_the_picker() {
+    let mut h = app();
+    let id = with_tile(&mut h);
+    let first = h.state().patterns.library.items[0].clone();
+    open_picker(&mut h, first.id);
+    h.get_by_label("Tile").click();
+    h.run_steps(4);
+    assert_eq!(h.state().fill_dialog.as_ref().unwrap().pattern, id);
+    assert!(h.query_by_label("Tile").is_none(), "closed");
+}
+
+#[test]
+fn a_built_in_pattern_is_shown_in_the_current_language() {
+    let mut h = app();
+    let id = h.state().patterns.library.items[0].id;
+    crate::i18n::set_lang(crate::i18n::Lang::Fr);
+    let french = t!("pattern8-builtin-checker");
+    h.state_mut().fill_dialog = Some(fill_dialog(id));
+    h.run_steps(3);
+    let found = h.query_by_value(&french).is_some();
+    let name = h.state().patterns.library.items[0].name.clone();
+    crate::i18n::set_lang(crate::i18n::Lang::En);
+    assert_eq!(name, french);
+    assert!(found, "{french}");
+}
+
+#[test]
+fn define_with_a_selection_off_the_canvas_is_refused() {
+    let mut h = app();
+    let app = h.state_mut();
+    let w = app.doc.as_ref().unwrap().width();
+    app.selection = Some(
+        PixelRect {
+            x: w as i64 + 100,
+            y: 0,
+            w: 10,
+            h: 10,
+        }
+        .into(),
+    );
+    assert_eq!(
+        app.define_pattern_refusal(),
+        Some(t!("pattern8-status-empty"))
+    );
+    app.run(Action::DefinePattern);
+    assert!(app.patterns.define.is_none());
+}
+
+#[test]
+fn defining_a_tile_already_there_says_so() {
+    let mut h = app();
+    let id = with_tile(&mut h);
+    let count = h.state().patterns.library.items.len();
+    h.state_mut().define_tile(&tile(), "Other");
+    let app = h.state();
+    assert_eq!(app.status, t!("pattern9-status-already", name = "Tile"));
+    assert_eq!(app.patterns.library.items.len(), count);
+    assert_eq!(app.patterns.library.get(id).unwrap().name, "Tile");
+    // A built-in as well.
+    let builtin = app.patterns.library.items[0].clone();
+    h.state_mut().define_tile(&builtin, "Mine");
+    assert_eq!(h.state().patterns.library.items.len(), count);
+    assert_eq!(
+        h.state().status,
+        t!("pattern9-status-already", name = builtin.name.as_str())
+    );
+}
+
+#[test]
+fn define_and_new_pattern_fill_are_recorded_and_played() {
+    let mut h = app();
+    let id = with_tile(&mut h);
+    let app = h.state_mut();
+    assert!(matches!(
+        app.recorded_action(Action::NewPatternFill),
+        Some(crate::actions::Recorded::NewPatternFill { pattern }) if pattern == id
+    ));
+    let before = app.doc.as_ref().unwrap().layers.len();
+    let step = crate::actions::Recorded::NewPatternFill { pattern: id };
+    app.play_step(&step, false).unwrap();
+    assert_eq!(app.doc.as_ref().unwrap().layers.len(), before + 1);
+    app.patterns.library.remove(id);
+    assert_eq!(app.play_step(&step, false), Err(t!("pattern8-why-missing")));
+
+    // Without its dialog: under the recorded name, when the tile is ready.
+    let count = app.patterns.library.items.len();
+    let step = crate::actions::Recorded::DefinePattern {
+        name: "Played".into(),
+    };
+    app.play_step(&step, false).unwrap();
+    settle(&mut h, |a| a.patterns.define.is_none());
+    let app = h.state();
+    assert_eq!(app.patterns.library.items.len(), count + 1);
+    assert_eq!(app.patterns.library.items.last().unwrap().name, "Played");
+}
+
+#[test]
+fn the_offset_fields_set_the_phase_and_snap_brings_it_back() {
+    let mut h = app();
+    let doc = h.state_mut().doc.as_mut().unwrap();
+    doc.add_layer(
+        "x".into(),
+        RgbaImage::from_pixel(40, 30, Rgba(BLUE)),
+        (0, 0),
+    );
+    doc.active_layer_mut().effects.pattern_overlay.enabled = true;
+    doc.active_layer_mut().effects.pattern_overlay.fill.phase = (3.0, 4.0);
+    h.state_mut()
+        .run(Action::LayerStyle(Some(Style::PatternOverlay)));
+    h.run_steps(3);
+    // Each is named twice: its label and its field.
+    assert!(h.query_all_by_label(&t!("pattern9-offset-x")).next().is_some());
+    assert!(h.query_all_by_label(&t!("pattern9-offset-y")).next().is_some());
+    h.get_by_label(&t!("pattern8-snap")).click();
+    h.run_steps(3);
+    let fill = &h
+        .state()
+        .doc
+        .as_ref()
+        .unwrap()
+        .active_layer()
+        .effects
+        .pattern_overlay
+        .fill;
+    assert_eq!(fill.phase, (0.0, 0.0));
+}
+
+fn asym() -> Arc<Pattern> {
+    Pattern::new(
+        "asym",
+        RgbaImage::from_fn(5, 3, |x, y| {
+            Rgba([(x * 50) as u8, (y * 100) as u8, 77, 255])
+        }),
+    )
+}
+
+/// A document whose size isn't a multiple of the tile's: nothing is right by
+/// luck.
+fn doc_of(linked: bool, overlay: bool) -> Document {
+    let mut doc = Document::new(RgbaImage::from_pixel(43, 31, Rgba(WHITE)), None);
+    let fill = PatternFill {
+        linked,
+        phase: (2.0, 1.0),
+        angle: 30.0,
+        ..PatternFill::of(asym())
+    };
+    if overlay {
+        doc.add_layer("x".into(), RgbaImage::from_pixel(30, 20, Rgba(RED)), (6, 5));
+        let fx = &mut doc.active_layer_mut().effects;
+        fx.pattern_overlay.enabled = true;
+        fx.pattern_overlay.fill = fill;
+    } else {
+        doc.add_fill_layer(Fill::Pattern(fill), None);
+    }
+    doc
+}
+
+/// The largest difference, per channel, between two images, away from the
+/// edges of a layer (`margin`), which are resampled.
+fn worst(a: &RgbaImage, b: &RgbaImage) -> u8 {
+    assert_eq!(a.dimensions(), b.dimensions());
+    a.pixels()
+        .zip(b.pixels())
+        .flat_map(|(p, q)| (0..4).map(move |i| p.0[i].abs_diff(q.0[i])))
+        .max()
+        .unwrap_or(0)
+}
+
+#[test]
+fn image_rotation_turns_pattern_fills_and_overlays_exactly() {
+    for (degrees, turn) in [
+        (
+            90.0,
+            image::imageops::rotate90 as fn(&RgbaImage) -> RgbaImage,
+        ),
+        (180.0, image::imageops::rotate180),
+        (270.0, image::imageops::rotate270),
+    ] {
+        for overlay in [false, true] {
+            for linked in [false, true] {
+                let mut doc = doc_of(linked, overlay);
+                let expected = turn(&doc.flatten());
+                doc.rotate_canvas(degrees);
+                let got = doc.flatten();
+                let w = worst(&got, &expected);
+                assert!(w <= 2, "{degrees} overlay {overlay} linked {linked}: {w}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_flip_mirrors_pattern_fills_and_overlays_exactly() {
+    for horizontal in [true, false] {
+        for overlay in [false, true] {
+            for linked in [false, true] {
+                let mut doc = doc_of(linked, overlay);
+                let before = doc.flatten();
+                let expected = if horizontal {
+                    image::imageops::flip_horizontal(&before)
+                } else {
+                    image::imageops::flip_vertical(&before)
+                };
+                doc.flip_canvas(horizontal);
+                let w = worst(&doc.flatten(), &expected);
+                assert!(
+                    w <= 2,
+                    "{horizontal} overlay {overlay} linked {linked}: {w}"
+                );
+                // Undone: as it was.
+                doc.undo();
+                assert_eq!(doc.flatten(), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_linked_overlay_stays_while_painting_and_follows_a_move() {
+    let mut doc = Document::new(RgbaImage::from_pixel(60, 60, Rgba(WHITE)), None);
+    doc.add_layer(
+        "x".into(),
+        RgbaImage::from_pixel(20, 20, Rgba(RED)),
+        (20, 20),
+    );
+    let fx = &mut doc.active_layer_mut().effects;
+    fx.pattern_overlay.enabled = true;
+    fx.pattern_overlay.fill = PatternFill::of(asym());
+    let a = doc.flatten();
+    // The layer enlarged, as a brush does, one pixel painted far away.
+    assert!(doc.expand_active_to_canvas());
+    let at = doc.active_layer().offset;
+    doc.active_layer_mut()
+        .pixels_mut()
+        .put_pixel((3 - at.0) as u32, (2 - at.1) as u32, Rgba(RED));
+    let b = doc.flatten();
+    for y in 20..40 {
+        for x in 20..40 {
+            assert_eq!(a.get_pixel(x, y), b.get_pixel(x, y), "{x},{y}");
+        }
+    }
+    // Moved: the tile comes along.
+    doc.active_layer_mut().translate(7, 4);
+    let c = doc.flatten();
+    for y in 20..40 {
+        for x in 20..40 {
+            assert_eq!(b.get_pixel(x, y), c.get_pixel(x + 7, y + 4), "{x},{y}");
+        }
+    }
+}
+
+#[test]
+fn a_linked_overlay_on_a_layer_without_pixels_follows_a_move() {
+    let mut doc = Document::new(RgbaImage::from_pixel(40, 30, Rgba(WHITE)), None);
+    doc.add_fill_layer(Fill::Solid([1, 2, 3]), None);
+    let fx = &mut doc.active_layer_mut().effects;
+    fx.pattern_overlay.enabled = true;
+    fx.pattern_overlay.fill = PatternFill::of(asym());
+    let a = doc.flatten();
+    doc.active_layer_mut().translate(1, 0);
+    let b = doc.flatten();
+    for y in 0..30 {
+        for x in 0..39 {
+            assert_eq!(a.get_pixel(x, y), b.get_pixel(x + 1, y), "{x},{y}");
+        }
+    }
+}
+
+#[test]
+fn free_transform_of_a_pattern_fill_scales_and_turns_its_tile() {
+    use crate::document::Placement;
+    let filter = image::imageops::FilterType::Triangle;
+    let mut doc = Document::new(RgbaImage::from_pixel(40, 30, Rgba(WHITE)), None);
+    doc.add_fill_layer(Fill::Pattern(PatternFill::of(asym())), None);
+    let a = doc.flatten();
+    let src = doc.full_rect();
+    let steps = doc.history().1;
+    let place = Placement {
+        at: (0, 0),
+        size: (80, 60),
+        angle: 0.0,
+    };
+    doc.transform_active(src, place, filter, false);
+    let LayerKind::Fill(Fill::Pattern(f)) = &doc.active_layer().kind else {
+        panic!("a fill");
+    };
+    assert_eq!(f.scale, 2.0);
+    assert_ne!(a, doc.flatten());
+    assert_eq!(doc.history().1, steps + 1);
+    let place = Placement {
+        at: (0, 0),
+        size: (40, 30),
+        angle: 90.0,
+    };
+    doc.transform_active(src, place, filter, false);
+    let LayerKind::Fill(Fill::Pattern(f)) = &doc.active_layer().kind else {
+        panic!("a fill");
+    };
+    assert_eq!(f.angle, -90.0);
+    // Only moved, a tile staying at the document's origin stays.
+    let mut doc = Document::new(RgbaImage::from_pixel(40, 30, Rgba(WHITE)), None);
+    let fill = PatternFill {
+        linked: false,
+        ..PatternFill::of(asym())
+    };
+    doc.add_fill_layer(Fill::Pattern(fill), None);
+    let a = doc.flatten();
+    let place = Placement {
+        at: (3, 2),
+        size: (40, 30),
+        angle: 0.0,
+    };
+    doc.transform_active(src, place, filter, false);
+    assert_eq!(a, doc.flatten());
+}
+
+#[test]
+fn a_plain_crop_leaves_every_pattern_where_it_was() {
+    for overlay in [false, true] {
+        for linked in [false, true] {
+            let mut doc = doc_of(linked, overlay);
+            let before = doc.flatten();
+            doc.resize_canvas(3, 2, 30, 20);
+            let after = doc.flatten();
+            for y in 0..20 {
+                for x in 0..30 {
+                    let (p, q) = (after.get_pixel(x, y).0, before.get_pixel(x + 3, y + 2).0);
+                    let d = (0..4).map(|i| p[i].abs_diff(q[i])).max().unwrap();
+                    assert!(d <= 1, "overlay {overlay} linked {linked}: {x},{y}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pattern_tiles_count_in_the_history_budget() {
+    let big = Pattern::new("big", RgbaImage::from_pixel(1024, 1024, Rgba(RED)));
+    let mut doc = Document::new(RgbaImage::from_pixel(8, 8, Rgba(WHITE)), None);
+    doc.add_fill_layer(Fill::Pattern(PatternFill::of(big.clone())), None);
+    let before = doc.history_bytes();
+    // A state holds it, the document no longer does.
+    doc.checkpoint("test".to_owned());
+    doc.layers.pop();
+    doc.active = 0;
+    let held = doc.history_bytes() - before;
+    assert!(held >= 4 * 1024 * 1024, "{held}");
+    // Its second use: counted once.
+    drop(big);
+    assert!(held < 8 * 1024 * 1024, "{held}");
+}
+
+#[test]
+fn a_disabled_overlay_keeps_its_settings_and_tile_in_a_file() {
+    let dir = std::env::temp_dir().join(format!("atelier-overlay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("x.atelier");
+    let mut doc = Document::new(RgbaImage::from_pixel(10, 10, Rgba(WHITE)), None);
+    doc.add_layer("x".into(), RgbaImage::from_pixel(4, 4, Rgba(RED)), (1, 1));
+    let fx = &mut doc.active_layer_mut().effects;
+    fx.pattern_overlay.enabled = false;
+    fx.pattern_overlay.opacity = 0.3;
+    fx.pattern_overlay.fill = PatternFill {
+        scale: 2.0,
+        ..PatternFill::of(asym())
+    };
+    let kept = fx.clone();
+    doc.save(&path).unwrap();
+    let back = Document::open(&path).unwrap().doc;
+    assert_eq!(back.layers.last().unwrap().effects, kept);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn two_names_of_a_tile_survive_a_file() {
+    let dir = std::env::temp_dir().join(format!("atelier-names-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("x.atelier");
+    let t = asym();
+    let mut doc = Document::new(RgbaImage::from_pixel(10, 10, Rgba(WHITE)), None);
+    doc.add_fill_layer(Fill::Pattern(PatternFill::of(t.clone())), None);
+    doc.add_fill_layer(Fill::Pattern(PatternFill::of(t.renamed("other"))), None);
+    doc.save(&path).unwrap();
+    let back = Document::open(&path).unwrap().doc;
+    let names: Vec<&str> = back.layers[1..]
+        .iter()
+        .filter_map(|l| match &l.kind {
+            LayerKind::Fill(Fill::Pattern(f)) => Some(f.pattern.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, ["asym", "other"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn values_that_are_not_numbers_still_give_a_file_that_opens() {
+    let dir = std::env::temp_dir().join(format!("atelier-nan-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("x.atelier");
+    let mut doc = Document::new(RgbaImage::from_pixel(10, 10, Rgba(WHITE)), None);
+    let fill = PatternFill {
+        scale: f32::NAN,
+        angle: f32::INFINITY,
+        phase: (f32::NAN, f32::NEG_INFINITY),
+        ..PatternFill::of(asym())
+    };
+    doc.add_fill_layer(Fill::Pattern(fill), None);
+    doc.save(&path).unwrap();
+    Document::open(&path).expect("opens");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -482,7 +946,10 @@ fn the_fields_fit_a_narrow_window() {
     h.state_mut().fill_dialog = Some(fill_dialog(id));
     h.run_steps(3);
     let picker = h.get_by_label(&t!("pattern8-pattern")).rect();
-    assert!(picker.right() <= 660.0 && picker.left() >= 0.0, "{picker:?}");
+    assert!(
+        picker.right() <= 660.0 && picker.left() >= 0.0,
+        "{picker:?}"
+    );
     h.state_mut().fill_dialog = None;
     let doc = h.state_mut().doc.as_mut().unwrap();
     doc.add_layer(

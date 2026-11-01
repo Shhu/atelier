@@ -179,7 +179,7 @@ impl AtelierApp {
         let text = self
             .doc
             .as_ref()
-            .filter(|d| !d.is_locked(d.active))
+            .filter(|d| !d.content_locked(d.active))
             .map(Document::active_layer)
             .filter(|l| l.id == edit.layer)
             .and_then(|l| l.text.as_ref());
@@ -302,7 +302,7 @@ impl AtelierApp {
         self.sync_type_edit();
         let Some(doc) = &self.doc else { return };
         let layer = doc.active_layer();
-        let (Some(old), false) = (layer.text.clone(), doc.is_locked(doc.active)) else {
+        let (Some(old), false) = (layer.text.clone(), doc.content_locked(doc.active)) else {
             return;
         };
         let id = layer.id;
@@ -867,7 +867,7 @@ impl AtelierApp {
         let doc = self.doc.as_ref()?;
         (0..doc.layers.len()).rev().find(|&i| {
             let l = &doc.layers[i];
-            l.visible && !doc.is_locked(i) && l.text.is_some() && to_rect(l.rect()).contains(ip)
+            l.visible && !doc.content_locked(i) && l.text.is_some() && to_rect(l.rect()).contains(ip)
         })
     }
 
@@ -1433,15 +1433,6 @@ impl AtelierApp {
             self.transform_text(i, map);
         }
     }
-}
-
-/// Canvas map of Image Rotation: `degrees` clockwise around the center of
-/// a canvas of `old` size, into one of `new` size.
-pub(super) fn canvas_rotation(old: (u32, u32), new: (u32, u32), degrees: f32) -> Affine {
-    let (s, c) = degrees.to_radians().sin_cos();
-    let (ox, oy) = (old.0 as f32 / 2.0, old.1 as f32 / 2.0);
-    let (nx, ny) = (new.0 as f32 / 2.0, new.1 as f32 / 2.0);
-    Affine([c, -s, nx - (c * ox - s * oy), s, c, ny - (s * ox + c * oy)])
 }
 
 /// Canvas map of Flip Canvas.

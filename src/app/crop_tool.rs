@@ -4,10 +4,15 @@
 //! around its center: applying turns the image the other way, and keeps
 //! what the box covered.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use super::canvas::{draw_frame, rotate_around};
 use super::*;
+use crate::actions::Recorded;
+use crate::document::{CropOrder, WholeChange, WholeDone};
 use crate::i18n::t;
-use crate::mask_ops::Affine;
+use crate::text::TextData;
 
 /// The presets of the options bar's first list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +110,65 @@ pub(super) struct CropTool {
     /// The box as it was when its turn started: it never grows back past
     /// this, and shrinks from it to stay on the image.
     turned_from: Option<Rect>,
+    /// The box that turn made: moved or resized by hand since, it starts
+    /// again from there.
+    turned_to: Option<Rect>,
+    /// The change of the whole document being computed aside.
+    pub(super) whole: Option<WholeRun>,
+}
+
+/// Something to do once a change lands.
+type Then = Box<dyn FnOnce(&mut AtelierApp)>;
+
+/// A change of the whole document being computed aside: not modal, input
+/// waits for it (see `wait_whole_for_input`).
+pub(super) struct WholeRun {
+    rx: std::sync::mpsc::Receiver<Option<WholeDone>>,
+    cancel: Arc<AtomicBool>,
+    doc: u64,
+    step: u64,
+    started: f64,
+    landing: Landing,
+    /// What was asked for meanwhile, once it lands.
+    then: Vec<Then>,
+    /// Where its window shows: a press there isn't input to wait for.
+    shown: Option<Rect>,
+}
+
+impl WholeRun {
+    /// `then` once it lands.
+    pub(super) fn then_do(&mut self, then: impl FnOnce(&mut AtelierApp) + 'static) {
+        self.then.push(Box::new(then));
+    }
+
+    /// Its indicator on the next frame.
+    #[cfg(test)]
+    pub(super) fn show_at_once(&mut self) {
+        self.started = f64::NEG_INFINITY;
+    }
+
+    #[cfg(test)]
+    pub(super) fn showing(&self) -> bool {
+        self.shown.is_some()
+    }
+}
+
+/// What a change of the whole document does once computed.
+struct Landing {
+    name: String,
+    texts: Vec<(u64, TextData, (i64, i64))>,
+    recorded: Option<Recorded>,
+    kind: LandingKind,
+}
+
+enum LandingKind {
+    Rotate(f32),
+    Crop {
+        /// The view keeps showing what the box showed.
+        shift: Vec2,
+        /// The box, back if the crop is cancelled.
+        back: Option<(Rect, f32)>,
+    },
 }
 
 impl Default for CropTool {
@@ -121,6 +185,8 @@ impl Default for CropTool {
             straighten: false,
             line: None,
             turned_from: None,
+            turned_to: None,
+            whole: None,
         }
     }
 }
@@ -137,6 +203,7 @@ impl CropTool {
         self.straighten = false;
         self.line = None;
         self.turned_from = None;
+        self.turned_to = None;
     }
 }
 
@@ -332,10 +399,47 @@ impl AtelierApp {
         }
     }
 
+    /// Width / height the box must keep, if any: Original Ratio is the
+    /// current document's.
+    pub(super) fn crop_ratio(&self) -> Option<f32> {
+        match (self.crop.preset, &self.doc) {
+            (CropPreset::Original, Some(d)) => Some(d.width() as f32 / d.height().max(1) as f32),
+            _ => self.crop.ratio(),
+        }
+    }
+
+    /// Original Ratio's fields: the current document's size.
+    pub(super) fn crop_sync_original(&mut self) {
+        if let (CropPreset::Original, Some(d)) = (self.crop.preset, &self.doc) {
+            (self.crop.w, self.crop.h) = (d.width() as f32, d.height() as f32);
+        }
+    }
+
+    /// W × H × Resolution asks for more than the box as it is.
+    fn crop_resamples(&self, r: Rect) -> bool {
+        if self.crop.preset != CropPreset::Size || self.crop.ratio().is_none() {
+            return false;
+        }
+        let density = self.doc.as_ref().and_then(|d| d.file_metadata.image.as_ref()?.density);
+        let ppi = f64::from(self.crop.resolution);
+        (self.crop.w.round(), self.crop.h.round()) != (r.width(), r.height())
+            || (ppi > 0.0 && density != Some((ppi, ppi)))
+    }
+
+    /// A crop box drawn or asking for a change, not applied yet: what Enter,
+    /// Apply and "Crop the image?" all go by.
+    pub(super) fn crop_box_pending(&self) -> bool {
+        self.tool == Tool::Canvas
+            && self.doc.is_some()
+            && self.canvas_rect.is_some_and(|r| {
+                Some(r) != self.full_rect() || self.crop.angle != 0.0 || self.crop_resamples(r)
+            })
+    }
+
     /// The box as a drag on it starts from: without one yet, what the ratio
     /// makes of the canvas.
     pub(super) fn crop_start_rect(&self, rect: Rect) -> Rect {
-        match (self.canvas_rect, self.crop.ratio()) {
+        match (self.canvas_rect, self.crop_ratio()) {
             (None, Some(ratio)) => fit_ratio(rect, ratio),
             _ => rect,
         }
@@ -343,7 +447,11 @@ impl AtelierApp {
 
     /// Starts turning the box, the pointer leaving it.
     pub(super) fn crop_turn_starts(&mut self, rect: Rect) {
-        self.crop.turned_from = Some(self.crop_start_rect(rect));
+        // The box as the last turn left it: that turn goes on from where it
+        // started, and the box can grow back.
+        if self.crop.turned_from.is_none() || self.crop.turned_to != self.canvas_rect {
+            self.crop.turned_from = Some(self.crop_start_rect(rect));
+        }
     }
 
     /// The box turned to `degrees`: it stays on the image, and the turned
@@ -351,10 +459,12 @@ impl AtelierApp {
     pub(super) fn crop_turn_to(&mut self, degrees: f32, full: Rect) {
         let from = self.crop.turned_from.or(self.canvas_rect).unwrap_or(full);
         if !fits_max_dimension(full.size(), degrees) {
+            self.status = t!("crop9-status-too-large");
             return;
         }
         self.crop.angle = degrees;
         self.canvas_rect = Some(fit_turned(from, degrees, full));
+        self.crop.turned_to = self.canvas_rect;
     }
 
     /// Straighten: a line is drawn, then the box levels with it.
@@ -375,9 +485,8 @@ impl AtelierApp {
         }
         if !down && let Some((from, to)) = self.crop.line.take() {
             if (to - from).length() * view.zoom >= canvas::CROP_SLIP {
-                self.crop.turned_from = Some(self.crop_start_rect(self.canvas_rect.unwrap_or(full)));
+                self.crop_turn_starts(self.canvas_rect.unwrap_or(full));
                 self.crop_turn_to(straighten_angle(from, to), full);
-                self.crop.turned_from = None;
             }
             self.crop.straighten = false;
         }
@@ -387,7 +496,7 @@ impl AtelierApp {
     /// A ratio or preset chosen: the box takes that shape, as large as the
     /// image allows.
     pub(super) fn crop_reshape(&mut self, full: Rect) {
-        let Some(ratio) = self.crop.ratio() else {
+        let Some(ratio) = self.crop_ratio() else {
             return;
         };
         let angle = self.crop.angle;
@@ -395,20 +504,40 @@ impl AtelierApp {
     }
 
     pub(super) fn crop_pick_preset(&mut self, preset: CropPreset, full: Rect) {
+        let was = self.crop.preset;
+        if preset == CropPreset::Size {
+            // The box stays and its size is what comes out, until W or H are
+            // typed; a ratio makes its box first. Never its values as pixels.
+            if was != CropPreset::Size {
+                let r = self.crop_start_rect(self.canvas_rect.unwrap_or(full));
+                self.canvas_rect = Some(r);
+                (self.crop.w, self.crop.h) = (r.width(), r.height());
+            }
+            self.crop.preset = preset;
+            return;
+        }
         self.crop.preset = preset;
         let canvas = (full.width() as u32, full.height() as u32);
-        if let Some((w, h)) = preset.values(canvas) {
-            (self.crop.w, self.crop.h) = (w, h);
-        } else if preset == CropPreset::Ratio {
-            (self.crop.w, self.crop.h) = (0.0, 0.0);
-        } else if self.crop.ratio().is_none() {
-            // W × H × Resolution starts from the box's own size.
-            let r = self.canvas_rect.unwrap_or(full);
-            (self.crop.w, self.crop.h) = (r.width(), r.height());
-        } else {
-            (self.crop.w, self.crop.h) = (self.crop.w.round(), self.crop.h.round());
+        match preset.values(canvas) {
+            Some((w, h)) => (self.crop.w, self.crop.h) = (w, h),
+            None => (self.crop.w, self.crop.h) = (0.0, 0.0),
         }
         self.crop_reshape(full);
+    }
+
+    /// Fit to Visible Pixels: the box around them; a ratio still holds.
+    pub(super) fn crop_fit_visible(&mut self) {
+        let Some(b) = self.doc.as_ref().and_then(Document::content_bounds) else {
+            return;
+        };
+        let bounds = to_rect(b);
+        self.canvas_rect = Some(match self.crop_ratio() {
+            Some(ratio) => fit_ratio(bounds, ratio),
+            None => bounds,
+        });
+        self.crop.angle = 0.0;
+        self.crop.turned_from = None;
+        self.crop.turned_to = None;
     }
 
     /// W or H typed: a named preset no longer applies.
@@ -421,8 +550,12 @@ impl AtelierApp {
 
     /// The swap button: W and H trade places, and the box its sides.
     pub(super) fn crop_swap(&mut self, full: Rect) {
+        self.crop_sync_original();
         std::mem::swap(&mut self.crop.w, &mut self.crop.h);
         if self.crop.ratio().is_some() {
+            if self.crop.preset == CropPreset::Original {
+                self.crop.preset = CropPreset::Ratio;
+            }
             return self.crop_values_edited(full);
         }
         let r = self.canvas_rect.unwrap_or(full);
@@ -463,69 +596,265 @@ impl AtelierApp {
     /// Applies the Crop tool's box, as a recorded step.
     pub(super) fn apply_crop_box(&mut self) {
         let Some(plan) = self.crop_plan() else { return };
-        self.record_crop(plan);
-        self.canvas_rect = None;
-        self.apply_crop(plan);
+        let recorded = self.crop_step(plan);
+        let back = self.canvas_rect.take().map(|r| (r, self.crop.angle));
+        self.start_crop(plan, recorded, back);
     }
 
     /// A crop as one step: turned first if it must be, cut, then resampled.
     pub(super) fn apply_crop(&mut self, plan: CropPlan) {
-        let mut r = plan.rect;
+        self.start_crop(plan, None, None);
+    }
+
+    fn start_crop(&mut self, plan: CropPlan, recorded: Option<Recorded>, back: Option<(Rect, f32)>) {
+        let r = plan.rect;
         if r.w == 0 || r.h == 0 {
             return;
         }
         let Some(doc) = &self.doc else { return };
-        let mark = doc.history_mark();
-        let old = (doc.width(), doc.height());
-        let old_center = pos2(old.0 as f32, old.1 as f32) / 2.0;
-        let box_center = to_rect(r).center();
-        if plan.angle != 0.0 {
-            let degrees = -plan.angle;
-            let texts = self.texts_before();
-            let Some(doc) = &mut self.doc else { return };
-            if doc.rotate_canvas(degrees) {
-                let map = type_tool::canvas_rotation(old, (doc.width(), doc.height()), degrees);
-                r = turned_box(r, box_center, map);
-                self.texts_after(texts, map);
+        let center = pos2(doc.width() as f32, doc.height() as f32) / 2.0;
+        let order = CropOrder {
+            rect: r,
+            angle: plan.angle,
+            delete: plan.delete,
+            size: plan.size,
+            resolution: plan.resolution,
+            filter: self.resize_filter.filter(),
+        };
+        self.start_whole(
+            WholeChange::Crop(order),
+            Landing {
+                name: t!("menu-image-crop"),
+                texts: self.texts_before(),
+                recorded,
+                kind: LandingKind::Crop {
+                    shift: to_rect(r).center() - center,
+                    back,
+                },
+            },
+        );
+    }
+
+    /// Image Rotation, on [`Self::start_whole`]'s way.
+    pub(super) fn start_rotation(&mut self, degrees: f32) {
+        let Some(full) = self.full_rect() else { return };
+        if !degrees.is_finite() || !fits_max_dimension(full.size(), degrees) {
+            self.status = t!("crop9-status-too-large");
+            return;
+        }
+        self.start_whole(
+            WholeChange::Rotate(degrees),
+            Landing {
+                name: t!("xchg-hist-rotate-canvas"),
+                texts: self.texts_before(),
+                recorded: Some(Recorded::RotateCanvas { angle: degrees }),
+                kind: LandingKind::Rotate(degrees),
+            },
+        );
+    }
+
+    /// Runs a change of the whole document: at once when small, otherwise
+    /// aside, with its indicator and Cancel.
+    fn start_whole(&mut self, change: WholeChange, landing: Landing) {
+        self.wait_whole();
+        let Some(doc) = &self.doc else { return };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job = doc.whole_job(change, cancel.clone());
+        let (uid, step) = (doc.uid(), doc.history_step());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let run = WholeRun {
+            rx,
+            cancel,
+            doc: uid,
+            step,
+            started: self.ctx.input(|i| i.time),
+            landing,
+            then: Vec::new(),
+            shown: None,
+        };
+        if job.size() < transform::ASYNC_PIXELS && !job.has_filters() {
+            let done = job.run();
+            return self.land_whole(run, done);
+        }
+        let ctx = self.ctx.clone();
+        let label = run.landing.name.clone();
+        std::thread::spawn(move || {
+            let _job = crate::diag::job(label);
+            let _ = tx.send(job.run());
+            ctx.request_repaint();
+        });
+        self.crop.whole = Some(run);
+    }
+
+    /// Waits for the change being computed and puts it in place.
+    pub(super) fn wait_whole(&mut self) {
+        if let Some(run) = self.crop.whole.take() {
+            let done = run.rx.recv().ok().flatten();
+            self.land_whole(run, done);
+        }
+    }
+
+    /// A press, a key, a paste or a drop during a change computed aside: it
+    /// lands first, then the input applies. Its window keeps its own.
+    pub(super) fn wait_whole_for_input(&mut self, ctx: &egui::Context) {
+        let Some(run) = &self.crop.whole else { return };
+        let shown = run.shown;
+        if ctx.input(|i| super::retouch_tools::input_waits(i, shown)) {
+            self.wait_whole();
+        }
+    }
+
+    /// The change being computed, once done, is put in place; meanwhile,
+    /// after a moment, its indicator and Cancel (Esc too).
+    pub(super) fn whole_window(&mut self, ctx: &egui::Context) {
+        let Some(run) = &mut self.crop.whole else {
+            return;
+        };
+        let done = match run.rx.try_recv() {
+            Ok(done) => done,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                let elapsed = ctx.input(|i| i.time) - run.started;
+                let delay = filters_ui::BUSY_DELAY;
+                if elapsed < delay {
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay - elapsed));
+                    return;
+                }
+                let mut cancel = ctx.input(|i| i.key_pressed(Key::Escape));
+                let name = run.landing.name.clone();
+                let area = egui::Area::new(egui::Id::new("whole_busy"))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        use ui_kit::color;
+                        egui::Frame::new()
+                            .fill(color::BG2)
+                            .stroke(UiStroke::new(1.0, color::WINDOW_LINE))
+                            .corner_radius(12)
+                            .inner_margin(egui::Margin::symmetric(18, 14))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 10.0;
+                                    ui.add(egui::Spinner::new().size(16.0).color(color::MUTED));
+                                    ui.label(
+                                        egui::RichText::new(format!("{name}…")).color(color::TEXT),
+                                    );
+                                    cancel |= ui_kit::button(
+                                        ui,
+                                        &t!("dialog-cancel"),
+                                        ui_kit::Kind::Normal,
+                                        None,
+                                        true,
+                                    )
+                                    .clicked();
+                                });
+                            });
+                    });
+                run.shown = Some(area.response.rect);
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                if !cancel {
+                    return;
+                }
+                // Dropped at once: the work stops at its next layer.
+                run.cancel.store(true, Ordering::Relaxed);
+                None
+            }
+        };
+        if let Some(run) = self.crop.whole.take() {
+            self.land_whole(run, done);
+        }
+    }
+
+    /// A change of the whole document done (`None`: cancelled): one step,
+    /// if it changed anything, with all that goes with it.
+    fn land_whole(&mut self, run: WholeRun, done: Option<WholeDone>) {
+        let WholeRun {
+            doc: uid,
+            step,
+            landing,
+            then,
+            ..
+        } = run;
+        let same = self
+            .doc
+            .as_ref()
+            .is_some_and(|d| (d.uid(), d.history_step()) == (uid, step));
+        match done {
+            Some(done) if same => self.put_whole(done, landing),
+            Some(_) => self.status = t!("crop9-status-dropped", name = landing.name.as_str()),
+            None => {
+                self.status = t!("crop9-status-cancelled", name = landing.name.as_str());
+                self.actions.step_stopped(actions_panel::Stopped::Cancelled);
+                if let LandingKind::Crop {
+                    back: Some((r, angle)),
+                    ..
+                } = landing.kind
+                    && self.tool == Tool::Canvas
+                {
+                    self.canvas_rect = Some(r);
+                    self.crop.angle = angle;
+                }
+                // What was to follow the crop waited for it: it stops too.
+                return;
             }
         }
+        for then in then {
+            then(self);
+        }
+    }
+
+    fn put_whole(&mut self, done: WholeDone, landing: Landing) {
+        let (map, (w, h), resampled) = (done.map, done.size, done.resampled);
         let Some(doc) = &mut self.doc else { return };
-        doc.crop_area(r, plan.delete);
-        let (mut w, mut h) = (r.w, r.h);
-        if let Some((tw, th)) = plan.size {
-            let filter = self.resize_filter.filter();
-            let doc = self.doc.as_mut().expect("checked");
-            if doc.resize_image(tw, th, filter) {
-                self.fit_pending = Some(1.0);
-                self.rerender_texts();
-            }
-            (w, h) = (tw, th);
+        // A step that changes nothing says nothing: an action goes on.
+        if !doc.put_whole(done, landing.name) {
+            return;
         }
-        let Some(doc) = &mut self.doc else { return };
-        if plan.resolution > 0.0 {
-            let density = f64::from(plan.resolution);
-            let meta = doc.file_metadata.image.get_or_insert_default();
-            std::sync::Arc::make_mut(meta).density = Some((density, density));
+        if let Some(recorded) = landing.recorded {
+            self.record(recorded);
         }
-        if doc.steps_since(mark) > 0 {
-            doc.join_since(mark);
-            doc.rename_last_step(t!("menu-image-crop"));
+        self.texts_after(landing.texts, map);
+        if resampled {
+            self.fit_pending = Some(1.0);
         }
-        self.status = t!("status-canvas-resized", width = w, height = h);
         // The selection's coordinates no longer make sense.
         self.forget_selection();
-        self.after_geometry_change(box_center - old_center);
+        match landing.kind {
+            LandingKind::Rotate(degrees) => {
+                let angle = i18n::short_decimal(f64::from(degrees.rem_euclid(360.0)));
+                self.status = t!("status-image-rotated", angle = angle);
+                self.reset_pending();
+            }
+            LandingKind::Crop { shift, .. } => {
+                self.status = t!("status-canvas-resized", width = w, height = h);
+                self.after_geometry_change(shift);
+            }
+        }
     }
-}
 
-/// `r`, centered on `center` before the canvas turned by `map`, in the
-/// turned canvas: same size, around the new place of its center.
-fn turned_box(r: PixelRect, center: Pos2, Affine(m): Affine) -> PixelRect {
-    let x = m[0] * center.x + m[1] * center.y + m[2];
-    let y = m[3] * center.x + m[4] * center.y + m[5];
-    PixelRect {
-        x: (x - r.w as f32 / 2.0).round() as i64,
-        y: (y - r.h as f32 / 2.0).round() as i64,
-        ..r
+    /// The Crop tool's keys: O goes through the overlays, X swaps W and H.
+    /// Shift + O has nothing to change here, but stays in the tool. Returns
+    /// whether it took `key`.
+    pub(super) fn crop_key(&mut self, key: Key, shift: bool) -> bool {
+        if self.tool != Tool::Canvas {
+            return false;
+        }
+        match key {
+            Key::O => {
+                if !shift {
+                    let all = CropOverlay::ALL;
+                    let i = all.iter().position(|o| *o == self.crop.overlay).unwrap_or(0);
+                    self.crop.overlay = all[(i + 1) % all.len()];
+                }
+                true
+            }
+            Key::X => {
+                if let Some(full) = self.full_rect() {
+                    self.crop_swap(full);
+                }
+                true
+            }
+            _ => false,
+        }
     }
 }

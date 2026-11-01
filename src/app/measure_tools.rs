@@ -54,11 +54,13 @@ impl SampleSize {
     }
 }
 
-/// A point being dragged: `moved`: its step is recorded.
+/// A point being dragged: `moved`: its step is recorded; `added`: that step
+/// is the one that adds it.
 #[derive(Clone, Copy)]
 struct SamplerDrag {
     index: usize,
     moved: bool,
+    added: bool,
 }
 
 /// What a drag of the Ruler tool holds.
@@ -119,6 +121,7 @@ impl AtelierApp {
             return None;
         }
         if doc.samplers.len() >= MAX_SAMPLERS {
+            self.status_shown.clear();
             self.status = t!("panels8-status-samplers-full", count = MAX_SAMPLERS);
             return None;
         }
@@ -141,7 +144,10 @@ impl AtelierApp {
         alt: bool,
     ) -> CursorIcon {
         let Some(p) = pointer else {
-            self.measure.sampler_drag = None;
+            // The pointer lost (out of the window): the drag ends here.
+            if let Some(drag) = self.measure.sampler_drag.take() {
+                self.end_sampler_drag(drag);
+            }
             return CursorIcon::Crosshair;
         };
         let at = view.to_image(p);
@@ -157,14 +163,17 @@ impl AtelierApp {
                     self.measure.sampler_drag = Some(SamplerDrag {
                         index,
                         moved: false,
+                        added: false,
                     });
                 }
                 None if alt => {}
                 None => {
                     // Follows the pointer in the step that adds it.
-                    self.measure.sampler_drag = self
-                        .add_sampler(at)
-                        .map(|index| SamplerDrag { index, moved: true });
+                    self.measure.sampler_drag = self.add_sampler(at).map(|index| SamplerDrag {
+                        index,
+                        moved: true,
+                        added: true,
+                    });
                 }
             }
         }
@@ -201,12 +210,31 @@ impl AtelierApp {
             return CursorIcon::Move;
         }
         self.measure.sampler_drag = None;
-        let (w, h) = (doc.width() as f32, doc.height() as f32);
-        let s = doc.samplers[drag.index];
-        if !(0.0..w).contains(&s.x) || !(0.0..h).contains(&s.y) {
-            doc.samplers.remove(drag.index);
-        }
+        self.end_sampler_drag(drag);
         CursorIcon::Crosshair
+    }
+
+    /// A point left off the canvas goes: its step says so, and one added in
+    /// this very drag leaves none.
+    fn end_sampler_drag(&mut self, drag: SamplerDrag) {
+        let Some(doc) = &mut self.doc else { return };
+        let (w, h) = (doc.width() as f32, doc.height() as f32);
+        let Some(&s) = doc.samplers.get(drag.index) else {
+            return;
+        };
+        if (0.0..w).contains(&s.x) && (0.0..h).contains(&s.y) {
+            return;
+        }
+        if drag.added {
+            doc.discard_step();
+            return;
+        }
+        if drag.moved {
+            doc.rename_last_step(t!("panels8-hist-delete-sampler"));
+        } else {
+            doc.checkpoint(t!("panels8-hist-delete-sampler"));
+        }
+        doc.samplers.remove(drag.index);
     }
 
     /// Options bar: every point goes, in one step.
@@ -287,8 +315,15 @@ impl AtelierApp {
             });
         }
         let Some(drag) = self.measure.ruler_drag else {
+            let open = self
+                .doc
+                .as_ref()
+                .and_then(|d| d.ruler)
+                .is_some_and(|m| m.second.is_none());
             return match self.ruler_part(view, p) {
                 Some(RulerDrag::Line(_)) => CursorIcon::Move,
+                // Alt+drag from here starts the protractor's other arm.
+                Some(RulerDrag::First | RulerDrag::Vertex) if alt && open => CursorIcon::Cell,
                 Some(_) => CursorIcon::Crosshair,
                 None => CursorIcon::Crosshair,
             };
@@ -336,23 +371,35 @@ impl AtelierApp {
             self.status = t!("panels8-status-straighten-quick-mask");
             return;
         }
-        let Some(m) = self.doc.as_ref().and_then(|d| d.ruler) else {
+        let Some(doc) = &self.doc else { return };
+        let Some(m) = doc.ruler else { return };
+        let active = doc.active_layer();
+        if active.is_group() {
+            self.status = t!("panels9-status-straighten-group");
             return;
-        };
+        }
+        if active.has_pixels() && !doc.transforms_mask() && active.content_bounds().is_none() {
+            self.status = t!("xform-status-nothing", name = active.name.clone());
+            return;
+        }
+        let uid = doc.uid();
+        let before = doc.history_step();
         let angle = m.straighten_angle();
+        let level = angle.abs() <= 0.01;
         let tool = self.tool;
         // The whole layer, whatever is selected (the selection stays).
         let selection = self.selection.take();
         let fit = std::mem::replace(&mut self.fit_canvas, false);
         let entered = self.enter_transform();
         let mut applied = false;
-        if entered && angle.abs() > 0.01 {
+        if entered && !level {
             self.transform_angle = normalize_angle(angle);
             self.xform.step = Some(t!("panels8-straighten-layer"));
             self.commit_pending_aside();
             applied = true;
         } else if entered {
             self.reset_pending();
+            self.status = t!("panels9-status-already-level");
         }
         self.fit_canvas = fit;
         if self.selection.is_none() {
@@ -364,12 +411,18 @@ impl AtelierApp {
         if !applied {
             return;
         }
-        if let Some(doc) = &mut self.doc {
+        // Only if the turn made its step, in the document it was asked of:
+        // the crop goes in that step and has none of its own.
+        self.after_transform(move |app| {
+            let Some(doc) = &mut app.doc else { return };
+            if doc.uid() != uid || doc.history_step() == before {
+                return;
+            }
             doc.ruler = None;
-        }
-        if !keep_canvas {
-            self.after_transform(move |app| app.crop_to_straightened(angle));
-        }
+            if !keep_canvas {
+                app.crop_to_straightened(angle);
+            }
+        });
     }
 
     /// The canvas becomes what a turn by `angle` left filled, in the step of

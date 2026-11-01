@@ -10,7 +10,7 @@ use super::bytes::{Writer, pack_row};
 use super::{adjust, artboard, blend_key, effects, pattern};
 use crate::cms::Conversion;
 use crate::document::native::{check_layer, par_map};
-use crate::document::{BlendMode, Document, FileError, Layer, LayerKind, PixelRect};
+use crate::document::{BlendMode, Document, FileError, Fill, Layer, LayerKind, PixelRect};
 use crate::guides::Orientation;
 use crate::i18n::t;
 
@@ -320,15 +320,28 @@ fn resources(
         r.bytes(&data);
         r.zeros(data.len() % 2);
     };
-    match kept.iter().find(|k| k.id == 1005) {
-        Some(res) => raw(r, res),
-        None => resource(r, 1005, &|r| {
-            for _ in 0..2 {
-                r.u32(72 << 16);
-                r.u16(1);
-                r.u16(1);
-            }
-        }),
+    // Crop's Resolution: the document's value over what the file said.
+    let density = doc.file_metadata.image.as_ref().and_then(|m| m.density);
+    let fixed = |ppi: f64| (ppi.clamp(1.0, 65000.0) * 65536.0).round() as u32;
+    match (kept.iter().find(|k| k.id == 1005), density) {
+        (Some(res), None) => raw(r, res),
+        // Its units stay, the values in pixels per inch.
+        (Some(res), Some((x, y))) if res.data.len() >= 16 => {
+            let mut data = res.data.to_vec();
+            data[..4].copy_from_slice(&fixed(x).to_be_bytes());
+            data[8..12].copy_from_slice(&fixed(y).to_be_bytes());
+            resource(r, 1005, &|r| r.bytes(&data));
+        }
+        (_, density) => {
+            let (x, y) = density.unwrap_or((72.0, 72.0));
+            resource(r, 1005, &|r| {
+                for ppi in [x, y] {
+                    r.u32(fixed(ppi));
+                    r.u16(1);
+                    r.u16(1);
+                }
+            });
+        }
     }
     for res in kept.iter().filter(|k| k.id != 1005) {
         raw(r, res);
@@ -350,14 +363,18 @@ fn resources(
         });
     }
     if !doc.samplers.is_empty() {
-        resource(r, 1038, &|r| {
-            r.u32(1);
+        // The current block, in the one form the specification and ag-psd
+        // read alike: version 2, floats, a depth. (Vertical first: see the
+        // reader.)
+        resource(r, 1073, &|r| {
+            r.u32(2);
             r.u32(doc.samplers.len() as u32);
             for s in &doc.samplers {
-                r.i32((s.y * 65536.0).round() as i32);
-                r.i32((s.x * 65536.0).round() as i32);
+                r.u32(s.y.to_bits());
+                r.u32(s.x.to_bits());
                 // The color space shown: as the document.
                 r.i16(-1);
+                r.u16(1);
             }
         });
     }
@@ -574,10 +591,19 @@ fn record(layer: Option<&Layer>, rect: PixelRect, channels: Vec<(i16, Vec<u8>)>)
                 });
                 artboard::write(l, x);
             }
+            LayerKind::Fill(Fill::Pattern(p)) => adjust::write(
+                &LayerKind::Fill(Fill::Pattern(pattern::rebased(p, l.offset, rect))),
+                x,
+            ),
             kind => adjust::write(kind, x),
         }
+        let mut styles = l.effects.clone();
+        if !l.is_group() {
+            let overlay = &mut styles.pattern_overlay.fill;
+            *overlay = pattern::rebased(overlay, l.offset, rect);
+        }
         if l.styleable()
-            && let Some(fx) = effects::write(&l.effects)
+            && let Some(fx) = effects::write(&styles)
         {
             x.tagged(b"lfx2", |x| {
                 x.u32(0);

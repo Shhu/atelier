@@ -285,6 +285,15 @@ impl ActionsState {
         self.recording = Some(at);
     }
 
+    /// The step error being shown.
+    #[cfg(test)]
+    pub(super) fn error_shown(&self) -> Option<String> {
+        match &self.message {
+            Some(Message::Error { text }) => Some(text.clone()),
+            _ => None,
+        }
+    }
+
     /// Why the last action played by Batch stopped.
     pub(super) fn take_batch_error(&mut self) -> Option<String> {
         self.batch_error.take()
@@ -303,6 +312,7 @@ fn has_dialog(r: &Recorded) -> bool {
         | Recorded::Adjust { .. }
         | Recorded::Fill { .. }
         | Recorded::Fade { .. }
+        | Recorded::DefinePattern { .. }
         | Recorded::Stroke { .. }
         | Recorded::ModifySelection { .. }
         | Recorded::Transform { .. }
@@ -313,6 +323,29 @@ fn has_dialog(r: &Recorded) -> bool {
         | Recorded::AssignProfile { .. }
         | Recorded::Grayscale => true,
         _ => false,
+    }
+}
+
+/// The locks of a step.
+fn locks_of(transparent: bool, pixels: bool, position: bool, all: bool) -> layer_locks::LastLock {
+    layer_locks::LastLock {
+        locks: crate::document::Locks {
+            transparent,
+            pixels,
+            position,
+        },
+        all,
+    }
+}
+
+/// A step that turns `set` on or off.
+pub(super) fn recorded_locks(set: layer_locks::LastLock, on: bool) -> Recorded {
+    Recorded::Locks {
+        transparent: set.locks.transparent,
+        pixels: set.locks.pixels,
+        position: set.locks.position,
+        all: set.all,
+        on,
     }
 }
 
@@ -331,6 +364,7 @@ fn edits(r: &Recorded) -> bool {
             | Recorded::ModifySelection { .. }
             | Recorded::Export { .. }
             | Recorded::Stop { .. }
+            | Recorded::DefinePattern { .. }
             | Recorded::Menu {
                 item: MenuItem::Copy
             }
@@ -642,6 +676,9 @@ impl AtelierApp {
             Action::Reselect => Recorded::Reselect,
             Action::InvertSelection => Recorded::InvertSelection,
             Action::FlipCanvas(horizontal) => Recorded::FlipCanvas { horizontal },
+            Action::NewPatternFill => Recorded::NewPatternFill {
+                pattern: self.last_pattern().id,
+            },
             Action::Adjust(AdjustKind::Invert) => Recorded::Adjust {
                 adjustment: Adjustment::Invert,
             },
@@ -664,6 +701,18 @@ impl AtelierApp {
             },
             // Without a selection, it duplicates the layer (recorded so).
             Action::LayerFromSelection if self.selection.is_none() => return None,
+            // Toggles: recorded as what they turn to.
+            Action::ToggleLock => {
+                let (set, on) = self.last_lock_change()?;
+                recorded_locks(set, on)
+            }
+            Action::Lock(kind) => {
+                let (shown, free) = kind.state(self.doc.as_ref()?, self.doc.as_ref()?.active);
+                if !free {
+                    return None;
+                }
+                recorded_locks(layer_locks::LastLock::only(kind), !shown)
+            }
             _ => Recorded::Menu {
                 item: MenuItem::of(action)?,
             },
@@ -708,18 +757,17 @@ impl AtelierApp {
     }
 
     /// The Crop tool's frame, about to be applied.
-    pub(super) fn record_crop(&mut self, plan: super::crop_tool::CropPlan) {
-        let Some(doc) = &self.doc else { return };
+    pub(super) fn crop_step(&self, plan: super::crop_tool::CropPlan) -> Option<Recorded> {
+        let doc = self.doc.as_ref()?;
         let r = plan.rect;
-        if r != doc.full_rect() || plan.angle != 0.0 || plan.size.is_some() || plan.delete {
-            self.record(Recorded::Crop {
+        (r != doc.full_rect() || plan.angle != 0.0 || plan.size.is_some() || plan.delete)
+            .then_some(Recorded::Crop {
                 rect: [r.x, r.y, r.w as i64, r.h as i64],
                 angle: plan.angle,
                 delete: plan.delete,
                 size: plan.size,
                 resolution: plan.resolution,
-            });
-        }
+            })
     }
 
     /// A marquee's shape (`None`: the plain rectangle, already the
@@ -879,6 +927,7 @@ impl AtelierApp {
     pub(super) fn actions_wait(&self) -> bool {
         self.modal_open()
             || self.select_busy()
+            || self.crop.whole.is_some()
             || self.subject_job.is_some()
             || (self.transform_pending()
                 && self
@@ -1123,6 +1172,19 @@ impl AtelierApp {
                 if *w <= 0 || *h <= 0 {
                     return Err(t!("status-nothing-to-crop"));
                 }
+                // From a file: nothing it says may allocate without limit.
+                let side = |v: i64| u32::try_from(v).unwrap_or(u32::MAX);
+                crate::document::check_size(side(*w), side(*h)).map_err(|e| e.to_string())?;
+                if let Some((width, height)) = size {
+                    crate::document::check_size(*width, *height).map_err(|e| e.to_string())?;
+                }
+                let area = vec2(canvas.w as f32, canvas.h as f32);
+                if !angle.is_finite()
+                    || !resolution.is_finite()
+                    || !super::fits_max_dimension(area, *angle)
+                {
+                    return Err(t!("crop9-status-too-large"));
+                }
                 let r = PixelRect {
                     x: *x,
                     y: *y,
@@ -1170,6 +1232,20 @@ impl AtelierApp {
                     }
                 }
             }
+            Recorded::DefinePattern { name } => {
+                if let Some(why) = self.define_pattern_refusal() {
+                    return Err(why);
+                }
+                self.open_define_pattern();
+                self.define_as(name, !dialog);
+            }
+            Recorded::NewPatternFill { pattern } => {
+                if self.patterns.library.get(*pattern).is_none() {
+                    return Err(t!("pattern8-why-missing"));
+                }
+                self.patterns.last = *pattern;
+                self.run(Action::NewPatternFill);
+            }
             Recorded::Fade { opacity, mode } => {
                 if locked {
                     return Err(lock_error());
@@ -1182,7 +1258,9 @@ impl AtelierApp {
                             d.fade.opacity = *opacity;
                             d.fade.mode = mode;
                         }
-                        None => return Err(t!("adjust8-why-no-fade")),
+                        // The command before it changed nothing on this image.
+                        None if self.doc.as_ref().is_some_and(Document::fade_of_nothing) => {}
+                        None => return Err(t!("adjust9-why-no-fade")),
                     }
                 } else {
                     self.fade_with(*opacity, mode)?;
@@ -1210,23 +1288,26 @@ impl AtelierApp {
                 }
                 let location = fade_stroke::location_named(location);
                 let mode = fade_stroke::blend_named(mode);
+                // A hand-edited file: as the dialog allows.
+                let width = (*width).clamp(1, crate::pixel_ops::StrokeSettings::MAX_WIDTH);
+                let opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
                 if dialog {
                     self.filters.stroke_options = fade_stroke::StrokeOptions {
-                        width: *width,
+                        width,
                         color: Some(*color),
                         location,
                         mode,
-                        opacity: *opacity,
+                        opacity,
                         preserve_transparency: *preserve_transparency,
                     };
                     self.filters.stroke_open = true;
                 } else {
                     self.apply_stroke(crate::pixel_ops::StrokeSettings {
-                        width: *width,
+                        width,
                         color: *color,
                         location,
                         mode,
-                        opacity: *opacity,
+                        opacity,
                         preserve_transparency: *preserve_transparency,
                     });
                 }
@@ -1360,15 +1441,21 @@ impl AtelierApp {
                     self.apply_transform();
                 }
             }
+            Recorded::Locks {
+                transparent,
+                pixels,
+                position,
+                all,
+                on,
+            } => {
+                self.play_locks(locks_of(*transparent, *pixels, *position, *all), *on)?;
+            }
             Recorded::Menu { item } => {
                 if item.selects() && !has_selection {
                     return Err(t!("actions-error-no-selection"));
                 }
-                let action = item.action();
-                if action.modifies_active() && locked {
-                    return Err(lock_error());
-                }
-                self.run(action);
+                // `run` refuses what the locks refuse, `step_failed` tells.
+                self.run(item.action());
             }
             Recorded::Export { options, folder } => {
                 if dialog {
@@ -2739,6 +2826,8 @@ pub(super) fn step_title(r: &Recorded) -> String {
         Recorded::CameraRaw { .. } => t!("raw-filter-title"),
         Recorded::Fill { .. } => t!("dialog-fill-title"),
         Recorded::Fade { .. } => t!("adjust8-fade-title"),
+        Recorded::DefinePattern { .. } => t!("pattern9-step-define"),
+        Recorded::NewPatternFill { .. } => t!("pattern9-step-new-fill"),
         Recorded::Stroke { .. } => t!("adjust8-stroke-title"),
         Recorded::Select { .. } => t!("actions-step-select"),
         Recorded::SelectAll => t!("actions-step-select-all"),
@@ -2752,6 +2841,20 @@ pub(super) fn step_title(r: &Recorded) -> String {
         Recorded::Transform { .. } => t!("menu-edit-free-transform"),
         Recorded::Place { linked: true, .. } => t!("smart-hist-place-linked"),
         Recorded::Place { .. } => t!("smart-hist-place-embedded"),
+        Recorded::Locks {
+            transparent,
+            pixels,
+            position,
+            all,
+            on,
+        } => {
+            let set = locks_of(*transparent, *pixels, *position, *all);
+            match (set == layer_locks::LastLock::EVERY, *on) {
+                (true, false) => t!("xchg-hist-unlock-layer"),
+                (_, true) => t!("locks9-step-on", lock = set.names()),
+                (_, false) => t!("locks9-step-off", lock = set.names()),
+            }
+        }
         Recorded::Menu { item } => item.label(),
         Recorded::Export { .. } => t!("actions-step-export"),
         Recorded::Liquify { .. } => t!("liquify-title"),
@@ -2856,6 +2959,7 @@ pub(super) fn step_details(r: &Recorded) -> Vec<String> {
                 fade_stroke::blend_named(mode).label().to_string(),
             ),
         ],
+        Recorded::DefinePattern { name } => vec![line(&t!("pattern8-name"), name.as_str())],
         Recorded::Stroke {
             width,
             mode,
@@ -3007,8 +3111,77 @@ fn adjustment_details(a: &Adjustment) -> Vec<String> {
         )],
         Adjustment::Posterize(p) => vec![line(&t!("core-posterize-levels"), p.levels.to_string())],
         Adjustment::Threshold(th) => vec![line(&t!("core-threshold-level"), th.level.to_string())],
+        Adjustment::ChannelMixer(m) => channel_mixer_details(m),
+        Adjustment::SelectiveColor(s) => selective_color_details(s),
         _ => Vec::new(),
     }
+}
+
+/// The named shares that aren't zero, as percentages.
+fn shares(names: &[String], values: &[f32]) -> String {
+    let shown: Vec<String> = names
+        .iter()
+        .zip(values)
+        .filter(|(_, v)| **v != 0.0)
+        .map(|(name, v)| format!("{name} {}", pct(f64::from((v * 100.0).round()))))
+        .collect();
+    shown.join(", ")
+}
+
+/// Monochrome and the output channels that aren't as they start.
+fn channel_mixer_details(m: &crate::pixel_ops::ChannelMixer) -> Vec<String> {
+    let channels = [
+        t!("dialog-color-red"),
+        t!("dialog-color-green"),
+        t!("dialog-color-blue"),
+    ];
+    let mut sources = channels.to_vec();
+    sources.push(t!("adjust8-constant"));
+    let mut lines = vec![line(&t!("adjust8-monochrome"), yes_no(m.monochrome))];
+    if m.monochrome {
+        lines.push(line(&t!("adjust8-output-channel"), shares(&sources, &m.rows[0])));
+        return lines;
+    }
+    let start = crate::pixel_ops::ChannelMixer::default().rows;
+    for ((name, row), start) in channels.iter().zip(&m.rows).zip(&start) {
+        if row != start {
+            lines.push(line(name, shares(&sources, row)));
+        }
+    }
+    lines
+}
+
+/// The method and the color ranges that were changed.
+fn selective_color_details(s: &crate::pixel_ops::SelectiveColor) -> Vec<String> {
+    let method = if s.absolute {
+        t!("adjust8-absolute")
+    } else {
+        t!("adjust8-relative")
+    };
+    let inks = [
+        t!("dialog-color-cyan"),
+        t!("dialog-color-magenta"),
+        t!("dialog-color-yellow"),
+        t!("adjust8-black"),
+    ];
+    let names = [
+        t!("core-bw-reds"),
+        t!("core-bw-yellows"),
+        t!("core-bw-greens"),
+        t!("core-bw-cyans"),
+        t!("core-bw-blues"),
+        t!("core-bw-magentas"),
+        t!("adjust8-whites"),
+        t!("adjust8-neutrals"),
+        t!("adjust8-blacks"),
+    ];
+    let mut lines = vec![line(&t!("adjust8-method"), method)];
+    for (name, range) in names.iter().zip(&s.ranges) {
+        if *range != [0.0; 4] {
+            lines.push(line(name, shares(&inks, range)));
+        }
+    }
+    lines
 }
 
 fn filter_details(f: &crate::filters::Filter) -> Vec<String> {
@@ -3077,7 +3250,15 @@ fn filter_details(f: &crate::filters::Filter) -> Vec<String> {
         F::ZigZag {
             amount: a, ridges, ..
         } => vec![amount(a), line(&t!("distort8-ridges"), n(ridges))],
-        F::FindEdges | F::Clouds(_) | F::Shear(_) => Vec::new(),
+        F::Shear(s) => vec![line(
+            &t!("filter-undefined-areas"),
+            match s.undefined {
+                crate::filters::Undefined::Transparent => t!("filter-set-transparent"),
+                crate::filters::Undefined::RepeatEdges => t!("filter-repeat-edges"),
+                crate::filters::Undefined::WrapAround => t!("filter-wrap-around"),
+            },
+        )],
+        F::FindEdges | F::Clouds(_) => Vec::new(),
     }
 }
 
@@ -4034,5 +4215,71 @@ mod tests {
         assert_eq!(a.notice.take(), Some(t!("smart4-actions-change-not-saved")));
         a.changed();
         assert!(a.notice.is_none(), "once");
+    }
+
+    fn crop_step(
+        app: &mut AtelierApp,
+        rect: [i64; 4],
+        size: Option<(u32, u32)>,
+        angle: f32,
+    ) -> Result<(), String> {
+        let step = Recorded::Crop {
+            rect,
+            angle,
+            delete: false,
+            size,
+            resolution: 0.0,
+        };
+        app.play_step(&step, false)
+    }
+
+    #[test]
+    fn a_crop_step_from_a_file_is_validated_before_it_allocates() {
+        let mut h = app();
+        let app = h.state_mut();
+        let doc = app.doc.as_ref().unwrap();
+        let (w, tall) = (doc.width(), doc.height());
+        let rect = [0, 0, i64::from(w), i64::from(tall)];
+        assert!(crop_step(app, rect, Some((u32::MAX, u32::MAX)), 0.0).is_err());
+        assert!(crop_step(app, rect, Some((0, 0)), 0.0).is_err());
+        assert!(crop_step(app, [0, 0, 1 << 40, 10], None, 0.0).is_err());
+        assert!(crop_step(app, rect, None, f32::NAN).is_err());
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!((doc.width(), doc.height()), (w, tall));
+    }
+
+    #[test]
+    fn a_crop_that_changes_nothing_is_no_failed_step() {
+        let mut h = app();
+        let app = h.state_mut();
+        let doc = app.doc.as_ref().unwrap();
+        let (w, tall) = (doc.width(), doc.height());
+        let id = doc.state_id();
+        app.status = "before".into();
+        let rect = [0, 0, i64::from(w), i64::from(tall)];
+        assert!(crop_step(app, rect, None, 0.0).is_ok());
+        assert!(crop_step(app, rect, Some((w, tall)), 0.0).is_ok());
+        assert_eq!(app.status, "before", "nothing said: `step_failed` goes by it");
+        assert_eq!(app.doc.as_ref().unwrap().state_id(), id);
+    }
+
+    #[test]
+    fn a_large_crop_step_is_waited_for_and_the_next_step_applies_to_it() {
+        let mut h = app();
+        let image = RgbaImage::from_pixel(3000, 2000, image::Rgba([9, 9, 9, 255]));
+        h.state_mut().doc = Some(Document::new(image, None));
+        h.run_steps(1);
+        let step = Recorded::Crop {
+            rect: [100, 100, 1000, 800],
+            angle: 10.0,
+            delete: true,
+            size: None,
+            resolution: 0.0,
+        };
+        with_action(&mut h, vec![Step::new(step), invert()]);
+        play(&mut h);
+        let doc = h.state().doc.as_ref().unwrap();
+        assert_eq!((doc.width(), doc.height()), (1000, 800));
+        assert_eq!(doc.flatten().get_pixel(500, 400).0[0], 246, "inverted after");
     }
 }

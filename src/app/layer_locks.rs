@@ -2,7 +2,7 @@
 //! Pixels, Lock Position and Lock All, and what they refuse.
 
 use super::*;
-use crate::document::Locks;
+use crate::document::{LockedBy, Locks};
 
 /// A lock of the Layers panel's row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,19 +59,47 @@ impl LockKind {
         }
     }
 
+    /// The innermost group holding layer `i` with this lock (or Lock All).
+    fn group(self, doc: &Document, i: usize) -> Option<usize> {
+        match self {
+            Self::Transparent => doc.group_with_lock(i, |l| l.transparent),
+            Self::Pixels => doc.group_with_lock(i, |l| l.pixels),
+            Self::Position => doc.group_with_lock(i, |l| l.position),
+            Self::All => doc.locking_group(i),
+        }
+    }
+
     /// As the panel's button and the menu show it for layer `i`: on, whether
     /// through Lock All or a group; and whether it can change.
     pub(super) fn state(self, doc: &Document, i: usize) -> (bool, bool) {
         let Some(l) = doc.layers.get(i) else {
             return (false, false);
         };
-        let group = doc.lock_group(i).map(|g| &doc.layers[g]);
-        let inherited = group.is_some_and(|g| g.locked || self.on(g));
-        let all = l.locked || group.is_some_and(|g| g.locked);
+        // Every group that holds it counts, not only the nearest locked one.
+        let inherited = self.group(doc, i).is_some();
+        let all = l.locked || doc.locking_group(i).is_some();
         let on = self.on(l) || inherited || (all && self != Self::All);
         // Lock All covers the others; a lock from the group stays with it.
         let free = !inherited && (self == Self::All || !l.locked) && self.applies(doc, i);
         (on, free)
+    }
+}
+
+/// A layer's own locks: Lock All, the partial ones.
+type OwnLocks = (bool, Locks);
+
+trait SetLock {
+    fn set(&mut self, kind: LockKind, on: bool);
+}
+
+impl SetLock for OwnLocks {
+    fn set(&mut self, kind: LockKind, on: bool) {
+        match kind {
+            LockKind::Transparent => self.1.transparent = on,
+            LockKind::Pixels => self.1.pixels = on,
+            LockKind::Position => self.1.position = on,
+            LockKind::All => self.0 = on,
+        }
     }
 }
 
@@ -92,6 +120,41 @@ impl Default for LastLock {
 }
 
 impl LastLock {
+    pub(super) const EVERY: Self = Self {
+        locks: Locks::ALL,
+        all: true,
+    };
+
+    pub(super) fn only(kind: LockKind) -> Self {
+        Self {
+            locks: Locks {
+                transparent: kind == LockKind::Transparent,
+                pixels: kind == LockKind::Pixels,
+                position: kind == LockKind::Position,
+            },
+            all: kind == LockKind::All,
+        }
+    }
+
+    fn holds(self, kind: LockKind) -> bool {
+        match kind {
+            LockKind::Transparent => self.locks.transparent,
+            LockKind::Pixels => self.locks.pixels,
+            LockKind::Position => self.locks.position,
+            LockKind::All => self.all,
+        }
+    }
+
+    /// The names of these locks, for a message or a step.
+    pub(super) fn names(self) -> String {
+        let names: Vec<String> = LockKind::ROW
+            .into_iter()
+            .filter(|&k| self.holds(k))
+            .map(LockKind::label)
+            .collect();
+        names.join(", ")
+    }
+
     /// For the session: `transparent,pixels,position,all`.
     pub(super) fn to_bits(self) -> u64 {
         u64::from(self.locks.transparent)
@@ -149,35 +212,100 @@ impl AtelierApp {
         self.status = lock_status(on, &name);
     }
 
-    /// Ctrl+/: a locked layer is unlocked; otherwise, the last lock used
-    /// goes on the selected layers (Lock All at first). One step.
-    pub(super) fn toggle_last_lock(&mut self) {
-        let Some(doc) = &self.doc else { return };
-        let active = doc.active_layer();
+    /// What Ctrl+/ would do: the locks concerned, on or off.
+    pub(super) fn last_lock_change(&self) -> Option<(LastLock, bool)> {
+        let active = self.doc.as_ref()?.active_layer();
         let on = !active.locked && !active.locks.any();
-        let last = self.last_lock;
-        let picked = self.selected_indices();
-        let name = active.name.clone();
-        self.record_change(lock_step(on), None);
-        let Some(doc) = &mut self.doc else { return };
-        for i in picked {
-            let can_hold_pixels = doc.lockable_pixels(i);
-            let l = &mut doc.layers[i];
-            if on {
-                l.locked = last.all;
-                l.locks.position = last.locks.position;
-                l.locks.transparent = last.locks.transparent && can_hold_pixels;
-                l.locks.pixels = last.locks.pixels && can_hold_pixels;
-            } else {
-                l.locked = false;
-                l.locks = Locks::default();
+        Some((if on { self.last_lock } else { LastLock::EVERY }, on))
+    }
+
+    /// The new own locks of the selected layers that `set` changes.
+    fn lock_changes(&self, set: LastLock, on: bool) -> Vec<(usize, bool, Locks)> {
+        let Some(doc) = &self.doc else {
+            return Vec::new();
+        };
+        let mut changes = Vec::new();
+        for i in self.selected_indices() {
+            // Under its group's Lock All, a layer's locks don't change.
+            if doc.locking_group(i).is_some() {
+                continue;
+            }
+            let l = &doc.layers[i];
+            let mut next: OwnLocks = (l.locked, l.locks);
+            for kind in LockKind::ROW.into_iter().filter(|&k| set.holds(k)) {
+                // Nothing to add to what the group says, or what can't hold it.
+                if !on || (kind.group(doc, i).is_none() && kind.applies(doc, i)) {
+                    next.set(kind, on);
+                }
+            }
+            if next != (l.locked, l.locks) {
+                changes.push((i, next.0, next.1));
             }
         }
+        changes
+    }
+
+    /// `set` on or off on the selected layers: one step. `false` when
+    /// nothing changes.
+    fn apply_locks(&mut self, set: LastLock, on: bool) -> bool {
+        let changes = self.lock_changes(set, on);
+        if changes.is_empty() {
+            return false;
+        }
+        let name = self.doc.as_ref().map_or_else(String::new, |d| d.active_layer().name.clone());
+        self.record_change(lock_step(on), None);
+        let Some(doc) = &mut self.doc else {
+            return false;
+        };
+        for (i, locked, locks) in changes {
+            (doc.layers[i].locked, doc.layers[i].locks) = (locked, locks);
+        }
         self.status = lock_status(on, &name);
+        true
+    }
+
+    /// Ctrl+/: a locked layer is unlocked; otherwise, the last lock used
+    /// goes on the selected layers (Lock All at first). One step, and none
+    /// when nothing would change: the status says why.
+    pub(super) fn toggle_last_lock(&mut self) {
+        let Some((set, on)) = self.last_lock_change() else {
+            return;
+        };
+        // The group's Lock All isn't this command's to undo.
+        let held = self.doc.as_ref().is_some_and(|d| d.locking_group(d.active).is_some());
+        if held {
+            self.refuse_if_locked();
+            return;
+        }
+        if !self.apply_locks(set, on) {
+            self.status = t!("layers8-lock-unavailable", lock = set.names());
+        }
+    }
+
+    /// A step of an action: `set` on or off. Already so: nothing to do.
+    pub(super) fn play_locks(&mut self, set: LastLock, on: bool) -> Result<(), String> {
+        if self.apply_locks(set, on) {
+            return Ok(());
+        }
+        let Some(doc) = &self.doc else {
+            return Err(t!("actions-error-no-document"));
+        };
+        let done = LockKind::ROW
+            .into_iter()
+            .filter(|&k| set.holds(k))
+            .all(|k| k.state(doc, doc.active).0 == on);
+        if done {
+            Ok(())
+        } else {
+            Err(t!("layers8-lock-unavailable", lock = set.names()))
+        }
     }
 
     /// A layer's own locks all off (the lock of its row in the panel).
     pub(super) fn unlock_layer(&mut self, i: usize) {
+        let recording = self.actions.recording_len();
+        let before = self.doc.as_ref().map(|d| (d.uid(), d.history_step()));
+        let active = self.doc.as_ref().is_some_and(|d| d.active == i);
         self.record_change(lock_step(false), None);
         let Some(l) = self.doc.as_mut().and_then(|d| d.layers.get_mut(i)) else {
             return;
@@ -185,25 +313,33 @@ impl AtelierApp {
         l.locked = false;
         l.locks = Locks::default();
         self.status = lock_status(false, &l.name.clone());
+        // An action plays on the active layer: another one's can't be a step.
+        if active {
+            self.record(actions_panel::recorded_locks(LastLock::EVERY, false));
+        } else {
+            self.tell_unrecorded(Action::ToggleLock, recording, before);
+        }
     }
 
-    /// The row of locks above the list of layers.
-    pub(super) fn lock_row(&mut self, ui: &mut egui::Ui) {
+    /// The locks of the Layers panel; `labelled`: after the word "Lock:".
+    pub(super) fn lock_row(&mut self, ui: &mut egui::Ui, labelled: bool) {
         let Some(doc) = &self.doc else { return };
-        let states = LockKind::ROW.map(|k| (k, k.state(doc, doc.active)));
-        let inherited = doc
-            .lock_group(doc.active)
-            .map(|g| doc.layers[g].name.clone());
+        let states = LockKind::ROW.map(|k| {
+            let group = k.group(doc, doc.active).map(|g| doc.layers[g].name.clone());
+            (k, k.state(doc, doc.active), group)
+        });
         let mut clicked = None;
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            ui.label(
-                egui::RichText::new(t!("layers8-lock-label"))
-                    .size(12.0)
-                    .color(ui_kit::color::LABEL),
-            );
-            ui.add_space(4.0);
-            for (kind, (on, free)) in states {
+            if labelled {
+                ui.label(
+                    egui::RichText::new(t!("layers8-lock-label"))
+                        .size(12.0)
+                        .color(ui_kit::color::LABEL),
+                );
+                ui.add_space(4.0);
+            }
+            for (kind, (on, free), inherited) in states {
                 let mut shown = on;
                 let label = kind.label();
                 let tip = match (&inherited, free) {
@@ -229,12 +365,40 @@ impl AtelierApp {
         }
     }
 
-    fn lock_refused(&mut self, message: i18n::Message) {
-        let lock = icon::LOCK_SIMPLE;
-        self.status_failed(i18n::Message::new(
-            format!("{lock} {}", message.shown),
-            format!("{lock} {}", message.english),
-        ));
+    /// Says that lock `kind` on layer `i` refuses what was asked, naming
+    /// the layer or group that has it, where it can be turned off.
+    fn refuse_lock_of(&mut self, i: usize, kind: LockKind) {
+        let Some(doc) = &self.doc else { return };
+        let Some(l) = doc.layers.get(i) else { return };
+        let name = l.name.as_str();
+        let group = (!kind.on(l) && !l.locked)
+            .then(|| kind.group(doc, i))
+            .flatten()
+            .map(|g| &doc.layers[g]);
+        let message = match (kind, group) {
+            (_, Some(g)) if g.locked => {
+                tm!("tools6-status-group-locked", name = name, group = g.name.as_str())
+            }
+            (_, None) if l.locked => tm!("status-layer-is-locked", name = name),
+            (LockKind::Pixels, Some(g)) => {
+                tm!("locks9-status-group-pixels-locked", name = name, group = g.name.as_str())
+            }
+            (LockKind::Transparent, Some(g)) => {
+                tm!("locks9-status-group-transparent-locked", name = name, group = g.name.as_str())
+            }
+            (LockKind::Position, Some(g)) => {
+                tm!("locks9-status-group-position-locked", name = name, group = g.name.as_str())
+            }
+            (LockKind::Pixels, None) => tm!("layers8-status-pixels-locked", name = name),
+            (LockKind::Transparent, None) => tm!("layers8-status-transparent-locked", name = name),
+            (LockKind::Position | LockKind::All, None) => {
+                tm!("layers8-status-position-locked", name = name)
+            }
+            (LockKind::All, Some(g)) => {
+                tm!("tools6-status-group-locked", name = name, group = g.name.as_str())
+            }
+        };
+        self.status_refused(message);
     }
 
     /// Lock Image Pixels on what is about to be edited (not a targeted
@@ -244,9 +408,54 @@ impl AtelierApp {
         if !doc.pixels_locked() {
             return false;
         }
-        let name = doc.active_layer().name.clone();
-        self.lock_refused(tm!("layers8-status-pixels-locked", name = name.as_str()));
+        self.refuse_lock_of(doc.active, LockKind::Pixels);
         true
+    }
+
+    /// What the active layer holds (text, path, smart object) may not be
+    /// edited, a targeted mask or not: says so and returns `true`.
+    pub(super) fn refuse_content_locked(&mut self) -> bool {
+        if self.refuse_if_locked() {
+            return true;
+        }
+        let Some(doc) = &self.doc else { return false };
+        if !doc.content_locked(doc.active) {
+            return false;
+        }
+        self.refuse_lock_of(doc.active, LockKind::Pixels);
+        true
+    }
+
+    /// The one rule for what resamples or turns the active element (Free
+    /// Transform, its commands, handles, Properties): says so and returns
+    /// `true` when a lock on it, or on a layer its group holds, refuses.
+    pub(super) fn refuse_transform_locked(&mut self) -> bool {
+        if self.refuse_position_locked() {
+            return true;
+        }
+        let Some(doc) = &self.doc else { return false };
+        let Some((i, by)) = doc.transform_block(doc.active) else {
+            return false;
+        };
+        let kind = match by {
+            LockedBy::Position => LockKind::Position,
+            LockedBy::Pixels => LockKind::Pixels,
+        };
+        self.refuse_lock_of(i, kind);
+        true
+    }
+
+    /// A layer about to land in a group that won't let it move, when it
+    /// has to be placed: says so and returns `true`.
+    pub(super) fn refuse_new_layer_stuck(&mut self) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        match doc.landing_group().filter(|&g| !doc.can_move(g)) {
+            Some(g) => {
+                self.refuse_lock_of(g, LockKind::Position);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Lock Transparent Pixels on what is about to take pixels away.
@@ -255,11 +464,7 @@ impl AtelierApp {
         if !doc.alpha_locked() {
             return false;
         }
-        let name = doc.active_layer().name.clone();
-        self.lock_refused(tm!(
-            "layers8-status-transparent-locked",
-            name = name.as_str()
-        ));
+        self.refuse_lock_of(doc.active, LockKind::Transparent);
         true
     }
 
@@ -270,17 +475,34 @@ impl AtelierApp {
             return true;
         }
         let Some(doc) = &self.doc else { return false };
-        if doc.can_move(doc.active) {
-            return false;
-        }
-        let name = doc.active_layer().name.clone();
-        self.lock_refused(tm!("layers8-status-position-locked", name = name.as_str()));
+        // A group none of whose layers can move doesn't move either.
+        let by = match doc.can_move(doc.active) {
+            true => doc.stuck_group_layer(doc.active),
+            false => Some(doc.active),
+        };
+        let Some(i) = by else { return false };
+        self.refuse_lock_of(i, LockKind::Position);
         true
     }
 
     /// What the partial locks refuse of `action`, beyond the checks of Lock
     /// All; `true` when it has been dealt with.
     pub(super) fn locks_refuse(&mut self, action: Action) -> bool {
+        // Whatever is targeted, it writes into the layer's own pixels.
+        if matches!(action, Action::ApplyMask)
+            && let Some(doc) = &self.doc
+        {
+            let (active, locks) = (doc.active, doc.locks(doc.active));
+            if locks.pixels || locks.transparent {
+                let kind = if locks.pixels {
+                    LockKind::Pixels
+                } else {
+                    LockKind::Transparent
+                };
+                self.refuse_lock_of(active, kind);
+                return true;
+            }
+        }
         if self.in_quick_mask() {
             return false;
         }
@@ -290,12 +512,17 @@ impl AtelierApp {
             }
             Action::Rasterize => self.refuse_pixels_locked(),
             Action::MakeTransparent => self.refuse_alpha_locked(),
-            Action::Transform(_) | Action::CenterElement => self.refuse_position_locked(),
-            // Delete can't take the pixels away: it fills them, asking how.
+            Action::Transform(_) => self.refuse_transform_locked(),
+            Action::CenterElement => self.refuse_position_locked(),
+            // Delete can't take the pixels away: it fills them, asking how
+            // (an action can't ask: the step fails).
             Action::ClearSelection
                 if self.selection.is_some()
                     && self.doc.as_ref().is_some_and(Document::alpha_locked) =>
             {
+                if self.actions.playing() {
+                    return self.refuse_alpha_locked();
+                }
                 self.run(Action::FillDialog);
                 true
             }
@@ -303,9 +530,10 @@ impl AtelierApp {
         }
     }
 
-    /// Under Lock Image Pixels, the Move tool only moves.
+    /// Under a lock that refuses transforms, the Move tool only moves.
     pub(super) fn transform_frozen(&self) -> bool {
-        !self.in_quick_mask() && self.doc.as_ref().is_some_and(Document::pixels_locked)
+        !self.in_quick_mask()
+            && self.doc.as_ref().is_some_and(|d| d.transform_block(d.active).is_some())
     }
 }
 

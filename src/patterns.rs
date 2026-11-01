@@ -1,8 +1,16 @@
 //! The pattern library: the built-in patterns, and those defined by the
 //! user, kept between sessions (`patterns/index.json` and a PNG for each, in
 //! the settings folder).
+//!
+//! What is on the disk is never replaced by what a session believes: a change
+//! is applied to the index found there, under a lock (other windows of the
+//! application save too), and a PNG only goes when the user removes its
+//! pattern. So what can't be read today, or was added by another window, is
+//! still there tomorrow.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, OnceLock};
 
 use image::{Rgba, RgbaImage};
@@ -95,12 +103,47 @@ struct IndexEntry {
 pub struct Library {
     /// Built-in, then the user's, oldest first.
     pub items: Vec<Arc<Pattern>>,
+    /// The file of those read from the disk (not always named after the id:
+    /// the index may have been edited).
+    files: HashMap<u64, String>,
+    /// The language of the built-in patterns' names.
+    lang: crate::i18n::Lang,
 }
 
 impl Default for Library {
     fn default() -> Self {
-        Self { items: builtins() }
+        Self {
+            items: builtins(),
+            files: HashMap::new(),
+            lang: crate::i18n::lang(),
+        }
     }
+}
+
+/// What [`Library::add`] did.
+#[derive(Debug, PartialEq)]
+pub enum Added {
+    New,
+    /// This very tile is already there, under this name.
+    Already(String),
+}
+
+/// What [`Library::read`] found.
+#[derive(Default)]
+pub struct Loaded {
+    /// The patterns, with their files.
+    patterns: Vec<(Arc<Pattern>, String)>,
+    /// Those listed that can't be read now; their entries and files stay.
+    pub left_out: usize,
+    /// The damaged index, set aside under this name.
+    pub set_aside: Option<String>,
+}
+
+/// A change of the library on the disk.
+pub enum Change {
+    Add { file: String, pattern: Arc<Pattern> },
+    Rename { file: String, name: String },
+    Remove { file: String },
 }
 
 /// File of pattern `id` in the library's folder.
@@ -121,19 +164,32 @@ impl Library {
         &self.items[BUILTIN_COUNT.min(self.items.len())..]
     }
 
-    /// Adds a pattern; the same tile again only takes the new name (not a
-    /// built-in's). Whether the library changed.
-    pub fn add(&mut self, pattern: Arc<Pattern>) -> bool {
-        match self.items.iter().position(|p| p.id == pattern.id) {
-            Some(i) if i < BUILTIN_COUNT => false,
-            Some(i) => {
-                let same = self.items[i].name == pattern.name;
-                self.items[i] = pattern;
-                !same
+    /// The built-in patterns named in the current language, once it changed.
+    pub fn follow_language(&mut self) {
+        let lang = crate::i18n::lang();
+        if lang != self.lang {
+            self.lang = lang;
+            for (i, item) in self.items.iter_mut().take(BUILTIN_COUNT).enumerate() {
+                *item = item.renamed(builtin_name(i));
             }
+        }
+    }
+
+    /// The file of pattern `id`.
+    pub fn file_for(&self, id: u64) -> String {
+        match self.files.get(&id) {
+            Some(file) => file.clone(),
+            None => file_of(id),
+        }
+    }
+
+    /// Adds a pattern; a tile is only there once, under the name it has.
+    pub fn add(&mut self, pattern: Arc<Pattern>) -> Added {
+        match self.get(pattern.id) {
+            Some(p) => Added::Already(p.name.clone()),
             None => {
                 self.items.push(pattern);
-                true
+                Added::New
             }
         }
     }
@@ -159,82 +215,284 @@ impl Library {
         }
     }
 
-    /// Merges the user's patterns read from a file (they come after those
-    /// that are already there only if new).
-    pub fn merge(&mut self, read: Vec<Arc<Pattern>>) {
-        for p in read {
-            if self.items.iter().all(|q| q.id != p.id) {
+    /// Merges the user's patterns read from the disk (those not there yet).
+    pub fn merge(&mut self, read: Loaded) {
+        for (p, file) in read.patterns {
+            if self.get(p.id).is_none() {
+                self.files.insert(p.id, file);
                 self.items.push(p);
             }
         }
     }
 
-    /// Writes the user's patterns in `folder`: the missing PNG files, the
-    /// index (whole or not at all), then drops those no longer used. A later
-    /// error leaves the former library readable.
-    pub fn save(user: &[Arc<Pattern>], folder: &Path) -> std::io::Result<()> {
+    /// Applies `changes` to the library in `folder`, whole or not at all: the
+    /// new PNG files, the index, then the files of what was removed. Entries
+    /// it can't read, and those of other windows, stay as they are.
+    pub fn apply(folder: &Path, changes: &[Change]) -> std::io::Result<()> {
         std::fs::create_dir_all(folder)?;
-        let mut entries = Vec::with_capacity(user.len());
-        for p in user {
-            let file = file_of(p.id);
-            let path = folder.join(&file);
-            if !path.exists() {
-                let temp = path.with_extension("png.tmp");
-                p.image
-                    .save_with_format(&temp, image::ImageFormat::Png)
-                    .map_err(std::io::Error::other)?;
-                std::fs::rename(&temp, &path)?;
+        let lock = std::fs::File::create(folder.join(".lock"))?;
+        // Where locks don't exist (some network drives), saving still works.
+        let _ = lock.lock();
+        // Under the lock, a temporary file is what a crash left.
+        for entry in std::fs::read_dir(folder)?.flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".tmp") {
+                let _ = std::fs::remove_file(entry.path());
             }
-            entries.push(IndexEntry {
-                name: p.name.clone(),
-                file,
-            });
         }
-        let json = serde_json::to_vec_pretty(&entries).map_err(std::io::Error::other)?;
+        let (mut entries, _) = load_index(folder)?;
+        let file_is = |entry: &serde_json::Value, file: &str| {
+            entry.get("file").and_then(serde_json::Value::as_str) == Some(file)
+        };
+        let mut removed = Vec::new();
+        for change in changes {
+            match change {
+                Change::Add { file, pattern } => {
+                    write_tile(&folder.join(file), &pattern.image)?;
+                    removed.retain(|r| r != file);
+                    let entry = serde_json::to_value(IndexEntry {
+                        name: pattern.name.clone(),
+                        file: file.clone(),
+                    })?;
+                    match entries.iter_mut().find(|e| file_is(e, file)) {
+                        Some(found) => *found = entry,
+                        None => entries.push(entry),
+                    }
+                }
+                Change::Rename { file, name } => {
+                    let entry = serde_json::to_value(IndexEntry {
+                        name: name.clone(),
+                        file: file.clone(),
+                    })?;
+                    match entries.iter_mut().find(|e| file_is(e, file)) {
+                        Some(found) => *found = entry,
+                        // Taken in from the folder, the index having no name
+                        // for it (see `Library::read`).
+                        None if folder.join(file).exists() => entries.push(entry),
+                        None => {}
+                    }
+                }
+                Change::Remove { file } => {
+                    entries.retain(|e| !file_is(e, file));
+                    removed.push(file.clone());
+                }
+            }
+        }
+        let json = serde_json::to_vec_pretty(&entries)?;
         let temp = folder.join("index.json.tmp");
         std::fs::write(&temp, json)?;
         std::fs::rename(&temp, folder.join("index.json"))?;
-        for entry in std::fs::read_dir(folder)?.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".png") && entries.iter().all(|e| e.file != *name) {
-                let _ = std::fs::remove_file(entry.path());
+        for file in removed {
+            // Only a file's name: the index may have been edited.
+            if Path::new(&file).file_name().is_some_and(|n| *n == *file) {
+                let _ = std::fs::remove_file(folder.join(file));
             }
         }
         Ok(())
     }
 
-    /// The patterns saved in `folder`; what is missing or damaged is left
-    /// out.
-    pub fn read(folder: &Path) -> Vec<Arc<Pattern>> {
-        let Ok(json) = std::fs::read(folder.join("index.json")) else {
-            return Vec::new();
+    /// The patterns saved in `folder`. What can't be read is left out, not
+    /// lost; a PNG the index doesn't list (its index was damaged, or a crash
+    /// came between the two) is taken in again.
+    pub fn read(folder: &Path) -> Loaded {
+        let mut out = Loaded::default();
+        let entries = match load_index(folder) {
+            Ok((entries, set_aside)) => {
+                out.set_aside = set_aside;
+                entries
+            }
+            Err(e) => {
+                crate::diag::warn(format!("pattern library not read: {e}"));
+                out.left_out = 1;
+                return out;
+            }
         };
-        let entries: Vec<IndexEntry> = serde_json::from_slice(&json).unwrap_or_default();
-        entries
-            .into_iter()
-            .filter_map(|e| {
-                // Only a file's name: the index may have been edited.
-                if Path::new(&e.file).file_name()? != e.file.as_str() {
-                    return None;
+        let mut memory = crate::document::free_memory();
+        let mut listed = Vec::new();
+        for value in entries {
+            if let Some(file) = value.get("file").and_then(serde_json::Value::as_str) {
+                listed.push(file.to_owned());
+            }
+            let tile = serde_json::from_value::<IndexEntry>(value)
+                .ok()
+                .and_then(|e| Some((read_tile(folder, &e.file, &mut memory)?, e)));
+            match tile {
+                Some((image, e)) => out.patterns.push((Pattern::new(e.name, image), e.file)),
+                None => out.left_out += 1,
+            }
+        }
+        let Ok(dir) = std::fs::read_dir(folder) else {
+            return out;
+        };
+        let mut unlisted: Vec<String> = dir
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".png") && !listed.contains(name))
+            .collect();
+        unlisted.sort();
+        for file in unlisted {
+            match read_tile(folder, &file, &mut memory) {
+                Some(image) => {
+                    let number = out.patterns.len() + 1;
+                    let name = t!("pattern8-default-name", number = number);
+                    out.patterns.push((Pattern::new(name, image), file));
                 }
-                let reader = image::ImageReader::open(folder.join(&e.file)).ok()?;
-                let image = reader
-                    .with_guessed_format()
-                    .ok()?
-                    .decode()
-                    .ok()?
-                    .into_rgba8();
-                let (w, h) = image.dimensions();
-                (w > 0 && h > 0 && w <= MAX_SIDE && h <= MAX_SIDE)
-                    .then(|| Pattern::new(e.name, image))
-            })
-            .collect()
+                None => out.left_out += 1,
+            }
+        }
+        out
     }
 
-    /// A copy of the user's patterns, to be saved on another thread.
+    /// A copy of the user's patterns.
     pub fn user_patterns(&self) -> Vec<Arc<Pattern>> {
         self.user().to_vec()
+    }
+}
+
+/// The entries of the index, each as it is written (a bad one stays), and
+/// the name a damaged index was set aside under. An index that can't be read
+/// for now is an error: nothing may be written over it.
+fn load_index(folder: &Path) -> std::io::Result<(Vec<serde_json::Value>, Option<String>)> {
+    let path = folder.join("index.json");
+    let json = match std::fs::read(&path) {
+        Ok(json) => json,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), None)),
+        Err(e) => return Err(e),
+    };
+    if let Ok(serde_json::Value::Array(entries)) = serde_json::from_slice(&json) {
+        return Ok((entries, None));
+    }
+    let backup = crate::actions::set_aside(&path).ok_or_else(|| {
+        std::io::Error::other("the damaged index of the pattern library can't be set aside")
+    })?;
+    let name = backup.file_name().unwrap_or_default();
+    Ok((Vec::new(), Some(name.to_string_lossy().into_owned())))
+}
+
+/// The pixels of a file of the library, if readable within `memory`, and what
+/// they will take is taken from it.
+fn read_tile(folder: &Path, file: &str, memory: &mut u64) -> Option<RgbaImage> {
+    // Only a file's name: the index may have been edited.
+    if Path::new(file).file_name()? != file {
+        return None;
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_SIDE);
+    limits.max_image_height = Some(MAX_SIDE);
+    limits.max_alloc = Some(*memory);
+    let mut reader = image::ImageReader::open(folder.join(file))
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(limits);
+    let image = reader.decode().ok()?.into_rgba8();
+    let (w, h) = image.dimensions();
+    // The tile and its smaller versions.
+    *memory = memory.saturating_sub(w as u64 * h as u64 * 6);
+    (w > 0 && h > 0).then_some(image)
+}
+
+/// Writes a tile's file, unless it is there and good. One that can't be read,
+/// or holds something else, is set aside.
+fn write_tile(path: &Path, image: &RgbaImage) -> std::io::Result<()> {
+    if path.exists() {
+        let same = image::open(path).is_ok_and(|d| d.into_rgba8() == *image);
+        if same {
+            return Ok(());
+        }
+        crate::actions::set_aside(path)
+            .ok_or_else(|| std::io::Error::other("a damaged pattern can't be set aside"))?;
+    }
+    let temp = path.with_extension("png.tmp");
+    image
+        .save_with_format(&temp, image::ImageFormat::Png)
+        .map_err(std::io::Error::other)?;
+    std::fs::rename(&temp, path)
+}
+
+/// The changes of the library on their way to the disk: one thread, in order,
+/// what failed being tried again with the next ones. What is waiting is
+/// written before the application ends.
+#[derive(Default)]
+pub struct Saver {
+    /// Another folder than the settings' (tests).
+    folder: Option<PathBuf>,
+    worker: Option<Worker>,
+}
+
+struct Worker {
+    queue: Sender<Change>,
+    errors: Receiver<String>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Saver {
+    #[cfg(test)]
+    fn in_folder(folder: &Path) -> Self {
+        Self {
+            folder: Some(folder.to_path_buf()),
+            worker: None,
+        }
+    }
+
+    pub fn send(&mut self, change: Change) {
+        // Tests of the interface don't touch the user's library.
+        if cfg!(test) && self.folder.is_none() {
+            return;
+        }
+        let folder = self.folder.clone().unwrap_or_else(folder);
+        let worker = self.worker.get_or_insert_with(|| {
+            let (queue, changes) = channel();
+            let (report, errors) = channel();
+            let thread = std::thread::spawn(move || save_changes(&folder, &changes, &report));
+            Worker {
+                queue,
+                errors,
+                thread,
+            }
+        });
+        let _ = worker.queue.send(change);
+    }
+
+    /// The last error since the last call, if any.
+    pub fn error(&self) -> Option<String> {
+        let mut last = None;
+        let worker = self.worker.as_ref()?;
+        loop {
+            match worker.errors.try_recv() {
+                Ok(e) => last = Some(e),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return last,
+            }
+        }
+    }
+}
+
+impl Drop for Saver {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            drop(worker.queue);
+            let _ = worker.thread.join();
+        }
+    }
+}
+
+/// The saving thread: until the queue is closed, then a last try.
+fn save_changes(folder: &Path, changes: &Receiver<Change>, report: &Sender<String>) {
+    let mut waiting = Vec::new();
+    while let Ok(change) = changes.recv() {
+        waiting.push(change);
+        waiting.extend(changes.try_iter());
+        match Library::apply(folder, &waiting) {
+            Ok(()) => waiting.clear(),
+            Err(e) => {
+                crate::diag::warn(format!("pattern library not saved: {e}"));
+                let _ = report.send(e.to_string());
+            }
+        }
+    }
+    if !waiting.is_empty()
+        && let Err(e) = Library::apply(folder, &waiting)
+    {
+        crate::diag::warn(format!("pattern library not saved: {e}"));
     }
 }
 
@@ -246,9 +504,42 @@ pub fn folder() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn tile(v: u8) -> RgbaImage {
         RgbaImage::from_pixel(3, 2, Rgba([v, 1, 2, 255]))
+    }
+
+    fn folder(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("atelier-patterns-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn add(p: &Arc<Pattern>) -> Change {
+        Change::Add {
+            file: file_of(p.id),
+            pattern: p.clone(),
+        }
+    }
+
+    fn pngs(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".png"))
+            .count()
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = Library::read(dir)
+            .patterns
+            .iter()
+            .map(|(p, _)| p.name.clone())
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]
@@ -258,10 +549,8 @@ mod tests {
         let first = lib.items[0].id;
         assert_eq!(default_pattern().id, first);
         assert!(!lib.remove(first) && !lib.rename(first, "x"));
-        assert!(
-            !lib.add(lib.items[0].renamed("x")),
-            "built-ins keep their name"
-        );
+        let name = lib.items[0].name.clone();
+        assert_eq!(lib.add(lib.items[0].renamed("x")), Added::Already(name));
         assert_eq!(lib.items.len(), BUILTIN_COUNT);
         // All different.
         let mut ids: Vec<u64> = lib.items.iter().map(|p| p.id).collect();
@@ -271,45 +560,237 @@ mod tests {
 
     #[test]
     fn defined_patterns_come_back_in_the_next_session() {
-        let dir = std::env::temp_dir().join(format!("atelier-patterns-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = folder("next");
         let mut lib = Library::default();
-        assert!(lib.add(Pattern::new("A", tile(1))));
-        assert!(lib.add(Pattern::new("B", tile(2))));
-        let b = lib.items.last().unwrap().id;
-        assert!(lib.rename(b, "Brick"));
-        Library::save(&lib.user_patterns(), &dir).unwrap();
+        let (a, b) = (Pattern::new("A", tile(1)), Pattern::new("B", tile(2)));
+        assert_eq!(lib.add(a.clone()), Added::New);
+        assert_eq!(lib.add(b.clone()), Added::New);
+        assert!(lib.rename(b.id, "Brick"));
+        let changes = [
+            add(&a),
+            add(&b),
+            Change::Rename {
+                file: lib.file_for(b.id),
+                name: "Brick".into(),
+            },
+        ];
+        Library::apply(&dir, &changes).unwrap();
         let mut next = Library::default();
         next.merge(Library::read(&dir));
         assert_eq!(next.items.len(), BUILTIN_COUNT + 2);
-        let back = next.get(b).unwrap();
+        let back = next.get(b.id).unwrap();
         assert_eq!(back.name, "Brick");
         assert_eq!(*back.image, tile(2));
         // Deleted: its file goes too; the others stay.
-        assert!(next.remove(b));
-        Library::save(&next.user_patterns(), &dir).unwrap();
-        assert!(!dir.join(file_of(b)).exists());
-        assert_eq!(Library::read(&dir).len(), 1);
-        // Damage leaves out what it touched.
-        std::fs::write(
-            dir.join("index.json"),
-            b"[{\"name\":\"x\",\"file\":\"../x\"}]",
-        )
-        .unwrap();
-        assert!(Library::read(&dir).is_empty());
-        std::fs::write(dir.join("index.json"), b"nonsense").unwrap();
-        assert!(Library::read(&dir).is_empty());
+        assert!(next.remove(b.id));
+        let file = next.file_for(b.id);
+        Library::apply(&dir, &[Change::Remove { file }]).unwrap();
+        assert!(!dir.join(file_of(b.id)).exists());
+        assert_eq!(Library::read(&dir).patterns.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn the_same_tile_again_only_takes_the_name() {
+    fn the_same_tile_again_changes_nothing() {
         let mut lib = Library::default();
         lib.add(Pattern::new("A", tile(1)));
-        assert!(lib.add(Pattern::new("B", tile(1))));
+        assert_eq!(
+            lib.add(Pattern::new("B", tile(1))),
+            Added::Already("A".into())
+        );
         assert_eq!(lib.items.len(), BUILTIN_COUNT + 1);
-        assert_eq!(lib.items.last().unwrap().name, "B");
-        lib.merge(vec![Pattern::new("C", tile(1)), Pattern::new("D", tile(3))]);
-        assert_eq!(lib.items.len(), BUILTIN_COUNT + 2);
+        assert_eq!(lib.items.last().unwrap().name, "A");
+    }
+
+    #[test]
+    fn a_damaged_index_loses_nothing() {
+        let dir = folder("index");
+        let (a, b) = (Pattern::new("A", tile(1)), Pattern::new("B", tile(2)));
+        Library::apply(&dir, &[add(&a), add(&b)]).unwrap();
+        let json = std::fs::read(dir.join("index.json")).unwrap();
+        std::fs::write(dir.join("index.json"), &json[..json.len() / 2]).unwrap();
+        // Set aside, its tiles taken in again from the folder.
+        let read = Library::read(&dir);
+        assert_eq!(read.set_aside.as_deref(), Some("index.json.bak"));
+        assert_eq!(read.patterns.len(), 2);
+        assert_eq!(
+            std::fs::read(dir.join("index.json.bak")).unwrap(),
+            json[..json.len() / 2]
+        );
+        // The next change leaves them on the disk, and a later session finds
+        // all three.
+        let c = Pattern::new("C", tile(3));
+        Library::apply(&dir, &[add(&c)]).unwrap();
+        assert_eq!(pngs(&dir), 3);
+        let read = Library::read(&dir);
+        assert_eq!(read.patterns.len(), 3);
+        assert_eq!(read.left_out, 0);
+        // Renamed once taken in: its entry is written.
+        let file = file_of(a.id);
+        Library::apply(
+            &dir,
+            &[Change::Rename {
+                file,
+                name: "Back".into(),
+            }],
+        )
+        .unwrap();
+        assert!(names(&dir).contains(&"Back".to_owned()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bad_entry_or_png_is_left_out_and_kept() {
+        let dir = folder("entry");
+        let (a, b) = (Pattern::new("A", tile(1)), Pattern::new("B", tile(2)));
+        Library::apply(&dir, &[add(&a), add(&b)]).unwrap();
+        // A bad entry beside the good ones; a PNG cut in half.
+        let mut entries: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(dir.join("index.json")).unwrap()).unwrap();
+        entries.push(serde_json::json!({ "name": 3 }));
+        entries.push(serde_json::json!({ "name": "x", "file": "../x" }));
+        std::fs::write(
+            dir.join("index.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let path = dir.join(file_of(a.id));
+        let good = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &good[..good.len() / 2]).unwrap();
+        let read = Library::read(&dir);
+        assert_eq!(read.patterns.len(), 1);
+        assert_eq!(read.left_out, 3);
+        // A later change keeps every one of them: repaired, A comes back.
+        let c = Pattern::new("C", tile(3));
+        Library::apply(&dir, &[add(&c)]).unwrap();
+        assert_eq!(pngs(&dir), 3);
+        std::fs::write(&path, &good).unwrap();
+        assert_eq!(names(&dir), ["A", "B", "C"]);
+        let index = std::fs::read_to_string(dir.join("index.json")).unwrap();
+        assert!(index.contains("../x"), "{index}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tile_defined_again_replaces_its_damaged_file() {
+        let dir = folder("redefine");
+        let a = Pattern::new("A", tile(1));
+        Library::apply(&dir, &[add(&a)]).unwrap();
+        let path = dir.join(file_of(a.id));
+        let good = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &good[..good.len() / 2]).unwrap();
+        assert!(Library::read(&dir).patterns.is_empty());
+        Library::apply(&dir, &[add(&a)]).unwrap();
+        assert_eq!(names(&dir), ["A"]);
+        assert!(dir.join(format!("{}.bak", file_of(a.id))).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_windows_keep_each_others_patterns() {
+        let dir = folder("two");
+        let (a, b) = (Pattern::new("A", tile(1)), Pattern::new("B", tile(2)));
+        Library::apply(&dir, &[add(&a)]).unwrap();
+        // Another window, its library older than this.
+        Library::apply(&dir, &[add(&b)]).unwrap();
+        assert_eq!(pngs(&dir), 2);
+        assert_eq!(names(&dir), ["A", "B"]);
+        // And at the same time.
+        let threads: Vec<_> = (10..18)
+            .map(|v| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let p = Pattern::new(format!("{v}"), tile(v));
+                    Library::apply(&dir, &[add(&p)]).unwrap();
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(names(&dir).len(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_library_unreadable_for_now_is_not_written_over() {
+        let dir = folder("unreadable");
+        std::fs::create_dir_all(dir.join("index.json")).unwrap();
+        let a = Pattern::new("A", tile(1));
+        assert!(Library::apply(&dir, &[add(&a)]).is_err());
+        assert_eq!(Library::read(&dir).left_out, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_saver_keeps_the_order_retries_and_finishes_before_the_end() {
+        let dir = folder("saver");
+        // A folder that can't be written yet: a file in its place.
+        std::fs::write(&dir, b"").unwrap();
+        let mut saver = Saver::in_folder(&dir);
+        let (a, b) = (Pattern::new("A", tile(1)), Pattern::new("B", tile(2)));
+        saver.send(add(&a));
+        let mut error = None;
+        for _ in 0..500 {
+            error = saver.error();
+            if error.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(error.is_some(), "the failure is reported");
+        std::fs::remove_file(&dir).unwrap();
+        saver.send(add(&b));
+        saver.send(Change::Rename {
+            file: file_of(b.id),
+            name: "B2".into(),
+        });
+        saver.send(Change::Remove {
+            file: file_of(a.id),
+        });
+        // At the end of the session everything is written.
+        drop(saver);
+        assert_eq!(names(&dir), ["B2"]);
+        assert!(!dir.join(file_of(a.id)).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_a_crash_left_goes_at_the_next_save() {
+        let dir = folder("temp");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("0000.png.tmp"), b"half").unwrap();
+        let a = Pattern::new("A", tile(1));
+        Library::apply(&dir, &[add(&a)]).unwrap();
+        assert!(!dir.join("0000.png.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past the reader's default limit (512 MiB): what is saved reads back.
+    #[test]
+    fn a_big_tile_comes_back() {
+        let dir = folder("big");
+        let p = Pattern::new(
+            "big",
+            RgbaImage::from_pixel(11600, 11600, Rgba([9, 9, 9, 255])),
+        );
+        Library::apply(&dir, &[add(&p)]).unwrap();
+        drop(p);
+        assert_eq!(names(&dir), ["big"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn built_in_names_follow_the_language() {
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let mut lib = Library::default();
+        let english = lib.items[0].name.clone();
+        lib.add(Pattern::new("Mine", tile(1)));
+        crate::i18n::set_lang(crate::i18n::Lang::Fr);
+        lib.follow_language();
+        let french = lib.items[0].name.clone();
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        assert_ne!(english, french);
+        assert_eq!(lib.items.last().unwrap().name, "Mine");
     }
 }

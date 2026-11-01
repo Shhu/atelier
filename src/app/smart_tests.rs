@@ -245,7 +245,7 @@ fn smart_filters_apply_then_reedit_and_rearrange() {
     h.state_mut().run(Action::Smart(Command::DeleteFilter(0)));
     assert_eq!(smart(&h).filters.len(), 1);
     let mut expected = original.clone();
-    small.apply(&mut expected, doc(&h).active_layer().offset);
+    small.apply(&mut expected, (0, 0));
     settle(&mut h, |app| !app.smart.busy());
     assert_eq!(*doc(&h).active_layer().image(), expected);
     h.state_mut().run(Action::Smart(Command::ToggleFilters));

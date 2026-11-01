@@ -9,7 +9,7 @@ use std::f32::consts::{FRAC_PI_2, PI, TAU};
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
 
-use super::{Undefined, cancel_flag, cancelled, par_rows};
+use super::{Filter, Undefined, cancel_flag, cancelled, par_rows};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -165,33 +165,159 @@ impl Shear {
     }
 }
 
-/// Every pixel takes its color at the place (in pixels, the top-left corner
-/// of the image being 0, 0) that `place` gives for the middle of the pixel;
-/// `None`: it stays as it is. Stops early once cancelled.
+/// Most samples of a result pixel along each axis.
+const MOST_SAMPLES: usize = 4;
+
+/// Samples along an axis of a pixel covering `span` source pixels: more than
+/// one only where the source is compressed (thin lines would break up).
+#[inline]
+fn samples(span: f32) -> usize {
+    if span <= 1.5 {
+        1
+    } else {
+        (span.ceil() as usize).min(MOST_SAMPLES)
+    }
+}
+
+/// `region` (x0, y0, x1, y1) of the result: every pixel takes its color at
+/// the place (in pixels, the top-left corner of the image being 0, 0) that
+/// `place` gives for the middle of the pixel; `None`: it stays as it is. Only
+/// the region is computed, and each of its pixels is what it is in the whole
+/// result. Stops early once cancelled.
 fn remap(
-    image: &mut RgbaImage,
+    src: &RgbaImage,
+    region: [u32; 4],
     edges: (Undefined, Undefined),
     place: impl Fn(f32, f32) -> Option<(f32, f32)> + Sync,
-) {
-    let src = image.clone();
-    let (w, h) = image.dimensions();
-    let (raw, width, height) = (src.as_raw().as_slice(), w as i64, h as i64);
-    let row = w as usize * 4;
-    par_rows(image.as_mut(), row, |first, band| {
+) -> RgbaImage {
+    let [x0, y0, x1, y1] = region;
+    let mut out = image::imageops::crop_imm(src, x0, y0, x1 - x0, y1 - y0).to_image();
+    let (w, h) = src.dimensions();
+    let (raw, size) = (src.as_raw().as_slice(), (w as i64, h as i64));
+    let row = (x1 - x0) as usize * 4;
+    let count = (x1 - x0) as usize;
+    if row == 0 {
+        return out;
+    }
+    // Where a row of pixels reads, one more on the right, to tell how much
+    // of the source each pixel covers.
+    let read = |y: u32, into: &mut Vec<Option<(f32, f32)>>| {
+        into.clear();
+        if y >= h {
+            into.resize(count + 1, None);
+            return;
+        }
+        let cy = y as f32 + 0.5;
+        into.extend((x0..x1).map(|x| place(x as f32 + 0.5, cy)));
+        into.push((x1 < w).then(|| place(x1 as f32 + 0.5, cy)).flatten());
+    };
+    par_rows(out.as_mut(), row, |first, band| {
         let cancel = cancel_flag();
+        let (mut here, mut below) = (Vec::with_capacity(count + 1), Vec::with_capacity(count + 1));
+        read(y0 + first as u32, &mut here);
         for (i, line) in band.chunks_exact_mut(row).enumerate() {
             if cancelled(&cancel) {
                 return;
             }
-            let y = (first + i) as f32 + 0.5;
+            let y = y0 + (first + i) as u32;
+            read(y + 1, &mut below);
             for (j, d) in line.chunks_exact_mut(4).enumerate() {
-                if let Some((sx, sy)) = place(j as f32 + 0.5, y) {
-                    let c = bilinear(raw, (width, height), edges, sx - 0.5, sy - 0.5);
-                    d.copy_from_slice(&c);
-                }
+                let Some((sx, sy)) = here[j] else { continue };
+                let span = |next: Option<(f32, f32)>| {
+                    next.map_or(0.0, |(nx, ny): (f32, f32)| (nx - sx).hypot(ny - sy))
+                };
+                let (across, down) = (samples(span(here[j + 1])), samples(span(below[j])));
+                let c = if across == 1 && down == 1 {
+                    bilinear(raw, size, edges, sx - 0.5, sy - 0.5)
+                } else {
+                    let (cx, cy) = ((x0 as usize + j) as f32, y as f32);
+                    averaged(raw, size, edges, (across, down), |a, b| {
+                        let (px, py) = (cx + a, cy + b);
+                        place(px, py).unwrap_or((px, py))
+                    })
+                };
+                d.copy_from_slice(&c);
             }
+            std::mem::swap(&mut here, &mut below);
         }
     });
+    out
+}
+
+/// The average, premultiplied, of `across` × `down` samples spread over a
+/// pixel: `place` gets the place inside it (0 to 1 on each axis).
+fn averaged(
+    raw: &[u8],
+    size: (i64, i64),
+    edges: (Undefined, Undefined),
+    (across, down): (usize, usize),
+    place: impl Fn(f32, f32) -> (f32, f32),
+) -> [u8; 4] {
+    let mut sum = [0.0f32; 4];
+    for b in 0..down {
+        let v = (b as f32 + 0.5) / down as f32;
+        for a in 0..across {
+            let (sx, sy) = place((a as f32 + 0.5) / across as f32, v);
+            let c = bilinear(raw, size, edges, sx - 0.5, sy - 0.5);
+            let alpha = f32::from(c[3]);
+            sum[0] += f32::from(c[0]) * alpha;
+            sum[1] += f32::from(c[1]) * alpha;
+            sum[2] += f32::from(c[2]) * alpha;
+            sum[3] += alpha;
+        }
+    }
+    if sum[3] <= 0.0 {
+        return [0; 4];
+    }
+    let c = |v: f32| (v / sum[3] + 0.5).min(255.0) as u8;
+    let alpha = sum[3] / (across * down) as f32 + 0.5;
+    [c(sum[0]), c(sum[1]), c(sum[2]), alpha.min(255.0) as u8]
+}
+
+/// A setting within its dialog's range (an action's file could hold anything,
+/// and 1e39 reads as infinity).
+#[inline]
+fn limited(v: f32, low: f32, high: f32) -> f32 {
+    if v.is_nan() {
+        low.max(0.0).min(high)
+    } else {
+        v.clamp(low, high)
+    }
+}
+
+/// A value per row or column, between two whole places: the middle of a pixel
+/// reads its own.
+#[inline]
+fn between(table: &[f32], first: u32, at: f32) -> f32 {
+    let place = (at - 0.5 - first as f32).clamp(0.0, (table.len() - 1) as f32);
+    let i = place as usize;
+    let next = table[(i + 1).min(table.len() - 1)];
+    table[i] + (next - table[i]) * (place - i as f32)
+}
+
+/// `region` of what `filter` gives for all of `src` (at `origin` in the
+/// canvas), if it is one of these filters.
+pub(super) fn render(
+    filter: &Filter,
+    src: &RgbaImage,
+    origin: (i64, i64),
+    region: [u32; 4],
+) -> Option<RgbaImage> {
+    Some(match *filter {
+        Filter::Ripple { amount, size } => ripple(src, region, amount, size, origin),
+        Filter::Wave(w) => wave(src, region, &w, origin),
+        Filter::Twirl { angle } => twirl(src, region, angle),
+        Filter::Spherize { amount, mode } => spherize(src, region, amount, mode),
+        Filter::PolarCoordinates { conversion } => polar(src, region, conversion),
+        Filter::Pinch { amount } => pinch(src, region, amount),
+        Filter::ZigZag {
+            amount,
+            ridges,
+            style,
+        } => zigzag(src, region, amount, ridges, style),
+        Filter::Shear(s) => shear(src, region, &s),
+        _ => return None,
+    })
 }
 
 /// Index along an axis of `n` pixels of position `i`; `None`: transparent.
@@ -261,17 +387,21 @@ fn bilinear(
 /// [`remap`] inside the ellipse fit in the image: `f` gets the place in the
 /// ellipse (from −1 to 1 on each axis) and its distance to the center (below
 /// 1), and gives the place to read in the same units.
-fn in_ellipse(image: &mut RgbaImage, f: impl Fn(f32, f32, f32) -> (f32, f32) + Sync) {
-    let (hw, hh) = (image.width() as f32 / 2.0, image.height() as f32 / 2.0);
+fn in_ellipse(
+    src: &RgbaImage,
+    region: [u32; 4],
+    f: impl Fn(f32, f32, f32) -> (f32, f32) + Sync,
+) -> RgbaImage {
+    let (hw, hh) = (src.width() as f32 / 2.0, src.height() as f32 / 2.0);
     let edge = Undefined::RepeatEdges;
-    remap(image, (edge, edge), |x, y| {
+    remap(src, region, (edge, edge), |x, y| {
         let (u, v) = ((x - hw) / hw, (y - hh) / hh);
         let r = (u * u + v * v).sqrt();
         (r < 1.0).then(|| {
             let (su, sv) = f(u, v, r);
             (hw + su * hw, hh + sv * hh)
         })
-    });
+    })
 }
 
 /// Turned by `a` radians, clockwise on the screen (y points down).
@@ -283,28 +413,28 @@ fn turned(u: f32, v: f32, a: f32) -> (f32, f32) {
 
 /// Twirl: a positive angle turns clockwise, the most at the center, not at
 /// the rim.
-pub(super) fn twirl(image: &mut RgbaImage, angle: f32) {
-    let angle = angle.to_radians();
-    in_ellipse(image, |u, v, r| turned(u, v, -angle * (1.0 - r)));
+fn twirl(src: &RgbaImage, region: [u32; 4], angle: f32) -> RgbaImage {
+    let angle = limited(angle, -999.0, 999.0).to_radians();
+    in_ellipse(src, region, |u, v, r| turned(u, v, -angle * (1.0 - r)))
 }
 
 /// Pinch: a positive amount squeezes toward the center, a negative one
 /// pushes out from it.
-pub(super) fn pinch(image: &mut RgbaImage, amount: f32) {
-    let k = -(amount / 100.0).clamp(-1.0, 1.0) / 2.0;
-    in_ellipse(image, |u, v, r| {
+fn pinch(src: &RgbaImage, region: [u32; 4], amount: f32) -> RgbaImage {
+    let k = -limited(amount / 100.0, -1.0, 1.0) / 2.0;
+    in_ellipse(src, region, |u, v, r| {
         if r <= 0.0 {
             return (u, v);
         }
         let factor = (r * FRAC_PI_2).sin().powf(k);
         (u * factor, v * factor)
-    });
+    })
 }
 
 /// Spherize: wraps the image around a sphere (a cylinder in the two
 /// one-axis modes); a negative amount, inside it.
-pub(super) fn spherize(image: &mut RgbaImage, amount: f32, mode: SpherizeMode) {
-    let k = (amount / 100.0).clamp(-1.0, 1.0);
+fn spherize(src: &RgbaImage, region: [u32; 4], amount: f32, mode: SpherizeMode) -> RgbaImage {
+    let k = limited(amount / 100.0, -1.0, 1.0);
     // Distance to the center read for a distance (0 to 1).
     let bend = move |r: f32| {
         let to = if k >= 0.0 {
@@ -316,7 +446,7 @@ pub(super) fn spherize(image: &mut RgbaImage, amount: f32, mode: SpherizeMode) {
     };
     let signed = move |c: f32| bend(c.abs()).copysign(c);
     match mode {
-        SpherizeMode::Normal => in_ellipse(image, |u, v, r| {
+        SpherizeMode::Normal => in_ellipse(src, region, |u, v, r| {
             if r <= 0.0 {
                 return (u, v);
             }
@@ -324,55 +454,61 @@ pub(super) fn spherize(image: &mut RgbaImage, amount: f32, mode: SpherizeMode) {
             (u * scale, v * scale)
         }),
         SpherizeMode::HorizontalOnly | SpherizeMode::VerticalOnly => {
-            let (hw, hh) = (image.width() as f32 / 2.0, image.height() as f32 / 2.0);
+            let (hw, hh) = (src.width() as f32 / 2.0, src.height() as f32 / 2.0);
             let edge = Undefined::RepeatEdges;
             let horizontal = mode == SpherizeMode::HorizontalOnly;
-            remap(image, (edge, edge), |x, y| {
+            remap(src, region, (edge, edge), |x, y| {
                 Some(if horizontal {
                     (hw + signed((x - hw) / hw) * hw, y)
                 } else {
                     (x, hh + signed((y - hh) / hh) * hh)
                 })
-            });
+            })
         }
     }
 }
 
 /// Polar Coordinates. Rectangular to Polar: the top row becomes the center,
 /// the bottom one the rim, the left and right edges meeting at the top.
-pub(super) fn polar(image: &mut RgbaImage, conversion: PolarConversion) {
-    let (w, h) = (image.width() as f32, image.height() as f32);
+fn polar(src: &RgbaImage, region: [u32; 4], conversion: PolarConversion) -> RgbaImage {
+    let (w, h) = (src.width() as f32, src.height() as f32);
     let (hw, hh) = (w / 2.0, h / 2.0);
     match conversion {
         PolarConversion::RectangularToPolar => {
             let edges = (Undefined::WrapAround, Undefined::RepeatEdges);
-            remap(image, edges, |x, y| {
+            remap(src, region, edges, |x, y| {
                 let (u, v) = ((x - hw) / hw, (y - hh) / hh);
                 let turn = u.atan2(-v).rem_euclid(TAU) / TAU;
                 Some((turn * w, (u * u + v * v).sqrt() * h))
-            });
+            })
         }
         PolarConversion::PolarToRectangular => {
             let edge = Undefined::RepeatEdges;
-            remap(image, (edge, edge), |x, y| {
+            remap(src, region, (edge, edge), |x, y| {
                 let (s, c) = (x / w * TAU).sin_cos();
                 let r = y / h;
                 Some((hw + r * s * hw, hh - r * c * hh))
-            });
+            })
         }
     }
 }
 
 /// ZigZag: rings around the center, fading to nothing at the rim.
-pub(super) fn zigzag(image: &mut RgbaImage, amount: f32, ridges: f32, style: ZigZagStyle) {
-    let k = (amount / 100.0).clamp(-1.0, 1.0);
-    let ridges = ridges.round().max(1.0);
+fn zigzag(
+    src: &RgbaImage,
+    region: [u32; 4],
+    amount: f32,
+    ridges: f32,
+    style: ZigZagStyle,
+) -> RgbaImage {
+    let k = limited(amount / 100.0, -1.0, 1.0);
+    let ridges = limited(ridges, 1.0, 20.0).round();
     let (turn, out) = match style {
         ZigZagStyle::AroundCenter => (PI, 0.0),
         ZigZagStyle::OutFromCenter => (0.0, 0.25),
         ZigZagStyle::PondRipples => (FRAC_PI_2, 0.25),
     };
-    in_ellipse(image, move |u, v, r| {
+    in_ellipse(src, region, move |u, v, r| {
         if r <= 0.0 {
             return (u, v);
         }
@@ -380,27 +516,33 @@ pub(super) fn zigzag(image: &mut RgbaImage, amount: f32, ridges: f32, style: Zig
         let (u, v) = turned(u, v, turn * wave);
         let scale = (r + out * wave).max(0.0) / r;
         (u * scale, v * scale)
-    });
+    })
 }
 
 /// Ripple: small irregular waves, the same each time.
-pub(super) fn ripple(image: &mut RgbaImage, amount: f32, size: RippleSize, origin: (i64, i64)) {
+fn ripple(
+    src: &RgbaImage,
+    region: [u32; 4],
+    amount: f32,
+    size: RippleSize,
+    origin: (i64, i64),
+) -> RgbaImage {
     let length = match size {
         RippleSize::Small => 6.0,
         RippleSize::Medium => 16.0,
         RippleSize::Large => 40.0,
     };
-    let amplitude = amount / 100.0 * length * 0.2;
+    let amplitude = limited(amount, -999.0, 999.0) / 100.0 * length * 0.2;
     let cells = ripple_noise();
     let (ox, oy) = (origin.0 as f32, origin.1 as f32);
     let edge = Undefined::RepeatEdges;
-    remap(image, (edge, edge), |x, y| {
+    remap(src, region, (edge, edge), |x, y| {
         let (cx, cy) = (x + ox, y + oy);
         let (nx, ny) = (cx / (length * 4.0), cy / (length * 4.0));
         let a = TAU * cy / length + 3.0 * smooth_noise(&cells, nx, ny);
         let b = TAU * cx / length + 3.0 * smooth_noise(&cells, nx + 17.0, ny + 31.0);
         Some((x + amplitude * a.sin(), y + amplitude * b.sin()))
-    });
+    })
 }
 
 const NOISE_SIDE: usize = 64;
@@ -432,7 +574,12 @@ struct Rng(u32);
 
 impl Rng {
     fn new(seed: u32) -> Self {
-        Self(seed.wrapping_mul(0x9E37_79B9) | 1)
+        // Small seeds (0 is Wave's first) mixed, or the first values would
+        // all be tiny.
+        let mut x = seed.wrapping_add(0x9E37_79B9);
+        x = (x ^ (x >> 16)).wrapping_mul(0x85EB_CA6B);
+        x = (x ^ (x >> 13)).wrapping_mul(0xC2B2_AE35);
+        Self((x ^ (x >> 16)) | 1)
     }
 
     fn next(&mut self) -> f32 {
@@ -448,33 +595,61 @@ impl Rng {
 /// up and down; computed per row and per column, so that many generators
 /// stay fast. The sum is reduced by the root of their number: more generators
 /// make the wave less regular, not wider.
-pub(super) fn wave(image: &mut RgbaImage, wave: &Wave, origin: (i64, i64)) {
-    let (w, h) = image.dimensions();
-    let generators = wave.generators.round().clamp(1.0, 999.0) as u32;
+fn wave(src: &RgbaImage, region: [u32; 4], wave: &Wave, origin: (i64, i64)) -> RgbaImage {
+    let (w, h) = src.dimensions();
+    let [x0, y0, x1, y1] = region;
+    let generators = limited(wave.generators, 1.0, 999.0).round() as u32;
     let mut rng = Rng::new(wave.seed);
     let scale = (generators as f32).sqrt();
-    let mut table = |len: u32, at: i64, percent: f32| -> Vec<f32> {
-        let mut out = vec![0.0f32; len as usize];
+    let cancel = cancel_flag();
+    let lengths = ordered(
+        limited(wave.wavelength_min, 1.0, 999.0),
+        limited(wave.wavelength_max, 1.0, 999.0),
+    );
+    let amplitudes = ordered(
+        limited(wave.amplitude_min, 0.0, 999.0),
+        limited(wave.amplitude_max, 0.0, 999.0),
+    );
+    // The places `first..end` along an axis. All the random values are drawn
+    // whatever the part: a part gets what the whole gets.
+    let mut table = |first: u32, end: u32, at: i64, percent: f32| -> Vec<f32> {
+        let mut out = vec![0.0f32; (end - first) as usize];
         for _ in 0..generators {
-            let (lo, hi) = ordered(wave.wavelength_min, wave.wavelength_max);
-            let length = (lo + (hi - lo) * rng.next()).max(1.0);
-            let (lo, hi) = ordered(wave.amplitude_min, wave.amplitude_max);
-            let amplitude = lo + (hi - lo) * rng.next();
+            let length = lengths.0 + (lengths.1 - lengths.0) * rng.next();
+            let amplitude = amplitudes.0 + (amplitudes.1 - amplitudes.0) * rng.next();
             let phase = rng.next();
+            if cancelled(&cancel) {
+                continue;
+            }
             for (i, v) in out.iter_mut().enumerate() {
-                let t = (i as i64 + at) as f32 / length + phase;
+                let t = (i as i64 + first as i64 + at) as f32 / length + phase;
                 *v += amplitude * wave_shape(wave.wave_type, t);
             }
         }
-        let k = percent / 100.0 / scale;
+        let k = limited(percent, 0.0, 100.0) / 100.0 / scale;
         out.iter_mut().for_each(|v| *v *= k);
         out
     };
-    let sideways = table(h, origin.1, wave.scale_horizontal);
-    let upward = table(w, origin.0, wave.scale_vertical);
-    remap(image, (wave.undefined, wave.undefined), |x, y| {
-        Some((x + sideways[y as usize], y + upward[x as usize]))
-    });
+    // One more on each side: between rows, a pixel's samples read two.
+    let (top, left) = (y0.saturating_sub(1), x0.saturating_sub(1));
+    let sideways = table(
+        top,
+        (y1 + 1).min(h).max(top + 1),
+        origin.1,
+        wave.scale_horizontal,
+    );
+    let upward = table(
+        left,
+        (x1 + 1).min(w).max(left + 1),
+        origin.0,
+        wave.scale_vertical,
+    );
+    remap(src, region, (wave.undefined, wave.undefined), |x, y| {
+        Some((
+            x + between(&sideways, top, y),
+            y + between(&upward, left, x),
+        ))
+    })
 }
 
 fn ordered(a: f32, b: f32) -> (f32, f32) {
@@ -507,19 +682,25 @@ fn wave_shape(kind: WaveType, t: f32) -> f32 {
 }
 
 /// Shear: each row shifts by what the curve gives for its height.
-pub(super) fn shear(image: &mut RgbaImage, shear: &Shear) {
-    let (w, h) = image.dimensions();
+fn shear(src: &RgbaImage, region: [u32; 4], shear: &Shear) -> RgbaImage {
+    let (w, h) = src.dimensions();
     let half = w as f32 / 2.0;
+    let mut curve = *shear;
+    for p in &mut curve.points {
+        *p = [limited(p[0], -1.0, 1.0), limited(p[1], 0.0, 1.0)];
+    }
     let shifts: Vec<f32> = (0..h)
-        .map(|y| shear.shift_at((y as f32 + 0.5) / h as f32) * half)
+        .map(|y| curve.shift_at((y as f32 + 0.5) / h as f32) * half)
         .collect();
-    let edges = (shear.undefined, Undefined::RepeatEdges);
-    remap(image, edges, |x, y| Some((x - shifts[y as usize], y)));
+    let edges = (curve.undefined, Undefined::RepeatEdges);
+    remap(src, region, edges, |x, y| {
+        Some((x - between(&shifts, 0, y), y))
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Filter, FilterKind, cancellable};
+    use super::super::{FilterKind, Target, cancellable};
     use super::*;
     use image::Rgba;
     use std::sync::Arc;
@@ -862,6 +1043,8 @@ mod tests {
         // changes, and a preview's region gives the same pixels.
         let image = Arc::new(gradient(60, 40));
         let target = super::super::Target {
+            alpha_locked: false,
+            whole_source: false,
             image: image.clone(),
             clip: Some(crate::pixel_ops::Clip {
                 rect: [10, 5, 50, 35],
@@ -923,6 +1106,221 @@ mod tests {
             Filter::Twirl { angle: 90.0 }.apply(&mut out, (0, 0));
         });
         assert_eq!(out, image);
+    }
+
+    fn strong(kind: FilterKind) -> Filter {
+        match kind.initial() {
+            Filter::Twirl { .. } => Filter::Twirl { angle: 999.0 },
+            Filter::Shear(mut s) => {
+                s.insert(0.6, 0.5);
+                Filter::Shear(s)
+            }
+            f => f,
+        }
+    }
+
+    #[test]
+    fn a_part_is_what_the_whole_gives_and_only_it_is_computed() {
+        let image = Arc::new(gradient(200, 150));
+        for kind in KINDS {
+            let filter = strong(kind);
+            let target = Target::of(image.clone(), (13, -4));
+            let mut whole = (*image).clone();
+            filter.apply(&mut whole, (13, -4));
+            let region = [31, 57, 94, 121];
+            let part = target.filter_region(region, &filter);
+            let expected = image::imageops::crop_imm(&whole, 31, 57, 63, 64).to_image();
+            assert_eq!(part, expected, "{kind:?}");
+            // The same with a selection's box, the geometry fit in it.
+            let clipped = Target {
+                clip: Some([20, 30, 180, 140].into()),
+                ..target.clone()
+            };
+            let all = clipped.process(0, |i, o| filter.apply(i, o));
+            let part = clipped.filter_region(region, &filter);
+            let expected = image::imageops::crop_imm(&all, 31, 57, 63, 64).to_image();
+            assert_eq!(part, expected, "{kind:?} in a box");
+        }
+    }
+
+    #[test]
+    fn compressed_detail_is_averaged_not_skipped() {
+        // Stripes of one pixel read four to one: one sample per pixel would
+        // see only one of the two colors.
+        let stripes = RgbaImage::from_fn(200, 8, |x, _| {
+            let v = if x % 2 == 0 { 255 } else { 0 };
+            Rgba([v, v, v, 255])
+        });
+        let e = Undefined::RepeatEdges;
+        let out = remap(&stripes, [0, 0, 50, 8], (e, e), |x, y| Some((x * 4.0, y)));
+        for p in out.pixels() {
+            assert!((90..=165).contains(&p[0]), "{p:?}");
+        }
+        // A thin line stays in one piece where a twirl compresses it.
+        let line = RgbaImage::from_fn(400, 400, |x, y| {
+            let v = if x.abs_diff(200) < 1 && y < 200 {
+                255
+            } else {
+                0
+            };
+            Rgba([v, v, v, 255])
+        });
+        let out = applied(Filter::Twirl { angle: 999.0 }, &line);
+        let total = |i: &RgbaImage| i.pixels().map(|p| u64::from(p[0])).sum::<u64>();
+        let (before, after) = (total(&line), total(&out));
+        assert!(after * 3 > before, "{before} -> {after}");
+    }
+
+    #[test]
+    fn neutral_rows_read_their_own_value() {
+        let t = [1.0, 3.0, 7.0];
+        assert_eq!(between(&t, 10, 10.5), 1.0);
+        assert_eq!(between(&t, 10, 11.5), 3.0);
+        assert_eq!(between(&t, 10, 12.0), 5.0);
+        assert_eq!(between(&t, 10, 99.0), 7.0);
+        assert_eq!(between(&t, 10, 0.0), 1.0);
+    }
+
+    #[test]
+    fn settings_out_of_range_from_a_file_do_not_erase_the_layer() {
+        let image = gradient(64, 48);
+        for text in [
+            r#"{"filter":"ripple","amount":1e39,"size":"medium"}"#,
+            r#"{"filter":"twirl","angle":1e39}"#,
+            r#"{"filter":"twirl","angle":-1e39}"#,
+            r#"{"filter":"pinch","amount":1e39}"#,
+            r#"{"filter":"zig-zag","amount":1e39,"ridges":1e39,"style":"pond-ripples"}"#,
+        ] {
+            let filter: Filter = serde_json::from_str(text).expect(text);
+            let out = applied(filter, &image);
+            assert!(out.pixels().all(|p| p[3] == 255), "{text}");
+        }
+        let Filter::Wave(mut w) = FilterKind::Wave.initial() else {
+            panic!()
+        };
+        w.amplitude_max = f32::INFINITY;
+        w.wavelength_max = f32::INFINITY;
+        w.scale_horizontal = f32::INFINITY;
+        w.undefined = Undefined::RepeatEdges;
+        assert!(
+            applied(Filter::Wave(w), &image)
+                .pixels()
+                .all(|p| p[3] == 255)
+        );
+        let Filter::Shear(mut s) = FilterKind::Shear.initial() else {
+            panic!()
+        };
+        s.points[0][0] = f32::INFINITY;
+        s.points[1][1] = f32::NAN;
+        s.undefined = Undefined::RepeatEdges;
+        assert!(
+            applied(Filter::Shear(s), &image)
+                .pixels()
+                .all(|p| p[3] == 255)
+        );
+    }
+
+    #[test]
+    fn the_first_values_of_small_seeds_are_not_tiny() {
+        for seed in 0..64 {
+            let mut rng = Rng::new(seed);
+            let first: Vec<f32> = (0..4).map(|_| rng.next()).collect();
+            assert!(first.iter().any(|v| *v > 0.1), "{seed}: {first:?}");
+        }
+        let (a, b) = (Rng::new(0).next(), Rng::new(1).next());
+        assert!((a - b).abs() > 1e-3, "{a} {b}");
+    }
+
+    #[test]
+    fn a_locked_target_keeps_the_opacity_and_the_old_color() {
+        let half = RgbaImage::from_fn(100, 100, |x, _| {
+            if x < 50 {
+                Rgba([255, 0, 0, 255])
+            } else {
+                Rgba([0, 0, 0, 0])
+            }
+        });
+        let target = Target {
+            alpha_locked: true,
+            ..Target::of(Arc::new(half.clone()), (0, 0))
+        };
+        let filter = FilterKind::Wave.initial();
+        let out = target.process(0, |i, o| filter.apply(i, o));
+        for (a, b) in out.pixels().zip(half.pixels()) {
+            assert_eq!(a[3], b[3]);
+            if b[3] == 255 {
+                assert!(a[0] > 200 && a[1] == 0 && a[2] == 0, "{a:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn keeping_the_opacity_can_be_done_again() {
+        let old = [10u8, 20, 30, 128];
+        // Less opaque than it was: half of what is missing is the old color.
+        let mut new = [200u8, 200, 200, 64];
+        crate::pixel_ops::keep_opacity(&mut new, &old);
+        assert_eq!(new, [105, 110, 115, 128]);
+        let again = new;
+        crate::pixel_ops::keep_opacity(&mut new, &old);
+        assert_eq!(new, again);
+        // As opaque or more (an adjustment, a brush): its color stays.
+        let mut new = [200u8, 100, 50, 128];
+        crate::pixel_ops::keep_opacity(&mut new, &old);
+        assert_eq!(new, [200, 100, 50, 128]);
+        let mut new = [200u8, 100, 50, 255];
+        crate::pixel_ops::keep_opacity(&mut new, &old);
+        assert_eq!(new, [200, 100, 50, 128]);
+        // Nothing left: the old pixel.
+        let mut new = [0u8; 4];
+        crate::pixel_ops::keep_opacity(&mut new, &old);
+        assert_eq!(new, old);
+    }
+
+    #[test]
+    fn huge_settings_of_any_filter_are_safe() {
+        let image = gradient(32, 32);
+        let mut kinds = KINDS.to_vec();
+        kinds.extend([
+            FilterKind::BoxBlur,
+            FilterKind::GaussianBlur,
+            FilterKind::MotionBlur,
+            FilterKind::SurfaceBlur,
+            FilterKind::AddNoise,
+            FilterKind::DustAndScratches,
+            FilterKind::Median,
+            FilterKind::ReduceNoise,
+            FilterKind::Mosaic,
+            FilterKind::SmartSharpen,
+            FilterKind::UnsharpMask,
+            FilterKind::Emboss,
+            FilterKind::HighPass,
+            FilterKind::Maximum,
+            FilterKind::Minimum,
+            FilterKind::Offset,
+        ]);
+        // Every number of its settings written as it would be in a file.
+        fn huge(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Number(n) if n.is_f64() => {
+                    *v = serde_json::Value::from(1e300);
+                }
+                serde_json::Value::Array(a) => a.iter_mut().for_each(huge),
+                serde_json::Value::Object(o) => o.values_mut().for_each(huge),
+                _ => {}
+            }
+        }
+        for kind in kinds {
+            let mut value = serde_json::to_value(kind.initial()).unwrap();
+            huge(&mut value);
+            let Ok(filter) = serde_json::from_value::<Filter>(value.clone()) else {
+                continue;
+            };
+            let _ = filter.reach();
+            let _ = applied(filter, &image);
+            let target = Target::of(Arc::new(image.clone()), (0, 0));
+            let _ = target.filter_region([4, 4, 20, 20], &filter);
+        }
     }
 
     /// `cargo test --release distort_speed -- --ignored --nocapture`

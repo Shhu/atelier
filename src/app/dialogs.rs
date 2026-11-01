@@ -330,6 +330,9 @@ impl AtelierApp {
         let Some(mut d) = self.fill_dialog else {
             return;
         };
+        // Lock Transparent Pixels keeps the opacity whatever the box says.
+        let alpha_locked = self.doc.as_ref().is_some_and(Document::alpha_locked);
+        d.preserve_transparency |= alpha_locked;
         let center = ctx.content_rect().center();
         // Content-Aware fills a selection.
         let content_aware = d.content == FillContent::ContentAware;
@@ -384,12 +387,14 @@ impl AtelierApp {
                 );
                 d.opacity = opacity / 100.0;
                 gap_between_blocks(ui);
-                ui_kit::checkbox(
-                    ui,
-                    &mut d.preserve_transparency,
-                    &t!("dialog-fill-preserve-transparency"),
-                )
-                .on_hover_text(t!("dialog-fill-preserve-transparency-tip"));
+                ui.add_enabled_ui(!alpha_locked, |ui| {
+                    ui_kit::checkbox(
+                        ui,
+                        &mut d.preserve_transparency,
+                        &t!("dialog-fill-preserve-transparency"),
+                    )
+                    .on_hover_text(t!("dialog-fill-preserve-transparency-tip"));
+                });
             },
         );
         self.fill_dialog = Some(d);
@@ -537,18 +542,7 @@ impl AtelierApp {
     /// Image Rotation: the whole image turns (clockwise), the canvas
     /// follows; the selection is dropped.
     pub(super) fn rotate_canvas(&mut self, degrees: f32) {
-        self.record(crate::actions::Recorded::RotateCanvas { angle: degrees });
-        let texts = self.texts_before();
-        let Some(doc) = &mut self.doc else { return };
-        let old = (doc.width(), doc.height());
-        if doc.rotate_canvas(degrees) {
-            let map = type_tool::canvas_rotation(old, (doc.width(), doc.height()), degrees);
-            self.texts_after(texts, map);
-            let angle = i18n::short_decimal(f64::from(degrees.rem_euclid(360.0)));
-            self.status = t!("status-image-rotated", angle = angle);
-            self.forget_selection();
-            self.reset_pending();
-        }
+        self.start_rotation(degrees);
     }
 
     /// Canvas Size (Ctrl+Alt+C), like Photoshop: new size (or what to add
@@ -892,7 +886,7 @@ fn canvas_area(ctx: &egui::Context) -> Rect {
 /// Where dialogs stay: the window's width, between the options bar and the
 /// status bar, so that they never cover the menus.
 /// A window too low for that gives them its whole height.
-fn dialog_bounds(ctx: &egui::Context) -> Rect {
+pub(super) fn dialog_bounds(ctx: &egui::Context) -> Rect {
     let window = ctx.content_rect();
     let area = canvas_area(ctx);
     let bounds = if area.height() >= 240.0 {
@@ -934,8 +928,8 @@ pub(super) fn panel_pos(ctx: &egui::Context, id: &'static str) -> Pos2 {
     let pos = match places.0.iter_mut().find(|p| p.0 == id) {
         // Placed again in its first frames, once its height is known.
         Some(place) if pass <= place.2 + 2 => {
-            let height = own.map_or(160.0, |r| r.height());
-            place.1 = free_place(ctx, &others, height);
+            let (width, height) = own.map_or((PANEL_WIDTH, 160.0), |r| (r.width(), r.height()));
+            place.1 = free_place(ctx, &others, width, height);
             place.3 = pass;
             place.1
         }
@@ -945,8 +939,8 @@ pub(super) fn panel_pos(ctx: &egui::Context, id: &'static str) -> Pos2 {
         }
         None => {
             // The size it had last time, if it was open before.
-            let height = own.map_or(160.0, |r| r.height());
-            let pos = free_place(ctx, &others, height);
+            let (width, height) = own.map_or((PANEL_WIDTH, 160.0), |r| (r.width(), r.height()));
+            let pos = free_place(ctx, &others, width, height);
             places.0.push((id, pos, pass, pass));
             // Opened from a menu: in front, even over a panel moved there.
             ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, egui::Id::new(id)));
@@ -959,20 +953,21 @@ pub(super) fn panel_pos(ctx: &egui::Context, id: &'static str) -> Pos2 {
 
 /// The first place, from the top right of the canvas, down then leftwards,
 /// where a panel `height` high covers none of `others`.
-fn free_place(ctx: &egui::Context, others: &[Rect], height: f32) -> Pos2 {
-    const WIDTH: f32 = 300.0;
+fn free_place(ctx: &egui::Context, others: &[Rect], width: f32, height: f32) -> Pos2 {
     let start = tool_dialog_pos(ctx);
     let bottom = dialog_bounds(ctx).bottom();
+    // A panel taller than the room scrolls: placed for what it can show.
+    let height = height.min(bottom - start.y);
     // New columns stay over the canvas, not over the tool bar.
     let left = canvas_area(ctx).left() + DIALOG_MARGIN;
     let mut pos = start;
     for _ in 0..16 {
-        let probe = Rect::from_min_max(pos2(pos.x - WIDTH, pos.y), pos2(pos.x, pos.y + height));
+        let probe = Rect::from_min_max(pos2(pos.x - width, pos.y), pos2(pos.x, pos.y + height));
         match others.iter().find(|r| r.intersects(probe)) {
             None => return pos,
             Some(r) if r.bottom() + 8.0 + height <= bottom => pos.y = r.bottom() + 8.0,
-            Some(_) if pos.x - 2.0 * WIDTH - 8.0 >= left => {
-                pos = pos2(pos.x - WIDTH - 8.0, start.y);
+            Some(_) if pos.x - 2.0 * width - 8.0 >= left => {
+                pos = pos2(pos.x - width - 8.0, start.y);
             }
             Some(_) => break,
         }
@@ -981,19 +976,29 @@ fn free_place(ctx: &egui::Context, others: &[Rect], height: f32) -> Pos2 {
     // `CASCADE` px stay in sight), from the last panel placed, then from
     // the others, then down each column.
     let title = |r: &Rect| Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + CASCADE)).shrink(0.5);
-    // How much of the title bars a panel there would cover (px²), if it
-    // is in bounds.
+    // How much a panel there would cover, if it is in bounds: the title bars
+    // above all, then the panels (px²).
     let covers = |pos: Pos2| {
-        let body = Rect::from_min_max(pos2(pos.x - WIDTH, pos.y), pos2(pos.x, pos.y + height));
-        let inside = pos.y + height <= bottom && pos.x - WIDTH >= left;
+        let body = Rect::from_min_max(pos2(pos.x - width, pos.y), pos2(pos.x, pos.y + height));
+        let inside = pos.y + height <= bottom && pos.x - width >= left;
         inside.then(|| {
             let area = |r: &Rect| {
                 let t = title(r);
-                if t.intersects(body) {
-                    t.intersect(body).area()
+                let over = |o: Rect| {
+                    if o.intersects(body) {
+                        o.intersect(body).area()
+                    } else {
+                        0.0
+                    }
+                };
+                let hidden = if over(t) >= t.area() * 0.9 {
+                    HIDES_TITLE
                 } else {
                     0.0
-                }
+                };
+                // (As few of them as can be.)
+                let touched = if over(t) > 0.0 { 1e9 } else { 0.0 };
+                hidden + touched + over(t) * 1000.0 + over(*r)
             };
             others.iter().map(area).sum::<f32>()
         })
@@ -1006,35 +1011,46 @@ fn free_place(ctx: &egui::Context, others: &[Rect], height: f32) -> Pos2 {
             .flat_map(move |step| (1..8).map(move |k| r.right_top() + step * k as f32))
     });
     let columns = (0..4)
-        .map(|c| pos2(start.x - c as f32 * (WIDTH + 8.0), start.y))
+        .map(|c| pos2(start.x - c as f32 * (width + 8.0), start.y))
         .flat_map(|top| {
             steps
                 .into_iter()
                 .flat_map(move |step| (0..16).map(move |k| top + step * k as f32))
         });
+    // Against the bottom of each column: over the end of what is above.
+    let low = (0..4).map(|c| pos2(start.x - c as f32 * (width + 8.0), bottom - height));
     // Too many for the room: over as few title bars as can be.
     let best = from_panels
         .chain(columns)
+        .chain(low)
         .filter_map(|p| covers(p).map(|n| (n, p)))
         .min_by(|a, b| a.0.total_cmp(&b.0));
-    if let Some((_, pos)) = best {
+    // (Unless over a whole title bar: the room is too low for them.)
+    if let Some((_, pos)) = best.filter(|b| b.0 < HIDES_TITLE) {
         return pos;
     }
     let Some(last) = others.last() else {
         return start;
     };
     let mut pos = pos2(last.right() - CASCADE, last.top() + CASCADE);
-    if pos.y + height > bottom || pos.x - WIDTH < left {
+    if pos.y + height > bottom || pos.x - width < left {
         pos = pos2(start.x - CASCADE, start.y);
     }
     for _ in 0..others.len() {
-        if !others.iter().any(|r| (r.right_top() - pos).length() < 4.0) {
+        if !others.iter().any(|r| (r.right() - pos.x).abs() < 4.0) {
             break;
         }
         pos += vec2(-CASCADE, CASCADE);
     }
     pos
 }
+
+/// What covering all of another panel's title bar counts for when choosing a
+/// place, beyond any other cover.
+const HIDES_TITLE: f32 = 1e12;
+
+/// A floating panel's width at first, with its border.
+const PANEL_WIDTH: f32 = 284.0;
 
 /// Offset of a floating panel cascaded over another (px).
 const CASCADE: f32 = 28.0;
@@ -1539,6 +1555,12 @@ pub(super) fn dialog_body_height(ctx: &egui::Context) -> f32 {
     (screen.height() - DIALOG_HEADER - DIALOG_FOOTER - 18.0 - 34.0).max(0.0)
 }
 
+/// Height of a dialog's body before it has to scroll, its margins aside.
+pub(super) fn dialog_body_room(ctx: &egui::Context) -> f32 {
+    let screen = dialog_bounds(ctx);
+    (screen.height() - DIALOG_HEADER - DIALOG_FOOTER - 18.0 - 34.0).max(0.0)
+}
+
 /// Room kept around dialogs, within the window.
 const DIALOG_MARGIN: f32 = 8.0;
 const DIALOG_HEADER: f32 = 44.0;
@@ -1868,6 +1890,45 @@ impl Steps {
     };
 }
 
+/// A track that isn't proportional to the values, drawn from `origin`.
+#[derive(Clone, Copy)]
+pub(super) struct TrackMap {
+    /// Position on the track (0..1) of a value.
+    position: fn(f32) -> f32,
+    /// Value at a position on the track.
+    value: fn(f32) -> f32,
+    origin: f32,
+}
+
+impl TrackMap {
+    /// Gamma correction: 1.00 in the middle, 9.99 at the left end and 0.01
+    /// at the right end, in equal ratios on each side.
+    const GAMMA: TrackMap = TrackMap {
+        position: gamma_position,
+        value: gamma_at,
+        origin: 1.0,
+    };
+}
+
+pub(super) fn gamma_position(gamma: f32) -> f32 {
+    use crate::pixel_ops::Exposure as E;
+    let g = gamma.clamp(*E::GAMMA.start(), *E::GAMMA.end());
+    if g >= 1.0 {
+        0.5 - 0.5 * g.ln() / E::GAMMA.end().ln()
+    } else {
+        0.5 + 0.5 * g.ln() / E::GAMMA.start().ln()
+    }
+}
+
+pub(super) fn gamma_at(position: f32) -> f32 {
+    use crate::pixel_ops::Exposure as E;
+    if position <= 0.5 {
+        E::GAMMA.end().powf(1.0 - 2.0 * position)
+    } else {
+        E::GAMMA.start().powf(2.0 * position - 1.0)
+    }
+}
+
 /// [`slider_row`] with decimals, or a track favoring the small values.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn slider_row_steps(
@@ -1880,6 +1941,23 @@ pub(super) fn slider_row_steps(
     track: Track,
     default: f32,
     steps: Steps,
+) -> bool {
+    slider_row_mapped(ui, label, right, value, range, unit, track, default, steps, None)
+}
+
+/// [`slider_row_steps`], with a track of its own if `map` is given.
+#[allow(clippy::too_many_arguments)]
+fn slider_row_mapped(
+    ui: &mut egui::Ui,
+    label: &str,
+    right: Option<&str>,
+    value: &mut f32,
+    range: RangeInclusive<f32>,
+    unit: &str,
+    track: Track,
+    default: f32,
+    steps: Steps,
+    map: Option<TrackMap>,
 ) -> bool {
     let (min, max) = (*range.start(), *range.end());
     let bipolar = min < 0.0;
@@ -1940,12 +2018,18 @@ pub(super) fn slider_row_steps(
         );
         let inner = rect.shrink2(vec2(7.0, 0.0));
         let to_x = |v: f32| {
+            if let Some(map) = map {
+                return inner.left() + (map.position)(v) * inner.width();
+            }
             let t = ((v - min) / (max - min)).clamp(0.0, 1.0);
             inner.left() + t.powf(1.0 / steps.exponent) * inner.width()
         };
         if let Some(p) = response.interact_pointer_pos() {
             let t = ((p.x - inner.left()) / inner.width()).clamp(0.0, 1.0);
-            *value = min + t.powf(steps.exponent) * (max - min);
+            *value = match map {
+                Some(map) => (map.value)(t),
+                None => min + t.powf(steps.exponent) * (max - min),
+            };
         }
         // A double-click on the track resets too, like Camera Raw.
         if response.double_clicked() {
@@ -1955,7 +2039,11 @@ pub(super) fn slider_row_steps(
         match track {
             Track::Accent => {
                 painter.rect_filled(line, 3.0, color::KBD_LINE);
-                let from = if bipolar { to_x(0.0) } else { line.left() };
+                let from = match map {
+                    Some(map) => to_x(map.origin),
+                    None if bipolar => to_x(0.0),
+                    None => line.left(),
+                };
                 let x = to_x(*value);
                 painter.rect_filled(
                     Rect::from_min_max(
@@ -1968,8 +2056,8 @@ pub(super) fn slider_row_steps(
             }
             Track::Gradient(colors) => gradient(painter, line, colors),
         }
-        if bipolar {
-            let x = to_x(0.0);
+        if bipolar || map.is_some() {
+            let x = to_x(map.map_or(0.0, |m| m.origin));
             painter.vline(
                 x,
                 rect.center().y - 7.0..=rect.center().y + 7.0,
@@ -2811,7 +2899,18 @@ pub(super) fn adjustment_editor(
                 0.0,
             );
             gap_between_blocks(ui);
-            exposure_row(ui, &t!("adjust8-gamma"), &mut e.gamma, E::GAMMA, 1.0);
+            slider_row_mapped(
+                ui,
+                &t!("adjust8-gamma"),
+                None,
+                &mut e.gamma,
+                E::GAMMA,
+                "",
+                Track::Accent,
+                1.0,
+                two,
+                Some(TrackMap::GAMMA),
+            );
         }
         Adjustment::ChannelMixer(m) => channel_mixer_editor(ui, m, range),
         Adjustment::SelectiveColor(s) => selective_color_editor(ui, s, range),

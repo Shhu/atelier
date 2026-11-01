@@ -26,6 +26,11 @@ const VISIBLE_ROWS: usize = 5;
 /// Below this panel height, the list shows this many rows before scrolling.
 const SHORT_PANEL: f32 = 650.0;
 const SHORT_VISIBLE_ROWS: usize = 3;
+/// Below this panel height, the locks go up into the Layers heading and the
+/// Properties give up more room, for the list.
+const COMPACT_PANEL: f32 = 450.0;
+/// Room the Properties keep in such a panel.
+const COMPACT_PROPERTIES_MIN: f32 = 110.0;
 /// Temp data: the Properties' height, unscrolled.
 const PROPERTIES_NATURAL: &str = "side-properties-natural";
 /// Room the Properties keep above the Layers, when the panel has it.
@@ -57,7 +62,9 @@ impl AtelierApp {
         };
         // A low panel lists fewer rows before scrolling, for the Properties;
         // a tall one more, as many as the Properties leave room for.
-        let fixed = HEADING_HEIGHT + BLEND_ROW + LOCK_ROW + 6.0 + FOOTER_HEIGHT;
+        let compact = full.height() < COMPACT_PANEL;
+        let lock_row = if compact { 0.0 } else { LOCK_ROW };
+        let fixed = HEADING_HEIGHT + BLEND_ROW + lock_row + 6.0 + FOOTER_HEIGHT;
         let visible = if full.height() < SHORT_PANEL {
             SHORT_VISIBLE_ROWS
         } else {
@@ -87,7 +94,11 @@ impl AtelierApp {
         // first, down to the layers' heading, one row and their buttons;
         // otherwise they keep a few lines whatever the split.
         let layers_min = ROW_HEIGHT + fixed;
-        let props_min = PROPERTIES_MIN;
+        let props_min = if compact {
+            COMPACT_PROPERTIES_MIN
+        } else {
+            PROPERTIES_MIN
+        };
         let split = (full.bottom() - layers_height)
             .max(full.top() + props_min)
             .min(full.bottom() - layers_min)
@@ -97,20 +108,27 @@ impl AtelierApp {
         let mut layers = ui.new_child(
             UiBuilder::new().max_rect(Rect::from_min_max(pos2(full.left(), split), full.max)),
         );
-        self.layers_section(&mut layers);
+        self.layers_section(&mut layers, compact);
         let props_rect = Rect::from_min_max(full.min, pos2(full.right(), split));
         let mut props = ui.new_child(UiBuilder::new().max_rect(props_rect));
         props.set_clip_rect(props_rect.intersect(ui.clip_rect()));
         // Their scroll bar shows while they overflow.
         props.spacing_mut().scroll.dormant_handle_opacity = 0.6;
         self.properties(&mut props);
-        self.layers_splitter(ui, full, split, layers_min);
+        self.layers_splitter(ui, full, split, layers_min, props_min);
     }
 
     /// The border between Properties and Layers: dragging it gives one
     /// more room (kept for the next sessions); a double click fits the
     /// Layers to their list again.
-    fn layers_splitter(&mut self, ui: &mut Ui, full: Rect, split: f32, layers_min: f32) {
+    fn layers_splitter(
+        &mut self,
+        ui: &mut Ui,
+        full: Rect,
+        split: f32,
+        layers_min: f32,
+        props_min: f32,
+    ) {
         let rect = Rect::from_x_y_ranges(full.x_range(), split - 3.0..=split + 3.0);
         let response = ui
             .interact(rect, Id::new("layers-splitter"), Sense::click_and_drag())
@@ -132,7 +150,7 @@ impl AtelierApp {
             && let Some(pointer) = ui.input(|i| i.pointer.interact_pos())
         {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-            let most = (full.height() - PROPERTIES_MIN).max(layers_min);
+            let most = (full.height() - props_min).max(layers_min);
             let height = start - (pointer.y - press);
             let share = height.clamp(layers_min, most) / full.height().max(1.0);
             layout.layers_share = Some(share.clamp(0.0, 1.0));
@@ -485,15 +503,15 @@ impl AtelierApp {
                         &mut new_angle,
                         pending,
                         |ui, v| {
-                            ui_kit::number_field(
+                            ui_kit::glyph_number_field(
                                 ui,
                                 icon::ARROW_CLOCKWISE,
+                                &t!("options-rotation"),
                                 v,
                                 -180.0..=180.0,
                                 "°",
                                 field,
                             )
-                            .on_hover_text(t!("options-rotation"))
                         },
                     );
                     let left = t!("side-rotate-left-tip");
@@ -551,7 +569,7 @@ impl AtelierApp {
             }
         } else {
             // A new size or angle resamples.
-            if self.refuse_pixels_locked() {
+            if self.refuse_transform_locked() {
                 return;
             }
             // Applied in place: the canvas never follows here.
@@ -565,7 +583,8 @@ impl AtelierApp {
 
     // ---------------------------------------------------------------- layers
 
-    fn layers_section(&mut self, ui: &mut Ui) {
+    /// `compact`: the locks in the heading, not on a row of their own.
+    fn layers_section(&mut self, ui: &mut Ui, compact: bool) {
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, color::LAYERS);
         ui.painter().hline(rect.x_range(), rect.top() + 0.5, line());
@@ -574,24 +593,45 @@ impl AtelierApp {
         };
         heading_bar(ui, &t!("panel-layers"), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
+            if compact {
+                // Four locks, as the row lays them out.
+                let locks = vec2(4.0 * 28.0 + 3.0 * 2.0, ui.available_height());
+                ui.allocate_ui_with_layout(
+                    locks,
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| self.lock_row(ui, false),
+                );
+            }
+            let count = if compact {
+                n.to_string()
+            } else {
+                t!("side-layer-count", count = n)
+            };
+            let tip = t!("side-layer-count", count = n);
             ui.label(
-                egui::RichText::new(t!("side-layer-count", count = n))
+                egui::RichText::new(count)
                     .font(ui_kit::mono(12.0))
                     .color(color::LABEL),
-            );
+            )
+            .on_hover_text(tip);
         });
         // Right under the heading (not after its spacing): the list starts
         // below it.
         let locks = rect.top() + HEADING_HEIGHT + BLEND_ROW;
-        let top = locks + LOCK_ROW;
+        let top = locks + if compact { 0.0 } else { LOCK_ROW };
         let blend = Rect::from_x_y_ranges(rect.x_range(), rect.top() + HEADING_HEIGHT..=locks);
         self.blend_row(&mut ui.new_child(UiBuilder::new().max_rect(blend)));
-        let row = Rect::from_x_y_ranges(rect.x_range(), locks..=top).shrink2(vec2(14.0, 1.0));
-        self.lock_row(&mut ui.new_child(
-            UiBuilder::new()
-                .max_rect(row)
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-        ));
+        if !compact {
+            let row = Rect::from_x_y_ranges(rect.x_range(), locks..=top).shrink2(vec2(14.0, 1.0));
+            self.lock_row(
+                &mut ui.new_child(
+                    UiBuilder::new()
+                        .max_rect(row)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                ),
+                true,
+            );
+        }
         let footer = Rect::from_min_max(pos2(rect.left(), rect.bottom() - FOOTER_HEIGHT), rect.max);
         let list = Rect::from_min_max(
             pos2(rect.left() + 6.0, top),
@@ -865,24 +905,38 @@ impl AtelierApp {
                             pos2(right - 24.0, rect.center().y - 12.0),
                             Vec2::splat(24.0),
                         );
-                        // A partial lock shows dimmer than Lock All.
+                        // Lock All shows solid, a partial lock hollow.
                         let (tip, tint) = if layer.locked {
                             (t!("panel-unlock-tip"), color::MUTED)
                         } else {
                             (t!("layers8-partial-unlock-tip"), color::LABEL)
                         };
                         let glyph = icon::LOCK_SIMPLE;
-                        if row_icon(
+                        let response = row_icon(
                             ui,
                             lock,
                             Id::new(("side_lock", layer.id)),
                             glyph,
                             tint,
                             &tip,
-                        )
-                        .clicked()
-                        {
+                        );
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &tip)
+                        });
+                        if response.clicked() {
                             unlock = Some(i);
+                        }
+                        if layer.locked {
+                            // The glyph's body filled (the icon font has no
+                            // filled weight).
+                            painter.rect_filled(
+                                Rect::from_center_size(
+                                    lock.center() + vec2(0.0, 1.6),
+                                    vec2(8.0, 6.0),
+                                ),
+                                1.0,
+                                tint,
+                            );
                         }
                         right = lock.left() - 4.0;
                     } else if let Some(g) = doc.lock_group(i) {
@@ -1797,8 +1851,15 @@ pub(super) fn gradient_fill_fields(ui: &mut Ui, g: &mut crate::compose::gradient
         )
         .response
         .on_hover_text(t!("core-gradient-style"));
-        ui_kit::number_field(ui, icon::ANGLE, &mut g.angle, -180.0..=180.0, "°", half)
-            .on_hover_text(t!("core-gradient-angle-tip"));
+        ui_kit::glyph_number_field(
+            ui,
+            icon::ANGLE,
+            &t!("core-gradient-angle-tip"),
+            &mut g.angle,
+            -180.0..=180.0,
+            "°",
+            half,
+        );
     });
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = GAP;

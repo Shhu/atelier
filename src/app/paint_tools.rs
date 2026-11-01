@@ -175,10 +175,12 @@ impl Tool {
 
 /// Pointer positions of this frame while the button is down, in order (the
 /// system may report several per frame), each with the pen pressure known
-/// at that point. Ends at `pointer` (or at the release).
+/// at that point. Ends at `pointer` (or at the release). Events are on screen,
+/// `pointer` and the samples in the space of `turn`'s upright coordinates.
 pub(super) fn frame_samples(
     ctx: &egui::Context,
     pointer: Option<Pos2>,
+    turn: view_turn::ViewTurn,
 ) -> Vec<(Pos2, Option<f32>)> {
     let mut force = None;
     let mut samples = Vec::new();
@@ -188,7 +190,7 @@ pub(super) fn frame_samples(
             match e {
                 // A pen (Windows Ink) reports its pressure with each position.
                 egui::Event::Touch { force: Some(f), .. } => force = Some(*f),
-                egui::Event::PointerMoved(p) => samples.push((*p, force)),
+                egui::Event::PointerMoved(p) => samples.push((turn.to_upright(*p), force)),
                 egui::Event::PointerButton {
                     pos,
                     button: PointerButton::Primary,
@@ -199,7 +201,7 @@ pub(super) fn frame_samples(
                         // Moves before the press are not part of the stroke.
                         samples.clear();
                     }
-                    samples.push((*pos, force));
+                    samples.push((turn.to_upright(*pos), force));
                     if !*pressed {
                         ended = true;
                         break;
@@ -349,7 +351,7 @@ impl AtelierApp {
         }
         // Shift + click: straight line from the end of the previous stroke.
         let line_from = self.last_paint.filter(|_| start && shift);
-        let samples = frame_samples(&self.ctx, pointer);
+        let samples = frame_samples(&self.ctx, pointer, self.view_turn);
         let (now, alt) = self.ctx.input(|i| (i.time, i.modifiers.alt));
         if start && let Some(doc) = &self.doc {
             let on_mask = doc.mask_targeted();
@@ -469,7 +471,8 @@ impl AtelierApp {
     }
 
     /// Alt + right drag with a brush tool, like Photoshop: left and right
-    /// change its size, up and down its hardness. Whether one is under way.
+    /// change its size, up and down its hardness, on screen whatever the
+    /// view's turn. Whether one is under way. Takes the screen pointer.
     pub(super) fn brush_size_drag(
         &mut self,
         hovered: bool,
@@ -521,7 +524,7 @@ impl AtelierApp {
     /// `false` when too small to show (a crosshair then).
     pub(super) fn draw_brush_cursor(&self, painter: &Painter, pos: Pos2, view: View) -> bool {
         // Resized with Alt + right drag: where the drag started.
-        let pos = self.paint.size_drag.map_or(pos, |d| d.0);
+        let pos = self.paint.size_drag.map_or(pos, |d| self.view_turn.to_upright(d.0));
         let radius = self.brush_size * 0.5 * view.zoom;
         if radius < 3.0 {
             return false;
@@ -672,6 +675,7 @@ impl AtelierApp {
             &style,
             b.all_layers,
         ) {
+            doc.mark_fade_changed();
             self.reset_pending();
         }
     }
@@ -809,6 +813,7 @@ impl AtelierApp {
             doc.discard_step();
             return;
         }
+        doc.mark_fade();
         self.reset_pending();
     }
 

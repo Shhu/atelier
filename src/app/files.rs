@@ -417,7 +417,7 @@ impl AtelierApp {
     /// Where Paste centers an image (canvas coordinates): on the
     /// selection, else on the part of the canvas in view. `None` before
     /// the canvas is shown (then the canvas center).
-    fn paste_center(&self) -> Option<(f32, f32)> {
+    pub(super) fn paste_center(&self) -> Option<(f32, f32)> {
         let doc = self.doc.as_ref()?;
         let canvas = doc.full_rect();
         if let Some(r) = self.selection.as_ref().and_then(|s| s.bounds(canvas)) {
@@ -425,10 +425,16 @@ impl AtelierApp {
         }
         let view = self.last_view?;
         let area = (self.ctx).data(|d| d.get_temp::<Rect>(egui::Id::new(DROP_AREA)))?;
-        let area = self.view_turn.upright_bounds(area);
-        let seen = Rect::from_min_max(view.to_image(area.min), view.to_image(area.max));
-        let visible = seen.intersect(to_rect(canvas));
-        (visible.is_positive()).then(|| (visible.center().x, visible.center().y))
+        // The window on the image, turned: its part inside the canvas.
+        let seen = [
+            area.left_top(),
+            area.right_top(),
+            area.right_bottom(),
+            area.left_bottom(),
+        ]
+        .map(|p| view.to_image(self.view_turn.to_upright(p)));
+        let center = view_turn::center_within(&seen, to_rect(canvas))?;
+        Some((center.x, center.y))
     }
 
     /// Files dropped on the window: placed as smart objects (Place

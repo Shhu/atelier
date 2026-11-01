@@ -78,6 +78,18 @@ pub struct PatternFx {
     pub blend: BlendMode,
 }
 
+impl PatternFx {
+    /// Turned on, or holding settings of its own while off (the default,
+    /// unused one needs no tile in a file, nor any work when the image turns).
+    pub fn in_use(&self) -> bool {
+        let default = Effects::default().pattern_overlay;
+        self.enabled
+            || self.fill != default.fill
+            || self.opacity != default.opacity
+            || self.blend != default.blend
+    }
+}
+
 /// Bevel & Emboss (inner bevel, smooth): highlights and shadows of a
 /// relief lit from `angle` (degrees) at `altitude` (degrees).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -294,7 +306,7 @@ impl Effects {
     }
 
     /// Offsets and light direction transformed by `f` (canvas rotation,
-    /// flip).
+    /// flip); see `Layer::map_patterns` for the Pattern Overlay.
     pub fn turn(&mut self, f: impl Fn(f32, f32) -> (f32, f32)) {
         for shadow in [&mut self.shadow, &mut self.inner_shadow] {
             (shadow.dx, shadow.dy) = f(shadow.dx, shadow.dy);
@@ -302,11 +314,6 @@ impl Effects {
         let (s, c) = self.bevel.angle.to_radians().sin_cos();
         let (x, y) = f(c, -s);
         self.bevel.angle = (-y).atan2(x).to_degrees();
-        let p = &mut self.pattern_overlay.fill;
-        p.phase = f(p.phase.0, p.phase.1);
-        let (s, c) = p.angle.to_radians().sin_cos();
-        let (x, y) = f(c, -s);
-        p.angle = (-y).atan2(x).to_degrees();
     }
 }
 

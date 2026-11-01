@@ -12,8 +12,8 @@ use crate::i18n::t;
 mod mixers;
 mod tones;
 pub use mixers::{
-    AutoMode, ChannelMixer, Exposure, Fade, SELECTIVE_RANGES, SelectiveColor, StrokeLocation,
-    StrokeSettings, auto_levels, stroke,
+    AutoMode, ChannelMixer, Exposure, Fade, FadeArea, SELECTIVE_RANGES, SelectiveColor,
+    StrokeLocation, StrokeSettings, auto_levels_within, stroke,
 };
 pub use tones::{BlackWhite, GradientMap, PhotoFilter, Posterize, Threshold};
 
@@ -89,6 +89,22 @@ fn par_pixels(image: &mut RgbaImage, f: impl Fn(&mut [u8]) + Sync) {
     par_bands(image.as_mut(), row, |band| {
         band.chunks_exact_mut(4).for_each(&f)
     });
+}
+
+/// Lock Transparent Pixels: `new` takes the opacity of `old`, its earlier
+/// state. Where it became less opaque, what it no longer covers shows the old
+/// color (no black where a filter read transparent pixels). A pixel at the
+/// old opacity keeps its color, so this can be done again.
+#[inline]
+pub fn keep_opacity(new: &mut [u8], old: &[u8]) {
+    let (from, to) = (u32::from(old[3]), u32::from(new[3]));
+    if to < from {
+        for c in 0..3 {
+            let (o, n) = (u32::from(old[c]), u32::from(new[c]));
+            new[c] = ((n * to + o * (from - to) + from / 2) / from) as u8;
+        }
+    }
+    new[3] = old[3];
 }
 
 /// Area of an image where pixels may be modified, with a per-pixel coverage

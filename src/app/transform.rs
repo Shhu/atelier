@@ -205,7 +205,7 @@ struct Applied {
 }
 
 /// Above this many pixels, a transform is computed on another thread.
-const ASYNC_PIXELS: u64 = 4 << 20;
+pub(super) const ASYNC_PIXELS: u64 = 4 << 20;
 
 /// What applying a transform takes (see `finish_transform`).
 struct Commit {
@@ -735,7 +735,7 @@ impl AtelierApp {
         // The quick mask: the layer's lock doesn't protect it.
         let quick = self.in_quick_mask();
         if self.doc.is_none()
-            || (!quick && (self.refuse_position_locked() || self.refuse_pixels_locked()))
+            || (!quick && self.refuse_transform_locked())
         {
             return false;
         }
@@ -785,6 +785,13 @@ impl AtelierApp {
             .filter(|_| doc.active_layer().paintable() && !doc.mask_targeted())
         else {
             return true;
+        };
+        // Lifting leaves a hole, the drop adds opacity elsewhere.
+        if self.refuse_alpha_locked() {
+            return false;
+        }
+        let Some(doc) = &mut self.doc else {
+            return false;
         };
         let mark = doc.history_mark();
         let Some(id) = doc.lift_region(&selection, false) else {
@@ -1059,7 +1066,7 @@ impl AtelierApp {
         selected
             .iter()
             .copied()
-            .filter(|&i| doc.can_transform(i) && !inside(i))
+            .filter(|&i| doc.transform_block(i).is_none() && !inside(i))
             .collect()
     }
 
@@ -1644,12 +1651,13 @@ impl AtelierApp {
     /// Whether a transform is being computed (it keeps the keyboard and
     /// the image).
     pub(super) fn transform_busy(&self) -> bool {
-        self.xform.applying.is_some()
+        self.xform.applying.is_some() || self.crop.whole.is_some()
     }
 
     /// Waits for the transform being computed and puts it in place: what
     /// follows (a command, a save, another tab) works with its result.
     pub(super) fn wait_transform(&mut self) {
+        self.wait_whole();
         let Some(a) = self.xform.applying.take() else {
             return;
         };
@@ -1662,6 +1670,7 @@ impl AtelierApp {
     /// another thread: it is waited for and put in place first, as if it
     /// had landed by itself, then the input applies: nothing is lost.
     pub(super) fn wait_transform_for_input(&mut self, ctx: &egui::Context) {
+        self.wait_whole_for_input(ctx);
         if self.xform.applying.is_none()
             || !ctx.input(|i| super::retouch_tools::input_waits(i, None))
         {
@@ -1698,6 +1707,9 @@ impl AtelierApp {
     /// [`Self::after_transform`], the frames showing its indicator
     /// meanwhile, rather than the window freezing.
     pub(super) fn commit_pending_aside(&mut self) -> bool {
+        if self.crop.whole.is_some() {
+            return true;
+        }
         if self.transform_rect.is_none() || self.crop_box_pending() {
             return false;
         }
@@ -1710,6 +1722,9 @@ impl AtelierApp {
     /// `then` once the transform being computed lands (at once without
     /// one).
     pub(super) fn after_transform(&mut self, then: impl FnOnce(&mut Self) + 'static) {
+        if let Some(run) = &mut self.crop.whole {
+            return run.then_do(then);
+        }
         match &mut self.xform.applying {
             Some(a) => a.then.push(Box::new(then)),
             None => then(self),
@@ -1719,6 +1734,7 @@ impl AtelierApp {
     /// The transform being computed, once done, is applied; meanwhile, its
     /// busy indicator.
     pub(super) fn transform_window(&mut self, ctx: &egui::Context) {
+        self.whole_window(ctx);
         let Some(a) = &self.xform.applying else {
             return;
         };
@@ -1789,6 +1805,7 @@ impl AtelierApp {
             .then(|| self.transform_source())
             .flatten();
         let Some(doc) = &mut self.doc else { return };
+        let lifted = c.lift.is_some();
         if let Some(lift) = c.lift {
             doc.drop_floating(lift.id);
             if changed {
@@ -1806,6 +1823,20 @@ impl AtelierApp {
         }
         if !changed {
             return self.reset_transform();
+        }
+        // One layer's pixels, or the quick mask: Fade can blend them back.
+        let active = doc.active_layer();
+        let pixels = c.texts.is_empty()
+            && !c.fit
+            && c.placed.is_none()
+            && active.paintable()
+            && !active.is_live()
+            // Lifted pixels are back in the layer they came from.
+            && (lifted
+                || (c.layers.len() == 1
+                    && doc.layers.get(c.layers[0]).is_some_and(|l| l.id == active.id)));
+        if pixels || quick {
+            doc.mark_fade_transformed();
         }
         let fitted = c
             .fit

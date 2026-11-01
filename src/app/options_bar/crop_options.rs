@@ -7,9 +7,10 @@ use super::*;
 impl AtelierApp {
     pub(super) fn canvas_options(&mut self, ui: &mut egui::Ui) {
         let Some(full) = self.full_rect() else { return };
+        self.crop_sync_original();
         let current = self.crop.preset;
         let mut picked = None;
-        dropdown(ui, "crop_preset", None, &current.label(), false, 0.0, |ui| {
+        let list = dropdown(ui, "crop_preset", None, &current.label(), false, 0.0, |ui| {
             for preset in CropPreset::ALL {
                 if ui.selectable_label(current == preset, preset.label()).clicked() {
                     picked = Some(preset);
@@ -17,11 +18,12 @@ impl AtelierApp {
                 }
             }
         });
+        ui_kit::name_control(ui, list.response.id, &t!("crop9-preset-name"), &current.label());
         if let Some(preset) = picked {
             self.crop_pick_preset(preset, full);
         }
         self.crop_values(ui, full);
-        let free = self.crop.preset == CropPreset::Ratio && self.crop.ratio().is_none();
+        let free = self.crop.preset == CropPreset::Ratio && self.crop_ratio().is_none();
         if ui_kit::button(ui, &t!("crop8-clear"), Kind::Normal, None, !free)
             .on_hover_text(t!("crop8-clear-tip"))
             .clicked()
@@ -35,6 +37,11 @@ impl AtelierApp {
             &t!("crop8-straighten-tip"),
             &mut self.crop.straighten,
         );
+        if ui_kit::icon_button(ui, icon::SELECTION_ALL, &t!("options-fit-visible-pixels"), true)
+            .clicked()
+        {
+            self.crop_fit_visible();
+        }
         self.crop_view_menu(ui);
         ui_kit::checkbox(ui, &mut self.crop.delete_cropped, &t!("crop8-delete-cropped"))
             .on_hover_text(t!("crop8-delete-cropped-tip"));
@@ -47,13 +54,9 @@ impl AtelierApp {
             );
         }
         // Icons, like the transform bars: the row doesn't wrap for them.
-        let resampled = self.crop.preset == CropPreset::Size
-            && self.crop.ratio().is_some()
-            && (self.crop.w, self.crop.h) != (full.width(), full.height());
-        let pending = self.crop_box_drawn(full) || resampled;
-        let (apply, cancel) = apply_cancel_icons(ui, pending);
+        // Lit when Enter applies, by the same rule.
+        let (apply, cancel) = apply_cancel_icons(ui, self.crop_box_pending());
         if apply {
-            self.canvas_rect.get_or_insert(full);
             self.apply_crop_box();
             self.reset_pending();
         }
@@ -62,12 +65,14 @@ impl AtelierApp {
         }
     }
 
-    /// W, swap, H, and the resolution with W × H × Resolution.
+    /// W, swap, H, and the resolution with W × H × Resolution. Empty is
+    /// shown empty; pixels say so, and a ratio reads as one.
     fn crop_values(&mut self, ui: &mut egui::Ui, full: Rect) {
         let size = self.crop.preset == CropPreset::Size;
         let suffix = if size { " px" } else { "" };
+        let tip = |pixels: String| if size { pixels } else { t!("crop9-ratio-tip") };
         let max = MAX_DIMENSION as f32;
-        let mut edited = ui_kit::number_field(
+        let mut edited = ui_kit::blank_number_field(
             ui,
             &t!("optbar-width-short"),
             &mut self.crop.w,
@@ -75,12 +80,15 @@ impl AtelierApp {
             suffix,
             82.0,
         )
-        .on_hover_text(t!("options-width"))
+        .on_hover_text(tip(t!("options-width")))
         .changed();
+        if !size {
+            ui.label(egui::RichText::new(":").color(color::LABEL));
+        }
         if ui_kit::icon_button(ui, icon::ARROWS_LEFT_RIGHT, &t!("crop8-swap"), true).clicked() {
             self.crop_swap(full);
         }
-        edited |= ui_kit::number_field(
+        edited |= ui_kit::blank_number_field(
             ui,
             &t!("optbar-height-short"),
             &mut self.crop.h,
@@ -88,10 +96,10 @@ impl AtelierApp {
             suffix,
             82.0,
         )
-        .on_hover_text(t!("options-height"))
+        .on_hover_text(tip(t!("options-height")))
         .changed();
         if size {
-            ui_kit::number_field(
+            let typed = ui_kit::blank_number_field(
                 ui,
                 &t!("crop8-resolution"),
                 &mut self.crop.resolution,
@@ -99,7 +107,11 @@ impl AtelierApp {
                 " ppi",
                 110.0,
             )
-            .on_hover_text(t!("crop8-resolution-tip"));
+            .on_hover_text(t!("crop8-resolution-tip"))
+            .changed();
+            if typed && self.canvas_rect.is_none() {
+                self.canvas_rect = Some(self.crop_start_rect(full));
+            }
         }
         if edited {
             if size {
@@ -109,11 +121,10 @@ impl AtelierApp {
         }
     }
 
-    /// Overlay, shield opacity, and the box around the visible pixels.
+    /// Overlay and shield opacity.
     fn crop_view_menu(&mut self, ui: &mut egui::Ui) {
         let name = t!("crop8-overlay");
-        let mut fit = false;
-        dropdown(ui, "crop_overlay", None, icon::GRID_NINE, false, 0.0, |ui| {
+        let response = dropdown(ui, "crop_overlay", None, icon::GRID_NINE, false, 0.0, |ui| {
             ui.set_width(220.0);
             ui_kit::field_label(ui, &name);
             for overlay in CropOverlay::ALL {
@@ -132,16 +143,10 @@ impl AtelierApp {
             {
                 self.crop.shield = shield as f32 / 100.0;
             }
-            ui.separator();
-            fit = ui_kit::button(ui, &t!("options-fit-visible-pixels"), Kind::Normal, None, true)
-                .on_hover_text(t!("options-fit-visible-pixels-tip"))
-                .clicked();
         })
         .response
-        .on_hover_text(name);
-        if fit && let Some(b) = self.doc.as_ref().and_then(Document::content_bounds) {
-            self.canvas_rect = Some(to_rect(b));
-            self.crop.angle = 0.0;
-        }
+        .on_hover_text(&name);
+        // Painted as a glyph: said by its name and the overlay chosen.
+        ui_kit::name_control(ui, response.id, &name, &self.crop.overlay.label());
     }
 }

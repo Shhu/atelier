@@ -39,6 +39,7 @@ mod smart;
 mod styles_jobs;
 mod transform;
 mod vectors;
+pub use crop::{CropOrder, WholeChange, WholeDone};
 pub use artboards::{
     ARTBOARD_GAP, Artboard, ArtboardBackground, ArtboardExport, ArtboardFiles, Side,
     artboard_file_stem, artboard_path, existing_artboard_files, windows_device,
@@ -170,6 +171,13 @@ struct StylesCache {
     /// Part of a move of its shape since then not yet in `offset`, under
     /// a pixel (see `Layer::carry_styles`).
     moved: std::cell::Cell<(f32, f32)>,
+}
+
+/// Which lock stops a transform (see `Document::transform_block`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockedBy {
+    Position,
+    Pixels,
 }
 
 /// The partial locks of a layer (Layers panel). Lock All is `Layer::locked`.
@@ -340,15 +348,21 @@ impl Layer {
 
     /// `area` and what `styles` cover beyond it.
     pub fn with_styles_extent(&self, area: PixelRect, styles: Option<&Styles>) -> PixelRect {
-        match styles.and_then(|s| s.extent()) {
-            Some([x0, y0, x1, y1]) => area.union(PixelRect {
-                x: self.offset.0 + x0,
-                y: self.offset.1 + y0,
-                w: (x1 - x0) as u32,
-                h: (y1 - y0) as u32,
-            }),
+        match self.styles_box(styles) {
+            Some(b) => area.union(b),
             None => area,
         }
+    }
+
+    /// The box of `styles` in the canvas, if they cover anything.
+    pub fn styles_box(&self, styles: Option<&Styles>) -> Option<PixelRect> {
+        let [x0, y0, x1, y1] = styles?.extent()?;
+        Some(PixelRect {
+            x: self.offset.0 + x0,
+            y: self.offset.1 + y0,
+            w: (x1 - x0) as u32,
+            h: (y1 - y0) as u32,
+        })
     }
 
     /// Fingerprint of what the mask does to the layer's shape.
@@ -358,7 +372,7 @@ impl Layer {
 
     /// Gives the pixels of `rect` (the whole image without one) the opacity
     /// they have in `before`, an earlier state of the same size (see
-    /// [`Locks::transparent`]).
+    /// [`Locks::transparent`] and [`crate::pixel_ops::keep_opacity`]).
     pub(crate) fn keep_alpha_of(&mut self, before: &RgbaImage, rect: Option<[u32; 4]>) {
         if before.dimensions() != self.image.dimensions() || std::ptr::eq(before, &*self.image) {
             return;
@@ -381,7 +395,8 @@ impl Layer {
             .for_each(|(y, row)| {
                 let line = &from[y * w * 4..(y + 1) * w * 4];
                 for x in x0..x1 {
-                    row[x * 4 + 3] = line[x * 4 + 3];
+                    let at = x * 4..x * 4 + 4;
+                    crate::pixel_ops::keep_opacity(&mut row[at.clone()], &line[at]);
                 }
             });
     }
@@ -431,8 +446,65 @@ impl Layer {
     /// a layer enlarged for a dialog's preview, the dialog cancelled.
     pub fn put_back_pixels(&mut self, image: Arc<RgbaImage>, offset: (i64, i64), rev: u64) {
         self.image = image;
-        self.offset = offset;
+        self.reframe(offset);
         self.rev = rev;
+    }
+
+    /// Its frame now starts at `offset`, the pixels staying where they are on
+    /// the canvas (enlarged for painting, cut): this isn't a move, so a linked
+    /// Pattern Overlay stays too.
+    pub fn reframe(&mut self, offset: (i64, i64)) {
+        let in_use = self.effects.pattern_overlay.in_use();
+        let fill = &mut self.effects.pattern_overlay.fill;
+        if fill.linked && in_use {
+            fill.phase.0 += (self.offset.0 - offset.0) as f32;
+            fill.phase.1 += (self.offset.1 - offset.1) as f32;
+        }
+        self.offset = offset;
+    }
+
+    /// The tiles of its patterns after the image's geometry changed by `a`,
+    /// the layer having been at `old`: their origin stays on the same point of
+    /// the image, and `change` turns or mirrors them. A group's overlay starts
+    /// from the box of what it holds, wherever that goes: only its offset turns.
+    fn map_patterns(
+        &mut self,
+        old: (i64, i64),
+        a: &mask_ops::Affine,
+        change: impl Fn(&mut crate::compose::pattern::PatternFill),
+    ) {
+        let point = |p: (i64, i64)| (p.0 as f32, p.1 as f32);
+        let anchors = (point(old), point(self.offset));
+        if let LayerKind::Fill(Fill::Pattern(f)) = &mut self.kind {
+            f.map_origin(|x, y| a.apply(x, y), anchors);
+            change(f);
+        }
+        if self.effects.pattern_overlay.in_use() {
+            let anchors = match self.kind {
+                LayerKind::Group { .. } => ((0.0, 0.0), a.apply(0.0, 0.0)),
+                _ => anchors,
+            };
+            let f = &mut self.effects.pattern_overlay.fill;
+            f.map_origin(|x, y| a.apply(x, y), anchors);
+            change(f);
+        }
+    }
+
+    /// The canvas now starts `(dx, dy)` further: what starts from the
+    /// document's origin moves as much, to stay on the same pixels.
+    fn canvas_moved(&mut self, dx: i64, dy: i64) {
+        let shift = |f: &mut crate::compose::pattern::PatternFill| {
+            if !f.linked {
+                f.phase.0 -= dx as f32;
+                f.phase.1 -= dy as f32;
+            }
+        };
+        if let LayerKind::Fill(Fill::Pattern(f)) = &mut self.kind {
+            shift(f);
+        }
+        if self.effects.pattern_overlay.in_use() {
+            shift(&mut self.effects.pattern_overlay.fill);
+        }
     }
 
     /// Box of the visible pixels (alpha > 0), in canvas coordinates.
@@ -493,37 +565,22 @@ impl Layer {
         }
     }
 
-    /// Box of what the layer shows on its own, styles included; `None` if
-    /// it reaches everywhere (adjustment, fill without a hiding mask).
-    pub fn extent(&self, held: bool) -> Option<PixelRect> {
-        self.extent_with(self.styles(held).as_deref())
-    }
-
-    /// The same, with these styles drawn (see [`Self::styles_later`]).
+    /// Box of what the layer shows on its own, with these styles drawn;
+    /// `None` if it reaches everywhere or depends on other layers
+    /// (adjustment, group, fill without a hiding mask). A mask limits the
+    /// shape; the styles drawn from it reach beyond.
     pub fn extent_with(&self, styles: Option<&Styles>) -> Option<PixelRect> {
-        let own = match &self.kind {
-            LayerKind::Pixels => {
+        let hiding = self.active_mask().filter(|m| m.default == 0);
+        let own = match (&self.kind, hiding) {
+            (LayerKind::Pixels, Some(m)) => {
                 let r = self.rect();
-                Some(match styles.and_then(|s| s.extent()) {
-                    Some([x0, y0, x1, y1]) => r.union(PixelRect {
-                        x: self.offset.0 + x0,
-                        y: self.offset.1 + y0,
-                        w: (x1 - x0) as u32,
-                        h: (y1 - y0) as u32,
-                    }),
-                    None => r,
-                })
-            }
-            _ => None,
-        };
-        // A mask that hides by default limits the layer to its box.
-        match (self.active_mask().filter(|m| m.default == 0), own) {
-            (Some(m), Some(r)) => {
                 Some(intersect(r, m.rect(self.offset)).unwrap_or(PixelRect { w: 0, h: 0, ..r }))
             }
-            (Some(m), None) => Some(self.with_styles_extent(m.rect(self.offset), styles)),
-            (None, own) => own,
-        }
+            (LayerKind::Pixels, None) => Some(self.rect()),
+            (_, Some(m)) => Some(m.rect(self.offset)),
+            (_, None) => None,
+        };
+        own.map(|r| self.with_styles_extent(r, styles))
     }
 }
 
@@ -577,11 +634,20 @@ impl Layer {
         if let Some(smart) = &self.smart {
             smart.buffers(out);
         }
+        if let LayerKind::Fill(Fill::Pattern(f)) = &self.kind {
+            f.pattern.buffers(out);
+        }
+        self.effects.pattern_overlay.fill.pattern.buffers(out);
     }
 }
 
 fn next_rev() -> u64 {
     NEXT_REV.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The memory something being opened may take now.
+pub fn free_memory() -> u64 {
+    file_io::Budget::new().left()
 }
 
 /// Intersection of two pixel rectangles.
@@ -707,6 +773,8 @@ struct State {
     quick_mask: Option<Arc<GrayImage>>,
     mask_target: Option<u64>,
     filter_mask_target: bool,
+    /// The file's metadata: Crop's Resolution changes it.
+    image_meta: Option<Arc<ImageMetadata>>,
     /// Identifies the state (whether it is the one saved).
     id: u64,
 }
@@ -1184,6 +1252,7 @@ impl Document {
             quick_mask: self.quick_mask.clone(),
             mask_target: self.mask_target,
             filter_mask_target: self.filter_mask_target,
+            image_meta: self.file_metadata.image.clone(),
             id: self.state_id,
         }
     }
@@ -1221,6 +1290,7 @@ impl Document {
                 &mut self.filter_mask_target,
                 s.filter_mask_target,
             ),
+            image_meta: std::mem::replace(&mut self.file_metadata.image, s.image_meta),
             id: std::mem::replace(&mut self.state_id, s.id),
         };
         for l in &mut self.layers {
@@ -2064,7 +2134,9 @@ impl Document {
     pub fn align(&mut self, indices: &[usize], op: AlignOp, to: Option<PixelRect>) -> bool {
         let items: Vec<(usize, PixelRect)> = indices
             .iter()
-            .filter(|&&i| i < self.layers.len() && self.can_move(i))
+            .filter(|&&i| {
+                i < self.layers.len() && self.can_move(i) && self.stuck_group_layer(i).is_none()
+            })
             .filter_map(|&i| self.element_bounds(i).map(|b| (i, b)))
             .collect();
         if items.is_empty() {
@@ -2137,9 +2209,9 @@ impl Document {
             AlignOp::DistributeH | AlignOp::DistributeV => t!("xchg-hist-distribute"),
             _ => t!("xchg-hist-align"),
         });
-        // A group with its layers.
+        // A group with its layers, those under Lock Position staying.
         for (i, dx, dy) in moves {
-            for j in self.block(i) {
+            for j in self.movable_block(i) {
                 self.layers[j].offset.0 += dx;
                 self.layers[j].offset.1 += dy;
             }
@@ -2159,7 +2231,7 @@ impl Document {
             return false;
         }
         self.checkpoint(t!("xchg-hist-move"));
-        for j in self.block(self.active) {
+        for j in self.movable_block(self.active) {
             self.layers[j].offset.0 += dx;
             self.layers[j].offset.1 += dy;
         }
@@ -2407,7 +2479,7 @@ impl Document {
                 target.offset.1 - region.y,
             );
             target.replace_pixels(grown);
-            target.offset = (region.x, region.y);
+            target.reframe((region.x, region.y));
         }
         let (dx, dy) = (
             (floating.offset.0 - target.offset.0) as u32,
@@ -2485,24 +2557,34 @@ impl Document {
     /// Returns `true` if the layer changed size; a layer whose content lies
     /// too far from the canvas keeps its size.
     pub fn expand_active_to_canvas(&mut self) -> bool {
-        let canvas = self.full_rect();
-        let layer = self.active_layer();
-        if !layer.has_pixels() {
+        if !self.active_layer().has_pixels() {
             return false;
         }
-        let (rect, content) = (layer.rect(), layer.content_bounds());
-        let u = content.map_or(canvas, |c| c.union(canvas));
-        let grow = !rect.contains_rect(canvas) && self.fits(u);
+        let grown = self.box_to_canvas();
         let layer = &mut self.layers[self.active];
         layer.text = None;
-        if !grow {
+        let Some(u) = grown else {
             return false;
-        }
+        };
+        let rect = layer.rect();
         let mut image = RgbaImage::new(u.w, u.h);
         image::imageops::replace(&mut image, layer.image(), rect.x - u.x, rect.y - u.y);
         layer.replace_pixels(image);
-        layer.offset = (u.x, u.y);
+        layer.reframe((u.x, u.y));
         true
+    }
+
+    /// The box [`Self::expand_active_to_canvas`] would give the active
+    /// layer; `None` if it would keep its size.
+    pub(crate) fn box_to_canvas(&self) -> Option<PixelRect> {
+        let canvas = self.full_rect();
+        let layer = self.active_layer();
+        if !layer.has_pixels() {
+            return None;
+        }
+        let (rect, content) = (layer.rect(), layer.content_bounds());
+        let u = content.map_or(canvas, |c| c.union(canvas));
+        (!rect.contains_rect(canvas) && self.fits(u)).then_some(u)
     }
 
     // ------------------------------------------------------------ geometry
@@ -2540,6 +2622,7 @@ impl Document {
         self.checkpoint(name);
         for layer in &mut self.layers {
             layer.translate(-x, -y);
+            layer.canvas_moved(x, y);
         }
         self.map_paths(&mask_ops::Affine([
             1.0, 0.0, -x as f32, 0.0, 1.0, -y as f32,
@@ -2553,7 +2636,18 @@ impl Document {
     /// Image Rotation (Image menu): the whole image turns by `degrees`
     /// (clockwise) around the canvas center, and the canvas becomes the box
     /// of the rotated canvas. Quarter turns are exact. Texts become pixels.
+    #[cfg(test)]
     pub fn rotate_canvas(&mut self, degrees: f32) -> bool {
+        self.rotate_canvas_unless(degrees, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// [`Self::rotate_canvas`], given up between two layers once `cancel`
+    /// is set (the document is then a work copy, thrown away).
+    pub(super) fn rotate_canvas_unless(
+        &mut self,
+        degrees: f32,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> bool {
         let degrees = degrees.rem_euclid(360.0);
         if degrees == 0.0 {
             return false;
@@ -2577,6 +2671,9 @@ impl Document {
         let limit = self.shape_limit();
         self.map_paths(&map);
         for layer in &mut self.layers {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return true;
+            }
             let old = layer.offset;
             let (lw, lh) = match layer.artboard {
                 Some(a) => (a.size.0 as f32, a.size.1 as f32),
@@ -2587,8 +2684,8 @@ impl Document {
                 layer.offset.1 as f32 + lh / 2.0,
             );
             let (dx, dy) = turn(center.0 - old_center.0, center.1 - old_center.1);
-            let image = rotate::rotate(&layer.image, degrees, false);
-            let (mut iw, mut ih) = (image.width() as f32, image.height() as f32);
+            let (iw, ih) = rotate::rotated_dimensions(layer.image.width(), layer.image.height(), degrees);
+            let (mut iw, mut ih) = (iw as f32, ih as f32);
             if let Some(a) = &mut layer.artboard {
                 // An artboard becomes the box of its turned rectangle.
                 let (rw, rh) = rotate::rotated_size(lw, lh, degrees);
@@ -2603,9 +2700,15 @@ impl Document {
                 && !layer.map_smart(old, &map, limit)
                 && layer.has_pixels()
             {
-                layer.replace_pixels(image);
+                // Only now: a shape or a smart object renders its own.
+                layer.replace_pixels(rotate::rotate(&layer.image, degrees, false));
             }
             layer.effects.turn(turn);
+            layer.map_patterns(old, &map, |f| f.turned(degrees));
+            // Degrees counterclockwise: it keeps its direction on the image.
+            if let LayerKind::Fill(Fill::Gradient(g)) = &mut layer.kind {
+                g.angle = (g.angle - degrees).rem_euclid(360.0);
+            }
             layer.edit_mask(old, |m| {
                 m.rotate(degrees, (old_center, new_center), turn, false, (0, 0));
             });
@@ -2658,6 +2761,7 @@ impl Document {
             layer
                 .effects
                 .turn(|x, y| if horizontal { (-x, y) } else { (x, -y) });
+            layer.map_patterns(old, &map, |f| f.mirrored(horizontal));
             layer.edit_mask(old, |m| m.flip(horizontal, (w, h), (0, 0)));
         }
     }
@@ -2690,7 +2794,7 @@ impl Document {
             dst.0 = over(dst.0, p.0);
         }
         bottom.replace_pixels(out);
-        bottom.offset = (region.x, region.y);
+        bottom.reframe((region.x, region.y));
     }
 
     /// Image Size (Ctrl+Alt+I): the canvas becomes `width` × `height` and
@@ -2713,6 +2817,7 @@ impl Document {
         for layer in &mut self.layers {
             let old = layer.offset;
             let (w, h) = layer.image.dimensions();
+            let empty = w == 0 || h == 0;
             let x0 = (layer.offset.0 as f64 * sx).round() as i64;
             let y0 = (layer.offset.1 as f64 * sy).round() as i64;
             let x1 = ((layer.offset.0 + w as i64) as f64 * sx).round() as i64;
@@ -2735,6 +2840,7 @@ impl Document {
             if !layer.map_shape(old, &map, limit)
                 && !layer.map_smart(old, &map, limit)
                 && layer.has_pixels()
+                && !empty
             {
                 layer.replace_pixels(crate::pixel_ops::resize(layer.image(), nw, nh, filter));
             }
@@ -2879,6 +2985,22 @@ impl Document {
         } else {
             layer.offset.0 += at.0 - src.x;
             layer.offset.1 += at.1 - src.y;
+            // A Pattern Fill has no pixels: its tile takes the transformation
+            // (at the same scale both ways: a tile can't be stretched). Only
+            // moved, one that stays at the document's origin doesn't move.
+            let new = layer.offset;
+            if let LayerKind::Fill(Fill::Pattern(f)) = &mut layer.kind
+                && !only_moved
+                && src.w > 0
+                && src.h > 0
+            {
+                use crate::compose::pattern::SCALE_RANGE;
+                let point = |p: (i64, i64)| (p.0 as f32, p.1 as f32);
+                f.map_origin(|x, y| map.apply(x, y), (point(old), point(new)));
+                let k = (size.0 as f32 / src.w as f32 * size.1 as f32 / src.h as f32).sqrt();
+                f.scale = (f.scale * k).clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end());
+                f.turned(angle);
+            }
         }
         // Its linked mask, the same way.
         if layer.mask.as_ref().is_some_and(Mask::linked) && (src.w, src.h) != (0, 0) {
@@ -2903,6 +3025,7 @@ impl Document {
     pub fn fit_canvas_to(&mut self, r: PixelRect) {
         for layer in &mut self.layers {
             layer.translate(-r.x, -r.y);
+            layer.canvas_moved(r.x, r.y);
         }
         self.map_paths(&mask_ops::Affine([
             1.0,

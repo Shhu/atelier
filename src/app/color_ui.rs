@@ -1006,6 +1006,22 @@ impl AtelierApp {
         })
     }
 
+    /// What [`Self::inks_of`] depends on besides the color, as a fingerprint.
+    pub(super) fn inks_key(&self) -> u64 {
+        let s = &self.color.settings;
+        hash_of((
+            self.picked_profile().name().to_owned(),
+            self.color.working_cmyk().name().to_owned(),
+            format!("{:?}", s.intent),
+            s.bpc,
+        ))
+    }
+
+    /// `rgb`'s inks (%) in the working CMYK.
+    pub(super) fn inks_of(&self, rgb: [u8; 3]) -> Option<[f32; 4]> {
+        self.color.to_cmyk(&self.picked_profile()).color_to_cmyk(rgb)
+    }
+
     /// The color of CMYK inks (%) typed in the Color Picker.
     pub(super) fn rgb_of_ink(&self, cmyk: [f32; 4]) -> Option<[u8; 3]> {
         let to = self.picked_profile();

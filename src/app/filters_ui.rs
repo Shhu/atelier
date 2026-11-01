@@ -9,8 +9,8 @@ use image::RgbaImage;
 
 use super::actions_panel::Stopped;
 use super::dialogs::{
-    DialogSpec, Steps, Track, block, floating_dialog, full_segmented, gap_between_blocks,
-    slider_row_steps, tool_dialog_pos,
+    DialogSpec, Steps, Track, block, dialog_body_room, dialog_bounds, floating_dialog,
+    full_segmented, gap_between_blocks, slider_row_steps, tool_dialog_pos,
 };
 use super::*;
 use crate::filters::{
@@ -263,6 +263,53 @@ struct FilterDialog {
     failed: Option<u64>,
     /// Smart Sharpen: Shadows and Highlights settings shown.
     tones: bool,
+    /// What the filter will find once the target is enlarged, without
+    /// changing it (see [`Document::target_as_painted`]), for a revision.
+    painted: Option<(u64, Option<crate::document::Layer>)>,
+    /// Height of the settings, once known.
+    settings_height: Option<f32>,
+}
+
+/// Width and height the preview square and the settings take in a dialog.
+struct DialogLayout {
+    /// Side by side rather than one above the other.
+    columns: bool,
+    /// Side of the preview square.
+    side: f32,
+    /// Height the settings get beside it.
+    room: f32,
+}
+
+impl DialogLayout {
+    /// Below each other when all fits, else side by side when the window is
+    /// wide enough, the settings scrolling on their own beside the square.
+    fn of(ctx: &egui::Context, settings: Option<f32>) -> Self {
+        let room = dialog_body_room(ctx);
+        let stacked = SQUARE + ZOOM_ROW + 16.0 + settings.unwrap_or(0.0);
+        let side = (room - ZOOM_ROW).clamp(MIN_SQUARE, SQUARE);
+        let wide = dialog_bounds(ctx).width() >= side + SQUARE + SCROLL_ROOM + 8.0 + 34.0;
+        if stacked <= room || !wide {
+            return Self {
+                columns: false,
+                side: SQUARE,
+                room,
+            };
+        }
+        Self {
+            columns: true,
+            side,
+            room: room.max(side + ZOOM_ROW),
+        }
+    }
+
+    /// Width of the dialog.
+    fn width(&self) -> f32 {
+        if self.columns {
+            self.side + SQUARE + SCROLL_ROOM + 8.0 + 32.0
+        } else {
+            SQUARE + 32.0
+        }
+    }
 }
 
 /// What the preview square shows.
@@ -284,6 +331,9 @@ struct Applying {
     started: f64,
     job: Job<RgbaImage>,
 }
+
+/// Size and canvas position of an image.
+type ImageBox = ((u32, u32), (i64, i64));
 
 /// A filter's result the dialog's preview already has, or is computing.
 enum Ready {
@@ -358,8 +408,15 @@ impl<T> Drop for Job<T> {
     }
 }
 
-/// Side of the preview square (the dialog's body width).
+/// Side of the preview square (the dialog's body width), and of the settings'
+/// width.
 const SQUARE: f32 = 288.0;
+/// Room for the scroll bar of settings beside the square.
+const SCROLL_ROOM: f32 = 12.0;
+/// Smallest side of the preview square, beside the settings on a short window.
+const MIN_SQUARE: f32 = 128.0;
+/// Height of the zoom row below the square, with the gap.
+const ZOOM_ROW: f32 = 36.0;
 /// Zoom levels of the preview square.
 const SQUARE_ZOOMS: [f32; 14] = [
     0.0625, 0.125, 0.25, 0.3333, 0.5, 0.6667, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0,
@@ -371,10 +428,18 @@ pub(super) const BUSY_DELAY: f64 = 0.3;
 /// targeted (see [`Document::target_layer`]), and the area of the
 /// selection. `None` without either, or if the selection does not touch it.
 pub(super) fn active_target(doc: &Document, selection: Option<&Selection>) -> Option<Target> {
-    let layer = doc.target_layer()?;
+    target_on(doc, doc.target_layer()?.as_ref(), selection)
+}
+
+/// [`active_target`] with `layer` as the pixels.
+fn target_on(
+    doc: &Document,
+    layer: &crate::document::Layer,
+    selection: Option<&Selection>,
+) -> Option<Target> {
     let clip = match selection {
         Some(selection) => {
-            let clip = selection.clip(&layer, doc.full_rect())?;
+            let clip = selection.clip(layer, doc.full_rect())?;
             let [x0, y0, x1, y1] = clip.rect;
             if x0 >= x1 || y0 >= y1 {
                 return None;
@@ -387,7 +452,30 @@ pub(super) fn active_target(doc: &Document, selection: Option<&Selection>) -> Op
         image: layer.shared_image(),
         clip,
         offset: layer.offset,
+        alpha_locked: doc.alpha_locked(),
+        whole_source: false,
     })
+}
+
+/// A filter that fits its geometry to its area, without a selection: the
+/// canvas's box, not however far the layer's hidden pixels go, which stay as
+/// they are.
+fn fit_to_canvas(target: &mut Target, doc: &Document, filter: &Filter) {
+    if target.clip.is_some() || !filter.fits_the_area() {
+        return;
+    }
+    let (w, h) = target.image.dimensions();
+    let c = doc.full_rect();
+    let local = |at: i64, from: i64, most: u32| (at - from).clamp(0, i64::from(most)) as u32;
+    let area = [
+        local(c.x, target.offset.0, w),
+        local(c.y, target.offset.1, h),
+        local(c.right(), target.offset.0, w),
+        local(c.bottom(), target.offset.1, h),
+    ];
+    if area != [0, 0, w, h] && area[0] < area[2] && area[1] < area[3] {
+        target.clip = Some(area.into());
+    }
 }
 
 /// A dialog's result is previewed over the whole layer: a layer smaller
@@ -512,13 +600,19 @@ impl AtelierApp {
         // The square shows the middle of the selection, or of the canvas.
         let canvas = doc.full_rect();
         let around = selection.filter(|s| !s.inverted).map_or(canvas, |s| s.rect);
-        let Some(target) = doc.target_layer() else {
+        let painted = doc.target_as_painted();
+        let Some(offset) = painted
+            .as_ref()
+            .map(|l| l.offset)
+            .or_else(|| doc.target_layer().map(|l| l.offset))
+        else {
             return;
         };
         let center = pos2(
-            (around.x - target.offset.0) as f32 + around.w as f32 / 2.0,
-            (around.y - target.offset.1) as f32 + around.h as f32 / 2.0,
+            (around.x - offset.0) as f32 + around.w as f32 / 2.0,
+            (around.y - offset.1) as f32 + around.h as f32 / 2.0,
         );
+        let painted = Some((doc.target_rev(), painted));
         self.filters.dialog = Some(FilterDialog {
             filter,
             opened: filter,
@@ -529,6 +623,8 @@ impl AtelierApp {
             canvas: None,
             failed: None,
             tones: false,
+            painted,
+            settings_height: None,
         });
     }
 
@@ -578,7 +674,12 @@ impl AtelierApp {
     /// [`Self::start_filter`], the result being `ready` already: the
     /// dialog's canvas preview of the same settings, computed or being
     /// computed for the same pixels.
-    fn start_filter_with(&mut self, filter: Filter, ready: Option<Ready>) {
+    /// `ready` comes with the size and the position of the image it fits.
+    fn start_filter_with(
+        &mut self,
+        filter: Filter,
+        ready: Option<(Ready, ImageBox)>,
+    ) {
         if self.refuse_hidden_target() {
             return;
         }
@@ -594,7 +695,6 @@ impl AtelierApp {
         }
         let Some(doc) = &mut self.doc else { return };
         let rasterized = doc.active_layer().text.is_some() && !doc.mask_targeted();
-        let before = doc.target_layer().map(|l| l.image().dimensions());
         doc.checkpoint(title(filter.kind()));
         // The layer grows to the canvas, or its targeted mask stands in for
         // it, until the result is in (`poll_filter`).
@@ -603,12 +703,13 @@ impl AtelierApp {
             self.status = t!("filter-no-pixels");
             return;
         }
-        let Some(target) = active_target(doc, self.selection.as_ref()) else {
+        let Some(mut target) = active_target(doc, self.selection.as_ref()) else {
             doc.end_paint();
             doc.discard_step();
             self.status = t!("status-selection-empty");
             return;
         };
+        fit_to_canvas(&mut target, doc, &filter);
         // A preview of other dimensions (a text, enlarged only now) would
         // not fit the layer any more.
         if self
@@ -618,8 +719,9 @@ impl AtelierApp {
         {
             self.preview_shown = None;
         }
-        // The preview is the result only if the target kept its size.
-        let ready = ready.filter(|_| before == Some(target.image.dimensions()));
+        // The preview is the result only if it was computed for this box.
+        let placed = (target.image.dimensions(), target.offset);
+        let ready = ready.filter(|(_, fits)| *fits == placed).map(|(r, _)| r);
         let job = match ready {
             Some(Ready::Job(job)) => job,
             Some(Ready::Image(image)) => {
@@ -980,12 +1082,30 @@ impl AtelierApp {
         // A smart filter filters what the ones below it give.
         let smart = self.smart_filter_input();
         let Some(doc) = &self.doc else { return };
-        let target = smart.or_else(|| active_target(doc, self.selection.as_ref()));
+        let target_rev = doc.target_rev();
+        if dialog.painted.as_ref().is_none_or(|(rev, _)| *rev != target_rev) {
+            dialog.painted = Some((target_rev, doc.target_as_painted()));
+        }
+        let painted = dialog.painted.as_ref().and_then(|(_, l)| l.as_ref());
+        let selection = self.selection.as_ref();
+        let target = smart.or_else(|| {
+            let mut target = match painted {
+                Some(layer) => target_on(doc, layer, selection),
+                None => active_target(doc, selection),
+            }?;
+            fit_to_canvas(&mut target, doc, &dialog.filter);
+            Some(target)
+        });
         let layer = doc.active_layer();
-        let (layer_id, layer_rev, size) = (layer.id, layer.rev(), layer.image().dimensions());
+        let (layer_id, layer_rev) = (layer.id, layer.rev());
+        let size = target
+            .as_ref()
+            .map_or(layer.image().dimensions(), |t| t.image.dimensions());
         let fingerprint = hash_of(format!("{:?}", dialog.filter));
+        let layout = DialogLayout::of(ctx, dialog.settings_height);
         if let Some(target) = &target {
-            self.update_square(ctx, &mut dialog, target, (layer_id, layer_rev, fingerprint));
+            let key = (layer_id, layer_rev, fingerprint);
+            self.update_square(ctx, &mut dialog, target, key, layout.side);
             let key = hash_of((layer_id, layer_rev, fingerprint));
             self.update_canvas_preview(ctx, &mut dialog, target, key);
         }
@@ -999,14 +1119,56 @@ impl AtelierApp {
                 preview: Some(&mut preview),
                 ok_enabled: target.is_some(),
                 note: target.is_none().then(|| t!("status-selection-empty")),
+                width: layout.width(),
                 ..DialogSpec::new("filter", title(kind), tool_dialog_pos(ctx))
             },
             |ui| {
-                preview_square(ui, &mut dialog);
-                gap_between_blocks(ui);
-                settings(ui, &mut dialog.filter, &mut dialog.tones, size);
+                let height = if layout.columns {
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(layout.side);
+                            preview_square(ui, &mut dialog, layout.side);
+                        });
+                        ui.vertical(|ui| {
+                            ui.set_width(SQUARE + SCROLL_ROOM);
+                            // A body that scrolls shows it.
+                            ui.spacing_mut().scroll.dormant_handle_opacity = 0.6;
+                            egui::ScrollArea::vertical()
+                                .id_salt("filter_settings")
+                                .max_height(layout.room)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.scope(|ui| {
+                                        ui.set_max_width(SQUARE);
+                                        settings(ui, &mut dialog.filter, &mut dialog.tones, size);
+                                    })
+                                    .response
+                                    .rect
+                                    .height()
+                                })
+                                .inner
+                        })
+                        .inner
+                    })
+                    .inner
+                } else {
+                    preview_square(ui, &mut dialog, layout.side);
+                    gap_between_blocks(ui);
+                    ui.scope(|ui| {
+                        settings(ui, &mut dialog.filter, &mut dialog.tones, size);
+                    })
+                    .response
+                    .rect
+                    .height()
+                };
+                dialog.settings_height = Some(height);
             },
         );
+        // The first frame only measures: shown laid out for what it measured.
+        let measured = DialogLayout::of(ctx, dialog.settings_height);
+        if measured.columns != layout.columns {
+            ctx.request_discard("the filter dialog's layout");
+        }
         if preview != dialog.preview {
             dialog.preview = preview;
             if !preview {
@@ -1035,6 +1197,8 @@ impl AtelierApp {
                     .filter(|job| job.key == key && !job.stopped())
                     .map(Ready::Job)
             };
+            let placed = target.as_ref().map(|t| (t.image.dimensions(), t.offset));
+            let ready = ready.zip(placed);
             self.start_filter_with(dialog.filter, ready);
         } else if out.cancel {
             self.end_layer_preview();
@@ -1055,6 +1219,7 @@ impl AtelierApp {
         dialog: &mut FilterDialog,
         target: &Target,
         key: (u64, u64, u64),
+        side: f32,
     ) {
         let ppp = ctx.pixels_per_point();
         let (w, h) = target.image.dimensions();
@@ -1062,7 +1227,7 @@ impl AtelierApp {
             dialog.center.x.clamp(0.0, w as f32),
             dialog.center.y.clamp(0.0, h as f32),
         );
-        let extent = SQUARE * ppp / dialog.zoom;
+        let extent = side * ppp / dialog.zoom;
         let (x0, y0) = (
             (dialog.center.x - extent / 2.0).floor().max(0.0) as u32,
             (dialog.center.y - extent / 2.0).floor().max(0.0) as u32,
@@ -1085,6 +1250,7 @@ impl AtelierApp {
         }
         if let Some(Ok(Some((filtered, original)))) = polled
             && let Some(job) = square.job.take()
+            && !job.stopped()
         {
             let (key, region) = (job.key, job.region);
             let load =
@@ -1095,6 +1261,13 @@ impl AtelierApp {
                 load("filter-square", filtered),
                 load("filter-square-original", original),
             ));
+        }
+        // A computation for another view is stopped; the newest one starts
+        // once it is over.
+        if let Some(job) = &square.job
+            && job.key != wanted
+        {
+            job.stop();
         }
         let shown = square.shown.as_ref().map(|s| s.0);
         if shown != Some(wanted) && square.job.is_none() {
@@ -1109,10 +1282,7 @@ impl AtelierApp {
                     region[3] - region[1],
                 )
                 .to_image();
-                let mut filtered =
-                    target.process_region(region, filter.reach(), |image, origin| {
-                        filter.apply(image, origin)
-                    });
+                let mut filtered = target.filter_region(region, &filter);
                 for image in [&mut filtered, &mut original] {
                     color_ui::show_through(lut.as_deref(), image.as_mut(), false);
                 }
@@ -1137,8 +1307,10 @@ impl AtelierApp {
                 if let Some(job) = dialog.canvas.take()
                     && dialog.preview
                     && !job.stopped()
+                    && image.dimensions() == target.image.dimensions()
                 {
-                    self.show_preview(LayerPreview::Filter(job.key), image);
+                    let preview = LayerPreview::Filter(job.key);
+                    self.show_preview_at(preview, image, target.offset);
                 }
             }
             Some(Err(())) => {
@@ -1199,9 +1371,9 @@ fn square_image(image: &RgbaImage, zoom: f32) -> ColorImage {
 
 /// The preview square: the result over a checkerboard, dragged to move
 /// around, the original shown while pressed; − and + zoom below it.
-fn preview_square(ui: &mut egui::Ui, dialog: &mut FilterDialog) {
+fn preview_square(ui: &mut egui::Ui, dialog: &mut FilterDialog, side: f32) {
     let ppp = ui.ctx().pixels_per_point();
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(SQUARE), Sense::drag());
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::drag());
     if response.dragged() {
         dialog.center -= response.drag_delta() * ppp / dialog.zoom;
     }
@@ -1724,8 +1896,8 @@ fn keep_ordered(min: &mut f32, max: &mut f32, min_before: f32) {
     }
 }
 
-/// The curve of Shear: drag a point, or the line for a new point; a point
-/// dragged out of the grid is removed.
+/// The curve of Shear: a click adds a point, a drag moves one or adds one
+/// where it starts; a point dragged out of the grid is removed.
 fn shear_curve(ui: &mut egui::Ui, s: &mut Shear) {
     let width = ui.available_width().min(SQUARE);
     let (rect, response) = ui.allocate_exact_size(vec2(width, 160.0), Sense::click_and_drag());
@@ -1745,6 +1917,16 @@ fn shear_curve(ui: &mut egui::Ui, s: &mut Shear) {
     };
     let id = response.id.with("point");
     let mut held: Option<usize> = ui.data(|d| d.get_temp(id)).flatten();
+    let on_a_point = |s: &Shear, at: Pos2| {
+        s.used().iter().any(|&p| to_screen(p).distance(at) <= 10.0)
+    };
+    if response.clicked()
+        && let Some(at) = response.interact_pointer_pos()
+        && !on_a_point(s, at)
+    {
+        let (shift, height) = from_screen(at);
+        s.insert(shift, height);
+    }
     // From where it was pressed: a drag only starts once the pointer moved.
     if response.drag_started()
         && let Some(at) = ui
@@ -2847,3 +3029,7 @@ mod tests {
         assert_eq!(app.actions.library.sets[0].actions[0].steps.len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "distort9_tests.rs"]
+mod distort9_tests;

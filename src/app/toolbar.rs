@@ -108,7 +108,7 @@ impl AtelierApp {
         let group = Tool::GROUPS[index];
         let tool = self.group_shown(index);
         let key = tool.shortcut().map_or("", |k| k.name());
-        let response = ui_kit::tool_button(ui, tool.glyph(), &tool.name(), key, self.tool == tool);
+        let response = ui_kit::tool_button(ui, tool.glyph(), &tool.name(), key, self.shown_tool() == tool);
         // A long press opens the group's menu instead.
         let menu_press = group.len() > 1 && self.group_menu(ui, &response, group);
         if response.clicked() && !menu_press {
@@ -175,7 +175,7 @@ impl AtelierApp {
                     let label = format!("{}   {}", tool.glyph(), tool.name());
                     let button = egui::Button::new(label)
                         .shortcut_text(key)
-                        .selected(tool == self.tool);
+                        .selected(tool == self.shown_tool());
                     let item = ui.add(button);
                     let dropped_on =
                         holding && released && pointer.is_some_and(|p| item.rect.contains(p));

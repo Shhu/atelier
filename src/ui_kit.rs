@@ -341,6 +341,12 @@ fn paint_kbd(painter: &Painter, rect: Rect, galley: Arc<egui::Galley>) {
 
 /// Tooltip with a name and its key, like the tool bar's.
 pub fn tip_with_key(response: Response, name: &str, key: &str) -> Response {
+    // An icon button with its name given here: screen readers say it too.
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        if node.label().is_none_or(|label| spoken_name(label, name) == name) {
+            node.set_label(name);
+        }
+    });
     response.on_hover_ui(|ui| {
         ui.horizontal(|ui| {
             ui.label(name);
@@ -659,6 +665,30 @@ pub fn number_field<N: Numeric>(
     suffix: &str,
     width: f32,
 ) -> Response {
+    number_field_in(ui, label, value, range, suffix, width, false)
+}
+
+/// [`number_field`] where 0 means nothing: shown empty, and emptied to it.
+pub fn blank_number_field(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut f32,
+    range: RangeInclusive<f32>,
+    suffix: &str,
+    width: f32,
+) -> Response {
+    number_field_in(ui, label, value, range, suffix, width, true)
+}
+
+fn number_field_in<N: Numeric>(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut N,
+    range: RangeInclusive<N>,
+    suffix: &str,
+    width: f32,
+    blank: bool,
+) -> Response {
     forget_field_label(ui);
     // A longer (translated) label widens the field rather than running
     // into the value.
@@ -690,12 +720,20 @@ pub fn number_field<N: Numeric>(
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
     frameless(&mut child);
+    let empty = blank && value.to_f64() == 0.0;
     let mut drag = egui::DragValue::new(value)
         .range(range)
-        .suffix(suffix)
+        .suffix(if empty { "" } else { suffix })
         .speed(0.5)
-        .custom_parser(|text| i18n::parse_decimal(text.trim_end_matches(suffix)));
-    if !N::INTEGRAL {
+        .custom_parser(|text| {
+            if blank && text.trim().is_empty() {
+                return Some(0.0);
+            }
+            i18n::parse_decimal(text.trim_end_matches(suffix))
+        });
+    if empty {
+        drag = drag.custom_formatter(|_, _| String::new());
+    } else if !N::INTEGRAL {
         // "48" rather than "48.0", but "48.5" stays.
         drag = drag.custom_formatter(|v, _| i18n::short_decimal(v));
     }
@@ -706,6 +744,23 @@ pub fn number_field<N: Numeric>(
         .accesskit_node_builder(response.id, |node| node.set_label(label));
     painter.set(frame, field_shape(rect, hovered, response.has_focus()));
     response
+}
+
+/// [`number_field`] labelled by a glyph: `name` is its tooltip and what
+/// screen readers say.
+pub fn glyph_number_field<N: Numeric>(
+    ui: &mut Ui,
+    glyph: &str,
+    name: &str,
+    value: &mut N,
+    range: RangeInclusive<N>,
+    suffix: &str,
+    width: f32,
+) -> Response {
+    let response = number_field(ui, glyph, value, range, suffix, width);
+    ui.ctx()
+        .accesskit_node_builder(response.id, |node| node.set_label(name));
+    response.on_hover_text(name)
 }
 
 /// Single-line text field with its label inside on the left.
@@ -918,6 +973,21 @@ pub fn combo<R>(
     width: f32,
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
+    let closing = egui::PopupCloseBehavior::CloseOnClick;
+    combo_closing(ui, id_salt, label, selected, width, closing, add_contents)
+}
+
+/// [`combo`] with its way of closing: what stays open on a click inside
+/// (a right click for a context menu) closes itself on a choice.
+pub fn combo_closing<R>(
+    ui: &mut Ui,
+    id_salt: impl egui::AsIdSalt,
+    label: Option<&str>,
+    selected: &str,
+    width: f32,
+    closing: egui::PopupCloseBehavior,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
     let mut text = LayoutJob::default();
     if let Some(label) = label {
         text.append(
@@ -943,6 +1013,7 @@ pub fn combo<R>(
         .selected_text(text)
         .width(width)
         .height(320.0)
+        .close_behavior(closing)
         .show_ui(ui, add_contents);
     // Named by its label, its value apart ("Scale" and "100%", not
     // "Scale100%"); without one, by the `field_label` just above it.

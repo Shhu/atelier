@@ -4,7 +4,7 @@ use super::bytes::{Reader, Result, Writer};
 use super::descriptor::{self, Descriptor, Value, color_of, enumerated, percent};
 use crate::color::{Hsb, hsb_to_rgb, rgb_to_hsb, to_f32, to_u8};
 use crate::compose::gradient::GradientFill;
-use crate::document::{Fill, LayerKind};
+use crate::document::{FileError, Fill, LayerKind};
 use crate::paint::gradient::{ColorStop, Gradient, OpacityStop, Shape, StopColor};
 use crate::pixel_ops::{
     Adjustment, BlackWhite, BrightnessContrast, ChannelMixer, ColorBalance, Curve, Curves,
@@ -86,7 +86,7 @@ pub fn read(
 }
 
 /// A descriptor after its version number.
-fn versioned(data: &[u8]) -> Result<Descriptor> {
+pub(super) fn versioned(data: &[u8]) -> Result<Descriptor> {
     let mut r = Reader::new(data);
     r.u32()?;
     Descriptor::read(&mut r)
@@ -240,9 +240,14 @@ fn legacy_brightness_contrast(d: &[u8]) -> Result<Adjustment> {
 }
 
 /// Version, then exposure, offset and gamma as big-endian floats.
+/// The version these blocks have been at: another's layout isn't known.
+fn version_one(r: &mut Reader) -> Result<()> {
+    if r.u16()? == 1 { Ok(()) } else { Err(FileError::Damaged) }
+}
+
 fn exposure(d: &[u8]) -> Result<Adjustment> {
     let mut r = Reader::new(d);
-    r.u16()?;
+    version_one(&mut r)?;
     let mut float = || r.u32().map(f32::from_bits);
     let (exposure, offset, gamma) = (float()?, float()?, float()?);
     let finite = |v: f32, or: f32| if v.is_finite() { v } else { or };
@@ -255,15 +260,19 @@ fn exposure(d: &[u8]) -> Result<Adjustment> {
 
 /// Version, monochrome, then per channel the percentages of red, green,
 /// blue, a fourth color and the constant. The fourth channel's row is there
-/// for CMYK.
+/// for CMYK. A block with fewer rows leaves the others as they start.
 fn channel_mixer(d: &[u8]) -> Result<Adjustment> {
     let mut r = Reader::new(d);
-    r.u16()?;
+    version_one(&mut r)?;
     let monochrome = r.u16()? != 0;
-    let mut rows = [[0.0; 4]; 3];
+    let mut rows = ChannelMixer::default().rows;
     for row in &mut rows {
-        let [red, green, blue, _, constant] =
-            [r.i16()?, r.i16()?, r.i16()?, r.i16()?, r.i16()?];
+        let mut value = || r.i16();
+        let (Ok(red), Ok(green), Ok(blue), Ok(_), Ok(constant)) =
+            (value(), value(), value(), value(), value())
+        else {
+            break;
+        };
         *row = [red, green, blue, constant].map(|v| {
             (v as f32 / 100.0).clamp(-ChannelMixer::LIMIT, ChannelMixer::LIMIT)
         });
@@ -278,7 +287,7 @@ fn channel_mixer(d: &[u8]) -> Result<Adjustment> {
 /// percentages of a reserved record followed by the ranges.
 fn selective_color(d: &[u8]) -> Result<Adjustment> {
     let mut r = Reader::new(d);
-    r.u16()?;
+    version_one(&mut r)?;
     let absolute = r.u16()? != 0;
     for _ in 0..4 {
         r.i16()?;
@@ -599,7 +608,8 @@ pub fn write(kind: &LayerKind, w: &mut Writer) {
             versioned_block(w, &gradient_fill_items(g, Descriptor::new(b"null")));
         }),
         LayerKind::Fill(Fill::Pattern(p)) => w.tagged(b"PtFl", |w| {
-            versioned_block(w, &super::pattern::fill_items(p, Descriptor::new(b"null")));
+            let items = super::pattern::fill_items(p, Descriptor::new(b"null"), b"Lnkd");
+            versioned_block(w, &items);
         }),
         LayerKind::Adjustment(a) => write_adjustment(a, w),
         LayerKind::Pixels | LayerKind::Group { .. } => {}
@@ -966,5 +976,28 @@ mod tests {
             (fill.style, fill.angle, fill.scale, fill.reverse)
         );
         assert_eq!(back.gradient.colors.len(), 7);
+    }
+
+    #[test]
+    fn mixer_rows_missing_stay_as_they_start_and_other_versions_are_refused() {
+        let read = |key: &[u8; 4], b: &[u8]| {
+            let blocks = vec![(*key, b)];
+            super::read(&blocks, &super::super::pattern::Patterns::new())
+        };
+        let mut short = vec![0u8, 1, 0, 0];
+        for v in [50i16, 25, 25, 0, 0] {
+            short.extend(v.to_be_bytes());
+        }
+        let Some(Ok(LayerKind::Adjustment(Adjustment::ChannelMixer(m)))) = read(b"mixr", &short)
+        else {
+            panic!("a short block is read");
+        };
+        assert_eq!(m.rows[0], [0.5, 0.25, 0.25, 0.0]);
+        assert_eq!(m.rows[1..], ChannelMixer::default().rows[1..]);
+        let mut wrong = short.clone();
+        wrong[1] = 9;
+        assert!(matches!(read(b"mixr", &wrong), Some(Err(()))));
+        assert!(matches!(read(b"expA", &[0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), Some(Err(()))));
+        assert!(matches!(read(b"selc", &[0, 2]), Some(Err(()))));
     }
 }

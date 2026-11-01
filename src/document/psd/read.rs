@@ -87,8 +87,8 @@ struct Resources {
     /// Index of the active layer's record.
     target_layer: Option<usize>,
     guides: Vec<Guide>,
-    /// Color Sampler points (canvas coordinates).
-    samplers: Vec<crate::document::ColorSampler>,
+    /// The Color Sampler blocks (read once the canvas is known).
+    sampler_blocks: Vec<(u16, Vec<u8>)>,
     global_angle: Option<f64>,
     /// JPEG preview.
     thumbnail: Option<Vec<u8>>,
@@ -131,36 +131,65 @@ const REWRITTEN: [u16; 26] = [
     1076, 1078, 1086, 1087, 1088, 1018, 1020, 1023, 1027, 1029,
 ];
 
-/// The color samplers resource (1038, or 1073 for its version 3): vertical
-/// and horizontal position (fixed-point in version 1, floats after), color
-/// space, depth (after version 1).
-fn color_samplers(raw: &[u8]) -> Result<Vec<crate::document::ColorSampler>> {
+/// The color samplers resource (1038, or 1073 since CS3, which wins). A
+/// header (version 1 to 3, count), then for each point its vertical and
+/// horizontal positions (the order of Photoshop's files according to ag-psd,
+/// taken from samples: the specification says "horizontal and vertical"), its
+/// color space, then a depth (version 2). Version 3 starts each point with
+/// its own version (32 bits), which says how the position reads and, in
+/// ag-psd only, is always followed by a depth: the size of the block tells.
+/// Points off a `canvas` the size of the file's are left out: they would be
+/// out of reach.
+fn color_samplers(raw: &[u8], canvas: (u32, u32)) -> Result<Vec<crate::document::ColorSampler>> {
     let mut d = Reader::new(raw);
     let version = d.u32()?;
     if !(1..=3).contains(&version) {
         return Ok(Vec::new());
     }
     let n = d.u32()? as usize;
-    let mut out = Vec::new();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let depth = match version {
+        1 => false,
+        2 => true,
+        _ => d.remaining() / n >= 16,
+    };
+    let mut fixed = Vec::new();
+    let mut floats = Vec::new();
     for _ in 0..n.min(crate::document::MAX_SAMPLERS) {
-        if version == 3 {
-            d.u16()?;
-        }
+        let own = if version == 3 { d.u32()? } else { version };
         let (v, h) = (d.i32()?, d.i32()?);
-        let at = |bits: i32| match version {
-            1 => bits as f32 / 65536.0,
-            _ => f32::from_bits(bits as u32),
-        };
         d.i16()?;
-        if version > 1 {
+        if depth {
             d.u16()?;
         }
-        let (x, y) = (at(h), at(v));
-        if x.is_finite() && y.is_finite() {
-            out.push(crate::document::ColorSampler { x, y });
+        match own {
+            1 => fixed.push((h, v)),
+            2 => floats.push((f32::from_bits(h as u32), f32::from_bits(v as u32))),
+            _ => return Ok(Vec::new()),
         }
     }
-    Ok(out)
+    let inside = |&(x, y): &(f32, f32)| {
+        (0.0..canvas.0 as f32).contains(&x) && (0.0..canvas.1 as f32).contains(&y)
+    };
+    let scaled = |by: f32| -> Vec<(f32, f32)> {
+        let at = |&(h, v): &(i32, i32)| (h as f32 / by, v as f32 / by);
+        fixed.iter().map(at).collect()
+    };
+    // A fixed position counts in 1/16 of a pixel in Photoshop's files (ag-psd,
+    // from samples). The specification only says "fixed": 16.16 for others,
+    // which then land far off the canvas in 1/16.
+    let mut points = scaled(16.0);
+    if !points.iter().all(inside) {
+        points = scaled(65536.0);
+    }
+    points.extend(floats);
+    Ok(points
+        .into_iter()
+        .filter(inside)
+        .map(|(x, y)| crate::document::ColorSampler { x, y })
+        .collect())
 }
 
 /// The frames of a frame animation (plug-in resource "mani", block
@@ -227,7 +256,7 @@ fn resources(r: &mut Reader) -> Result<Resources> {
                 }
             }
             // Damaged or of a later version: no points, not a damaged file.
-            1038 | 1073 => out.samplers = color_samplers(raw).unwrap_or_default(),
+            1038 | 1073 => out.sampler_blocks.push((id, raw.to_vec())),
             1037 => {
                 out.global_angle = Some(d.i32()? as f64);
                 out.kept.push(kept());
@@ -785,6 +814,7 @@ struct Notes {
     shapes: Vec<String>,
     dropped: Vec<String>,
     styles: Vec<String>,
+    pattern_fills: Vec<String>,
 }
 
 impl Notes {
@@ -829,6 +859,10 @@ impl Notes {
                 &self.dropped,
                 t!("xchg-psd-note-dropped", names = list(&self.dropped)),
             ),
+            (
+                &self.pattern_fills,
+                t!("pattern9-psd-note-fills", names = list(&self.pattern_fills)),
+            ),
         ];
         for (names, line) in groups {
             if !names.is_empty() {
@@ -847,8 +881,9 @@ struct File<'a> {
     records: Vec<Record<'a>>,
     /// The merged image's first alpha channel is its transparency.
     merged_alpha: bool,
-    /// The tiles of the Pattern Fill layers and Pattern Overlays.
-    patterns: super::pattern::Patterns,
+    /// The blocks of the tiles of the Pattern Fill layers and Pattern
+    /// Overlays, read once the memory is accounted for.
+    pattern_blocks: Vec<&'a [u8]>,
     /// The merged image's data (compression first).
     image_data: &'a [u8],
 }
@@ -898,10 +933,11 @@ fn parse(data: &[u8]) -> Result<File<'_>> {
     merged_alpha |= global
         .iter()
         .any(|(k, _)| matches!(k, b"Mtrn" | b"Mt16" | b"Mt32"));
-    let patterns = global
+    // 'Pat2' and 'Pat3': the same block, in 16 and 32 bits documents.
+    let pattern_blocks = global
         .iter()
-        .filter(|(k, _)| k == b"Patt")
-        .flat_map(|(_, block)| super::pattern::read_block(block))
+        .filter(|(k, _)| matches!(k, b"Patt" | b"Pat2" | b"Pat3"))
+        .map(|(_, block)| *block)
         .collect();
     Ok(File {
         header,
@@ -909,9 +945,37 @@ fn parse(data: &[u8]) -> Result<File<'_>> {
         palette,
         records,
         merged_alpha,
-        patterns,
+        pattern_blocks,
         image_data,
     })
+}
+
+/// The styles of a layer, as written.
+fn effects_of(rec: &Record) -> Option<Descriptor> {
+    let d = rec
+        .block(b"lmfx")
+        .or_else(|| rec.block(b"lfx2"))
+        .or_else(|| rec.block(b"lfxs"))?;
+    let mut r = Reader::new(d);
+    r.skip(8).ok()?;
+    Descriptor::read(&mut r).ok()
+}
+
+/// The identifiers of the tiles the layers use.
+fn pattern_ids(records: &[Record]) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    for rec in records {
+        let fill = rec.block(b"PtFl").and_then(|d| adjust::versioned(d).ok());
+        if let Some(id) = fill.as_ref().and_then(super::pattern::id_of) {
+            ids.insert(id.to_owned());
+        }
+        let fx = effects_of(rec);
+        let overlay = fx.as_ref().and_then(|fx| fx.object(b"patternFill"));
+        if let Some(id) = overlay.and_then(super::pattern::id_of) {
+            ids.insert(id.to_owned());
+        }
+    }
+    ids
 }
 
 /// The merged image's channels `wanted` (by index), decoded.
@@ -999,6 +1063,13 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
             budget.take(h.width, h.height, 1)?;
         }
     }
+    // The tiles some layer uses.
+    let wanted = pattern_ids(&f.records);
+    let mut patterns = super::pattern::Patterns::new();
+    for block in &f.pattern_blocks {
+        let contains = |id: &str| wanted.contains(id);
+        patterns.extend(super::pattern::read_block(block, &contains, &mut budget)?);
+    }
     // The merged image's channels (the alpha channels, or the flat image).
     budget.take(
         h.width,
@@ -1068,11 +1139,15 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
                 layer.artboard = Some(a);
             }
         } else {
-            match adjust::read(&rec.blocks, &f.patterns) {
+            match adjust::read(&rec.blocks, &patterns) {
                 Some(Ok(kind)) => {
                     layer.kind = kind;
                     layer.replace_pixels(RgbaImage::new(0, 0));
                     layer.offset = (0, 0);
+                }
+                // Its tile isn't in the file: what it looked like still is.
+                Some(Err(())) if rec.block(b"PtFl").is_some() => {
+                    notes.pattern_fills.push(rec.name.clone());
                 }
                 Some(Err(())) => {
                     notes.dropped.push(rec.name.clone());
@@ -1120,18 +1195,9 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
             }
         }
         // Layer styles: those Atelier has.
-        let fx = rec
-            .block(b"lmfx")
-            .or_else(|| rec.block(b"lfx2"))
-            .or_else(|| rec.block(b"lfxs"))
-            .and_then(|d| {
-                let mut r = Reader::new(d);
-                r.skip(8).ok()?;
-                Descriptor::read(&mut r).ok()
-            });
-        if let Some(fx) = fx {
+        if let Some(fx) = effects_of(rec) {
             let angle = f.resources.global_angle.unwrap_or(120.0);
-            let (effects, simplified) = effects::read(&fx, angle, &f.patterns);
+            let (effects, simplified) = effects::read(&fx, angle, &patterns);
             if simplified || (!layer.styleable() && effects.any()) {
                 notes.styles.push(rec.name.clone());
             }
@@ -1243,7 +1309,14 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
     }
     doc.active = target.unwrap_or(doc.layers.len() - 1);
     doc.guides = f.resources.guides;
-    doc.samplers = f.resources.samplers;
+    // The newer block when it holds points, whatever their order in the file.
+    let mut blocks = f.resources.sampler_blocks;
+    blocks.sort_by_key(|b| std::cmp::Reverse(b.0));
+    doc.samplers = blocks
+        .iter()
+        .map(|b| color_samplers(&b.1, canvas).unwrap_or_default())
+        .find(|points| !points.is_empty())
+        .unwrap_or_default();
     let path = |data: &[u8]| super::vector::path_of(data, canvas).ok();
     doc.paths = (f.resources.paths.iter())
         .filter_map(|(name, data)| {

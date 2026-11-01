@@ -93,16 +93,80 @@ impl Document {
         None
     }
 
+    /// The innermost group holding layer `i` that has Lock All, or a lock
+    /// `on` picks.
+    pub fn group_with_lock(&self, i: usize, on: impl Fn(Locks) -> bool) -> Option<usize> {
+        let mut at = self.parent(i);
+        while let Some(j) = at {
+            let g = &self.layers[j];
+            if g.locked || on(g.locks) {
+                return Some(j);
+            }
+            at = self.parent(j);
+        }
+        None
+    }
+
+    /// What holds layer `i`'s block together when it would be resampled,
+    /// the one rule for every transform: Lock Position or Lock Image Pixels
+    /// on the layer or on one the group holds. A mask transformed alone
+    /// leaves the layer's pixels.
+    pub fn transform_block(&self, i: usize) -> Option<(usize, super::LockedBy)> {
+        let mask_alone = i == self.active && self.transforms_mask();
+        self.block(i).rev().find_map(|j| {
+            let l = self.locks(j);
+            if l.position {
+                Some((j, super::LockedBy::Position))
+            } else if l.pixels && !mask_alone {
+                Some((j, super::LockedBy::Pixels))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The layers of layer `i`'s block that a plain move takes along (a
+    /// group's layers under Lock Position stay).
+    pub fn movable_block(&self, i: usize) -> Vec<usize> {
+        self.block(i).filter(|&j| self.can_move(j)).collect()
+    }
+
+    /// A group with layers, none of which can move: moving it would do nothing.
+    pub fn stuck_group_layer(&self, i: usize) -> Option<usize> {
+        if !self.layers.get(i)?.is_group() {
+            return None;
+        }
+        let mut members = self.block(i).filter(|&j| !self.layers[j].is_group());
+        let first = members.next()?;
+        (!self.can_move(first) && members.all(|j| !self.can_move(j))).then_some(first)
+    }
+
+    /// Whether what layer `i` holds (a text, a shape's path, a smart
+    /// object's contents, its pixels) may not be edited.
+    pub fn content_locked(&self, i: usize) -> bool {
+        self.locks(i).pixels
+    }
+
+    /// The group a new layer would land in, from the active layer (see
+    /// `insert_layer`).
+    pub fn landing_group(&self) -> Option<usize> {
+        let a = self.layers.get(self.active)?;
+        if matches!(a.kind, LayerKind::Group { expanded: true }) {
+            Some(self.active)
+        } else {
+            self.parent(self.active)
+        }
+    }
+
+    /// A merge replaces layers: none of their locks can be kept, so any of
+    /// them refuses it.
+    fn merge_locked(&self, mut layers: impl Iterator<Item = usize>) -> bool {
+        layers.any(|i| self.locks(i).any())
+    }
+
     /// Whether layer `i` may move (Lock Position, Lock All).
     pub fn can_move(&self, i: usize) -> bool {
         !self.locks(i).position
-    }
-
-    /// Whether layer `i` may be transformed: its pixels stay what they are
-    /// under Lock Image Pixels.
-    pub fn can_transform(&self, i: usize) -> bool {
-        let l = self.locks(i);
-        !l.position && !l.pixels
     }
 
     /// The active layer's own pixels are the target, and may not be changed.
@@ -548,10 +612,7 @@ impl Document {
             .iter()
             .map(|l| {
                 self.next_id += 1;
-                Layer {
-                    id: self.next_id,
-                    ..l.clone()
-                }
+                l.copy_as(self.next_id)
             })
             .collect();
         let n = copies.len();
@@ -620,22 +681,29 @@ impl Document {
         plan.render(region)
     }
 
-    /// Box of what layers `indices` show on their own (the canvas for those
-    /// reaching everywhere). Refused if too large.
+    /// Box of what layers `indices` show on their own, their styles
+    /// included (the canvas for those reaching everywhere; a group's layers
+    /// count on their own). Refused if too large.
     fn merge_region(
         &self,
         indices: impl IntoIterator<Item = usize>,
     ) -> Result<PixelRect, MergeError> {
         let mut region: Option<PixelRect> = None;
+        let canvas = self.full_rect();
         for i in indices {
             let l = &self.layers[i];
-            let e = match l.kind {
-                LayerKind::Pixels => match (l.content_bounds(), l.extent(false)) {
+            let own = match l.kind {
+                LayerKind::Pixels => match (l.content_bounds(), l.extent_with(None)) {
                     (Some(c), Some(e)) => Some(intersect_or(e, c)),
                     _ => None,
                 },
                 LayerKind::Group { .. } | LayerKind::Adjustment(_) => None,
-                LayerKind::Fill(_) => Some(l.extent(false).unwrap_or(self.full_rect())),
+                LayerKind::Fill(_) => Some(l.extent_with(None).unwrap_or(canvas)),
+            };
+            let styles = super::styles_of(&self.layers, i, canvas, false, false);
+            let e = match (own, l.styles_box(styles.as_deref())) {
+                (Some(a), Some(b)) => Some(a.union(b)),
+                (a, b) => a.or(b),
             };
             if let Some(e) = e {
                 region = Some(region.map_or(e, |r| r.union(e)));
@@ -666,7 +734,7 @@ impl Document {
         if !below.visible || !above.visible || !below.has_pixels() {
             return Err(MergeError::Nothing);
         }
-        if self.is_locked(lower) || self.is_locked(upper) || self.locks(lower).pixels {
+        if self.merge_locked([lower, upper].into_iter()) {
             return Err(MergeError::Locked);
         }
         let region = self.merge_region([lower, upper])?;
@@ -701,11 +769,11 @@ impl Document {
     pub fn merge_group(&mut self) -> Result<(), MergeError> {
         let g = self.active;
         let r = self.block(g);
-        if r.clone().any(|i| self.is_locked(i)) {
+        if self.merge_locked(r.clone()) {
             return Err(MergeError::Locked);
         }
         let group = self.layers[g].clone();
-        let region = self.merge_region(r.start..g)?;
+        let region = self.merge_region(r.clone())?;
         let mut part: Vec<Layer> = self.layers[r.clone()].to_vec();
         let base = group.depth;
         for l in &mut part {
@@ -737,7 +805,7 @@ impl Document {
         let [first, _, ..] = visible[..] else {
             return Err(MergeError::Nothing);
         };
-        if visible.iter().any(|&i| self.is_locked(i)) {
+        if self.merge_locked(visible.iter().copied()) {
             return Err(MergeError::Locked);
         }
         let region = self.merge_region(visible.iter().copied())?;
@@ -1027,7 +1095,7 @@ mod lock_tests {
         assert_eq!(d.locks(1), Locks::default());
         d.layers[1].locked = true;
         assert_eq!(d.locks(1), Locks::ALL);
-        assert!(!d.can_move(1) && !d.can_transform(1));
+        assert!(!d.can_move(1) && d.transform_block(1).is_some());
         d.layers[1].locked = false;
         d.group_layers(&[1]);
         d.layers[2].locks.position = true;
@@ -1037,7 +1105,7 @@ mod lock_tests {
         d.layers[2].locks = Locks::default();
         d.layers[2].locks.pixels = true;
         d.active = 1;
-        assert!(d.pixels_locked() && d.can_move(1) && !d.can_transform(1));
+        assert!(d.pixels_locked() && d.can_move(1) && d.transform_block(1).is_some());
     }
 
     #[test]

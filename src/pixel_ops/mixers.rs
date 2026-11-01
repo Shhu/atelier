@@ -6,7 +6,8 @@ use std::sync::Arc;
 use image::RgbaImage;
 
 use super::{
-    AUTO_CLIP, Levels, LevelsChannel, MAX_GAMMA, MIN_GAMMA, distance_field, histogram, par_pixels,
+    AUTO_CLIP, Clip, Levels, LevelsChannel, MAX_GAMMA, MIN_GAMMA, distance_field, histogram_within,
+    mix, par_pixels,
 };
 use crate::compose::{BlendMode, blend};
 use crate::document::PixelRect;
@@ -178,31 +179,55 @@ pub enum AutoMode {
     Color,
 }
 
-/// Levels `mode` finds in `image` (its visible pixels).
+/// Levels `mode` finds in the visible pixels of `image`.
+#[cfg(test)]
 pub fn auto_levels(image: &RgbaImage, mode: AutoMode) -> Levels {
+    auto_levels_within(image, None, mode)
+}
+
+/// Levels `mode` finds in the visible pixels of `image` inside `clip`, each
+/// counting as much as it is selected.
+pub fn auto_levels_within(image: &RgbaImage, clip: Option<&Clip>, mode: AutoMode) -> Levels {
     match mode {
-        AutoMode::Tone => Levels::auto(&histogram(image)),
+        AutoMode::Tone => Levels::auto(&histogram_within(image, clip)),
         AutoMode::Contrast => {
-            let h = histogram(image);
+            let h = histogram_within(image, clip);
             let all: [u32; 256] = std::array::from_fn(|i| h[1][i] + h[2][i] + h[3][i]);
             Levels {
                 rgb: LevelsChannel::auto(&all, AUTO_CLIP),
                 ..Levels::default()
             }
         }
-        AutoMode::Color => auto_color(image),
+        AutoMode::Color => auto_color(image, clip),
     }
 }
 
-fn auto_color(image: &RgbaImage) -> Levels {
-    let luma = |p: &[u8]| ((77 * p[0] as u32 + 151 * p[1] as u32 + 28 * p[2] as u32) >> 8) as u8;
-    let visible = || image.as_raw().chunks_exact(4).filter(|p| p[3] > 0);
-    let mut levels = [0u32; 256];
-    for p in visible() {
-        levels[luma(p) as usize] += 1;
+/// Calls `f` with each visible pixel of `image` inside `clip` and its weight.
+fn each_selected(image: &RgbaImage, clip: Option<&Clip>, mut f: impl FnMut([u8; 4], u64)) {
+    let Some(clip) = clip else {
+        for p in image.pixels().filter(|p| p.0[3] > 0) {
+            f(p.0, 255);
+        }
+        return;
+    };
+    let [x0, y0, x1, y1] = clip.rect;
+    for y in y0..y1.min(image.height()) {
+        for x in x0..x1.min(image.width()) {
+            let p = image.get_pixel(x, y).0;
+            let weight = u64::from(clip.coverage(x, y));
+            if p[3] > 0 && weight > 0 {
+                f(p, weight);
+            }
+        }
     }
-    let total: u32 = levels.iter().sum();
-    let limit = (total as f32 * AUTO_CLIP) as u32;
+}
+
+fn auto_color(image: &RgbaImage, clip: Option<&Clip>) -> Levels {
+    let luma = |p: [u8; 4]| ((77 * p[0] as u32 + 151 * p[1] as u32 + 28 * p[2] as u32) >> 8) as u8;
+    let mut levels = [0u64; 256];
+    each_selected(image, clip, |p, weight| levels[luma(p) as usize] += weight);
+    let total: u64 = levels.iter().sum();
+    let limit = (total as f32 * AUTO_CLIP) as u64;
     let mut sum = 0;
     let lo = (0..256).find(|&i| {
         sum += levels[i];
@@ -221,17 +246,17 @@ fn auto_color(image: &RgbaImage) -> Levels {
     }
     // The average colors of the darkest and of the lightest pixels.
     let (mut dark, mut light) = (([0u64; 3], 0u64), ([0u64; 3], 0u64));
-    for p in visible() {
+    each_selected(image, clip, |p, weight| {
         let l = luma(p) as usize;
         for (side, on) in [(&mut dark, l <= lo), (&mut light, l >= hi)] {
             if on {
-                side.1 += 1;
+                side.1 += weight;
                 for (sum, v) in side.0.iter_mut().zip(p) {
-                    *sum += *v as u64;
+                    *sum += v as u64 * weight;
                 }
             }
         }
-    }
+    });
     let average = |(s, n): ([u64; 3], u64)| s.map(|v| (v / n.max(1)) as u8);
     let (dark, light) = (average(dark), average(light));
     let mut channels: [LevelsChannel; 3] = std::array::from_fn(|c| {
@@ -249,16 +274,16 @@ fn auto_color(image: &RgbaImage) -> Levels {
     // becomes a gray through each channel's gamma.
     let luts = channels.map(|c| c.lut());
     let (mut mids, mut n) = ([0u64; 3], 0u64);
-    for p in visible() {
+    each_selected(image, clip, |p, weight| {
         let q = [0, 1, 2].map(|c| luts[c][p[c] as usize]);
         let (lo, hi) = (q[0].min(q[1]).min(q[2]), q[0].max(q[1]).max(q[2]));
         if hi - lo < 40 && lo >= 32 && hi <= 224 {
-            n += 1;
+            n += weight;
             for (sum, v) in mids.iter_mut().zip(q) {
-                *sum += v as u64;
+                *sum += v as u64 * weight;
             }
         }
-    }
+    });
     if n > 0 {
         let mean = mids.map(|v| v as f32 / n as f32 / 255.0);
         let gray = (mean[0] + mean[1] + mean[2]) / 3.0;
@@ -272,11 +297,25 @@ fn auto_color(image: &RgbaImage) -> Levels {
     }
 }
 
+/// The pixels Edit › Fade blends: what the step it fades covered. Outside,
+/// the pixels stay; inside, even those it left as they were are blended, as
+/// a copy of the result over the original would be.
+#[derive(Clone)]
+pub enum FadeArea {
+    /// The whole frame.
+    All,
+    /// The pixels that differ: a step that paints only where it paints.
+    Changed,
+    /// The selection it worked in, with its coverage.
+    Within(Clip),
+}
+
 /// What Edit › Fade brings the last result back toward: the pixels before
 /// it, in the frame of the current ones.
 #[derive(Clone)]
 pub struct Fade {
     pub before: Arc<RgbaImage>,
+    pub area: FadeArea,
     /// Canvas position of the frame's corner (Dissolve's pattern).
     pub origin: (i64, i64),
     /// 0..1.
@@ -284,7 +323,8 @@ pub struct Fade {
     pub mode: BlendMode,
 }
 
-// A comparison of the settings: the pixels are the same object or differ.
+// A comparison of the settings: the pixels are the same object or differ,
+// and the area goes with them.
 impl PartialEq for Fade {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.before, &other.before)
@@ -296,7 +336,7 @@ impl PartialEq for Fade {
 
 impl Fade {
     /// `after`, the result, faded: the result blended in `mode` over what
-    /// was there, at `opacity`. Pixels the result didn't change stay.
+    /// was there, at `opacity`, in the area of the step.
     pub fn apply(&self, after: &mut RgbaImage) {
         if after.dimensions() != self.before.dimensions() {
             return;
@@ -304,16 +344,35 @@ impl Fade {
         let row = after.width() as usize * 4;
         let before = self.before.as_raw();
         let (origin, opacity, mode) = (self.origin, self.opacity.clamp(0.0, 1.0), self.mode);
+        let area = &self.area;
+        // The result already carries a soft selection; a pixel it left alone
+        // comes out the same. Other modes blend it with itself.
+        let plain = matches!(
+            mode,
+            BlendMode::Normal | BlendMode::PassThrough | BlendMode::Dissolve
+        );
         par_rows(after.as_mut(), row, |first, band| {
             let w = row / 4;
             for (i, p) in band.chunks_exact_mut(4).enumerate() {
                 let at = first * row + i * 4;
                 let b = [before[at], before[at + 1], before[at + 2], before[at + 3]];
-                if *p == b {
+                let same = *p == b;
+                if same && (plain || b[3] == 0) {
                     continue;
                 }
-                let (x, y) = (origin.0 + (i % w) as i64, origin.1 + (first + i / w) as i64);
+                let (ix, iy) = ((i % w) as u32, (first + i / w) as u32);
+                let coverage = match area {
+                    FadeArea::All => 255,
+                    FadeArea::Changed if same => 0,
+                    FadeArea::Changed => 255,
+                    FadeArea::Within(clip) => clip.coverage(ix, iy),
+                };
+                if coverage == 0 {
+                    continue;
+                }
+                let (x, y) = (origin.0 + i64::from(ix), origin.1 + i64::from(iy));
                 let out = fade_pixel(b, [p[0], p[1], p[2], p[3]], opacity, mode, x, y);
+                let out = if plain { out } else { mix(b, out, coverage) };
                 p.copy_from_slice(&out);
             }
         });
@@ -386,7 +445,12 @@ pub fn stroke(
     let width = s.width.clamp(1, StrokeSettings::MAX_WIDTH) as f32;
     let (band_lo, band_hi) = match s.location {
         StrokeLocation::Inside => (-width, 0.0),
-        StrokeLocation::Center => (-width / 2.0, width / 2.0),
+        // An odd width on whole pixels: the odd one inside, so a straight
+        // edge stays crisp.
+        StrokeLocation::Center => {
+            let inner = (width / 2.0).ceil();
+            (-inner, width - inner)
+        }
         StrokeLocation::Outside => (0.0, width),
     };
     let frame = PixelRect {
@@ -626,6 +690,7 @@ mod tests {
     fn fade(before: [u8; 4], after: [u8; 4], opacity: f32, mode: BlendMode) -> [u8; 4] {
         let f = Fade {
             before: Arc::new(RgbaImage::from_pixel(1, 1, Rgba(before))),
+            area: FadeArea::All,
             origin: (0, 0),
             opacity,
             mode,
@@ -648,8 +713,9 @@ mod tests {
         assert_eq!(fade([10, 20, 30, 255], [10, 20, 30, 0], 0.5, BlendMode::Normal)[3], 128);
         // On transparency, no backdrop for the mode.
         assert_eq!(fade([0; 4], a, 1.0, BlendMode::Multiply), a);
-        // Pixels the result didn't touch aren't blended with themselves.
-        assert_eq!(fade(b, b, 1.0, BlendMode::Multiply), b);
+        // What the step covered is blended even where it changed nothing.
+        assert_eq!(fade(b, b, 1.0, BlendMode::Multiply), [157, 39, 0, 255]);
+        assert_eq!(fade(b, b, 1.0, BlendMode::Normal), b);
     }
 
     fn settings(width: u32, location: StrokeLocation) -> StrokeSettings {
@@ -660,6 +726,86 @@ mod tests {
             mode: BlendMode::Normal,
             opacity: 1.0,
             preserve_transparency: false,
+        }
+    }
+
+    #[test]
+    fn fade_blends_its_whole_area_without_seams() {
+        // Neighbours one level apart stay close, whichever the step changed.
+        let before = RgbaImage::from_fn(2, 1, |x, _| Rgba([200 + x as u8, 200, 200, 255]));
+        let mut after = before.clone();
+        after.get_pixel_mut(1, 0).0[0] = 202;
+        let mut f = Fade {
+            before: Arc::new(before),
+            area: FadeArea::All,
+            origin: (0, 0),
+            opacity: 1.0,
+            mode: BlendMode::Multiply,
+        };
+        let mut all = after.clone();
+        f.apply(&mut all);
+        let (a, b) = (all.get_pixel(0, 0).0[0], all.get_pixel(1, 0).0[0]);
+        assert!(a.abs_diff(b) <= 2, "{a} {b}");
+        assert_eq!(a, 157);
+        // Outside the selection nothing moves; half selected, half way.
+        f.area = FadeArea::Within(Clip {
+            rect: [0, 0, 2, 1],
+            shape: Some(super::super::ClipShape::Mask(
+                Arc::new(image::GrayImage::from_fn(2, 1, |x, _| image::Luma([x as u8 * 128]))),
+                (0, 0),
+            )),
+            inverted: false,
+        });
+        let mut within = after.clone();
+        f.apply(&mut within);
+        assert_eq!(within.get_pixel(0, 0).0[0], 200);
+        let half = within.get_pixel(1, 0).0[0];
+        assert!((175..=185).contains(&half), "{half}");
+        // A painting step: only what it painted.
+        f.area = FadeArea::Changed;
+        let mut changed = after.clone();
+        f.apply(&mut changed);
+        assert_eq!(changed.get_pixel(0, 0).0[0], 200);
+        assert!(changed.get_pixel(1, 0).0[0] < 170);
+    }
+
+    #[test]
+    fn center_strokes_stay_crisp_at_odd_widths() {
+        let canvas = PixelRect { x: 0, y: 0, w: 20, h: 20 };
+        let base = RgbaImage::from_pixel(20, 20, Rgba([255, 255, 255, 255]));
+        let sel: Selection = PixelRect { x: 5, y: 5, w: 10, h: 10 }.into();
+        for (width, red) in [(1u32, 5..6), (3, 4..7), (5, 3..8), (4, 3..7)] {
+            let i = stroke(&base, (0, 0), Some(&sel), canvas, &settings(width, StrokeLocation::Center));
+            for x in 0..10 {
+                let want = if red.contains(&x) { 0 } else { 255 };
+                assert_eq!(i.get_pixel(x, 10).0[1], want, "width {width}, x {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn auto_measures_only_what_is_selected() {
+        // Mid grays selected; pure black and white in the unselected heart.
+        let image = RgbaImage::from_fn(40, 1, |x, _| match x {
+            18 => Rgba([0, 0, 0, 255]),
+            19 => Rgba([255, 255, 255, 255]),
+            _ => Rgba([100 + x as u8, 100 + x as u8, 100 + x as u8, 255]),
+        });
+        let mask = image::GrayImage::from_fn(40, 1, |x, _| {
+            image::Luma([if x == 18 || x == 19 { 0 } else { 255 }])
+        });
+        let clip = Clip {
+            rect: [0, 0, 40, 1],
+            shape: Some(super::super::ClipShape::Mask(Arc::new(mask), (0, 0))),
+            inverted: false,
+        };
+        for mode in [AutoMode::Tone, AutoMode::Contrast, AutoMode::Color] {
+            let levels = auto_levels_within(&image, Some(&clip), mode);
+            assert_ne!(levels, auto_levels(&image, mode), "{mode:?}");
+            let mut i = image.clone();
+            super::super::levels(&mut i, &levels);
+            assert!(i.get_pixel(0, 0).0[0] < 10, "{mode:?}: {:?}", i.get_pixel(0, 0));
+            assert!(i.get_pixel(39, 0).0[0] > 245, "{mode:?}: {:?}", i.get_pixel(39, 0));
         }
     }
 

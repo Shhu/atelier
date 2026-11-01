@@ -178,6 +178,18 @@ impl AtelierApp {
         }
     }
 
+    /// What keeps the active layer from moving: Lock All, or only its
+    /// position (it can still be painted on).
+    fn transform_locked_notice(&self, ui: &mut egui::Ui) {
+        let all = self.doc.as_ref().is_some_and(|d| d.is_locked(d.active));
+        let label = if all {
+            t!("options-layer-locked")
+        } else {
+            t!("ui9-options-position-locked")
+        };
+        locked_notice(ui, &label, &t!("options-layer-locked-hint"));
+    }
+
     /// Move tool: Auto-Select and Show Transform Controls; while a
     /// transform is pending, its reference point, numbers, Resample, Warp
     /// and the ✕ ✓ pair instead (the bar stays short the rest of the time).
@@ -188,18 +200,17 @@ impl AtelierApp {
                 .on_hover_text(t!("input3-auto-select-tip", key = ctrl));
             sep(ui);
             if self.transform_locked() {
-                locked_notice(
-                    ui,
-                    &t!("options-layer-locked"),
-                    &t!("options-layer-locked-hint"),
-                );
+                self.transform_locked_notice(ui);
                 return;
             }
-            let response = ui_kit::checkbox(
-                ui,
-                &mut self.show_transform_controls,
-                &t!("tools4-show-transform-controls"),
-            );
+            // Frozen: it would do nothing, the Move tool only moves.
+            let frozen = self.transform_frozen();
+            let show = &mut self.show_transform_controls;
+            let response = ui
+                .add_enabled_ui(!frozen, |ui| {
+                    ui_kit::checkbox(ui, show, &t!("tools4-show-transform-controls"))
+                })
+                .inner;
             let tip = t!("tools4-show-transform-controls-tip");
             ui.ctx()
                 .accesskit_node_builder(response.id, |node| node.set_description(tip.clone()));
@@ -207,11 +218,7 @@ impl AtelierApp {
             return;
         }
         if self.transform_locked() {
-            locked_notice(
-                ui,
-                &t!("options-layer-locked"),
-                &t!("options-layer-locked-hint"),
-            );
+            self.transform_locked_notice(ui);
             return;
         }
         if self.warp_options(ui) {
@@ -824,6 +831,22 @@ fn trailing_hint(ui: &mut egui::Ui, text: &str) {
         sep(ui);
         ui_kit::hint(ui, text);
     }
+}
+
+/// A hint that says what nothing else on screen does: on the next row
+/// when it doesn't fit on this one.
+fn wrapped_hint(ui: &mut egui::Ui, text: &str) {
+    let width = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), FontId::proportional(12.0), color::LABEL)
+        .size()
+        .x;
+    if room(ui) < width + 5.0 + 2.0 * ui.spacing().item_spacing.x {
+        ui.end_row();
+    } else {
+        sep(ui);
+    }
+    ui_kit::hint(ui, text);
 }
 
 /// Lock and what is locked, then how to unlock it if there is room.

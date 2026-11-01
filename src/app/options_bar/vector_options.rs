@@ -403,7 +403,7 @@ impl AtelierApp {
         stroke_fields(ui, "vector_stroke_options", &mut stroke, 92.0, 110.0);
         match active {
             Some(old) => {
-                if (fill != old.fill || stroke != old.stroke) && !self.refuse_if_locked() {
+                if (fill != old.fill || stroke != old.stroke) && !self.refuse_content_locked() {
                     let Some(doc) = &self.doc else { return };
                     let id = doc.active_layer().id;
                     self.record_change(t!("vector-hist-edit-shape"), Some((id, "shape-paint")));
@@ -446,7 +446,7 @@ impl AtelierApp {
             .collect();
         if ui_kit::segmented(ui, &mut op, &options)
             && let Some(op) = op
-            && !(matches!(r, crate::document::PathRef::Layer(_)) && self.refuse_if_locked())
+            && !self.path_locked(r)
         {
             for &k in &selected {
                 path.subpaths[k].op = op;

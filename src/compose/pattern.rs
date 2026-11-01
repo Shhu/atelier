@@ -29,10 +29,18 @@ impl PartialEq for Pattern {
     }
 }
 
-/// FNV-1a over 64-bit words, of the size and pixels.
+/// Hash of the size and pixels (the 64-bit lane of MurmurHash3): every bit
+/// of every word reaches every bit of the result.
 fn hash_pixels(image: &RgbaImage) -> u64 {
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mix = |h: u64, v: u64| (h ^ v).wrapping_mul(PRIME);
+    const C1: u64 = 0x87c3_7b91_1142_53d5;
+    const C2: u64 = 0x4cf5_ad43_2745_937f;
+    let mix = |h: u64, v: u64| {
+        let k = v.wrapping_mul(C1).rotate_left(31).wrapping_mul(C2);
+        (h ^ k)
+            .rotate_left(27)
+            .wrapping_mul(5)
+            .wrapping_add(0x52dc_e729)
+    };
     let mut h = 0xcbf2_9ce4_8422_2325;
     h = mix(h, image.width() as u64);
     h = mix(h, image.height() as u64);
@@ -41,6 +49,11 @@ fn hash_pixels(image: &RgbaImage) -> u64 {
         bytes[..word.len()].copy_from_slice(word);
         h = mix(h, u64::from_le_bytes(bytes));
     }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
     // Never 0: the choice "none yet" of the dialogs.
     h.max(1)
 }
@@ -70,6 +83,25 @@ impl Pattern {
             image: self.image.clone(),
             mips: self.mips.clone(),
         })
+    }
+
+    /// This tile mirrored, under the same name.
+    pub fn mirrored(&self, horizontal: bool) -> Arc<Self> {
+        let image = if horizontal {
+            image::imageops::flip_horizontal(&*self.image)
+        } else {
+            image::imageops::flip_vertical(&*self.image)
+        };
+        Self::new(self.name.clone(), image)
+    }
+
+    /// The memory it holds, for the history's budget: (address, bytes).
+    pub fn buffers(&self, out: &mut Vec<(usize, usize)>) {
+        let mut raw = |r: &[u8]| out.push((r.as_ptr() as usize, r.len()));
+        raw(self.image.as_raw());
+        for m in self.mips.get().into_iter().flatten() {
+            raw(m.as_raw());
+        }
     }
 
     /// The tile reduced `k` times by half (`k` = 0: itself; beyond the
@@ -106,31 +138,62 @@ impl Pattern {
     }
 }
 
-/// `image` at half its size (rounded up), each pixel the mean of those it
-/// covers, tile edges wrapping around; weighted by opacity.
+/// For each of `cells` equal parts of `size` pixels: the pixels it covers
+/// with their share, in 1/`cells` of a pixel (each part adds up to `size`).
+/// At most 3 pixels, a part being at most 2 pixels wide.
+fn coverage(size: u32, cells: u32) -> Vec<[(u32, u64); 3]> {
+    (0..cells)
+        .map(|c| {
+            let (start, end) = (c as u64 * size as u64, (c as u64 + 1) * size as u64);
+            let first = start / cells as u64;
+            let mut out = [(0, 0); 3];
+            for (k, slot) in out.iter_mut().enumerate() {
+                let i = first + k as u64;
+                let from = start.max(i * cells as u64);
+                let to = end.min((i + 1) * cells as u64);
+                if to > from {
+                    *slot = (i as u32, to - from);
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+/// `image` at half its size (rounded up), each pixel the exact mean of the
+/// part of the tile it covers, weighted by opacity: an odd tile keeps its
+/// tone however much it is reduced.
 fn halved(image: &RgbaImage) -> RgbaImage {
     let (w, h) = image.dimensions();
     let (nw, nh) = (w.div_ceil(2), h.div_ceil(2));
+    let (across, down) = (coverage(w, nw), coverage(h, nh));
     let raw = image.as_raw();
-    let at = |x: u32, y: u32| {
-        let i = ((y % h) as usize * w as usize + (x % w) as usize) * 4;
-        &raw[i..i + 4]
-    };
+    let total = w as u64 * h as u64;
     RgbaImage::from_fn(nw, nh, |x, y| {
-        let mut sum = [0u32; 4];
-        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-            let p = at(x * 2 + dx, y * 2 + dy);
-            let a = p[3] as u32;
-            sum[0] += p[0] as u32 * a;
-            sum[1] += p[1] as u32 * a;
-            sum[2] += p[2] as u32 * a;
-            sum[3] += a;
+        let mut sum = [0u64; 4];
+        for &(py, wy) in &down[y as usize] {
+            if wy == 0 {
+                continue;
+            }
+            for &(px, wx) in &across[x as usize] {
+                if wx == 0 {
+                    continue;
+                }
+                let i = (py as usize * w as usize + px as usize) * 4;
+                let p = &raw[i..i + 4];
+                let a = p[3] as u64 * wx * wy;
+                sum[0] += p[0] as u64 * a;
+                sum[1] += p[1] as u64 * a;
+                sum[2] += p[2] as u64 * a;
+                sum[3] += a;
+            }
         }
         if sum[3] == 0 {
             return image::Rgba([0; 4]);
         }
-        let c = |v: u32| ((v + sum[3] / 2) / sum[3]) as u8;
-        image::Rgba([c(sum[0]), c(sum[1]), c(sum[2]), ((sum[3] + 2) / 4) as u8])
+        let c = |v: u64| ((v + sum[3] / 2) / sum[3]) as u8;
+        let alpha = (sum[3] + total / 2) / total;
+        image::Rgba([c(sum[0]), c(sum[1]), c(sum[2]), alpha as u8])
     })
 }
 
@@ -142,8 +205,8 @@ pub struct PatternFill {
     pub scale: f32,
     /// Degrees, counterclockwise.
     pub angle: f32,
-    /// Moves with the layer ("Link with Layer"), from its top left corner,
-    /// or stays at the document's origin.
+    /// Moves with the layer ("Link with Layer"), from the layer's top left
+    /// corner, or stays at the document's origin.
     pub linked: bool,
     /// Offset of the tile from that origin, in canvas pixels.
     pub phase: (f32, f32),
@@ -167,6 +230,51 @@ impl PatternFill {
             linked: true,
             phase: (0.0, 0.0),
         }
+    }
+
+    /// The document's geometry changed by `map`: the tile's origin stays on
+    /// the same point of the image. `anchor` is the point a linked tile
+    /// starts from, before and after (the layer's top left corner).
+    pub fn map_origin(
+        &mut self,
+        map: impl Fn(f32, f32) -> (f32, f32),
+        anchor: ((f32, f32), (f32, f32)),
+    ) {
+        let (before, after) = match self.linked {
+            true => anchor,
+            false => ((0.0, 0.0), (0.0, 0.0)),
+        };
+        let (x, y) = map(before.0 + self.phase.0, before.1 + self.phase.1);
+        self.phase = (x - after.0, y - after.1);
+    }
+
+    /// The tile turned by `degrees` clockwise.
+    pub fn turned(&mut self, degrees: f32) {
+        self.angle = (self.angle - degrees + 180.0).rem_euclid(360.0) - 180.0;
+    }
+
+    /// The tile seen in a mirror (a flip of the canvas): the same picture
+    /// needs the mirrored tile, and the opposite angle.
+    pub fn mirrored(&mut self, horizontal: bool) {
+        self.pattern = self.pattern.mirrored(horizontal);
+        self.angle = -self.angle;
+    }
+}
+
+/// Sine and cosine of `degrees`, exact on quarter turns (turned images
+/// stay exact).
+fn sin_cos(degrees: f32) -> (f32, f32) {
+    let turn = degrees.rem_euclid(360.0);
+    if turn == 0.0 {
+        (0.0, 1.0)
+    } else if turn == 90.0 {
+        (1.0, 0.0)
+    } else if turn == 180.0 {
+        (0.0, -1.0)
+    } else if turn == 270.0 {
+        (-1.0, 0.0)
+    } else {
+        degrees.to_radians().sin_cos()
     }
 }
 
@@ -201,7 +309,7 @@ impl Sampler {
         } else {
             0.0
         };
-        let (sin, cos) = angle.to_radians().sin_cos();
+        let (sin, cos) = sin_cos(angle);
         let (px, py) = (
             if fill.phase.0.is_finite() {
                 fill.phase.0
@@ -356,5 +464,112 @@ mod tests {
             ..f
         };
         assert!(Sampler::new(&f, (0.0, 0.0), 0).at(0.5, 0.5)[3] > 0.99);
+    }
+
+    #[test]
+    fn two_top_bits_do_not_cancel_out() {
+        // Two alphas differing by 128 at odd pixels: the top bit of two words.
+        let a = RgbaImage::from_pixel(4, 1, Rgba([10, 20, 30, 200]));
+        let mut b = a.clone();
+        b.put_pixel(1, 0, Rgba([10, 20, 30, 72]));
+        b.put_pixel(3, 0, Rgba([10, 20, 30, 72]));
+        assert_ne!(Pattern::new("a", a).id, Pattern::new("b", b).id);
+    }
+
+    /// The mean color of a tile, over a whole number of periods.
+    fn mean_at(s: &Sampler, w: u32, h: u32, level: u32) -> f32 {
+        let step = (1u32 << level) as f32;
+        // Enough pixels of the level for every tile pixel to count alike.
+        let (nx, ny) = (w * 8, h * 8);
+        let mut total = 0.0;
+        for y in 0..ny {
+            for x in 0..nx {
+                total += s.at((x as f32 + 0.5) * step, (y as f32 + 0.5) * step)[0];
+            }
+        }
+        total / (nx * ny) as f32
+    }
+
+    #[test]
+    fn odd_tiles_keep_their_tone_when_reduced() {
+        for (w, h) in [
+            (3, 3),
+            (5, 5),
+            (7, 7),
+            (15, 15),
+            (16, 16),
+            (17, 1),
+            (33, 33),
+        ] {
+            let image = RgbaImage::from_fn(w, h, |x, y| {
+                let v = if x == 0 || y == 0 { 0 } else { 255 };
+                Rgba([v, v, v, 255])
+            });
+            let truth = image.pixels().map(|p| p.0[0] as f32 / 255.0).sum::<f32>() / (w * h) as f32;
+            let f = PatternFill::of(Pattern::new("t", image));
+            for level in 1..6 {
+                let mean = mean_at(&Sampler::new(&f, (0.0, 0.0), level), w, h, level);
+                // One rounding per reduction.
+                assert!(
+                    (mean - truth).abs() < 0.02,
+                    "{w}x{h} level {level}: {mean} for {truth}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_reduced_pixel_is_covered_exactly() {
+        for (size, cells) in [(1, 1), (2, 1), (3, 2), (5, 3), (7, 4), (16, 8), (33, 17)] {
+            let parts = coverage(size, cells);
+            let mut each = vec![0; size as usize];
+            for part in &parts {
+                let sum: u64 = part.iter().map(|&(_, k)| k).sum();
+                assert_eq!(sum, size as u64);
+                for &(i, k) in part {
+                    if k > 0 {
+                        each[i as usize] += k;
+                    }
+                }
+            }
+            assert!(each.iter().all(|&k| k == cells as u64), "{size}/{cells}");
+        }
+    }
+
+    #[test]
+    fn mirrored_and_turned_tiles_draw_the_mirrored_and_turned_picture() {
+        let tile = Pattern::new(
+            "t",
+            RgbaImage::from_fn(5, 3, |x, y| Rgba([x as u8 * 50, y as u8 * 100, 7, 255])),
+        );
+        // A point of the canvas, and where it goes.
+        for (angle, phase) in [(0.0, (0.0, 0.0)), (30.0, (2.0, 1.0)), (-75.0, (-3.0, 4.0))] {
+            let f = PatternFill {
+                angle,
+                phase,
+                linked: false,
+                ..PatternFill::of(tile.clone())
+            };
+            let before = Sampler::new(&f, (0.0, 0.0), 0);
+            let mut flipped = f.clone();
+            flipped.map_origin(|x, y| (40.0 - x, y), Default::default());
+            flipped.mirrored(true);
+            let flipped = Sampler::new(&flipped, (0.0, 0.0), 0);
+            let mut quarter = f.clone();
+            quarter.map_origin(|x, y| (30.0 - y, x), Default::default());
+            quarter.turned(90.0);
+            let quarter = Sampler::new(&quarter, (0.0, 0.0), 0);
+            for (x, y) in [(3.5, 2.5), (11.5, 7.5), (21.5, 13.5)] {
+                let (a, b, c) = (
+                    before.at(x, y),
+                    flipped.at(40.0 - x, y),
+                    quarter.at(30.0 - y, x),
+                );
+                for i in 0..4 {
+                    assert!((a[i] - b[i]).abs() < 0.02, "flip {angle} {a:?} {b:?}");
+                    assert!((a[i] - c[i]).abs() < 0.02, "turn {angle} {a:?} {c:?}");
+                }
+            }
+        }
     }
 }

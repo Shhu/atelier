@@ -66,16 +66,17 @@ impl AtelierApp {
 
     fn reading_at(&self, pixel: (i64, i64), radius: i64) -> Option<Reading> {
         let rgb = self.doc.as_ref()?.sampled(pixel, radius)?;
+        // (Inks only: what the Color Picker adds about the gamut costs ms.)
         Some(Reading {
             rgb,
-            cmyk: self.ink_of(rgb).map(|i| i.cmyk),
+            cmyk: self.inks_of(rgb),
         })
     }
 
     /// The values under the pointer and of the points, computed again only
     /// when the image, the pixel or the settings change.
     fn update_readings(&mut self) {
-        let image = self.composite_key();
+        let image = hash_of((self.composite_key(), self.inks_key()));
         let hover = self.hover_pixel;
         let key = hash_of((image, hover));
         if self.info.cursor.as_ref().is_none_or(|c| c.0 != key) {
@@ -120,7 +121,8 @@ impl AtelierApp {
     }
 
     pub(super) fn info_window(&mut self, ctx: &egui::Context) {
-        if !self.info.open || self.doc.is_none() {
+        // (Hidden by Tab or Full Screen: nothing to compute for.)
+        if !self.info.open || self.doc.is_none() || !self.chrome_shown() {
             return;
         }
         self.update_readings();
@@ -129,7 +131,8 @@ impl AtelierApp {
         let channel = |i: usize| reading.map(|r| r.rgb[i]);
         let cyan = |i: usize| reading.and_then(|r| r.cmyk).map(|c| c[i]);
         let selection = self.selection_size();
-        let measure = self.measure_values();
+        // The line shows with its tool only: its values too.
+        let measure = self.measure_values().filter(|_| self.tool == Tool::Ruler);
         let hover = self.hover_pixel;
         let Some(doc) = &self.doc else { return };
         let size = (doc.width(), doc.height());

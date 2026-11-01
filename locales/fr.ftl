@@ -121,7 +121,6 @@ options-opacity = Opacité
 ## Crop tool options
 
 options-fit-visible-pixels = Ajuster aux pixels visibles
-options-fit-visible-pixels-tip = Cadre exactement le contenu de tous les calques visibles.
 
 ## Move tool options
 
@@ -2897,7 +2896,7 @@ ui5-shortcuts-cycle-note = Maj avec la touche d'un outil choisit l'outil suivant
 ui5-drop-place-hint = Déposez pour placer dans cette image. Pour ouvrir dans un onglet à part : Fichier › Ouvrir ({ $key }).
 
 ## Quick Mask: moving the mask
-qm6-status-moved = Masque du mode Masque déplacé de ({ $x }, { $y })
+qm6-status-moved = Mode Masque : masque déplacé de ({ $x }, { $y })
 qm6-quick-mask-name = Masque
 
 ## Select Subject computed in the background
@@ -3040,7 +3039,6 @@ adjust8-menu-fade-none = Estomper…
 adjust8-fade-title = Estomper
 adjust8-hist-fade = Estomper { $name }
 adjust8-mode = Mode
-adjust8-why-no-fade = Disponible uniquement juste après un filtre, un réglage ou un tracé
 ## Edit: Stroke
 adjust8-menu-stroke = Contour…
 adjust8-stroke-title = Contour
@@ -3112,7 +3110,7 @@ pattern8-default-name = Motif { $number }
 pattern8-status-defined = Motif « { $name } » défini
 pattern8-status-empty = Impossible de définir le motif : la zone est vide.
 pattern8-why-rectangle = Nécessite une sélection rectangulaire sans contour progressif
-pattern8-why-quick-mask = Quittez d'abord le masque rapide
+pattern8-why-quick-mask = Quittez d'abord le mode Masque
 pattern8-why-missing = Ce motif n'est plus dans la bibliothèque.
 pattern8-rename = Renommer le motif…
 pattern8-delete = Supprimer le motif
@@ -3142,7 +3140,7 @@ panels8-why-no-samplers = Aucun point d'échantillonnage à effacer.
 panels8-why-no-line = Tracez d'abord une ligne avec la Règle.
 panels8-sampler-hint = Clic : ajouter un point. { $alt_click } : en retirer un.
 panels8-status-samplers-full = Un document contient { $count } points d'échantillonnage au plus.
-panels8-status-straighten-quick-mask = Pas en mode Masque.
+panels8-status-straighten-quick-mask = Quittez d'abord le mode Masque.
 panels8-hint-add-sampler = ajouter un point
 panels8-hint-move-sampler = déplacer un point
 panels8-hint-delete-sampler = retirer un point
@@ -3196,7 +3194,7 @@ panels8-histogram-median = Médiane :
 panels8-histogram-pixels = Pixels :
 panels8-histogram-level = Niveau :
 panels8-histogram-count = Nombre :
-panels8-histogram-percentile = Percentile :
+panels8-histogram-percentile = Centile :
 panels8-histogram-computing = Mise à jour…
 
 ## Navigator panel
@@ -3258,7 +3256,7 @@ view8-palette-keywords-flip = miroir retourner inverser vue vérifier compositio
 ## Filter menu: Distort group and filter names
 
 distort8-group = Déformation
-distort8-pinch = Contraction
+distort8-pinch = Pincement
 distort8-polar = Coordonnées polaires
 distort8-ripple = Ondulation
 distort8-shear = Cisaillement
@@ -3303,7 +3301,7 @@ distort8-shear-tip = Faites glisser un point ou la ligne pour la courber. Faites
 
 ## Distort filters: command palette keywords
 
-distort8-keywords-pinch = déformer déformation pincer gonfler
+distort8-keywords-pinch = pincement déformer déformation pincer gonfler
 distort8-keywords-polar = déformer déformation polaire cercle planète
 distort8-keywords-ripple = déformer déformation eau vagues
 distort8-keywords-shear = déformer déformation courber incliner courbe
@@ -3311,3 +3309,64 @@ distort8-keywords-spherize = déformer déformation sphère bombé fisheye
 distort8-keywords-twirl = déformer déformation spirale torsion
 distort8-keywords-wave = déformer déformation sinusoïde vagues
 distort8-keywords-zigzag = déformer déformation étang anneaux
+
+## Crop tool, whole-document changes: fixes after review
+crop9-preset-name = Préréglage de recadrage
+crop9-ratio-tip = Une proportion, pas des pixels. Vide : libre.
+## Status bar: the image turned would be too large
+crop9-status-too-large = L'image tournée dépasserait la taille maximale.
+## Status bar: { $name } is the command (Crop, Image Rotation)
+crop9-status-cancelled = { $name } annulé.
+crop9-status-dropped = { $name } non appliqué : le document a changé entre-temps.
+
+## Edit > Fade: why it is unavailable
+adjust9-why-no-fade = Disponible uniquement juste après un filtre, un réglage, un remplissage, une étape de peinture ou une transformation
+## Edit > Stroke: nothing came of it
+adjust9-stroke-nothing = Le contour ne change rien ici
+adjust9-stroke-soft = Aucun pixel n'est sélectionné à plus de 50 % : la sélection n'a pas de bord à entourer
+
+## Ruler: Straighten Layer on a group.
+panels9-status-straighten-group = Redresser le calque fait pivoter un seul calque : sélectionnez un calque dans le groupe.
+## Ruler: Straighten Layer with a line already level.
+panels9-status-already-level = La ligne est déjà à niveau.
+## Ruler options; { $alt_drag } is the key and gesture, "Alt+Drag".
+panels9-ruler-hint = { $alt_drag } depuis une extrémité : mesurer un angle.
+
+## Layer locks: a refusal when the lock is on the group that holds the layer
+locks9-status-group-pixels-locked = « { $name } » est dans le groupe « { $group } », dont les pixels sont verrouillés : désactivez ce verrou sur le groupe dans le panneau Calques.
+locks9-status-group-transparent-locked = « { $name } » est dans le groupe « { $group } », dont les pixels transparents sont verrouillés : désactivez ce verrou sur le groupe dans le panneau Calques.
+locks9-status-group-position-locked = « { $name } » est dans le groupe « { $group } », dont la position est verrouillée : désactivez ce verrou sur le groupe dans le panneau Calques.
+## Actions panel: a step that turns layer locks on or off
+locks9-step-on = { $lock } : activé
+locks9-step-off = { $lock } : désactivé
+
+## Patterns: messages of the library, Delete Pattern, the tile's position
+pattern9-status-not-saved = La bibliothèque de motifs n'a pas pu être enregistrée : { $error }. Vos motifs restent disponibles pendant cette session.
+pattern9-status-index-damaged = L'index de la bibliothèque de motifs était endommagé. Il a été mis de côté sous le nom { $backup } et ses motifs sont revenus, renommés.
+pattern9-status-left-out = { $count ->
+    [one] { $count } motif de la bibliothèque est illisible ; son fichier reste sur le disque.
+   *[other] { $count } motifs de la bibliothèque sont illisibles ; leurs fichiers restent sur le disque.
+}
+pattern9-status-already = Ce motif est déjà dans la bibliothèque, sous le nom « { $name } ».
+pattern9-tile-tip = { $name } (clic droit pour renommer ou supprimer)
+pattern9-delete-title = Supprimer le motif
+pattern9-delete-ok = Supprimer
+pattern9-delete-question = Supprimer « { $name } » de la bibliothèque ? Les calques qui l'utilisent gardent leur motif.
+pattern9-offset-x = X
+pattern9-offset-y = Y
+pattern9-offset-tip = Où le motif commence, depuis le coin supérieur gauche du calque, ou du document s'il n'est pas lié
+## Steps of an action
+pattern9-step-define = Utiliser comme motif
+pattern9-step-new-fill = Nouveau calque de remplissage de motif
+## Opening a file: Pattern Fill layers whose tile isn't in the file
+pattern9-psd-note-fills = le motif de remplissage de { $names }, absent du fichier (conservé en pixels)
+
+## Help > Shortcuts: rows missing until now
+ui9-shortcut-screen-mode-back = Mode d'affichage précédent
+ui9-shortcut-rotate-view-hold = Rotation de l'affichage tant que la touche est maintenue
+
+## Move tool: only the position is locked
+ui9-options-position-locked = Position verrouillée
+
+## Navigator: what screen readers say of the picture
+ui9-navigator-image = Vue d'ensemble de l'image

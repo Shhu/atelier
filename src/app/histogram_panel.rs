@@ -20,6 +20,30 @@ const BODY: f32 = 290.0;
 /// Rows composited between two looks at the cancel flag.
 const BAND: u32 = 256;
 const POLL: std::time::Duration = std::time::Duration::from_millis(40);
+/// How long what a panel shows must stay the same before it is computed
+/// again (seconds).
+const SETTLE: f64 = 0.15;
+
+/// When a panel may compute what changed. Not while a pointer is held: a job
+/// keeps the layers alive, and each dab of a stroke would then copy its whole
+/// layer on the UI thread. Not until it stops changing either, unless the
+/// panel has nothing to show.
+#[derive(Default)]
+pub(super) struct Settle {
+    key: u64,
+    since: f64,
+}
+
+impl Settle {
+    pub(super) fn ready(&mut self, ctx: &egui::Context, key: u64, nothing_shown: bool) -> bool {
+        let (now, down) = ctx.input(|i| (i.time, i.pointer.any_down()));
+        if self.key != key {
+            self.key = key;
+            self.since = now;
+        }
+        !down && (nothing_shown || now - self.since >= SETTLE)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Channel {
@@ -203,6 +227,9 @@ pub(super) struct HistogramPanel {
     /// The last result, and what it was counted for.
     shown: Option<(u64, Arc<Counts>)>,
     job: Option<Job>,
+    settle: Settle,
+    /// The last result is for what is there now.
+    fresh: bool,
 }
 
 impl HistogramPanel {
@@ -266,14 +293,18 @@ impl AtelierApp {
         {
             panel.shown = Some((key, Arc::new(counts)));
         }
-        if panel.shown.as_ref().is_some_and(|s| s.0 == key) {
+        panel.fresh = panel.shown.as_ref().is_some_and(|s| s.0 == key);
+        if panel.fresh {
             return;
         }
         ctx.request_repaint_after(POLL);
         if let Some(job) = &panel.job {
-            if job.key != key {
+            if job.key != key || ctx.input(|i| i.pointer.any_down()) {
                 job.cancel.store(true, Ordering::Relaxed);
             }
+            return;
+        }
+        if !panel.settle.ready(ctx, key, panel.shown.is_none()) {
             return;
         }
         let Some(doc) = &self.doc else { return };
@@ -343,12 +374,13 @@ impl AtelierApp {
     }
 
     pub(super) fn histogram_window(&mut self, ctx: &egui::Context) {
-        if !self.hist_panel.open || self.doc.is_none() {
+        // (Hidden by Tab or Full Screen: nothing to compute for.)
+        if !self.hist_panel.open || self.doc.is_none() || !self.chrome_shown() {
             self.hist_panel.stop();
             return;
         }
         self.update_histogram(ctx);
-        let fresh = self.hist_panel.job.is_none();
+        let fresh = self.hist_panel.fresh;
         let counts = self.hist_panel.shown.as_ref().map(|s| Arc::clone(&s.1));
         let mut channel = self.hist_panel.channel;
         let mut source = self.hist_panel.source;

@@ -122,7 +122,6 @@ options-opacity = Opacity
 ## Crop tool options
 
 options-fit-visible-pixels = Fit to Visible Pixels
-options-fit-visible-pixels-tip = Frames exactly the content of all visible layers.
 
 ## Move tool options
 
@@ -3035,7 +3034,6 @@ adjust8-menu-fade-none = Fade…
 adjust8-fade-title = Fade
 adjust8-hist-fade = Fade { $name }
 adjust8-mode = Mode
-adjust8-why-no-fade = Available only right after a filter, an adjustment or a stroke
 ## Edit: Stroke
 adjust8-menu-stroke = Stroke…
 adjust8-stroke-title = Stroke
@@ -3107,7 +3105,7 @@ pattern8-default-name = Pattern { $number }
 pattern8-status-defined = Pattern "{ $name }" defined
 pattern8-status-empty = Could not define the pattern: the area is empty.
 pattern8-why-rectangle = Needs a rectangular selection without feather
-pattern8-why-quick-mask = Leave Quick Mask first
+pattern8-why-quick-mask = Leave Quick Mask Mode first
 pattern8-why-missing = This pattern is no longer in the library.
 pattern8-rename = Rename Pattern…
 pattern8-delete = Delete Pattern
@@ -3137,7 +3135,7 @@ panels8-why-no-samplers = No sampling point to clear.
 panels8-why-no-line = Draw a line with the Ruler first.
 panels8-sampler-hint = Click: add a point. { $alt_click }: remove one.
 panels8-status-samplers-full = A document holds { $count } sampling points at most.
-panels8-status-straighten-quick-mask = Not in Quick Mask Mode.
+panels8-status-straighten-quick-mask = Leave Quick Mask Mode first.
 panels8-hint-add-sampler = add a point
 panels8-hint-move-sampler = move a point
 panels8-hint-delete-sampler = remove a point
@@ -3306,3 +3304,64 @@ distort8-keywords-spherize = distort sphere bulge fisheye
 distort8-keywords-twirl = distort swirl spiral whirl
 distort8-keywords-wave = distort sine undulate
 distort8-keywords-zigzag = distort pond rings
+
+## Crop tool, whole-document changes: fixes after review
+crop9-preset-name = Crop preset
+crop9-ratio-tip = A proportion, not pixels. Empty: free.
+## Status bar: the image turned would be too large
+crop9-status-too-large = The turned image would exceed the maximum size.
+## Status bar: { $name } is the command (Crop, Image Rotation)
+crop9-status-cancelled = { $name } cancelled.
+crop9-status-dropped = { $name } not applied: the document changed meanwhile.
+
+## Edit > Fade: why it is unavailable
+adjust9-why-no-fade = Available only right after a filter, an adjustment, a fill, a painting step or a transform
+## Edit > Stroke: nothing came of it
+adjust9-stroke-nothing = The stroke changes nothing here
+adjust9-stroke-soft = No pixels are more than 50% selected: the selection has no edge to stroke
+
+## Ruler: Straighten Layer on a group.
+panels9-status-straighten-group = Straighten Layer turns one layer: select a layer inside the group.
+## Ruler: Straighten Layer with a line already level.
+panels9-status-already-level = The line is already level.
+## Ruler options; { $alt_drag } is the key and gesture, "Alt+Drag".
+panels9-ruler-hint = { $alt_drag } from an end: measure an angle.
+
+## Layer locks: a refusal when the lock is on the group that holds the layer
+locks9-status-group-pixels-locked = "{ $name }" is in the group "{ $group }", which has Lock Image Pixels on: turn it off on the group in the Layers panel.
+locks9-status-group-transparent-locked = "{ $name }" is in the group "{ $group }", which has Lock Transparent Pixels on: turn it off on the group in the Layers panel.
+locks9-status-group-position-locked = "{ $name }" is in the group "{ $group }", which has Lock Position on: turn it off on the group in the Layers panel.
+## Actions panel: a step that turns layer locks on or off
+locks9-step-on = { $lock }: on
+locks9-step-off = { $lock }: off
+
+## Patterns: messages of the library, Delete Pattern, the tile's position
+pattern9-status-not-saved = The pattern library could not be saved: { $error }. Your patterns stay available in this session.
+pattern9-status-index-damaged = The pattern library's index was damaged. It was set aside as { $backup } and its patterns are back, renamed.
+pattern9-status-left-out = { $count ->
+    [one] { $count } pattern of the library can't be read; its file stays on the disk.
+   *[other] { $count } patterns of the library can't be read; their files stay on the disk.
+}
+pattern9-status-already = This tile is already in the library, as "{ $name }".
+pattern9-tile-tip = { $name } (right-click to rename or delete)
+pattern9-delete-title = Delete Pattern
+pattern9-delete-ok = Delete
+pattern9-delete-question = Delete "{ $name }" from the library? Layers using it keep their tile.
+pattern9-offset-x = X
+pattern9-offset-y = Y
+pattern9-offset-tip = Where the tile starts, from the top left corner of the layer, or of the document when not linked
+## Steps of an action
+pattern9-step-define = Define Pattern
+pattern9-step-new-fill = New Pattern Fill Layer
+## Opening a file: Pattern Fill layers whose tile isn't in the file
+pattern9-psd-note-fills = the Pattern Fill of { $names }, whose tile is missing (kept as pixels)
+
+## Help > Shortcuts: rows missing until now
+ui9-shortcut-screen-mode-back = Previous screen mode
+ui9-shortcut-rotate-view-hold = Rotate View while held
+
+## Move tool: only the position is locked
+ui9-options-position-locked = Position locked
+
+## Navigator: what screen readers say of the picture
+ui9-navigator-image = Image overview

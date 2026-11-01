@@ -34,6 +34,29 @@ impl Default for ViewTurn {
     }
 }
 
+/// The image axis a ruler reads. It keeps the view's scale and passes through
+/// the view's center: at the quarter turns each mark is what lies under it;
+/// between them, a value and the pixel beside it can't agree along a whole
+/// ruler, and the pointer's mark goes where its true coordinate is written.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct RulerAxis {
+    pub image_x: bool,
+    /// -1 when the values run backwards along the ruler.
+    pub sign: f32,
+}
+
+impl RulerAxis {
+    fn of(self, p: Pos2) -> f32 {
+        if self.image_x { p.x } else { p.y }
+    }
+
+    /// Where upright point `p` reads on this ruler, whose center on screen
+    /// is `middle`, the turn's center being `center`.
+    pub(super) fn place(self, p: Pos2, center: Pos2, middle: f32) -> f32 {
+        middle + self.sign * (self.of(p) - self.of(center))
+    }
+}
+
 /// `angle` brought into -180..=180.
 fn wrapped(angle: f32) -> f32 {
     let a = (angle + 180.0).rem_euclid(360.0) - 180.0;
@@ -83,6 +106,41 @@ impl ViewTurn {
             return p;
         }
         self.center + self.vec_to_screen(p - self.center)
+    }
+
+    /// Whether an upright rectangle shows at all in a screen rectangle: their
+    /// two boxes meet in both spaces (separating axes of two rectangles).
+    pub(super) fn shows(self, screen: Rect, r: Rect) -> bool {
+        self.upright_bounds(screen).intersects(r)
+            && Rect::from_points(
+                &[
+                    r.left_top(),
+                    r.right_top(),
+                    r.left_bottom(),
+                    r.right_bottom(),
+                ]
+                .map(|p| self.to_screen(p)),
+            )
+            .intersects(screen)
+    }
+
+    /// What the top and left rulers read: each one the image axis nearest its
+    /// direction on screen, running as that axis does.
+    pub(super) fn ruler_axes(self) -> [RulerAxis; 2] {
+        let along = self.vec_to_upright(vec2(1.0, 0.0));
+        let down = self.vec_to_upright(vec2(0.0, 1.0));
+        let sign = |v: f32| if v < 0.0 { -1.0 } else { 1.0 };
+        if along.x.abs() >= along.y.abs() {
+            [
+                RulerAxis { image_x: true, sign: sign(along.x) },
+                RulerAxis { image_x: false, sign: sign(down.y) },
+            ]
+        } else {
+            [
+                RulerAxis { image_x: false, sign: sign(along.y) },
+                RulerAxis { image_x: true, sign: sign(down.x) },
+            ]
+        }
     }
 
     /// All the upright space a screen rectangle can show.
@@ -263,6 +321,45 @@ fn label_moves(shapes: &[&ClippedShape], turn: ViewTurn) -> Vec<Option<Vec2>> {
     moves
 }
 
+/// Center of the part of a convex polygon inside a rectangle; `None` when
+/// they don't meet.
+pub(super) fn center_within(polygon: &[Pos2], rect: Rect) -> Option<Pos2> {
+    let edges: [&dyn Fn(Pos2) -> f32; 4] = [
+        &|p| p.x - rect.left(),
+        &|p| rect.right() - p.x,
+        &|p| p.y - rect.top(),
+        &|p| rect.bottom() - p.y,
+    ];
+    let mut points = polygon.to_vec();
+    for edge in edges {
+        let mut next = Vec::with_capacity(points.len() + 1);
+        for (i, &a) in points.iter().enumerate() {
+            let b = points[(i + 1) % points.len()];
+            let (da, db) = (edge(a), edge(b));
+            if da >= 0.0 {
+                next.push(a);
+            }
+            if (da >= 0.0) != (db >= 0.0) {
+                next.push(a + (b - a) * (da / (da - db)));
+            }
+        }
+        points = next;
+    }
+    let first = *points.first()?;
+    let (mut area, mut sum) = (0.0f64, [0.0f64; 2]);
+    for pair in points.windows(2).skip(1) {
+        let (u, v) = (pair[0] - first, pair[1] - first);
+        let cross = f64::from(u.x) * f64::from(v.y) - f64::from(u.y) * f64::from(v.x);
+        area += cross;
+        sum[0] += cross * f64::from(u.x + v.x);
+        sum[1] += cross * f64::from(u.y + v.y);
+    }
+    (area.abs() > 1e-6).then(|| {
+        let at = |s: f64| (s / (3.0 * area)) as f32;
+        first + vec2(at(sum[0]), at(sum[1]))
+    })
+}
+
 /// A mesh's triangles cut by a rectangle.
 fn clipped_mesh(mesh: &Mesh, clip: Rect) -> Mesh {
     let mut out = Mesh::with_texture(mesh.texture_id);
@@ -316,6 +413,9 @@ fn clipped_mesh(mesh: &Mesh, clip: Rect) -> Mesh {
 pub(super) struct RotateView {
     /// The angle at the press, and the pointer's around the center.
     drag: Option<(f32, f32)>,
+    /// Hand, Rotate View or Zoom chosen over a transform or a crop box being
+    /// prepared: it works, and the tool (with what it prepares) stays.
+    pub(super) over: Option<Tool>,
     /// R held down: the tool to come back to when the key goes up, once the
     /// tool was used for a moment.
     spring_from: Option<Tool>,
@@ -323,6 +423,16 @@ pub(super) struct RotateView {
 }
 
 impl AtelierApp {
+    /// Something a change of tool would apply, that a view tool leaves alone.
+    pub(super) fn view_tool_keeps_pending(&self) -> bool {
+        self.transform_rect.is_some() || self.crop_box_pending() || self.sel.transform.is_some()
+    }
+
+    /// The tool that takes the pointer, for what the toolbar shows.
+    pub(super) fn shown_tool(&self) -> Tool {
+        self.rotate_view.over.unwrap_or(self.tool)
+    }
+
     /// Sets the view's angle (with Rotate All Windows, of all the documents).
     pub(super) fn set_view_angle(&mut self, angle: f32) {
         let angle = wrapped(angle);
@@ -398,7 +508,12 @@ impl AtelierApp {
             return;
         }
         self.rotate_view.spring_from = None;
-        if self.rotate_view.spring_used && self.tool == Tool::RotateView {
+        if !self.rotate_view.spring_used {
+            return;
+        }
+        if self.rotate_view.over == Some(Tool::RotateView) {
+            self.rotate_view.over = None;
+        } else if self.tool == Tool::RotateView {
             self.set_tool(from);
         }
     }

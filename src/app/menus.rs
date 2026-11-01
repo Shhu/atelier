@@ -217,7 +217,7 @@ impl AtelierApp {
                     ),
                     Item(
                         t!("adjust8-menu-stroke"),
-                        has_doc && !self.smart_filters_apply(),
+                        !self.smart_filters_apply() && self.can_stroke(),
                         None,
                         Action::Stroke,
                     ),
@@ -969,7 +969,14 @@ pub(super) fn explained_menu_entries(
     }
 }
 
-/// A menu's contents, scrolling past `max_height`.
+/// Height of the strips that say a clipped menu goes on.
+const MENU_MORE: f32 = 18.0;
+/// How fast a clipped menu scrolls under the pointer on such a strip.
+const MENU_MORE_SPEED: f32 = 420.0;
+
+/// A menu's contents, scrolling past `max_height`, with a scroll bar always
+/// shown and, at each end that has more, a strip with an arrow that scrolls
+/// while the pointer is on it.
 pub(super) fn scrolling_menu(
     ui: &mut egui::Ui,
     salt: &str,
@@ -981,14 +988,60 @@ pub(super) fn scrolling_menu(
     let height = ui.ctx().data(|d| d.get_temp::<f32>(id));
     let max_height = max_height.max(80.0);
     let used = if height.is_some_and(|h| h > max_height) {
-        egui::ScrollArea::vertical()
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+        let output = egui::ScrollArea::vertical()
             .id_salt(("menu", salt))
             .max_height(max_height)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .show(ui, |ui| {
                 add_contents(ui);
                 ui.min_rect().height()
-            })
-            .inner
+            });
+        let used = output.inner;
+        let (view, offset) = (output.inner_rect, output.state.offset.y);
+        let last = (output.content_size.y - view.height()).max(0.0);
+        let strip = |top: f32| Rect::from_x_y_ranges(view.x_range(), top..=top + MENU_MORE);
+        let ends = [
+            (offset > 0.5, strip(view.top()), icon::CARET_UP, -1.0),
+            (
+                offset < last - 0.5,
+                strip(view.bottom() - MENU_MORE),
+                icon::CARET_DOWN,
+                1.0,
+            ),
+        ];
+        let mut scrolled = offset;
+        for (more, rect, glyph, direction) in ends {
+            if !more {
+                continue;
+            }
+            // Above the rows: they aren't hovered or clicked through it.
+            let response = ui.interact(
+                rect,
+                egui::Id::new(("menu-more", salt, glyph)),
+                Sense::hover(),
+            );
+            ui.painter()
+                .rect_filled(rect, 0.0, ui.visuals().window_fill);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                glyph,
+                egui::FontId::proportional(13.0),
+                ui_kit::color::TEXT,
+            );
+            if response.hovered() {
+                let dt = ui.input(|i| i.stable_dt).min(0.1);
+                scrolled = (offset + direction * MENU_MORE_SPEED * dt).clamp(0.0, last);
+                ui.ctx().request_repaint();
+            }
+        }
+        if scrolled != offset {
+            let mut state = output.state;
+            state.offset.y = scrolled;
+            state.store(ui.ctx(), output.id);
+        }
+        used
     } else {
         let top = ui.cursor().top();
         add_contents(ui);

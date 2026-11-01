@@ -475,11 +475,17 @@ impl Mask {
 
     /// Fingerprint of what the mask does (cache keys).
     pub fn key(&self, layer_offset: (i64, i64)) -> u64 {
+        self.key_from(layer_offset, (0, 0))
+    }
+
+    /// [`Self::key`], its place counted from `from`.
+    pub fn key_from(&self, layer_offset: (i64, i64), from: (i64, i64)) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        let origin = self.origin(layer_offset);
         (
             self.rev,
-            self.origin(layer_offset),
+            (origin.0 - from.0, origin.1 - from.1),
             self.default,
             self.enabled,
             self.density.to_bits(),
@@ -1070,6 +1076,42 @@ impl Document {
             .then_some(std::borrow::Cow::Borrowed(layer))
     }
 
+    /// What [`Self::target_layer`] will give once [`Self::begin_paint`] has
+    /// enlarged the target, when that differs from what it gives now: a text
+    /// or a shape over the canvas, a mask with a box of its own grown to it.
+    /// Nothing changes (they stay as they are until an operation applies).
+    pub fn target_as_painted(&self) -> Option<Layer> {
+        if self.swapped.is_some() || self.quick_mask.is_some() {
+            return None;
+        }
+        let layer = &self.layers[self.active];
+        if self.mask_targeted() {
+            let (area, filter) = (self.full_rect(), self.filter_mask_target);
+            let mask = target_mask(layer, filter)?;
+            let (x, y) = mask.origin(layer.offset);
+            let (w, h) = mask.image.dimensions();
+            if w == 0 || h == 0 {
+                return None;
+            }
+            let own = PixelRect { x, y, w, h };
+            let grown = own.union(area);
+            return (grown != own).then(|| stand_in_over(layer, grown, filter));
+        }
+        if !layer.is_live() || !layer.paintable() {
+            return None;
+        }
+        let u = self.box_to_canvas()?;
+        let rect = layer.rect();
+        let mut image = RgbaImage::new(u.w, u.h);
+        image::imageops::replace(&mut image, layer.image(), rect.x - u.x, rect.y - u.y);
+        Some(Layer {
+            image: Arc::new(image),
+            rev: next_rev(),
+            offset: (u.x, u.y),
+            ..stand_in_shell(layer)
+        })
+    }
+
     /// [`stand_in`] of the targeted mask, made again only when the mask
     /// (or the canvas) changed: a dialog asks for it at every frame.
     fn cached_stand_in(&self) -> Layer {
@@ -1213,6 +1255,19 @@ fn stand_in(layer: &Layer, area: PixelRect, filter: bool) -> Layer {
         h: mask.image.height(),
     };
     let r = if own.w == 0 || own.h == 0 { area } else { own };
+    stand_in_over(layer, r, filter)
+}
+
+/// [`stand_in`] covering `r`: the mask's default around its box.
+fn stand_in_over(layer: &Layer, r: PixelRect, filter: bool) -> Layer {
+    let mask = target_mask(layer, filter).expect("a mask");
+    let (x, y) = mask.origin(layer.offset);
+    let own = PixelRect {
+        x,
+        y,
+        w: mask.image.width(),
+        h: mask.image.height(),
+    };
     let (w, d) = (r.w as usize, mask.default);
     let mut raw = vec![255u8; w * r.h as usize * 4];
     let src = mask.image.as_raw();

@@ -191,6 +191,11 @@ impl Budget {
         }
     }
 
+    /// What can still be taken.
+    pub(super) fn left(&self) -> u64 {
+        self.left
+    }
+
     /// Takes `w` × `h` pixels of `bpp` bytes from the budget.
     pub(super) fn take(&mut self, w: u32, h: u32, bpp: u64) -> Result<(), FileError> {
         self.take_bytes(

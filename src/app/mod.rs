@@ -106,6 +106,8 @@ mod type_tool;
 #[cfg(test)]
 mod ui_tests;
 #[cfg(test)]
+mod ui9_tests;
+#[cfg(test)]
 mod vector_tests;
 #[cfg(test)]
 mod view_tests;
@@ -367,6 +369,11 @@ enum Tool {
 }
 
 impl Tool {
+    /// Moves or turns the view, never the document.
+    fn only_views(self) -> bool {
+        matches!(self, Tool::Hand | Tool::RotateView | Tool::Zoom)
+    }
+
     const ALL: [Tool; 45] = [
         Tool::Transform,
         Tool::Artboard,
@@ -1280,6 +1287,7 @@ impl Action {
                 | Action::ClearSelection
                 | Action::Cut
                 | Action::LayerViaCut
+                | Action::Stroke
         )
     }
 
@@ -1295,6 +1303,7 @@ impl Action {
                 | Action::FillPrimaryKeep
                 | Action::FillSecondary
                 | Action::FillSecondaryKeep
+                | Action::AutoAdjust(_)
         )
     }
 
@@ -1699,6 +1708,13 @@ impl AtelierApp {
     }
 
     fn set_tool(&mut self, tool: Tool) {
+        // A view tool changes nothing: what is being prepared stays.
+        if tool != self.tool && tool.only_views() && self.view_tool_keeps_pending() {
+            self.rotate_view.over = Some(tool);
+            self.group_tool.insert(tool.group(), tool);
+            return;
+        }
+        self.rotate_view.over = None;
         if tool != self.tool && self.crop_asks(canvas::CropThen::Tool(tool)) {
             return;
         }
@@ -1732,8 +1748,8 @@ impl AtelierApp {
     /// group, otherwise the group's last used tool.
     fn group_shown(&self, group: usize) -> Tool {
         let tools = Tool::GROUPS[group];
-        if tools.contains(&self.tool) {
-            return self.tool;
+        if tools.contains(&self.shown_tool()) {
+            return self.shown_tool();
         }
         self.group_tool.get(&group).copied().unwrap_or(tools[0])
     }
@@ -2228,11 +2244,7 @@ impl AtelierApp {
                 ),
                 None => tm!("status-layer-is-locked", name = layer.name.as_str()),
             };
-            let lock = icon::LOCK_SIMPLE;
-            self.status_failed(i18n::Message::new(
-                format!("{lock} {}", m.shown),
-                format!("{lock} {}", m.english),
-            ));
+            self.status_refused(m);
         }
         locked
     }
@@ -2351,7 +2363,7 @@ impl AtelierApp {
             // A targeted mask gets its place back.
             doc.end_paint();
             if changed {
-                doc.mark_fade();
+                doc.mark_fade_changed();
             } else {
                 doc.discard_step();
                 self.stroke_dirty = None;
@@ -2461,7 +2473,15 @@ impl AtelierApp {
                     } else {
                         Action::ClearSelection
                     };
+                    let before = self.doc.as_ref().map(Document::history_step);
                     self.muted(|app| app.run(clear));
+                    // It stays a Cut in the history, whatever took the place.
+                    if let Some(doc) = &mut self.doc
+                        && alpha
+                        && before != Some(doc.history_step())
+                    {
+                        doc.rename_last_step(t!("menu-edit-cut"));
+                    }
                 }
             }
             Action::SelectAll => {
@@ -2482,6 +2502,7 @@ impl AtelierApp {
                 if let (Some(sel), Some(doc)) = (&self.selection, &mut self.doc)
                     && doc.clear_region(sel)
                 {
+                    doc.mark_fade();
                     self.reset_pending();
                 }
             }
@@ -3011,6 +3032,7 @@ impl AtelierApp {
             || self.fill_dialog.is_some()
             || self.patterns.define.is_some()
             || self.patterns.rename.is_some()
+            || self.patterns.delete.is_some()
             || self.retouch.busy()
             || self.retouch.dialog.is_some()
             || self.image_size.is_some()
@@ -3197,15 +3219,14 @@ impl AtelierApp {
         });
         if let Some(action) = action {
             // An action given F8 keeps it over the Info panel.
-            let f8 = crate::actions::FnKey {
-                number: 8,
-                shift: false,
-                ctrl: false,
-            };
             if matches!(action, Action::Workspace(workspace::Command::Info))
-                && self.actions.library.with_key(f8).is_some()
+                && self.f8_has_action()
             {
-                self.play_key(f8);
+                self.play_key(crate::actions::FnKey {
+                    number: 8,
+                    shift: false,
+                    ctrl: false,
+                });
             } else {
                 self.run(action);
             }
@@ -3287,7 +3308,7 @@ impl AtelierApp {
         if quick_mask {
             self.run(Action::Select(select_menu::Command::QuickMask));
         }
-        if swap {
+        if swap && !self.crop_key(Key::X, false) {
             std::mem::swap(&mut self.primary, &mut self.secondary);
         }
         if reset {
@@ -3310,10 +3331,12 @@ impl AtelierApp {
                 fresh_press(i, Key::Escape),
             )
         });
-        if let Some((tool, shift)) = tool {
+        if let Some((tool, shift)) = tool
+            && !tool.shortcut().is_some_and(|k| self.crop_key(k, shift))
+        {
             let from = self.tool;
             self.set_tool(self.tool_for_key(tool, shift));
-            if self.tool == Tool::RotateView {
+            if self.shown_tool() == Tool::RotateView {
                 self.arm_rotate_spring(from);
             }
         }

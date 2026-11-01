@@ -275,6 +275,150 @@ mod tests {
         assert_eq!(again.doc.samplers, doc.samplers);
     }
 
+    /// A 400 × 300 document holding a resource block, read back.
+    fn with_block(id: u16, data: Vec<u8>) -> Document {
+        let mut doc = Document::new(RgbaImage::new(400, 300), None);
+        doc.file_metadata.psd_resources = Arc::new(vec![crate::document::PsdResource {
+            id,
+            name: Vec::new(),
+            data,
+        }]);
+        write_read(&doc).0.doc
+    }
+
+    /// Bytes of a samplers block: header, then `record` for each point.
+    fn samplers_block(
+        version: u32,
+        points: &[(f32, f32)],
+        record: &dyn Fn(f32, f32, &mut Vec<u8>),
+    ) -> Vec<u8> {
+        let mut data = version.to_be_bytes().to_vec();
+        data.extend((points.len() as u32).to_be_bytes());
+        for &(x, y) in points {
+            record(x, y, &mut data);
+        }
+        data
+    }
+
+    /// Each layout of the block, byte by byte: vertical first (Photoshop's
+    /// files according to ag-psd), points off the canvas left out.
+    #[test]
+    fn color_sampler_blocks_read_in_every_version() {
+        use crate::document::ColorSampler;
+        let points = [(100.5, 200.5), (300.5, 50.5)];
+        let want = [
+            ColorSampler { x: 100.5, y: 200.5 },
+            ColorSampler { x: 300.5, y: 50.5 },
+        ];
+        let fixed = |v: f32, by: f32| ((v * by) as i32).to_be_bytes();
+        let float = |v: f32| v.to_bits().to_be_bytes();
+        let cases: Vec<(&str, u16, Vec<u8>)> = vec![
+            (
+                "1038 v1 in 1/16",
+                1038,
+                samplers_block(1, &points, &|x, y, d| {
+                    d.extend(fixed(y, 16.0));
+                    d.extend(fixed(x, 16.0));
+                    d.extend([0xff, 0xff]);
+                }),
+            ),
+            (
+                "1038 v1 in 16.16",
+                1038,
+                samplers_block(1, &points, &|x, y, d| {
+                    d.extend(fixed(y, 65536.0));
+                    d.extend(fixed(x, 65536.0));
+                    d.extend([0xff, 0xff]);
+                }),
+            ),
+            (
+                "1073 v2",
+                1073,
+                samplers_block(2, &points, &|x, y, d| {
+                    d.extend(float(y));
+                    d.extend(float(x));
+                    d.extend([0xff, 0xff, 0, 1]);
+                }),
+            ),
+            (
+                "1073 v3, fixed, depth (ag-psd)",
+                1073,
+                samplers_block(3, &points, &|x, y, d| {
+                    d.extend(1u32.to_be_bytes());
+                    d.extend(fixed(y, 16.0));
+                    d.extend(fixed(x, 16.0));
+                    d.extend([0xff, 0xff, 0, 1]);
+                }),
+            ),
+            (
+                "1073 v3, fixed, no depth (specification)",
+                1073,
+                samplers_block(3, &points, &|x, y, d| {
+                    d.extend(1u32.to_be_bytes());
+                    d.extend(fixed(y, 16.0));
+                    d.extend(fixed(x, 16.0));
+                    d.extend([0xff, 0xff]);
+                }),
+            ),
+            (
+                "1073 v3, floats, depth",
+                1073,
+                samplers_block(3, &points, &|x, y, d| {
+                    d.extend(2u32.to_be_bytes());
+                    d.extend(float(y));
+                    d.extend(float(x));
+                    d.extend([0xff, 0xff, 0, 1]);
+                }),
+            ),
+        ];
+        for (name, id, data) in cases {
+            assert_eq!(with_block(id, data).samplers, want, "{name}");
+        }
+        // Off the canvas, not finite, a later version: not points.
+        let off = samplers_block(
+            2,
+            &[(500.5, 10.5), (f32::NAN, 1.0), (10.5, 20.5)],
+            &|x, y, d| {
+                d.extend(float(y));
+                d.extend(float(x));
+                d.extend([0xff, 0xff, 0, 1]);
+            },
+        );
+        assert_eq!(
+            with_block(1073, off).samplers,
+            [ColorSampler { x: 10.5, y: 20.5 }]
+        );
+        assert!(
+            with_block(1073, vec![0, 0, 0, 9, 0, 0, 0, 1])
+                .samplers
+                .is_empty()
+        );
+    }
+
+    /// What is written: only the current block, version 2, its bytes known.
+    #[test]
+    fn color_samplers_are_written_in_the_current_block() {
+        let mut doc = Document::new(RgbaImage::new(20_000, 8), None);
+        doc.samplers = vec![crate::document::ColorSampler {
+            x: 19_000.5,
+            y: 7.5,
+        }];
+        let (back, _) = write_read(&doc);
+        assert_eq!(back.doc.samplers, doc.samplers);
+        let bytes = write::document(&doc, None).unwrap().0;
+        let mut want = b"8BIM\x04\x31\0\0".to_vec();
+        want.extend(20u32.to_be_bytes());
+        want.extend([0, 0, 0, 2, 0, 0, 0, 1]);
+        want.extend(7.5f32.to_bits().to_be_bytes());
+        want.extend(19_000.5f32.to_bits().to_be_bytes());
+        want.extend([0xff, 0xff, 0, 1]);
+        assert!(bytes.windows(want.len()).any(|w| w == want), "the block");
+        assert!(
+            !bytes.windows(6).any(|w| w == b"8BIM\x04\x0e"),
+            "no old block"
+        );
+    }
+
     /// Each lock comes back by itself; Lock All stays apart from them.
     #[test]
     fn partial_locks_round_trip() {
@@ -308,10 +452,7 @@ mod tests {
         let mut doc = Document::new(RgbaImage::from_pixel(16, 16, Rgba([9, 9, 9, 255])), None);
         doc.add_fill_layer(crate::document::Fill::Solid([200, 10, 10]), None);
         doc.active_layer_mut().effects.color_overlay.enabled = true;
-        doc.add_adjustment_layer(
-            crate::pixel_ops::Adjustment::Invert,
-            None,
-        );
+        doc.add_adjustment_layer(crate::pixel_ops::Adjustment::Invert, None);
         doc.active_layer_mut().effects.inner_glow.enabled = true;
         doc.active = 0;
         doc.add_group();
@@ -1068,5 +1209,100 @@ mod tests {
         assert!(losses(&clear).is_empty());
         channels(&mut clear, 53);
         assert_eq!(losses(&clear), write::document(&clear, None).unwrap().1);
+    }
+}
+
+#[cfg(test)]
+mod pattern_files {
+    use super::*;
+    use crate::compose::pattern::{Pattern, PatternFill};
+    use crate::document::{Document, Fill, LayerKind};
+    use image::{Rgba, RgbaImage};
+
+    fn doc_with(f: PatternFill) -> Document {
+        let mut doc = Document::new(RgbaImage::from_pixel(20, 20, Rgba([255; 4])), None);
+        doc.add_fill_layer(Fill::Pattern(f), None);
+        doc
+    }
+
+    fn tile() -> std::sync::Arc<Pattern> {
+        Pattern::new(
+            "t",
+            RgbaImage::from_fn(3, 1, |x, _| Rgba([x as u8 * 100, 0, 0, 255])),
+        )
+    }
+
+    fn find(data: &[u8], key: &[u8]) -> usize {
+        data.windows(key.len()).position(|w| w == key).expect("key")
+    }
+
+    #[test]
+    fn the_three_names_of_the_tiles_block_are_read() {
+        let (mut data, _) = write::document(&doc_with(PatternFill::of(tile())), None).unwrap();
+        let at = find(&data, b"8BIMPatt");
+        for key in [b"Pat2", b"Pat3"] {
+            data[at + 4..at + 8].copy_from_slice(key);
+            let back = read::document(&data).unwrap();
+            assert!(matches!(
+                back.doc.layers[1].kind,
+                LayerKind::Fill(Fill::Pattern(_))
+            ));
+            assert!(back.notes.is_empty(), "{:?}", back.notes);
+        }
+    }
+
+    #[test]
+    fn a_fill_without_its_tile_stays_a_layer_and_says_so() {
+        let (mut data, _) = write::document(&doc_with(PatternFill::of(tile())), None).unwrap();
+        let at = find(&data, b"8BIMPatt");
+        data[at + 4..at + 8].copy_from_slice(b"Xxxx");
+        let back = read::document(&data).unwrap();
+        assert_eq!(back.doc.layers.len(), 2, "kept");
+        assert!(back.doc.layers[1].has_pixels());
+        assert_eq!(back.notes.len(), 1, "{:?}", back.notes);
+    }
+
+    /// The list's rectangle patched: a few bytes for a big tile.
+    #[test]
+    fn a_tile_bigger_than_its_data_is_refused_within_the_budget() {
+        let (mut data, _) = write::document(&doc_with(PatternFill::of(tile())), None).unwrap();
+        let at = find(&data, b"8BIMPatt");
+        let id = data[at + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 2] as usize;
+        let rect = at + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 2 + 1 + id + 4 + 4;
+        assert_eq!(&data[rect + 8..rect + 16], &[0, 0, 0, 1, 0, 0, 0, 3]);
+        let side = 12000i32;
+        data[rect + 8..rect + 12].copy_from_slice(&side.to_be_bytes());
+        data[rect + 12..rect + 16].copy_from_slice(&side.to_be_bytes());
+        let budget = crate::document::file_io::Budget::of(10_000_000);
+        // Refused for not holding its data: the layer stays, as pixels.
+        let back = read::document_within(&data, budget).expect("read");
+        assert!(!matches!(
+            back.doc.layers[1].kind,
+            LayerKind::Fill(Fill::Pattern(_))
+        ));
+    }
+
+    #[test]
+    fn a_linked_tile_stays_in_place_through_a_file() {
+        let t = Pattern::new(
+            "asym",
+            RgbaImage::from_fn(5, 3, |x, y| Rgba([(x * 50) as u8, (y * 80) as u8, 7, 255])),
+        );
+        // A moved fill, and a pixel layer with margins: the file trims them.
+        let mut doc = doc_with(PatternFill::of(t.clone()));
+        doc.active_layer_mut().translate(2, 1);
+        let mut image = RgbaImage::new(16, 16);
+        for y in 4..12 {
+            for x in 3..11 {
+                image.put_pixel(x, y, Rgba([1, 2, 3, 255]));
+            }
+        }
+        doc.add_layer("x".into(), image, (2, 2));
+        let fx = &mut doc.active_layer_mut().effects;
+        fx.pattern_overlay.enabled = true;
+        fx.pattern_overlay.fill = PatternFill::of(t);
+        let (data, _) = write::document(&doc, None).unwrap();
+        let back = read::document(&data).unwrap().doc;
+        assert_eq!(doc.flatten(), back.flatten());
     }
 }

@@ -314,7 +314,7 @@ fn applied(turn: view_turn::ViewTurn, paint: impl Fn(&Painter)) -> Vec<(Rect, eg
     let area = Rect::from_center_size(Pos2::new(400.0, 300.0), vec2(800.0, 600.0));
     let layer = egui::LayerId::background();
     let mut out = Vec::new();
-    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
         let ctx = ui.ctx().clone();
         let mut turn = turn;
         turn.center = area.center();
@@ -331,6 +331,8 @@ fn applied(turn: view_turn::ViewTurn, paint: impl Fn(&Painter)) -> Vec<(Rect, eg
                 .collect();
         });
     });
+    // No renderer here: the font atlas's upload mustn't trip epaint's drop check.
+    output.textures_delta.clear();
     out
 }
 
@@ -595,4 +597,400 @@ fn the_type_tool_lands_on_the_image_on_a_turned_or_flipped_view() {
         let cursor = h.output().platform_output.ime.expect("input methods on").cursor_rect;
         near(cursor.center(), p, 2.0);
     }
+}
+
+/// Grey noise: every tool through `brush_input` changes something in it.
+fn noise(w: u32, h: u32) -> Document {
+    let mut img = image::RgbaImage::new(w, h);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        let n = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)).wrapping_mul(2654435761) >> 24;
+        let v = 90 + (n % 80) as u8;
+        *p = image::Rgba([v, 200 - v / 2, 255 - v, 255]);
+    }
+    Document::new(img, None)
+}
+
+const BRUSH_TOOLS: [Tool; 11] = [
+    Tool::Brush,
+    Tool::Eraser,
+    Tool::Dodge,
+    Tool::Burn,
+    Tool::Sponge,
+    Tool::Blur,
+    Tool::Sharpen,
+    Tool::Smudge,
+    Tool::CloneStamp,
+    Tool::HealingBrush,
+    Tool::SpotHealing,
+];
+
+/// A real moving drag: the events reach `frame_samples` as the system sends them.
+#[test]
+fn every_brush_tool_strokes_only_along_the_pointer_on_a_turned_view() {
+    let turns = [
+        (0.0, false),
+        (90.0, false),
+        (33.0, false),
+        (180.0, false),
+        (0.0, true),
+        (-120.0, true),
+    ];
+    for tool in BRUSH_TOOLS {
+        for (angle, flipped) in turns {
+            let what = format!("{tool:?} {angle} {flipped}");
+            let mut h = turned(tool, angle, flipped);
+            h.state_mut().doc = Some(noise(400, 300));
+            h.run_steps(2);
+            let before = (*doc(&h).active_layer().shared_image()).clone();
+            let app = h.state_mut();
+            app.primary = Color32::BLACK;
+            app.secondary = Color32::WHITE;
+            app.brush_size = 10.0;
+            app.hardness = 1.0;
+            app.paint.smoothing = 0.0;
+            if tool.clones() {
+                app.set_clone_source(pos2(40.0, 260.0));
+            }
+            let (a, b) = (pos2(100.0, 100.0), pos2(300.0, 140.0));
+            let (sa, sb) = (screen(&h, a.x, a.y), screen(&h, b.x, b.y));
+            drag(&mut h, sa, sb);
+            // Healing lands from its job.
+            for _ in 0..400 {
+                if !h.state().retouch_running() {
+                    break;
+                }
+                h.run_steps(1);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            h.run_steps(2);
+            let layer = doc(&h).active_layer();
+            let (mut near_line, mut stray) = (0, 0);
+            let ab = b - a;
+            for (x, y, p) in before.enumerate_pixels() {
+                if layer.pixel_at(i64::from(x), i64::from(y)) == Some(p.0) {
+                    continue;
+                }
+                let at = pos2(x as f32, y as f32);
+                let t = ((at - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0);
+                if (a + ab * t).distance(at) > 14.0 {
+                    stray += 1;
+                } else {
+                    near_line += 1;
+                }
+            }
+            assert_eq!(stray, 0, "{what}: pixels away from the stroke");
+            assert!(near_line > 300, "{what}: the stroke painted {near_line}");
+        }
+    }
+}
+
+#[test]
+fn alt_right_drag_resizes_the_brush_in_screen_directions() {
+    for (angle, flipped) in [(0.0, false), (90.0, false), (180.0, false), (0.0, true), (33.0, true)] {
+        let what = format!("{angle} {flipped}");
+        let mut h = turned(Tool::Brush, angle, flipped);
+        h.state_mut().brush_size = 100.0;
+        h.state_mut().hardness = 0.5;
+        let at = screen(&h, 200.0, 150.0);
+        h.hover_at(at);
+        h.run_steps(1);
+        h.event(egui::Event::ModifiersChanged(Modifiers::ALT));
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: PointerButton::Secondary,
+            pressed: true,
+            modifiers: Modifiers::ALT,
+        });
+        h.run_steps(2);
+        let zoom = h.state().last_view.expect("canvas").zoom;
+        // To the right on screen: the size only.
+        h.event(egui::Event::PointerMoved(at + vec2(20.0, 0.0)));
+        h.run_steps(2);
+        let expected = (100.0 + 2.0 * 20.0 / zoom).round();
+        assert_eq!(h.state().brush_size, expected, "{what}");
+        assert_eq!(h.state().hardness, 0.5, "{what}");
+        // Down on screen: the hardness only.
+        h.event(egui::Event::PointerMoved(at + vec2(20.0, 40.0)));
+        h.run_steps(2);
+        assert_eq!(h.state().brush_size, expected, "{what}");
+        assert!((h.state().hardness - 0.7).abs() < 1e-4, "{what}");
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: PointerButton::Secondary,
+            pressed: false,
+            modifiers: Modifiers::ALT,
+        });
+        h.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+        h.run_steps(2);
+    }
+}
+
+/// At quarter turns and flips, what each ruler reads at a screen position is
+/// the coordinate of the image under it.
+#[test]
+fn the_rulers_read_the_image_under_them_at_quarter_turns() {
+    for flipped in [false, true] {
+        for angle in [0.0, 90.0, 180.0, -90.0] {
+            let h = turned(Tool::Hand, angle, flipped);
+            let (view, turn) = (h.state().last_view.expect("canvas"), h.state().view_turn);
+            let c = turn.center;
+            let [top, left] = turn.ruler_axes();
+            assert_ne!(top.image_x, left.image_x);
+            let (origin_top, origin_left) = (
+                top.place(view.origin, c, c.x),
+                left.place(view.origin, c, c.y),
+            );
+            for ip in [pos2(0.0, 0.0), pos2(400.0, 0.0), pos2(120.0, 77.0)] {
+                let s = screen(&h, ip.x, ip.y);
+                let value = |image_x: bool| if image_x { ip.x } else { ip.y };
+                let tick_top = origin_top + top.sign * value(top.image_x) * view.zoom;
+                let tick_left = origin_left + left.sign * value(left.image_x) * view.zoom;
+                let what = format!("{angle} {flipped} {ip:?}");
+                assert!((tick_top - s.x).abs() < 0.01, "{what}: {tick_top} {}", s.x);
+                assert!((tick_left - s.y).abs() < 0.01, "{what}: {tick_left} {}", s.y);
+                // The pointer's mark is right on it.
+                let u = turn.to_upright(s);
+                assert!((top.place(u, c, c.x) - s.x).abs() < 0.01, "{what}");
+                assert!((left.place(u, c, c.y) - s.y).abs() < 0.01, "{what}");
+            }
+        }
+    }
+}
+
+#[test]
+fn each_ruler_keeps_its_own_axis_between_quarter_turns() {
+    for angle in [45.0, -45.0, 135.0, -135.0, 30.0, 60.0] {
+        for flipped in [false, true] {
+            let t = view_turn::ViewTurn { angle, flipped, center: Pos2::ZERO };
+            let [top, left] = t.ruler_axes();
+            assert_ne!(top.image_x, left.image_x, "{angle} {flipped}");
+        }
+    }
+}
+
+#[test]
+fn a_drag_anywhere_on_an_artboard_name_takes_that_artboard() {
+    use crate::document::ArtboardBackground;
+    for (angle, end) in [
+        (0.0f32, -1.0f32),
+        (90.0, -1.0),
+        (90.0, 0.0),
+        (90.0, 1.0),
+        (45.0, -1.0),
+        (45.0, 1.0),
+    ] {
+        let mut h = app(Tool::Transform);
+        let mut board = Document::with_artboard(300, 200, ArtboardBackground::White);
+        board.layers[1].name = "A rather long artboard name".into();
+        board.add_artboard(
+            "new".into(),
+            "B".into(),
+            PixelRect { x: 500, y: 0, w: 100, h: 100 },
+            ArtboardBackground::White,
+        );
+        board.active = board.layers.iter().position(|l| l.name == "B").expect("B");
+        h.state_mut().doc = Some(board);
+        h.state_mut().view_turn.angle = angle;
+        h.run_steps(3);
+        let (_, r) = h.state().artboards.labels[0];
+        let c = h.state().view_turn.to_screen(r.center());
+        let from = c + vec2(end * (r.width() / 2.0 - 4.0), 0.0);
+        drag(&mut h, from, from + vec2(60.0, 40.0));
+        let name = &doc(&h).active_layer().name;
+        assert!(name.starts_with("A rather"), "{angle} {end}: {name}");
+    }
+}
+
+/// A Free Transform with a dragged corner.
+fn free_transform() -> Harness<'static, AtelierApp> {
+    let mut h = app(Tool::Transform);
+    h.state_mut().auto_select = false;
+    let img = image::RgbaImage::from_pixel(100, 100, image::Rgba([10, 20, 30, 255]));
+    h.state_mut().doc.as_mut().expect("doc").add_layer("s".into(), img, (0, 0));
+    h.run_steps(2);
+    h.state_mut().free_transform = true;
+    h.run_steps(2);
+    let (a, b) = (screen(&h, 100.0, 100.0), screen(&h, 150.0, 150.0));
+    drag(&mut h, a, b);
+    assert!(h.state().transform_rect.is_some());
+    h
+}
+
+fn r_key(h: &mut Harness<'static, AtelierApp>, pressed: bool) {
+    h.event(egui::Event::Key {
+        key: Key::R,
+        physical_key: Some(Key::R),
+        pressed,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    });
+    h.run_steps(2);
+}
+
+#[test]
+fn holding_r_turns_the_view_during_a_free_transform_and_keeps_it() {
+    let mut h = free_transform();
+    let steps = doc(&h).history().1;
+    let frame = h.state().transform_rect;
+    r_key(&mut h, true);
+    assert_eq!(h.state().tool, Tool::Transform);
+    assert_eq!(h.state().transform_rect, frame, "not applied");
+    let c = h.state().rulers.canvas_area().expect("canvas").center();
+    drag(&mut h, c + vec2(200.0, 0.0), c + vec2(0.0, 200.0));
+    assert!((h.state().view_turn.angle - 90.0).abs() < 1.5);
+    assert_eq!(h.state().transform_rect, frame, "the drag only turned");
+    r_key(&mut h, false);
+    assert_eq!(h.state().shown_tool(), Tool::Transform);
+    assert_eq!(doc(&h).history().1, steps, "no step");
+
+    // The handles still answer, where they now show.
+    let (a, b) = (screen(&h, 150.0, 150.0), screen(&h, 180.0, 180.0));
+    drag(&mut h, a, b);
+    let r = h.state().transform_rect.expect("a frame");
+    assert!((r.max.x - 180.0).abs() <= 3.0, "{r:?}");
+    assert!((r.max.y - 180.0).abs() <= 3.0, "{r:?}");
+
+    // Enter applies it, once.
+    h.key_press(Key::Enter);
+    h.run_steps(3);
+    assert!(h.state().transform_rect.is_none());
+    assert_eq!(doc(&h).active_layer().rect().w, 180);
+}
+
+#[test]
+fn a_view_tool_tapped_over_a_transform_stays_until_another_is_chosen() {
+    let mut h = free_transform();
+    let frame = h.state().transform_rect;
+    h.key_press(Key::R);
+    h.run_steps(2);
+    assert_eq!(h.state().shown_tool(), Tool::RotateView);
+    let c = h.state().rulers.canvas_area().expect("canvas").center();
+    drag(&mut h, c + vec2(200.0, 0.0), c + vec2(0.0, 200.0));
+    assert!(h.state().view_turn.angle.abs() > 80.0);
+    assert_eq!(h.state().transform_rect, frame);
+
+    // The Zoom tool clicks in; the frame doesn't care.
+    let zoom = h.state().zoom;
+    h.key_press(Key::Z);
+    h.run_steps(2);
+    let at = c + vec2(150.0, 150.0);
+    drag(&mut h, at, at);
+    assert!(h.state().zoom > zoom);
+    assert_eq!(h.state().transform_rect, frame);
+
+    // The Hand pans.
+    h.key_press(Key::H);
+    h.run_steps(2);
+    let before = screen(&h, 150.0, 150.0);
+    drag(&mut h, at, at + vec2(120.0, 40.0));
+    near(screen(&h, 150.0, 150.0), before + vec2(120.0, 40.0), 1.5);
+    assert_eq!(h.state().transform_rect, frame);
+
+    // Its own key gives the Move tool back; another tool applies it.
+    h.key_press(Key::V);
+    h.run_steps(2);
+    assert_eq!(h.state().shown_tool(), Tool::Transform);
+    assert_eq!(h.state().transform_rect, frame);
+    h.key_press(Key::B);
+    h.run_steps(3);
+    assert_eq!(h.state().tool, Tool::Brush);
+    assert!(h.state().transform_rect.is_none());
+    assert_eq!(doc(&h).active_layer().rect().w, 150);
+}
+
+#[test]
+fn view_tools_leave_a_crop_box_without_asking() {
+    let mut h = app(Tool::Canvas);
+    h.state_mut().rulers.settings.snap = false;
+    h.run_steps(1);
+    let (a, b) = (screen(&h, 100.0, 80.0), screen(&h, 220.0, 170.0));
+    drag(&mut h, a, b);
+    let frame = h.state().canvas_rect.expect("a box");
+    r_key(&mut h, true);
+    assert!(h.state().crop_confirm.is_none(), "no question");
+    let c = h.state().rulers.canvas_area().expect("canvas").center();
+    drag(&mut h, c + vec2(300.0, 0.0), c + vec2(0.0, 300.0));
+    r_key(&mut h, false);
+    assert!(h.state().view_turn.angle.abs() > 80.0);
+    assert_eq!(h.state().tool, Tool::Canvas);
+    assert_eq!(h.state().canvas_rect, Some(frame));
+    assert_eq!(h.state().crop.angle, 0.0, "the box wasn't turned");
+}
+
+#[test]
+fn a_turned_view_only_keeps_the_tiles_on_screen() {
+    let mut h = app(Tool::Hand);
+    let img = image::RgbaImage::from_pixel(6000, 4000, image::Rgba([255, 255, 255, 255]));
+    h.state_mut().doc = Some(Document::new(img, None));
+    h.state_mut().zoom = 1.0;
+    h.state_mut().fit_pending = None;
+    h.state_mut().pan = Vec2::ZERO;
+    h.state_mut().view_turn.angle = 45.0;
+    for _ in 0..60 {
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let area = h.state().rulers.canvas_area().expect("canvas");
+    let (view, turn) = (h.state().last_view.expect("canvas"), h.state().view_turn);
+    let (tiles, side) = h.state().tiles_held();
+    let rect = |t: (i64, i64)| {
+        let at = pos2((t.0 * side) as f32, (t.1 * side) as f32);
+        view.rect_to_screen(Rect::from_min_size(at, Vec2::splat(side as f32)))
+    };
+    for &t in &tiles {
+        assert!(turn.shows(area.expand(1.0), rect(t)), "{t:?} is off screen");
+    }
+    // None missing: every pixel on screen, over the canvas, has its tile.
+    for sy in (area.top() as i32..area.bottom() as i32).step_by(40) {
+        for sx in (area.left() as i32..area.right() as i32).step_by(40) {
+            let ip = image_at(&h, pos2(sx as f32, sy as f32));
+            if (0.0..6000.0).contains(&ip.x) && (0.0..4000.0).contains(&ip.y) {
+                let t = (ip.x as i64 / side, ip.y as i64 / side);
+                assert!(tiles.contains(&t), "{t:?} missing at {sx},{sy}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_paste_lands_in_the_part_of_the_canvas_on_screen() {
+    let mut h = app(Tool::Hand);
+    let img = image::RgbaImage::from_pixel(4000, 4000, image::Rgba([255, 255, 255, 255]));
+    h.state_mut().doc = Some(Document::new(img, None));
+    h.state_mut().zoom = 1.0;
+    h.state_mut().fit_pending = None;
+    h.state_mut().view_turn.angle = 45.0;
+    h.run_steps(3);
+    let area = h.state().rulers.canvas_area().expect("canvas");
+    // Only a little of the canvas is shown, against an edge of the window.
+    let view = h.state().last_view.expect("canvas");
+    let corner = h.state().view_turn.to_screen(view.to_screen(pos2(4000.0, 4000.0)));
+    let by = h.state().view_turn.vec_to_upright(area.center() + vec2(300.0, 0.0) - corner);
+    h.state_mut().pan += by;
+    h.run_steps(3);
+    let (x, y) = h.state().paste_center().expect("in view");
+    assert!(area.contains(screen(&h, x, y)), "{x} {y}");
+
+    // The canvas out of the window: nothing to aim at.
+    h.state_mut().pan += vec2(20000.0, 20000.0);
+    h.run_steps(3);
+    assert_eq!(h.state().paste_center(), None);
+}
+
+#[test]
+fn the_center_within_a_rectangle_is_the_polygons_part() {
+    let r = Rect::from_min_size(Pos2::ZERO, vec2(100.0, 100.0));
+    let square = |c: Pos2, s: f32| {
+        [
+            c + vec2(-s, -s),
+            c + vec2(s, -s),
+            c + vec2(s, s),
+            c + vec2(-s, s),
+        ]
+    };
+    let inner = view_turn::center_within(&square(pos2(30.0, 40.0), 5.0), r).expect("inside");
+    near(inner, pos2(30.0, 40.0), 0.001);
+    let cut = view_turn::center_within(&square(pos2(100.0, 50.0), 20.0), r).expect("half");
+    near(cut, pos2(90.0, 50.0), 0.001);
+    assert!(view_turn::center_within(&square(pos2(300.0, 50.0), 20.0), r).is_none());
 }

@@ -702,7 +702,13 @@ fn the_slider_and_the_buttons_zoom_around_the_view() {
     let mut h = navigator_open([1400.0, 1000.0]);
     let center = h.state().view_center().unwrap();
     let zoom = h.state().zoom;
-    h.get_by_label(&t!("menu-view-zoom-in")).click();
+    // The Navigator's, on the right (the zoom bar's has the same name).
+    let name = t!("menu-view-zoom-in");
+    let button = h
+        .query_all_by_label(&name)
+        .max_by(|a, b| a.rect().left().total_cmp(&b.rect().left()))
+        .unwrap();
+    button.click();
     h.run_steps(3);
     assert!(h.state().zoom > zoom);
     let c = h.state().view_center().unwrap();
@@ -926,4 +932,393 @@ fn the_view_menu_says_the_screen_mode() {
         .map(|e| matches!(e, MenuEntry::Choice(_, true, _)))
         .collect();
     assert_eq!(chosen, [false, true, false]);
+}
+
+// ------------------------------------------------------------ Later fixes
+
+/// Whatever the group holds, the canvas stays: no crop without a turn.
+#[test]
+fn straighten_on_a_group_or_an_empty_layer_is_refused_and_changes_nothing() {
+    for kind in ["empty group", "group with a child", "empty layer"] {
+        let mut h = app(Tool::Ruler);
+        let d = h.state_mut().doc.as_mut().unwrap();
+        match kind {
+            "empty group" => d.add_group(),
+            "group with a child" => {
+                d.add_layer("c".into(), image::RgbaImage::new(200, 100), (50, 50));
+                d.add_group();
+            }
+            _ => d.add_empty_layer(),
+        }
+        straighten_setup(&mut h, -9.0);
+        h.run_steps(2);
+        let before = steps(&h);
+        h.state_mut().status.clear();
+        h.state_mut().straighten_layer(false);
+        wait(&mut h, |a| !a.transform_busy());
+        h.run_steps(3);
+        assert_eq!((doc(&h).width(), doc(&h).height()), (400, 300), "{kind}");
+        assert_eq!(steps(&h), before, "{kind}");
+        assert!(doc(&h).ruler.is_some(), "{kind}: the line stays");
+        assert!(!h.state().status.is_empty(), "{kind}: said");
+        assert_eq!(h.state().tool, Tool::Ruler, "{kind}");
+    }
+}
+
+/// The turn is computed aside: its crop doesn't land in another document.
+#[test]
+fn straighten_crops_only_the_document_it_turned() {
+    let mut h = app(Tool::Ruler);
+    straighten_setup(&mut h, 10.0);
+    h.state_mut().straighten_layer(false);
+    // Whatever was computed, this one wasn't asked for anything.
+    let other = Document::new(image(), None);
+    let turned = h.state_mut().doc.replace(other);
+    wait(&mut h, |a| !a.transform_busy());
+    h.run_steps(2);
+    assert_eq!((doc(&h).width(), doc(&h).height()), (400, 300));
+    drop(turned);
+}
+
+#[test]
+fn straighten_with_a_level_line_says_so_and_keeps_the_line() {
+    let mut h = app(Tool::Ruler);
+    straighten_setup(&mut h, 0.0);
+    let before = steps(&h);
+    h.state_mut().straighten_layer(false);
+    h.run_steps(2);
+    assert_eq!(steps(&h), before);
+    assert!(doc(&h).ruler.is_some());
+    assert_eq!(h.state().status, t!("panels9-status-already-level"));
+    assert_eq!((doc(&h).width(), doc(&h).height()), (400, 300));
+}
+
+fn point_at(h: &mut Harness<'static, AtelierApp>, x: f32, y: f32) -> Pos2 {
+    let at = screen(h, x, y);
+    click(h, at, Modifiers::NONE);
+    assert_eq!(doc(h).samplers.len(), 1);
+    at
+}
+
+/// The pointer lost in the drag (real events): the point doesn't stay off the
+/// canvas, out of reach, and it is undone as a whole.
+#[test]
+fn a_point_dragged_out_of_the_window_goes_when_the_pointer_is_lost() {
+    let mut h = app(Tool::ColorSampler);
+    let at = point_at(&mut h, 100.0, 100.0);
+    h.hover_at(at);
+    h.run_steps(1);
+    h.drag_at(at);
+    h.run_steps(1);
+    let off = pos2(5.0, 500.0);
+    h.hover_at(off);
+    h.run_steps(2);
+    assert!(doc(&h).samplers[0].x < 0.0, "{:?}", doc(&h).samplers);
+    h.event(egui::Event::PointerGone);
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton {
+        pos: off,
+        button: PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    h.run_steps(2);
+    assert!(doc(&h).samplers.is_empty());
+    assert_eq!(
+        doc(&h).history().0.last().copied(),
+        Some(t!("panels8-hist-delete-sampler").as_str()),
+        "named for what it did"
+    );
+    h.state_mut().doc.as_mut().unwrap().undo();
+    assert_eq!(doc(&h).samplers.len(), 1);
+    assert_eq!(doc(&h).samplers[0], ColorSampler { x: 100.5, y: 100.5 });
+}
+
+/// A new point dragged off the canvas at once: as if nothing happened.
+#[test]
+fn a_new_point_dragged_off_the_canvas_leaves_no_step() {
+    let mut h = app(Tool::ColorSampler);
+    let before = steps(&h);
+    let from = screen(&h, 100.0, 100.0);
+    drag(&mut h, from, pos2(5.0, 500.0));
+    assert!(doc(&h).samplers.is_empty());
+    assert_eq!(steps(&h), before);
+}
+
+// The notices of Full Screen.
+
+fn notices(h: &mut Harness<'static, AtelierApp>) -> Vec<String> {
+    let ctx = h.ctx.clone();
+    let list = h.state_mut().full_screen_notices(&ctx);
+    list.into_iter().map(|n| n.0).collect()
+}
+
+#[test]
+fn full_screen_shows_how_to_leave_then_messages_for_their_usual_time() {
+    let mut h = app(Tool::Brush);
+    h.state_mut()
+        .status_failed(tm!("panels8-status-straighten-quick-mask"));
+    // Old by the time Full Screen comes: nothing of it is left.
+    h.run_steps(120);
+    let leave = t!("panels8-screen-notice");
+    h.state_mut().set_screen_mode(workspace::ScreenMode::Full);
+    h.run_steps(1);
+    assert_eq!(notices(&mut h), vec![leave.clone()], "not the old error");
+    // An error while the notice shows: both.
+    h.state_mut()
+        .status_failed(tm!("panels8-status-straighten-quick-mask"));
+    h.run_steps(1);
+    let got = notices(&mut h);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!(got[0], leave);
+    assert!(got[1].ends_with(&t!("panels8-status-straighten-quick-mask")));
+    h.run_steps(120);
+    assert!(notices(&mut h).is_empty(), "both gone");
+    // An ordinary message, which the status bar would show (real clicks).
+    h.state_mut().tool = Tool::ColorSampler;
+    h.run_steps(2);
+    let d = h.state_mut().doc.as_mut().unwrap();
+    d.samplers = vec![ColorSampler { x: 1.5, y: 1.5 }; MAX_SAMPLERS];
+    let at = screen(&h, 200.0, 200.0);
+    click(&mut h, at, Modifiers::NONE);
+    assert_eq!(
+        notices(&mut h),
+        [t!("panels8-status-samplers-full", count = MAX_SAMPLERS)]
+    );
+}
+
+// Painting with the panels open.
+
+fn shared_pixels(h: &Harness<'static, AtelierApp>) -> *const image::RgbaImage {
+    Arc::as_ptr(&doc(h).render_layers()[0].shared_image())
+}
+
+/// The whole layer isn't copied on the UI thread at each dab because a panel
+/// holds it; the panels catch up when the stroke is over.
+#[test]
+fn panels_compute_nothing_during_a_stroke_then_catch_up() {
+    let mut h = histogram_open(Tool::Brush);
+    h.state_mut().navigator.open = true;
+    counted(&mut h);
+    wait(&mut h, |a| a.navigator.ready());
+    h.state_mut().brush_size = 20.0;
+    h.run_steps(2);
+    let before = h.state().hist_panel.counts().unwrap().clone();
+    let from = screen(&h, 20.0, 150.0);
+    h.hover_at(from);
+    h.run_steps(1);
+    h.drag_at(from);
+    h.run_steps(2);
+    let mut copies = 0;
+    let mut last = shared_pixels(&h);
+    for i in 1..=40 {
+        h.hover_at(screen(&h, 20.0 + i as f32 * 8.0, 150.0));
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(!h.state().hist_panel.counting(), "dab {i}: no count");
+        let now = shared_pixels(&h);
+        if now != last {
+            copies += 1;
+            last = now;
+        }
+    }
+    assert!(copies <= 1, "{copies} copies of the layer");
+    assert_eq!(
+        h.state().hist_panel.counts(),
+        Some(&before),
+        "the old one stays"
+    );
+    let end = screen(&h, 380.0, 150.0);
+    h.drop_at(end);
+    h.run_steps(1);
+    wait(&mut h, |a| {
+        a.hist_panel.counts() != Some(&before) && !a.hist_panel.counting()
+    });
+    wait(&mut h, |a| !a.navigator.busy());
+    assert!(h.state_mut().navigator_current());
+}
+
+#[test]
+fn panels_hidden_by_tab_or_full_screen_compute_nothing() {
+    for full in [false, true] {
+        let mut h = histogram_open(Tool::Brush);
+        h.state_mut().navigator.open = true;
+        counted(&mut h);
+        wait(&mut h, |a| a.navigator.ready() && !a.navigator.busy());
+        if full {
+            h.state_mut().set_screen_mode(workspace::ScreenMode::Full);
+        } else {
+            h.key_press(Key::Tab);
+        }
+        h.run_steps(2);
+        let d = h.state_mut().doc.as_mut().unwrap();
+        d.add_layer(
+            "x".into(),
+            image::RgbaImage::from_pixel(400, 300, image::Rgba(BLUE)),
+            (0, 0),
+        );
+        let before = h.state().hist_panel.counts().unwrap().clone();
+        h.run_steps(6);
+        assert!(!h.state().hist_panel.counting(), "full: {full}");
+        assert!(!h.state().navigator.busy(), "full: {full}");
+        assert_eq!(h.state().hist_panel.counts(), Some(&before));
+        // Shown again: up to date.
+        if full {
+            h.state_mut()
+                .set_screen_mode(workspace::ScreenMode::Standard);
+        } else {
+            h.key_press(Key::Tab);
+        }
+        wait(&mut h, |a| {
+            a.hist_panel.counts() != Some(&before) && !a.hist_panel.counting()
+        });
+    }
+}
+
+// The Navigator's box.
+
+/// Dragged to the corner of the window, the view stays on the image.
+#[test]
+fn the_navigator_box_cant_lose_the_image() {
+    let mut h = navigator_open([1400.0, 1000.0]);
+    h.state_mut().zoom = 2.0;
+    h.run_steps(3);
+    let r = thumb_rect(&h);
+    h.hover_at(r.center());
+    h.run_steps(1);
+    h.drag_at(r.center());
+    h.run_steps(1);
+    h.hover_at(pos2(0.0, 990.0));
+    h.run_steps(3);
+    let c = h.state().view_center().unwrap();
+    assert!((-1.0..=401.0).contains(&c.x), "{c:?}");
+    assert!((-1.0..=301.0).contains(&c.y), "{c:?}");
+    h.drop_at(pos2(0.0, 990.0));
+    h.run_steps(2);
+}
+
+#[test]
+fn the_view_box_stays_within_the_picture() {
+    let picture = Rect::from_min_size(pos2(10.0, 10.0), vec2(100.0, 50.0));
+    let upright = |a: Pos2, b: Pos2| [a, pos2(b.x, a.y), b, pos2(a.x, b.y)];
+    // A window wider than the image: no loose lines beyond the picture.
+    let wide = navigator::upright_box(upright(pos2(-40.0, 0.0), pos2(150.0, 70.0)), picture);
+    assert_eq!(wide, Some(picture));
+    let part = navigator::upright_box(upright(pos2(20.0, 20.0), pos2(500.0, 30.0)), picture);
+    assert_eq!(
+        part,
+        Some(Rect::from_min_max(pos2(20.0, 20.0), pos2(110.0, 30.0)))
+    );
+    // Turned: not a box of the picture.
+    let turned = [
+        pos2(50.0, 0.0),
+        pos2(100.0, 30.0),
+        pos2(50.0, 60.0),
+        pos2(0.0, 30.0),
+    ];
+    assert_eq!(navigator::upright_box(turned, picture), None);
+}
+
+/// Another document's image isn't stretched to this one's shape.
+#[test]
+fn the_navigator_shows_nothing_of_another_document() {
+    let mut h = navigator_open([1400.0, 1000.0]);
+    assert!(h.state().navigator.ready());
+    h.state_mut().doc = Some(Document::new(image::RgbaImage::new(50, 400), None));
+    h.run_steps(1);
+    assert!(!h.state().navigator.shows_document_of(doc(&h).uid()));
+    wait(&mut h, |a| {
+        a.navigator
+            .shows_document_of(a.doc.as_ref().map_or(0, |d| d.uid()))
+    });
+}
+
+// Info.
+
+#[test]
+fn info_shows_the_measure_with_the_ruler_only() {
+    let mut h = app(Tool::Brush);
+    h.state_mut().doc.as_mut().unwrap().ruler = Some(Measure {
+        vertex: (0.0, 0.0),
+        first: (30.0, 40.0),
+        second: None,
+    });
+    h.state_mut()
+        .run(Action::Workspace(workspace::Command::Info));
+    h.run_steps(3);
+    assert!(h.query_by_label("50").is_none(), "no line drawn");
+    h.state_mut().tool = Tool::Ruler;
+    h.run_steps(3);
+    assert!(h.query_all_by_label("50").next().is_some());
+}
+
+#[test]
+fn f_in_the_diagnostics_has_a_name() {
+    i18n::set_lang(Lang::En);
+    assert_eq!(
+        diagnostics::static_operation("Workspace(CycleScreenMode(false))"),
+        Some(t!("panels8-menu-screen-mode"))
+    );
+}
+/// Opened one after the other, none hides the others: each one's title bar
+/// can be reached, wherever the window leaves room.
+#[test]
+fn the_panels_opened_together_leave_each_title_in_reach() {
+    for size in [
+        [660.0, 500.0],
+        [1024.0, 700.0],
+        [1366.0, 768.0],
+        [1600.0, 900.0],
+    ] {
+        let mut h = app_sized(Tool::Brush, size);
+        for command in [
+            workspace::Command::Info,
+            workspace::Command::Histogram,
+            workspace::Command::Navigator,
+        ] {
+            h.state_mut().run(Action::Workspace(command));
+            h.run_steps(4);
+        }
+        for id in ["info", "histogram", "navigator"] {
+            on_screen(&h, id);
+            let r = h.ctx.memory(|m| m.area_rect(egui::Id::new(id))).unwrap();
+            let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new(id));
+            // (Its ✕ at the right end counts.)
+            let free = (0..=10).any(|i| {
+                let x = egui::lerp(r.left() + 6.0..=r.right() - 6.0, i as f32 / 10.0);
+                let at = pos2(x, r.top() + 12.0);
+                h.ctx.layer_id_at(at) == Some(layer)
+            });
+            assert!(free, "{id} at {size:?}: {r:?}");
+        }
+        if size[0] >= 1024.0 {
+            // Enough room: each shows most of itself.
+            let rects: Vec<Rect> = ["info", "histogram", "navigator"]
+                .map(|id| h.ctx.memory(|m| m.area_rect(egui::Id::new(id))).unwrap())
+                .to_vec();
+            for (i, a) in rects.iter().enumerate() {
+                for b in &rects[i + 1..] {
+                    let over = if a.intersects(*b) {
+                        a.intersect(*b).area()
+                    } else {
+                        0.0
+                    };
+                    assert!(
+                        over < a.area().min(b.area()) * 0.25,
+                        "{a:?} {b:?} at {size:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The inks read under the pointer follow the color settings at once.
+#[test]
+fn info_readings_depend_on_the_color_settings() {
+    let mut h = app(Tool::Brush);
+    let before = h.state().inks_key();
+    let bpc = h.state().color.settings.bpc;
+    h.state_mut().color.settings.bpc = !bpc;
+    assert_ne!(h.state().inks_key(), before);
 }

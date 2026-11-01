@@ -11,8 +11,10 @@ const MESSAGE_TIME: f64 = 5.0;
 const ERROR_TIME: f64 = 20.0;
 
 impl AtelierApp {
-    pub(super) fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let now = ui.input(|i| i.time);
+    /// How visible the last message is (0: gone), and whether it is an
+    /// error: wherever it shows, it lasts as long.
+    pub(super) fn status_fade(&mut self, ctx: &egui::Context) -> (f32, bool) {
+        let now = ctx.input(|i| i.time);
         if self.status != self.status_shown {
             self.status_shown = self.status.clone();
             self.status_since = now;
@@ -28,9 +30,13 @@ impl AtelierApp {
         // Repaints only when the message starts fading, then while it fades.
         if !self.status.is_empty() && alpha > 0.0 {
             let wait = (time - age).max(0.1);
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_secs_f64(wait));
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
+        (alpha, error)
+    }
+
+    pub(super) fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let (alpha, error) = self.status_fade(ui.ctx());
 
         let text = |ui: &mut egui::Ui, s: String, font: egui::FontId, color: Color32| {
             ui.label(egui::RichText::new(s).font(font).color(color));

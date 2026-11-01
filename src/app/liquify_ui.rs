@@ -1234,7 +1234,7 @@ fn brush_input(
         ws.line_from = Some(last);
         return;
     };
-    let samples = frame_samples(ctx, pointer);
+    let samples = frame_samples(ctx, pointer, view_turn::ViewTurn::default());
     let mut points: Vec<([f32; 2], Option<f32>)> = samples
         .into_iter()
         .map(|(p, force)| (to_mesh(p), force))

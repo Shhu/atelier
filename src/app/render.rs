@@ -268,6 +268,9 @@ pub(super) struct ShownPreview {
     /// When the mask is the target: `image` as the mask, and its canvas
     /// origin.
     pub(super) mask: Option<(Arc<image::GrayImage>, (i64, i64))>,
+    /// The image's canvas position, when not the layer's (a text or a shape
+    /// the result will enlarge).
+    pub(super) origin: Option<(i64, i64)>,
     /// That mask is the Quick Mask's: shown by its overlay, not on the
     /// layer.
     pub(super) quick_mask: bool,
@@ -283,6 +286,7 @@ impl ShownPreview {
             fingerprint: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             image: Arc::new(image),
             mask: None,
+            origin: None,
             quick_mask: false,
         }
     }
@@ -331,7 +335,7 @@ impl ShownPreview {
                 });
             }
             None => {
-                let origin = doc_offset;
+                let origin = self.origin.unwrap_or(doc_offset);
                 let image = &self.image;
                 opts.pixels = Some(compose::Preview {
                     layer,
@@ -809,6 +813,16 @@ impl AtelierApp {
         let visible: Vec<(i64, i64)> = if shown.is_positive() {
             rows.clone()
                 .flat_map(|ty| cols.clone().map(move |tx| (tx, ty)))
+                // A turned window's box holds corners not on screen.
+                .filter(|&t| {
+                    let turn = self.view_turn;
+                    (turn.angle == 0.0 && !turn.flipped)
+                        || self.rulers.canvas_area().is_none_or(|area| {
+                            let at = pos2((t.0 * tile) as f32, (t.1 * tile) as f32);
+                            let r = Rect::from_min_size(at, Vec2::splat(tile as f32));
+                            turn.shows(area.expand(1.0), view.rect_to_screen(r))
+                        })
+                })
                 .collect()
         } else {
             Vec::new()
@@ -1371,10 +1385,21 @@ impl AtelierApp {
         );
         opts.only = Some(i);
         let (display, lut) = self.color.shown();
+        let canvas = doc.full_rect();
+        let block_styles: Vec<_> = block
+            .clone()
+            .map(|j| {
+                crate::document::styles_of(&layers, j, canvas, opts.held, opts.later_styles)
+            })
+            .collect();
         // What it looks like, wherever it is.
         let key = hash_of((
             display,
             level,
+            block_styles
+                .iter()
+                .map(|s| s.as_ref().map(|s| s.version))
+                .collect::<Vec<_>>(),
             layers[block.clone()]
                 .iter()
                 .map(|l| {
@@ -1396,10 +1421,11 @@ impl AtelierApp {
         if slot.as_ref().is_none_or(|l| l.key != key) {
             let extent = layers[block.clone()]
                 .iter()
-                .filter(|l| !l.is_group())
-                .map(|l| {
-                    let styles = l.styles_shown(opts.held, opts.later_styles);
-                    l.extent_with(styles.as_deref()).unwrap_or(doc.full_rect())
+                .zip(&block_styles)
+                .filter_map(|(l, styles)| match l.is_group() {
+                    // Its layers count on their own, its styles reach beyond.
+                    true => l.styles_box(styles.as_deref()),
+                    false => Some(l.extent_with(styles.as_deref()).unwrap_or(canvas)),
                 })
                 .reduce(PixelRect::union)?;
             let b = 1i64 << level;
@@ -2141,6 +2167,16 @@ impl AtelierApp {
     /// Memory the display's copies of the documents take: reduced layers,
     /// tiles (also on the GPU), the Channels thumbnails' and the
     /// histograms' reductions, a layer lifted to be moved.
+    /// Tests: the tiles of the view, and the side of one in image pixels.
+    #[cfg(test)]
+    pub(super) fn tiles_held(&self) -> (Vec<(i64, i64)>, i64) {
+        let cv = self.canvas_view.as_ref().expect("a canvas");
+        (
+            cv.tiles.keys().copied().collect(),
+            (compose::TILE as i64) << cv.level,
+        )
+    }
+
     pub(super) fn display_bytes(&self) -> usize {
         let view = self.canvas_view.as_ref().map_or(0, CanvasView::bytes);
         let channels = self.channels.reduced.as_ref().map_or(0, |(_, c)| c.bytes());

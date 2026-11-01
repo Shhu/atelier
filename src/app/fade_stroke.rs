@@ -11,7 +11,7 @@ use super::filters_ui::{Job, active_target, cancellable_indicator};
 use super::*;
 use crate::actions::{MenuItem, Recorded};
 use crate::i18n::{Message, t, tm};
-use crate::pixel_ops::{AutoMode, Fade, StrokeLocation, StrokeSettings};
+use crate::pixel_ops::{AutoMode, Fade, StrokeLocation, StrokeSettings, auto_levels_within};
 
 pub(super) const SHORTCUT_FADE: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::F);
@@ -121,10 +121,9 @@ impl AtelierApp {
             return;
         };
         let job = Job::spawn(&self.ctx, 0, [0; 4], Some(format!("Auto {mode:?}")), move || {
-            target.process(0, |image, _| {
-                let levels = crate::pixel_ops::auto_levels(image, mode);
-                crate::pixel_ops::levels(image, &levels);
-            })
+            // Measured on the selected pixels, not the selection's box.
+            let levels = auto_levels_within(&target.image, target.clip.as_ref(), mode);
+            target.process(0, |image, _| crate::pixel_ops::levels(image, &levels))
         });
         self.start_processing(Work::Auto(mode), job);
     }
@@ -132,17 +131,22 @@ impl AtelierApp {
     /// Edit › Fade: its window, on what can be faded.
     pub(super) fn open_fade(&mut self) {
         let Some(doc) = &mut self.doc else { return };
-        match doc.fade_source() {
+        match doc.fade_source(self.selection.as_ref()) {
             Some(fade) => self.filters.fade = Some(FadeDialog { fade, preview: true }),
-            None => self.status = t!("adjust8-why-no-fade"),
+            None => self.status = t!("adjust9-why-no-fade"),
         }
     }
 
     /// The last result faded at once (an action played).
     pub(super) fn fade_with(&mut self, opacity: f32, mode: BlendMode) -> Result<(), String> {
-        let fade = self.doc.as_mut().and_then(Document::fade_source);
+        // The command before it changed nothing on this image.
+        if self.doc.as_ref().is_some_and(Document::fade_of_nothing) {
+            return Ok(());
+        }
+        let selection = self.selection.as_ref();
+        let fade = self.doc.as_mut().and_then(|d| d.fade_source(selection));
         let Some(fade) = fade else {
-            return Err(t!("adjust8-why-no-fade"));
+            return Err(t!("adjust9-why-no-fade"));
         };
         self.apply_fade(Fade {
             opacity,
@@ -249,13 +253,26 @@ impl AtelierApp {
         }
     }
 
+    /// Whether the target has pixels a stroke can go on (a text or shape
+    /// layer: rasterized first).
+    pub(super) fn can_stroke(&self) -> bool {
+        self.doc
+            .as_ref()
+            .is_some_and(|d| d.quick_mask().is_some() || d.can_paint())
+    }
+
     /// Edit › Stroke: its window, as it was last used.
     pub(super) fn open_stroke(&mut self) {
         if self.smart_filters_apply() {
             return self.refuse_on_smart();
         }
-        if self.doc.is_some() {
+        if self.doc.is_none() {
+            return;
+        }
+        if self.can_stroke() {
             self.filters.stroke_open = true;
+        } else {
+            self.status = t!("filter-no-pixels");
         }
     }
 
@@ -457,7 +474,9 @@ impl AtelierApp {
             Work::Auto(mode) => {
                 let same = doc.target_layer().is_some_and(|l| *l.image() == image);
                 let name = auto_title(*mode);
-                if !same && doc.put_processed_active(name.clone(), image) {
+                if same {
+                    doc.mark_fade_nothing();
+                } else if doc.put_processed_active(name.clone(), image) {
                     doc.mark_fade();
                     self.status = t!("dialog-adjust-applied", name = name.as_str());
                 }
@@ -471,14 +490,35 @@ impl AtelierApp {
             }
             Work::Fade(fade) => self.put_fade(fade, image),
             Work::Stroke(s) => {
-                doc.active_layer_mut().replace_pixels(image);
-                doc.end_paint();
-                doc.mark_fade();
-                self.status = t!("adjust8-stroke-title");
+                if *doc.active_layer().image() == image {
+                    doc.end_paint();
+                    doc.discard_step();
+                    doc.mark_fade_nothing();
+                    let soft = self.selection.as_ref().is_some_and(barely_selected);
+                    self.status = if soft {
+                        t!("adjust9-stroke-soft")
+                    } else {
+                        t!("adjust9-stroke-nothing")
+                    };
+                } else {
+                    doc.active_layer_mut().replace_pixels(image);
+                    doc.end_paint();
+                    doc.mark_fade_changed();
+                    self.status = t!("adjust8-stroke-title");
+                }
                 self.record(recorded_stroke(s));
             }
         }
     }
+}
+
+/// No pixel is more than 50% selected: a selection without an edge to stroke.
+fn barely_selected(selection: &Selection) -> bool {
+    !selection.inverted
+        && selection
+            .mask
+            .as_ref()
+            .is_some_and(|m| m.as_raw().iter().all(|&v| v < 128))
 }
 
 fn recorded_fade(fade: &Fade) -> Recorded {

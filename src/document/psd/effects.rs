@@ -328,7 +328,7 @@ pub fn write(e: &Effects) -> Option<Descriptor> {
     let p = &e.pattern_overlay;
     if p.enabled {
         let d = base(b"patternFill", p.blend).with(b"Opct", percent(p.opacity as f64 * 100.0));
-        fx = fx.with(b"patternFill", Value::Object(fill_items(&p.fill, d)));
+        fx = fx.with(b"patternFill", Value::Object(fill_items(&p.fill, d, b"Algn")));
     }
     let s = &e.stroke;
     if s.enabled {

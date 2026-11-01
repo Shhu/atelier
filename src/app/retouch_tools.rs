@@ -983,6 +983,12 @@ impl AtelierApp {
         });
     }
 
+    /// Tests: a fill or heal is still computed on another thread.
+    #[cfg(test)]
+    pub(super) fn retouch_running(&self) -> bool {
+        self.retouch.job.is_some() || self.stroke.is_some()
+    }
+
     /// The fill just started is a tool's stroke (see `FillJob::stroke`).
     fn stroke_job(&mut self) {
         if let Some(job) = &mut self.retouch.job {

@@ -25,6 +25,11 @@ pub(super) struct Navigator {
     /// The thumbnail and what it shows.
     shown: Option<(u64, TextureHandle)>,
     job: Option<(u64, JoinHandle<RgbaImage>)>,
+    /// The document of the thumbnail, of the one being made: another tab's
+    /// image isn't shown in this one's shape.
+    shown_doc: u64,
+    job_doc: u64,
+    settle: histogram_panel::Settle,
     /// A drag of the view box: from the view's center, in image pixels.
     grab: Option<Vec2>,
     /// Where the picture is on screen (for the tests).
@@ -36,6 +41,16 @@ impl Navigator {
     #[cfg(test)]
     pub(super) fn ready(&self) -> bool {
         self.shown.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn shows_document_of(&self, uid: u64) -> bool {
+        self.shown.is_some() && self.shown_doc == uid
     }
 
     #[cfg(test)]
@@ -78,6 +93,23 @@ fn make_thumbnail(layers: &[Layer], canvas: PixelRect, held: bool) -> RgbaImage 
     image::imageops::thumbnail(&image, w, h)
 }
 
+/// The view box when its sides are along the picture's, kept within it: its
+/// parts beyond would float around the picture as loose lines.
+pub(super) fn upright_box(corners: [Pos2; 4], picture: Rect) -> Option<Rect> {
+    let [a, b, _, d] = corners;
+    let along = |p: Pos2, q: Pos2| (p.x - q.x).abs() < 0.01 || (p.y - q.y).abs() < 0.01;
+    if !along(a, b) || !along(a, d) {
+        return None;
+    }
+    let r = Rect::from_points(&corners).intersect(picture);
+    Some(if r.is_positive() {
+        r
+    } else {
+        // Wholly off the picture: a line on the side it left by.
+        Rect::from_points(&corners.map(|c| picture.clamp(c)))
+    })
+}
+
 impl AtelierApp {
     /// The thumbnail shows the document as it is now (for the tests).
     #[cfg(test)]
@@ -116,6 +148,7 @@ impl AtelierApp {
             let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
             let texture = ctx.load_texture("navigator", color, TextureOptions::LINEAR);
             nav.shown = Some((made_for, texture));
+            nav.shown_doc = nav.job_doc;
         }
         if nav.shown.as_ref().is_some_and(|s| s.0 == key) {
             return;
@@ -124,6 +157,11 @@ impl AtelierApp {
         if nav.job.is_some() {
             return;
         }
+        let other_doc = nav.shown_doc != doc.uid();
+        if !nav.settle.ready(ctx, key, nav.shown.is_none() || other_doc) {
+            return;
+        }
+        nav.job_doc = doc.uid();
         let layers = doc.render_layers().to_vec();
         let (canvas, held) = (doc.full_rect(), doc.effects_held());
         let job = std::thread::Builder::new()
@@ -135,13 +173,18 @@ impl AtelierApp {
     }
 
     pub(super) fn navigator_window(&mut self, ctx: &egui::Context) {
-        if !self.navigator.open || self.doc.is_none() {
+        // (Hidden by Tab or Full Screen: nothing to compute for.)
+        if !self.navigator.open || self.doc.is_none() || !self.chrome_shown() {
+            self.navigator.grab = None;
             return;
         }
         self.update_thumbnail(ctx);
         let Some(doc) = &self.doc else { return };
         let (w, h) = (doc.width() as f32, doc.height() as f32);
-        let texture = self.navigator.shown.as_ref().map(|s| s.1.id());
+        let nav = &self.navigator;
+        let texture = (nav.shown_doc == doc.uid())
+            .then(|| nav.shown.as_ref().map(|s| s.1.id()))
+            .flatten();
         let (view, area) = (self.last_view, self.rulers.canvas_area());
         let turn = self.view_turn;
         let mut zoom = self.zoom;
@@ -178,6 +221,13 @@ impl AtelierApp {
                     ui.id().with("navigator-image"),
                     Sense::click_and_drag(),
                 );
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Image,
+                        true,
+                        t!("ui9-navigator-image"),
+                    )
+                });
                 let painter = ui.painter_at(band);
                 painter.rect_filled(rect, 0.0, ui_kit::color::BG0);
                 if let Some(texture) = texture {
@@ -195,11 +245,18 @@ impl AtelierApp {
                     .map(|c| view.to_image(turn.to_upright(c)))
                 });
                 if let Some(corners) = box_corners {
-                    let thumb = corners.map(to_thumb).to_vec();
-                    painter.add(egui::Shape::closed_line(
-                        thumb,
-                        UiStroke::new(1.5, Color32::from_rgb(240, 60, 60)),
-                    ));
+                    let stroke = UiStroke::new(1.5, Color32::from_rgb(240, 60, 60));
+                    let thumb = corners.map(to_thumb);
+                    match upright_box(thumb, rect) {
+                        Some(part) => {
+                            painter.rect_stroke(part, 0.0, stroke, egui::StrokeKind::Middle);
+                        }
+                        // Turned: what of its sides is over the picture.
+                        None => {
+                            ui.painter_at(rect.expand(1.0))
+                                .add(egui::Shape::closed_line(thumb.to_vec(), stroke));
+                        }
+                    }
                 }
                 let pointer = response.interact_pointer_pos();
                 if let Some(p) = pointer {
@@ -217,8 +274,10 @@ impl AtelierApp {
                             _ => Vec2::ZERO,
                         });
                     }
+                    // The view's center stays over the image.
                     if let Some(g) = grab {
-                        target = Some(at - g);
+                        let c = at - g;
+                        target = Some(pos2(c.x.clamp(0.0, w), c.y.clamp(0.0, h)));
                     }
                 }
                 if !response.is_pointer_button_down_on() {

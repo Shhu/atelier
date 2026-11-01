@@ -9,11 +9,13 @@ use image::RgbaImage;
 use super::dialogs::{DialogSpec, floating_dialog, gap_between_blocks};
 use super::*;
 use crate::compose::pattern::{Pattern, PatternFill, SCALE_RANGE};
-use crate::patterns::Library;
+use crate::patterns::{Added, Change, Library, Loaded, Saver};
 
 /// Edit › Define Pattern…: its tile, computed on another thread, and name.
 pub(super) struct DefineDialog {
     name: String,
+    /// Played by an action, without showing the dialog.
+    quiet: bool,
     job: Option<Receiver<Option<Arc<Pattern>>>>,
     tile: Option<Arc<Pattern>>,
 }
@@ -42,6 +44,12 @@ impl RenameDialog {
     }
 }
 
+/// Delete Pattern asks first: nothing brings a pattern back.
+pub(super) struct DeleteDialog {
+    id: u64,
+    name: String,
+}
+
 /// What a picker asks of the library, handled at the next frame.
 #[derive(Clone, Copy)]
 enum Request {
@@ -54,11 +62,14 @@ enum Request {
 pub(super) struct PatternState {
     pub(super) library: Library,
     /// The user's patterns being read at startup.
-    loading: Option<Receiver<Vec<Arc<Pattern>>>>,
+    loading: Option<Receiver<Loaded>>,
+    /// The library's changes on their way to the disk.
+    saver: Saver,
     /// The last one chosen: the first offered next time.
     pub(super) last: u64,
     pub(super) define: Option<DefineDialog>,
     pub(super) rename: Option<RenameDialog>,
+    pub(super) delete: Option<DeleteDialog>,
 }
 
 fn list_id() -> egui::Id {
@@ -116,17 +127,26 @@ pub(super) fn pattern_picker(ui: &mut egui::Ui, current: &mut Arc<Pattern>) -> b
     let builtin = crate::patterns::BUILTIN_COUNT;
     let mut chosen = None;
     let label = t!("pattern8-pattern");
+    // A built-in pattern is named in the current language, whichever it was
+    // given in.
+    let position = list.iter().position(|p| p.id == current.id);
+    let shown = match position {
+        Some(i) if i < builtin => list[i].name.clone(),
+        _ => current.name.clone(),
+    };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
         paint_tile(ui.painter(), rect, current, 4.0);
         let width = (ui.available_width() - 8.0).max(40.0);
-        ui_kit::combo(
+        // Stays open on a right click, for the menu of a tile.
+        ui_kit::combo_closing(
             ui,
             ("pattern_picker", ui.id()),
             Some(&label),
-            &current.name,
+            &shown,
             width,
+            egui::PopupCloseBehavior::CloseOnClickOutside,
             |ui| {
                 ui.set_min_width(width.max(220.0));
                 ui.horizontal_wrapped(|ui| {
@@ -135,25 +155,13 @@ pub(super) fn pattern_picker(ui: &mut egui::Ui, current: &mut Arc<Pattern>) -> b
                     let extra = (!known).then(|| current.clone());
                     for (i, p) in extra.iter().chain(list.iter()).enumerate() {
                         let user = known && i >= builtin || !known && i > builtin;
-                        let response = tile(ui, p, p.id == current.id);
+                        let response = tile(ui, p, p.id == current.id, user);
                         if response.clicked() {
                             chosen = Some(p.clone());
                             ui.close();
                         }
                         if user {
-                            response.context_menu(|ui| {
-                                let ask = |ui: &egui::Ui, r: Request| {
-                                    ui.data_mut(|d| d.insert_temp(request_id(), Some(r)));
-                                };
-                                if ui.button(t!("pattern8-rename")).clicked() {
-                                    ask(ui, Request::Rename(p.id));
-                                    ui.close();
-                                }
-                                if ui.button(t!("pattern8-delete")).clicked() {
-                                    ask(ui, Request::Delete(p.id));
-                                    ui.close();
-                                }
-                            });
+                            tile_menu(ui, &response, p.id);
                         }
                     }
                 });
@@ -169,8 +177,41 @@ pub(super) fn pattern_picker(ui: &mut egui::Ui, current: &mut Arc<Pattern>) -> b
     }
 }
 
+/// The menu of a tile, on a right click. Not a context menu: egui opens one
+/// popup at a time, and that would close the picker it is in.
+fn tile_menu(ui: &mut egui::Ui, response: &egui::Response, id: u64) {
+    let key = egui::Id::new("pattern_tile_menu");
+    if response.secondary_clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        ui.data_mut(|d| d.insert_temp(key, (id, pos)));
+    }
+    let open = ui.data(|d| d.get_temp::<(u64, Pos2)>(key));
+    let Some((_, pos)) = open.filter(|&(which, _)| which == id) else {
+        return;
+    };
+    let mut still = true;
+    egui::Popup::new(key, ui.ctx().clone(), pos, ui.layer_id())
+        .open_bool(&mut still)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+        .show(|ui| {
+            let ask = |ui: &egui::Ui, r: Request| {
+                ui.data_mut(|d| d.insert_temp(request_id(), Some(r)));
+            };
+            if ui.button(t!("pattern8-rename")).clicked() {
+                ask(ui, Request::Rename(id));
+            }
+            if ui.button(t!("pattern8-delete")).clicked() {
+                ask(ui, Request::Delete(id));
+            }
+        });
+    if !still {
+        ui.data_mut(|d| d.remove_temp::<(u64, Pos2)>(key));
+    }
+}
+
 /// A pattern in the grid.
-fn tile(ui: &mut egui::Ui, p: &Pattern, selected: bool) -> egui::Response {
+fn tile(ui: &mut egui::Ui, p: &Pattern, selected: bool, user: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
     paint_tile(ui.painter(), rect, p, 4.0);
     let line = if selected {
@@ -183,7 +224,11 @@ fn tile(ui: &mut egui::Ui, p: &Pattern, selected: bool) -> egui::Response {
     ui.painter()
         .rect_stroke(rect, 4.0, line, StrokeKind::Inside);
     ui_kit::name_control(ui, response.id, &p.name, "");
-    response.on_hover_text(&p.name)
+    if user {
+        response.on_hover_text(t!("pattern9-tile-tip", name = p.name.as_str()))
+    } else {
+        response.on_hover_text(&p.name)
+    }
 }
 
 /// The picker for a choice kept as an id (Fill…): the first one if unknown.
@@ -204,8 +249,15 @@ pub(super) fn pattern_fill_fields(ui: &mut egui::Ui, f: &mut PatternFill) {
     let half = (ui.available_width() - 8.0) / 2.0;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        ui_kit::number_field(ui, icon::ANGLE, &mut f.angle, -180.0..=180.0, "°", half)
-            .on_hover_text(t!("core-gradient-angle-tip"));
+        ui_kit::glyph_number_field(
+            ui,
+            icon::ANGLE,
+            &t!("core-gradient-angle-tip"),
+            &mut f.angle,
+            -180.0..=180.0,
+            "°",
+            half,
+        );
         let mut scale = (f.scale * 100.0).round();
         let unit = i18n::percent("");
         let range = SCALE_RANGE.start() * 100.0..=SCALE_RANGE.end() * 100.0;
@@ -213,6 +265,31 @@ pub(super) fn pattern_fill_fields(ui: &mut egui::Ui, f: &mut PatternFill) {
         if ui_kit::number_field(ui, &label, &mut scale, range, &unit, half).changed() {
             f.scale = scale / 100.0;
         }
+    });
+    // Where the tile starts, from the layer or the document.
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let range =
+            -(crate::document::MAX_DIMENSION as f32)..=crate::document::MAX_DIMENSION as f32;
+        let tip = t!("pattern9-offset-tip");
+        ui_kit::number_field(
+            ui,
+            &t!("pattern9-offset-x"),
+            &mut f.phase.0,
+            range.clone(),
+            "px",
+            half,
+        )
+        .on_hover_text(&tip);
+        ui_kit::number_field(
+            ui,
+            &t!("pattern9-offset-y"),
+            &mut f.phase.1,
+            range,
+            "px",
+            half,
+        )
+        .on_hover_text(&tip);
     });
     ui_kit::checkbox(ui, &mut f.linked, &t!("pattern8-link"))
         .on_hover_text(t!("pattern8-link-tip"));
@@ -251,25 +328,18 @@ impl AtelierApp {
         self.patterns.loading = Some(recv);
     }
 
-    fn save_patterns(&self) {
-        if cfg!(test) {
-            return;
-        }
-        static SAVING: Mutex<()> = Mutex::new(());
-        let user = self.patterns.library.user_patterns();
-        std::thread::spawn(move || {
-            let _guard = SAVING.lock();
-            if let Err(e) = Library::save(&user, &crate::patterns::folder()) {
-                crate::diag::warn(format!("pattern library not saved: {e}"));
-            }
-        });
-    }
-
     /// What pickers read and asked for; once per frame, before the panels.
     pub(super) fn patterns_frame(&mut self, ctx: &egui::Context) {
         if let Some(job) = &self.patterns.loading {
             match job.try_recv() {
                 Ok(read) => {
+                    if let Some(backup) = &read.set_aside {
+                        self.status = t!("pattern9-status-index-damaged", backup = backup.as_str());
+                        crate::diag::warn(format!("pattern index damaged, set aside: {backup}"));
+                    } else if read.left_out > 0 {
+                        self.status = t!("pattern9-status-left-out", count = read.left_out);
+                        crate::diag::warn(format!("{} patterns not read", read.left_out));
+                    }
                     self.patterns.library.merge(read);
                     self.patterns.loading = None;
                 }
@@ -277,6 +347,10 @@ impl AtelierApp {
                 Err(TryRecvError::Empty) => {}
             }
         }
+        if let Some(error) = self.patterns.saver.error() {
+            self.status = t!("pattern9-status-not-saved", error = error);
+        }
+        self.patterns.library.follow_language();
         let asked = ctx.data_mut(|d| d.remove_temp::<Option<Request>>(request_id()));
         match asked.flatten() {
             Some(Request::Rename(id)) => {
@@ -287,8 +361,14 @@ impl AtelierApp {
                     });
                 }
             }
-            Some(Request::Delete(id)) if self.patterns.library.remove(id) => self.save_patterns(),
-            Some(Request::Delete(_)) => {}
+            Some(Request::Delete(id)) => {
+                if let Some(p) = self.patterns.library.get(id) {
+                    self.patterns.delete = Some(DeleteDialog {
+                        id,
+                        name: p.name.clone(),
+                    });
+                }
+            }
             None => {}
         }
         let list = Arc::new(self.patterns.library.items.clone());
@@ -313,8 +393,12 @@ impl AtelierApp {
         if self.in_quick_mask() {
             return Some(t!("pattern8-why-quick-mask"));
         }
-        match &self.selection {
-            Some(s) if s.mask.is_some() || s.inverted => Some(t!("pattern8-why-rectangle")),
+        match (&self.selection, &self.doc) {
+            (Some(s), _) if s.mask.is_some() || s.inverted => Some(t!("pattern8-why-rectangle")),
+            // Nothing selected on the canvas isn't the same as no selection.
+            (Some(s), Some(doc)) if s.bounds(doc.full_rect()).is_none() => {
+                Some(t!("pattern8-status-empty"))
+            }
             _ => None,
         }
     }
@@ -326,6 +410,7 @@ impl AtelierApp {
             return;
         }
         let Some(doc) = &self.doc else { return };
+        // (Not on the canvas: refused above.)
         let area = self
             .selection
             .as_ref()
@@ -339,14 +424,25 @@ impl AtelierApp {
         let number = self.patterns.library.user_patterns().len() + 1;
         self.patterns.define = Some(DefineDialog {
             name: t!("pattern8-default-name", number = number),
+            quiet: false,
             job: Some(recv),
             tile: None,
         });
     }
 
+    /// The dialog just opened by an action's step: under the recorded name,
+    /// `quiet` without showing it.
+    pub(super) fn define_as(&mut self, name: &str, quiet: bool) {
+        if let Some(d) = &mut self.patterns.define {
+            d.name = name.to_owned();
+            d.quiet = quiet;
+        }
+    }
+
     pub(super) fn pattern_windows(&mut self, ctx: &egui::Context) {
         self.define_pattern_window(ctx);
         self.rename_pattern_window(ctx);
+        self.delete_pattern_window(ctx);
     }
 
     fn define_pattern_window(&mut self, ctx: &egui::Context) {
@@ -360,13 +456,25 @@ impl AtelierApp {
                     d.job = None;
                 }
                 Ok(None) | Err(TryRecvError::Disconnected) => {
-                    self.status = t!("pattern8-status-empty");
+                    let text = t!("pattern8-status-empty");
+                    if d.quiet {
+                        self.actions
+                            .step_stopped(actions_panel::Stopped::Failed(text.clone()));
+                    }
+                    self.status = text;
                     return;
                 }
                 Err(TryRecvError::Empty) => ctx.request_repaint(),
             }
         }
         let ready = d.tile.is_some() && !d.name.trim().is_empty();
+        if d.quiet {
+            match d.tile.take() {
+                Some(tile) => self.define_tile(&tile, d.name.trim()),
+                None => self.patterns.define = Some(d),
+            }
+            return;
+        }
         let out = floating_dialog(
             ctx,
             DialogSpec {
@@ -393,16 +501,31 @@ impl AtelierApp {
         if out.ok
             && let Some(tile) = d.tile.take()
         {
-            let p = tile.renamed(d.name.trim());
-            self.patterns.last = p.id;
-            self.status = t!("pattern8-status-defined", name = p.name.as_str());
-            if self.patterns.library.add(p) {
-                self.save_patterns();
-            }
+            let name = d.name.trim();
+            self.define_tile(&tile, name);
+            self.record(crate::actions::Recorded::DefinePattern {
+                name: name.to_owned(),
+            });
             return;
         }
         if !(out.cancel || out.ok) {
             self.patterns.define = Some(d);
+        }
+    }
+
+    /// The tile goes in the library under `name`, unless it is already there.
+    fn define_tile(&mut self, tile: &Pattern, name: &str) {
+        let p = tile.renamed(name);
+        self.patterns.last = p.id;
+        match self.patterns.library.add(p.clone()) {
+            Added::New => {
+                self.status = t!("pattern8-status-defined", name = p.name.as_str());
+                let file = self.patterns.library.file_for(p.id);
+                self.patterns.saver.send(Change::Add { file, pattern: p });
+            }
+            Added::Already(name) => {
+                self.status = t!("pattern9-status-already", name = name);
+            }
         }
     }
 
@@ -427,11 +550,45 @@ impl AtelierApp {
             },
         );
         if out.ok {
-            if self.patterns.library.rename(d.id, d.name.trim()) {
-                self.save_patterns();
+            let name = d.name.trim();
+            if self.patterns.library.rename(d.id, name) {
+                let file = self.patterns.library.file_for(d.id);
+                self.patterns.saver.send(Change::Rename {
+                    file,
+                    name: name.to_owned(),
+                });
             }
         } else if !out.cancel {
             self.patterns.rename = Some(d);
+        }
+    }
+
+    fn delete_pattern_window(&mut self, ctx: &egui::Context) {
+        let Some(d) = self.patterns.delete.take() else {
+            return;
+        };
+        let out = floating_dialog(
+            ctx,
+            DialogSpec {
+                pivot: egui::Align2::CENTER_CENTER,
+                ok: t!("pattern9-delete-ok"),
+                ..DialogSpec::new(
+                    "delete_pattern",
+                    t!("pattern9-delete-title"),
+                    ctx.content_rect().center(),
+                )
+            },
+            |ui| {
+                ui.label(t!("pattern9-delete-question", name = d.name.as_str()));
+            },
+        );
+        if out.ok {
+            let file = self.patterns.library.file_for(d.id);
+            if self.patterns.library.remove(d.id) {
+                self.patterns.saver.send(Change::Remove { file });
+            }
+        } else if !out.cancel {
+            self.patterns.delete = Some(d);
         }
     }
 
@@ -448,6 +605,7 @@ impl AtelierApp {
         let selection = self.selection.as_ref();
         let done = doc.fill_active_pattern(&pattern, selection, opacity, preserve);
         if done {
+            doc.mark_fade();
             self.status = t!(
                 "status-filled",
                 name = doc.active_layer().name.as_str(),

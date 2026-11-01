@@ -433,15 +433,27 @@ impl RenderJob {
         self
     }
 
+    /// Top-left corner of all the object covers, in the canvas.
+    fn covered_corner(&self) -> Option<(i64, i64)> {
+        let (w, h) = self.flat.dimensions();
+        let b = self.t.bounds([0.0, 0.0, w as f64, h as f64])?;
+        let g = Grid::covering(b, 1.0);
+        Some((g.x, g.y))
+    }
+
     pub fn run(self) -> SmartRender {
         let (base, origin) = self.base();
         let base = Arc::new(base);
+        // What filters anchor (noise, ripples, mosaic cells) belongs to the
+        // object: it looks the same wherever it is moved.
+        let corner = self.covered_corner().unwrap_or(origin);
+        let within = (origin.0 - corner.0, origin.1 - corner.1);
         let filtered = match self.filters.is_empty() {
             true => Arc::clone(&base),
             false => {
                 let mut image = (*base).clone();
                 for f in &self.filters {
-                    apply_filter(&mut image, f, origin);
+                    apply_filter(&mut image, f, within);
                 }
                 Arc::new(image)
             }
@@ -511,7 +523,7 @@ fn grid_rect(g: Grid) -> PixelRect {
     }
 }
 
-/// `f` applied to `image` (at `origin` in the canvas), blended with it by
+/// `f` applied to `image` (at `origin` in the object), blended with it by
 /// its mode and opacity.
 fn apply_filter(image: &mut RgbaImage, f: &SmartFilter, origin: (i64, i64)) {
     let mut out = image.clone();
@@ -988,7 +1000,12 @@ impl Document {
         let bounds = tops
             .iter()
             .flat_map(|r| r.clone())
-            .map(|i| self.layers[i].extent(false).unwrap_or(canvas))
+            .map(|i| {
+                let l = &self.layers[i];
+                let styles = super::styles_of(&self.layers, i, canvas, false, false);
+                let e = l.extent_with(styles.as_deref()).unwrap_or(canvas);
+                l.with_styles_extent(e, styles.as_deref())
+            })
             .filter(|r| r.w > 0 && r.h > 0)
             .reduce(PixelRect::union)
             .unwrap_or(canvas);
@@ -1007,12 +1024,16 @@ impl Document {
         let below: usize = tops[..tops.len() - 1].iter().map(|r| r.len()).sum();
         let at = top.start - below;
         let single = moved.len() == 1;
+        // The contents keep their layers' locks; Lock Position is the one
+        // that also means something outside.
+        let position = moved.iter().any(|l| l.locks.position);
         let mut smart = self.make_layer(
             top_layer.name.clone(),
             RgbaImage::new(0, 0),
             (bounds.x, bounds.y),
         );
         smart.depth = top_layer.depth;
+        smart.locks.position = position;
         if single {
             let l = &mut moved[0];
             (smart.visible, smart.opacity, smart.blend) = (l.visible, l.opacity, l.blend);
@@ -1045,10 +1066,7 @@ impl Document {
         }
         self.checkpoint(t!("smart-menu-new-via-copy"));
         self.next_id += 1;
-        let mut copy = Layer {
-            id: self.next_id,
-            ..self.active_layer().clone()
-        };
+        let mut copy = self.active_layer().copy_as(self.next_id);
         copy.name = self.copy_name(&copy.name);
         if let Some(s) = copy.smart.as_deref_mut() {
             s.contents.id = next_rev();
@@ -1422,6 +1440,15 @@ impl Document {
         Some(s.job(s.transform(l.offset), l.offset, self.shape_limit()))
     }
 
+    /// Where the pixels of smart object `i` are in the object (what its
+    /// filters are anchored to, see [`RenderJob::run`]).
+    pub fn smart_filter_origin(&self, i: usize) -> Option<(i64, i64)> {
+        let l = self.layers.get(i)?;
+        let job = self.smart_preview_job(i, |_| {})?;
+        let corner = job.covered_corner()?;
+        Some((l.offset.0 - corner.0, l.offset.1 - corner.1))
+    }
+
     /// What smart filter `k` of smart object `i` filters (`None`: a new
     /// one, on top): the rendering through the filters below it, before
     /// their mask.
@@ -1705,7 +1732,7 @@ mod tests {
         let filtered = |filters: &[Filter]| {
             let mut image = original.clone();
             for f in filters {
-                f.apply(&mut image, (20, 10));
+                f.apply(&mut image, (0, 0));
             }
             image
         };
@@ -1767,7 +1794,7 @@ mod tests {
             s.filters = vec![SmartFilter::new(Filter::Mosaic { cell: 8.0 })]
         });
         let mut full = original.clone();
-        Filter::Mosaic { cell: 8.0 }.apply(&mut full, (20, 10));
+        Filter::Mosaic { cell: 8.0 }.apply(&mut full, (0, 0));
         assert!(doc.add_filter_mask(1, None));
         doc.target_filter_mask(true);
         assert!(doc.filter_mask_targeted() && doc.can_paint());

@@ -112,6 +112,9 @@ struct Manifest {
     active: usize,
     /// From the bottom up.
     layers: Vec<LayerEntry>,
+    /// Pixels per inch, horizontally and vertically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolution: Option<(f64, f64)>,
     /// Ruler guides.
     #[serde(default)]
     guides: Vec<GuideEntry>,
@@ -520,6 +523,10 @@ struct PatternEntry {
 #[derive(Serialize, Deserialize)]
 struct PatternFillEntry {
     pattern: String,
+    /// What this use calls the tile, when it isn't the document's entry
+    /// (the same tile can have two names).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     scale: f32,
     angle: f32,
     linked: bool,
@@ -537,10 +544,13 @@ struct PatternFxEntry {
 fn pattern_fill_entry(f: &PatternFill) -> PatternFillEntry {
     PatternFillEntry {
         pattern: format!("{:016x}", f.pattern.id),
-        scale: f.scale,
-        angle: f.angle,
+        name: Some(f.pattern.name.clone()),
+        // A number that isn't one (from a damaged file) would make a
+        // document that can't be opened.
+        scale: finite_or(f.scale, 1.0),
+        angle: finite_or(f.angle, 0.0),
         linked: f.linked,
-        phase: f.phase,
+        phase: (finite_or(f.phase.0, 0.0), finite_or(f.phase.1, 0.0)),
     }
 }
 
@@ -549,8 +559,12 @@ fn pattern_fill_of(
     e: &PatternFillEntry,
     patterns: &std::collections::HashMap<String, Arc<Pattern>>,
 ) -> Result<PatternFill, FileError> {
+    let mut pattern = patterns.get(&e.pattern).ok_or(FileError::Damaged)?.clone();
+    if let Some(name) = e.name.as_ref().filter(|n| **n != pattern.name) {
+        pattern = pattern.renamed(name.clone());
+    }
     Ok(PatternFill {
-        pattern: patterns.get(&e.pattern).ok_or(FileError::Damaged)?.clone(),
+        pattern,
         scale: finite_or(e.scale, 1.0).clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end()),
         angle: finite_or(e.angle, 0.0),
         linked: e.linked,
@@ -1042,7 +1056,8 @@ pub(super) fn write(
             _ => None,
         };
         let fx = &layer.effects.pattern_overlay;
-        for f in kind.into_iter().chain(fx.enabled.then_some(&fx.fill)) {
+        let overlay = fx.in_use().then_some(&fx.fill);
+        for f in kind.into_iter().chain(overlay) {
             let id = format!("{:016x}", f.pattern.id);
             if patterns.iter().all(|p| p.id != id) {
                 let image = format!("patterns/{id}.png");
@@ -1063,6 +1078,7 @@ pub(super) fn write(
         version: VERSION,
         width: doc.width(),
         height: doc.height(),
+        resolution: doc.file_metadata.image.as_ref().and_then(|m| m.density),
         active: doc.active,
         layers: entries,
         patterns,
@@ -1540,11 +1556,10 @@ fn layer_entry(layer: &super::Layer, image: Option<String>) -> LayerEntry {
             opacity: fx.color_overlay.opacity,
             blend: blend_entry(fx.color_overlay.blend),
         }),
-        // The default, unused one needs no tile in the file.
-        pattern_overlay: fx.pattern_overlay.enabled.then(|| PatternFxEntry {
-            enabled: true,
+        pattern_overlay: fx.pattern_overlay.in_use().then(|| PatternFxEntry {
+            enabled: fx.pattern_overlay.enabled,
             fill: pattern_fill_entry(&fx.pattern_overlay.fill),
-            opacity: fx.pattern_overlay.opacity,
+            opacity: finite_or(fx.pattern_overlay.opacity, 1.0),
             blend: blend_entry(fx.pattern_overlay.blend),
         }),
         gradient_overlay: Some(GradientFxEntry {
@@ -1753,6 +1768,15 @@ fn read_archive(
         None => None,
     };
     let mut file_metadata = super::FileMetadata::default();
+    // Not a value of a damaged or hand-edited file that makes no sense.
+    if let Some((x, y)) = manifest.resolution.filter(|(x, y)| {
+        x.is_finite() && y.is_finite() && *x > 0.0 && *y > 0.0
+    }) {
+        file_metadata.image = Some(Arc::new(super::ImageMetadata {
+            density: Some((x, y)),
+            ..Default::default()
+        }));
+    }
     if let Some(name) = &manifest.exif {
         file_metadata.exif = Some(Arc::new(read_entry(zip, name, MAX_SMALL_ENTRY)?));
     }

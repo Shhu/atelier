@@ -373,9 +373,11 @@ impl AtelierApp {
         Some((r, self.doc.as_ref()?.path(r)?))
     }
 
-    /// Refuses edits of a locked shape layer's path.
-    fn path_locked(&mut self, r: PathRef) -> bool {
-        matches!(r, PathRef::Layer(_)) && self.refuse_if_locked()
+    /// Refuses edits of a shape layer's path: it is what places the shape
+    /// (Lock Position) and what it holds (a group's Lock Image Pixels).
+    pub(super) fn path_locked(&mut self, r: PathRef) -> bool {
+        matches!(r, PathRef::Layer(_))
+            && (self.refuse_position_locked() || self.refuse_content_locked())
     }
 
     fn mode(&self) -> ToolMode {
@@ -438,7 +440,8 @@ impl AtelierApp {
         let doc = self.doc.as_mut()?;
         let r = match mode {
             ToolMode::Shape => {
-                let unlocked = !doc.is_locked(doc.active);
+                let locks = doc.locks(doc.active);
+                let unlocked = !locks.position && !locks.pixels;
                 let active = doc.active_layer();
                 match (op, active.shape.is_some() && unlocked) {
                     (Some(op), true) => {

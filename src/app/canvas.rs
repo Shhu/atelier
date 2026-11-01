@@ -82,17 +82,34 @@ impl AtelierApp {
         if image.dimensions() != target.image().dimensions() {
             return;
         }
+        let offset = target.offset;
+        drop(target);
+        self.show_preview_at(preview, image, offset);
+    }
+
+    /// [`Self::show_preview`] of what fills another box than the target's,
+    /// at `offset` in the canvas (see [`Document::target_as_painted`]).
+    pub(super) fn show_preview_at(
+        &mut self,
+        preview: LayerPreview,
+        image: image::RgbaImage,
+        offset: (i64, i64),
+    ) {
+        let Some(doc) = &self.doc else { return };
         let shown = ShownPreview {
             // A mask's preview is for its revision.
             rev: doc.target_rev(),
             ..ShownPreview::new(preview, doc.active_layer(), image)
         };
         self.preview_shown = Some(if doc.quick_mask().is_some() {
-            shown.on_quick_mask(target.offset)
+            shown.on_quick_mask(offset)
         } else if doc.mask_targeted() {
-            shown.on_mask(target.offset)
+            shown.on_mask(offset)
         } else {
-            shown
+            ShownPreview {
+                origin: Some(offset),
+                ..shown
+            }
         });
     }
 
@@ -184,7 +201,12 @@ impl AtelierApp {
         let space_key = ctx.input(|i| i.key_down(Key::Space))
             && !ctx.egui_wants_keyboard_input()
             && !self.typing_on_canvas();
-        let space = space_key || self.tool == Tool::Hand;
+        // A view tool over a transform or a crop box being prepared.
+        if self.rotate_view.over.is_some() && !self.view_tool_keeps_pending() {
+            self.rotate_view.over = None;
+        }
+        let over = self.rotate_view.over;
+        let space = space_key || self.tool == Tool::Hand || over == Some(Tool::Hand);
         let (press, zoom_keys) = ctx.input(|i| {
             let m = i.modifiers;
             (i.pointer.primary_pressed(), (m.command, m.alt))
@@ -238,6 +260,9 @@ impl AtelierApp {
         self.snap_off = ctx.input(|i| i.modifiers.command);
         // A press that closed a menu doesn't start anything either.
         let mut start = pressed && hovered && !space && !panning && !self.popup_press;
+        // The view tool takes the press: what is being prepared stays as it is.
+        let over_start = start && over.is_some();
+        start &= over.is_none();
 
         // "Transparent color" dialog open: the click picks the color.
         if start
@@ -493,7 +518,7 @@ impl AtelierApp {
                         })
                         .unwrap_or(CursorIcon::Default),
                 );
-                if self.tool == Tool::Transform {
+                if self.tool == Tool::Transform && over.is_none() {
                     self.commit_artboard_move(drag_end);
                 }
             }
@@ -505,7 +530,24 @@ impl AtelierApp {
         if let Some(start) = transforming {
             let double =
                 hovered && ctx.input(|i| i.pointer.button_double_clicked(PointerButton::Primary));
+            let double = double && over.is_none();
             cursor = Some(self.selection_transform_input(view, tool_pointer, start, down, double));
+        }
+        match over {
+            Some(Tool::RotateView) => {
+                cursor = Some(self.rotate_view_input(screen_pointer, over_start, down, shift));
+            }
+            Some(Tool::Zoom) => {
+                cursor = Some(if alt {
+                    CursorIcon::ZoomOut
+                } else {
+                    CursorIcon::ZoomIn
+                });
+                if over_start && let Some(p) = pointer {
+                    self.zoom_step(!alt, p, area.center());
+                }
+            }
+            _ => {}
         }
 
         if temp_move_hover && self.stroke.is_none() {
@@ -515,7 +557,7 @@ impl AtelierApp {
             cursor = guide_cursor;
         }
         // Alt + right drag: the brush's size and hardness.
-        if self.brush_size_drag(hovered, pointer, view.zoom) {
+        if self.brush_size_drag(hovered, screen_pointer, view.zoom) {
             cursor = None;
         } else if self.stroke.is_none() && self.paint_blocked() {
             // A locked or hidden layer: painting is refused before the click.
@@ -1186,7 +1228,7 @@ impl AtelierApp {
             let mut ip = rotate_around(view.to_image(p), drag.start_center(), -angle);
             // Move: proportions kept by default, Shift inverts. Canvas: free, Shift constrains.
             let keep_ratio = if is_canvas {
-                shift || self.crop.ratio().is_some()
+                shift || self.crop_ratio().is_some()
             } else {
                 self.keep_ratio != shift
             };
@@ -1283,7 +1325,7 @@ impl AtelierApp {
         }
         if let (Some(from), Some(p), true) = (self.crop_draw, pointer, down) {
             let mut d = view.to_image(p) - from;
-            if let Some(ratio) = self.crop.ratio() {
+            if let Some(ratio) = self.crop_ratio() {
                 let w = d.x.abs().max(d.y.abs() * ratio);
                 d = vec2(w.copysign(d.x), (w / ratio).copysign(d.y));
             } else if shift {
@@ -1315,13 +1357,6 @@ impl AtelierApp {
             self.snap_targets = None;
         }
         CursorIcon::Crosshair
-    }
-
-    /// A crop box drawn with the Crop tool, not applied yet.
-    pub(super) fn crop_box_pending(&self) -> bool {
-        self.tool == Tool::Canvas
-            && self.doc.is_some()
-            && self.canvas_rect.is_some_and(|r| Some(r) != self.full_rect() || self.crop.angle != 0.0)
     }
 
     /// Before `then` (another tool, tab, a save…) with a crop box drawn:
@@ -1394,7 +1429,8 @@ impl AtelierApp {
             self.apply_crop_box();
         }
         self.reset_pending();
-        then.resume(self);
+        // Computed aside: once it lands.
+        self.after_transform(move |app| then.resume(app));
     }
 
     /// Whether the Move tool shows the frame and handles of what it moves:
@@ -1452,7 +1488,7 @@ impl AtelierApp {
             let doc = self.doc.as_ref()?;
             (0..doc.layers.len()).rev().find(|&i| {
                 let l = &doc.layers[i];
-                l.visible && !doc.is_locked(i) && l.text.is_some() && to_rect(l.rect()).contains(ip)
+                l.visible && !doc.content_locked(i) && l.text.is_some() && to_rect(l.rect()).contains(ip)
             })?
         } else {
             // Visible pixel of an element, or else the active element's

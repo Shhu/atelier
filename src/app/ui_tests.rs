@@ -96,7 +96,9 @@ fn menus_are_not_covered_at_the_minimum_width() {
     h.drop_at(pos);
     h.run_steps(3);
     assert_eq!(h.state().doc.as_ref().unwrap().layers.len(), 2, "undone");
-    h.get_by_label_contains(&t!("menu-view-fit-on-screen"));
+    // Its name (the zoom bar's button has it too): the menu is open.
+    let fit = t!("menu-view-fit-on-screen");
+    assert!(h.query_all_by_label_contains(&fit).count() > 1);
 }
 
 /// Menus, the palette and tooltips show the shortcuts in the UI's language.
@@ -364,12 +366,12 @@ fn steps_of(h: &Harness<'static, AtelierApp>) -> usize {
 
 /// Floating panels opened one by one from the menus (the usual way), in
 /// small windows: none hides the title bar of one opened before (where
-/// the five can't all fit, the Actions panel being tall, one is partly
-/// covered at most).
+/// the five can't all fit, the Actions panel being tall, partly covered at
+/// most: one, or two where the four others fill the canvas).
 #[test]
 fn panels_opened_one_by_one_leave_the_title_bars_in_sight() {
     for (lang, size, overlaps) in [
-        (Lang::En, [1024.0, 700.0], 1),
+        (Lang::En, [1024.0, 700.0], 2),
         (Lang::Fr, [1280.0, 720.0], 1),
         (Lang::Fr, [1366.0, 768.0], 0),
     ] {

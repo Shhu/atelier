@@ -32,7 +32,7 @@ impl AtelierApp {
             self.clear_samplers();
         }
         let alt_click = keys::click(ui.ctx(), Modifiers::ALT);
-        trailing_hint(ui, &t!("panels8-sampler-hint", alt_click = alt_click));
+        wrapped_hint(ui, &t!("panels8-sampler-hint", alt_click = alt_click));
     }
 
     pub(in crate::app) fn ruler_options(&mut self, ui: &mut egui::Ui) {
@@ -74,5 +74,7 @@ impl AtelierApp {
         {
             doc.ruler = None;
         }
+        let alt_drag = keys::combo(ui.ctx(), Modifiers::ALT, &t!("hint-key-drag"));
+        wrapped_hint(ui, &t!("panels9-ruler-hint", alt_drag = alt_drag));
     }
 }

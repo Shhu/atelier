@@ -1,7 +1,7 @@
 //! The partial locks and styles on any layer, driven through the app.
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT as _, Queryable};
 use image::{Rgba, RgbaImage};
 
 use super::layer_locks::{LastLock, LockKind};
@@ -350,4 +350,667 @@ fn group_style_reaches_the_display_composite() {
         255,
         "the stroke beyond the content"
     );
+}
+
+// ---------------------------------------------------------- Every path, one rule
+
+fn sel(x: i64, y: i64, w: u32, h: u32) -> Selection {
+    PixelRect { x, y, w, h }.into()
+}
+
+fn settle(h: &mut Harness<'static, AtelierApp>) {
+    for _ in 0..1000 {
+        h.run_steps(1);
+        if !h.state().filters.busy() && !h.state().retouch.busy() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("still busy");
+}
+
+fn steps(h: &Harness<'static, AtelierApp>) -> usize {
+    doc(h).history().1
+}
+
+/// A group of the active layer and a free one over it: (layer, free, group).
+fn in_a_group(h: &mut Harness<'static, AtelierApp>) -> (usize, usize, usize) {
+    let child = doc(h).active;
+    let image = RgbaImage::from_pixel(20, 20, Rgba(RED));
+    doc_mut(h).add_layer("free".into(), image, (5, 5));
+    let free = doc(h).active;
+    assert!(doc_mut(h).group_layers(&[child, free]));
+    (child, free, doc(h).active)
+}
+
+fn shape() -> crate::vector::Shape {
+    use crate::vector::{Bounds, Live, Paint, Shape, ShapeKind, ShapeStroke, pt};
+    let bounds = Bounds::of(pt(20.0, 20.0), pt(80.0, 70.0));
+    let live = Live::new(ShapeKind::Rectangle, bounds);
+    Shape::live(live, Paint::Color([255, 0, 0]), ShapeStroke::default())
+}
+
+#[test]
+fn free_transform_of_a_selection_keeps_lock_transparent_pixels() {
+    let commands = [
+        transform::Command::Free,
+        transform::Command::FlipHorizontal,
+    ];
+    for command in commands {
+        let mut h = app();
+        let a = doc(&h).active;
+        doc_mut(&mut h).layers[a].locks.transparent = true;
+        h.state_mut().selection = Some(sel(10, 10, 20, 20));
+        let (before, n) = (doc(&h).layers[a].image().clone(), steps(&h));
+        h.state_mut().run(Action::Transform(command));
+        settle(&mut h);
+        assert_eq!(*doc(&h).layers[a].image(), before, "{command:?}");
+        assert_eq!((doc(&h).layers.len(), steps(&h)), (2, n), "{command:?}");
+        assert!(h.state().transform_rect.is_none());
+        assert!(h.state().status.contains("half"), "{}", h.state().status);
+    }
+    // The whole layer lifts nothing: it stays allowed.
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks.transparent = true;
+    h.state_mut().run(Action::Transform(transform::Command::Free));
+    assert!(h.state().transform_rect.is_some());
+}
+
+#[test]
+fn apply_mask_is_refused_by_the_pixel_locks_with_the_mask_targeted() {
+    let pixels = Locks { pixels: true, ..Default::default() };
+    let transparent = Locks { transparent: true, ..Default::default() };
+    for locks in [pixels, transparent] {
+        let mut h = app();
+        let a = doc(&h).active;
+        doc_mut(&mut h).add_mask(NewMask::HideAll, None);
+        doc_mut(&mut h).layers[a].locks = locks;
+        for target in [true, false] {
+            if target {
+                doc_mut(&mut h).target_mask(true);
+            } else {
+                doc_mut(&mut h).target_mask(false);
+            }
+            let n = steps(&h);
+            h.state_mut().run(Action::ApplyMask);
+            assert!(doc(&h).layers[a].mask.is_some(), "{locks:?}");
+            assert_eq!(pixel(&h, 10, 10), RED);
+            assert_eq!(steps(&h), n);
+        }
+    }
+    // Without a lock it applies.
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).add_mask(NewMask::HideAll, None);
+    h.state_mut().run(Action::ApplyMask);
+    assert!(doc(&h).layers[a].mask.is_none());
+}
+
+#[test]
+fn lock_image_pixels_stops_transforms_with_the_linked_mask_targeted() {
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).add_mask(NewMask::RevealAll, None);
+    doc_mut(&mut h).target_mask(true);
+    doc_mut(&mut h).layers[a].locks.pixels = true;
+    // Painting the mask stays free.
+    assert!(!doc(&h).pixels_locked());
+    assert!(h.state().transform_frozen());
+    let before = doc(&h).layers[a].image().clone();
+    for command in [transform::Command::FlipHorizontal, transform::Command::Free] {
+        h.state_mut().run(Action::Transform(command));
+        settle(&mut h);
+        assert_eq!(*doc(&h).layers[a].image(), before);
+        assert!(h.state().transform_rect.is_none(), "{command:?}");
+    }
+}
+
+#[test]
+fn a_group_command_respects_the_locks_of_its_layers() {
+    let position = Locks { position: true, ..Default::default() };
+    let pixels = Locks { pixels: true, ..Default::default() };
+    for (locks, all, moves) in [(position, false, false), (pixels, false, true), (Locks::default(), true, false)] {
+        let setup = || {
+            let mut h = app();
+            let (child, free, g) = in_a_group(&mut h);
+            doc_mut(&mut h).layers[child].locks = locks;
+            doc_mut(&mut h).layers[child].locked = all;
+            (h, child, free, g)
+        };
+        // Transforms: refused altogether.
+        for command in [transform::Command::Free, transform::Command::FlipHorizontal] {
+            let (mut h, child, free, _) = setup();
+            let before = (doc(&h).layers[child].image().clone(), doc(&h).layers[free].offset);
+            h.state_mut().run(Action::Transform(command));
+            settle(&mut h);
+            let after = (doc(&h).layers[child].image().clone(), doc(&h).layers[free].offset);
+            assert_eq!(after, before, "{locks:?} {all} {command:?}");
+            assert!(h.state().transform_rect.is_none());
+            assert!(h.state().status.contains("half"), "names the layer: {}", h.state().status);
+        }
+        // Moves: the free layers go, a locked one only if it may.
+        let expected = |d: (i64, i64)| if moves { d } else { (0, 0) };
+        let (mut h, child, free, _) = setup();
+        h.state_mut().auto_select = false;
+        h.state_mut().set_tool(Tool::Transform);
+        h.run_steps(1);
+        h.key_press(Key::ArrowRight);
+        h.run_steps(1);
+        assert_eq!(doc(&h).layers[child].offset, expected((1, 0)), "arrow");
+        assert_eq!(doc(&h).layers[free].offset, (6, 5), "arrow");
+
+        let (mut h, child, free, _) = setup();
+        h.state_mut().run(Action::CenterElement);
+        let moved = doc(&h).layers[free].offset;
+        assert_ne!(moved, (5, 5), "center");
+        let d = (moved.0 - 5, moved.1 - 5);
+        assert_eq!(doc(&h).layers[child].offset, expected(d), "center");
+
+        // The stack is narrower than the canvas to the right of half: align
+        // on a selection so that something must move.
+        let (mut h, child, free, _) = setup();
+        h.state_mut().selection = Some(sel(150, 0, 50, 100));
+        h.state_mut().run(Action::Align(AlignOp::Right));
+        assert_ne!(doc(&h).layers[free].offset, (5, 5), "align");
+        let d = (doc(&h).layers[free].offset.0 - 5, doc(&h).layers[free].offset.1 - 5);
+        assert_eq!(doc(&h).layers[child].offset, expected(d), "align");
+    }
+}
+
+#[test]
+fn a_group_whose_layers_all_stay_doesnt_pretend_to_move() {
+    let mut h = app();
+    let (child, free, _) = in_a_group(&mut h);
+    doc_mut(&mut h).layers[child].locks.position = true;
+    doc_mut(&mut h).layers[free].locks.position = true;
+    let n = steps(&h);
+    h.state_mut().set_tool(Tool::Transform);
+    h.run_steps(1);
+    h.key_press(Key::ArrowRight);
+    h.run_steps(1);
+    h.state_mut().run(Action::CenterElement);
+    h.state_mut().run(Action::Align(AlignOp::Left));
+    assert_eq!(steps(&h), n);
+    assert!(h.state().status.contains("half"), "{}", h.state().status);
+}
+
+#[test]
+fn a_selection_of_groups_leaves_the_one_holding_a_locked_layer_out_of_a_transform() {
+    let mut h = app();
+    let (child, _, g) = in_a_group(&mut h);
+    doc_mut(&mut h).layers[child].locks.pixels = true;
+    doc_mut(&mut h).add_layer("over".into(), RgbaImage::from_pixel(20, 20, Rgba(RED)), (5, 5));
+    let over = doc(&h).active;
+    h.state_mut().layer_set = [doc(&h).layers[g].id, doc(&h).layers[over].id].into_iter().collect();
+    assert_eq!(h.state().transform_targets(), vec![over]);
+}
+
+#[test]
+fn lock_position_stops_the_path_tools_on_a_shape() {
+    let mut h = app();
+    doc_mut(&mut h).add_shape_layer("R".into(), "R", shape());
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks.position = true;
+    h.state_mut().set_tool(Tool::PathSelect);
+    h.run_steps(2);
+    let b = doc(&h).layers[a].content_bounds();
+    drag(&mut h, (50.0, 45.0), (61.0, 52.0));
+    assert_eq!(doc(&h).layers[a].content_bounds(), b);
+    assert!(h.state().status.contains("R"), "{}", h.state().status);
+    h.key_press(Key::ArrowRight);
+    h.run_steps(2);
+    assert_eq!(doc(&h).layers[a].content_bounds(), b);
+    // Unlocked, the same gesture moves it: the test does reach the tool.
+    doc_mut(&mut h).layers[a].locks.position = false;
+    drag(&mut h, (50.0, 45.0), (61.0, 52.0));
+    assert_ne!(doc(&h).layers[a].content_bounds(), b);
+}
+
+#[test]
+fn lock_position_stops_the_artboard_tool() {
+    use crate::document::ArtboardBackground as B;
+    for locked in [false, true] {
+        let mut h = app();
+        let d = doc_mut(&mut h);
+        d.add_artboard("a".into(), "A".into(), PixelRect { x: 0, y: 0, w: 80, h: 60 }, B::Transparent);
+        d.add_artboard("b".into(), "B".into(), PixelRect { x: 200, y: 0, w: 80, h: 60 }, B::Transparent);
+        h.run_steps(3);
+        let i = doc(&h).artboards()[0];
+        doc_mut(&mut h).active = i;
+        doc_mut(&mut h).layers[i].locks.position = locked;
+        h.state_mut().set_tool(Tool::Artboard);
+        h.run_steps(3);
+        let id = doc(&h).layers[i].id;
+        let rect = |h: &Harness<'static, AtelierApp>| {
+            let at = doc(h).layers.iter().position(|l| l.id == id).unwrap();
+            doc(h).layers[at].artboard_rect().unwrap()
+        };
+        let r = rect(&h);
+        let (cx, cy) = (r.x as f32 + r.w as f32 / 2.0, r.y as f32 + r.h as f32 / 2.0);
+        drag(&mut h, (cx, cy), (cx + 20.0, cy + 15.0));
+        assert_eq!(rect(&h) == r, locked, "move");
+        // Its bottom right handle.
+        let r = rect(&h);
+        let corner = (r.x as f32 + r.w as f32, r.y as f32 + r.h as f32);
+        drag(&mut h, corner, (corner.0 + 10.0, corner.1 + 10.0));
+        assert_eq!(rect(&h) == r, locked, "resize");
+    }
+}
+
+#[test]
+fn merges_keep_every_lock() {
+    let kinds = [
+        Locks { transparent: true, ..Default::default() },
+        Locks { pixels: true, ..Default::default() },
+        Locks { position: true, ..Default::default() },
+    ];
+    let mk = |upper: Locks, lower: Locks| {
+        let mut h = app();
+        let lo = doc(&h).active;
+        let image = RgbaImage::from_pixel(200, 100, Rgba([0, 0, 255, 255]));
+        doc_mut(&mut h).add_layer("top".into(), image, (0, 0));
+        let up = doc(&h).active;
+        doc_mut(&mut h).layers[up].locks = upper;
+        doc_mut(&mut h).layers[lo].locks = lower;
+        h
+    };
+    for locks in kinds {
+        for (upper, lower) in [(locks, Locks::default()), (Locks::default(), locks)] {
+            for action in [Action::MergeDown, Action::MergeVisible] {
+                let mut h = mk(upper, lower);
+                let (n, count) = (steps(&h), doc(&h).layers.len());
+                h.state_mut().run(action);
+                assert_eq!((steps(&h), doc(&h).layers.len()), (n, count), "{locks:?}");
+                assert!(!h.state().status.is_empty());
+            }
+        }
+        // A group's merge too, and through what the group says.
+        let mut h = app();
+        let (child, _, g) = in_a_group(&mut h);
+        doc_mut(&mut h).layers[child].locks = locks;
+        assert!(doc_mut(&mut h).merge_group().is_err());
+        doc_mut(&mut h).layers[child].locks = Locks::default();
+        doc_mut(&mut h).layers[g].locks = locks;
+        assert!(doc_mut(&mut h).merge_group().is_err());
+    }
+    let mut h = mk(Locks::default(), Locks::default());
+    let count = doc(&h).layers.len();
+    h.state_mut().run(Action::MergeDown);
+    assert_eq!(doc(&h).layers.len(), count - 1);
+}
+
+#[test]
+fn the_row_reads_every_group_that_holds_the_layer() {
+    let mut h = app();
+    let child = doc(&h).active;
+    assert!(doc_mut(&mut h).group_layers(&[child]));
+    let inner = doc(&h).active;
+    assert!(doc_mut(&mut h).group_layers(&[inner]));
+    let outer = doc(&h).active;
+    let id = doc(&h).layers[child].id;
+    let child = doc(&h).layers.iter().position(|l| l.id == id).unwrap();
+    let inner = doc(&h).parent(child).unwrap();
+    doc_mut(&mut h).layers[inner].locks.position = true;
+    doc_mut(&mut h).layers[outer].locks.pixels = true;
+    let d = doc(&h);
+    assert_eq!(LockKind::Pixels.state(d, child), (true, false));
+    assert_eq!(LockKind::Position.state(d, child), (true, false));
+    assert_eq!(LockKind::Transparent.state(d, child), (false, true));
+    doc_mut(&mut h).layers[outer].locks.pixels = false;
+    doc_mut(&mut h).layers[outer].locked = true;
+    let d = doc(&h);
+    assert_eq!(LockKind::All.state(d, child), (true, false));
+    assert_eq!(LockKind::Transparent.state(d, child), (true, false));
+    assert!(d.is_locked(child));
+}
+
+#[test]
+fn ctrl_slash_says_when_it_can_lock_nothing() {
+    let mut h = app();
+    h.state_mut().last_lock = LastLock::only(LockKind::Transparent);
+    doc_mut(&mut h).add_shape_layer("R".into(), "R", shape());
+    let n = steps(&h);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::Slash);
+    h.run_steps(1);
+    let l = doc(&h).active_layer();
+    assert!(!l.locked && !l.locks.any());
+    assert_eq!(steps(&h), n);
+    assert!(h.state().status.contains(&t!("layers8-lock-transparent")));
+
+    // Held by its group's Lock All: the group is named, nothing changes.
+    let mut h = app();
+    let child = doc(&h).active;
+    assert!(doc_mut(&mut h).group_layers(&[child]));
+    let g = doc(&h).active;
+    doc_mut(&mut h).layers[g].name = "Outer".into();
+    doc_mut(&mut h).layers[g].locked = true;
+    let id = doc(&h).layers[child].id;
+    let child = doc(&h).layers.iter().position(|l| l.id == id).unwrap();
+    doc_mut(&mut h).active = child;
+    let n = steps(&h);
+    h.state_mut().run(Action::ToggleLock);
+    assert!(h.state().status.contains("Outer"), "{}", h.state().status);
+    assert!(!doc(&h).layers[child].locked);
+    assert_eq!(steps(&h), n);
+}
+
+#[test]
+fn convert_to_smart_object_keeps_lock_position() {
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks = Locks::ALL;
+    h.state_mut().run(Action::Smart(smart_ui::Command::Convert));
+    let d = doc(&h);
+    assert!(d.active_layer().is_smart());
+    assert!(d.active_layer().locks.position);
+    assert!(!d.can_move(d.active));
+    h.key_press(Key::ArrowRight);
+    assert_eq!(doc(&h).active_layer().offset, (0, 0));
+}
+
+#[test]
+fn a_groups_lock_image_pixels_reaches_text_shape_and_smart_content() {
+    // Text.
+    let mut h = app();
+    h.state_mut().set_tool(Tool::Text);
+    h.run_steps(2);
+    drag(&mut h, (20.0, 20.0), (20.0, 20.0));
+    h.run_steps(2);
+    h.event(egui::Event::Text("abc".into()));
+    h.run_steps(3);
+    h.state_mut().set_tool(Tool::Transform);
+    h.run_steps(3);
+    let t = doc(&h).active;
+    assert!(doc_mut(&mut h).group_layers(&[t]));
+    let g = doc(&h).active;
+    doc_mut(&mut h).layers[g].locks.pixels = true;
+    let t = g - 1;
+    h.state_mut().select_layer(t);
+    h.state_mut().change_text(|d, _| d.text.push_str("zz"));
+    h.run_steps(2);
+    assert_eq!(doc(&h).layers[t].text.as_ref().unwrap().text, "abc");
+
+    // Shape's path, by a real drag.
+    let mut h = app();
+    doc_mut(&mut h).add_shape_layer("R".into(), "R", shape());
+    let a = doc(&h).active;
+    assert!(doc_mut(&mut h).group_layers(&[a]));
+    let g = doc(&h).active;
+    doc_mut(&mut h).layers[g].locks.pixels = true;
+    h.state_mut().select_layer(a);
+    h.state_mut().set_tool(Tool::PathSelect);
+    h.run_steps(2);
+    let b = doc(&h).layers[a].content_bounds();
+    drag(&mut h, (50.0, 45.0), (61.0, 52.0));
+    assert_eq!(doc(&h).layers[a].content_bounds(), b);
+    assert!(!h.state().status.is_empty());
+}
+
+#[test]
+fn refusals_name_the_group_that_has_the_lock() {
+    let mut h = app();
+    let child = doc(&h).active;
+    assert!(doc_mut(&mut h).group_layers(&[child]));
+    let g = doc(&h).active;
+    doc_mut(&mut h).layers[g].name = "Outer".into();
+    doc_mut(&mut h).layers[g].locks.pixels = true;
+    h.state_mut().select_layer(g - 1);
+    h.state_mut().run(Action::Adjust(AdjustKind::Invert));
+    let status = &h.state().status;
+    let said = t!("locks9-status-group-pixels-locked", name = "half", group = "Outer");
+    assert!(status.contains(&said), "{status:?}");
+    assert!(!status.contains(&t!("layers8-status-pixels-locked", name = "half")));
+}
+
+#[test]
+fn place_doesnt_land_in_a_group_that_wont_let_it_move() {
+    let dir = std::env::temp_dir().join("atelier-locks-place");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("place.png");
+    RgbaImage::from_pixel(30, 30, Rgba([0, 255, 0, 255])).save(&path).unwrap();
+    let mut h = app();
+    let child = doc(&h).active;
+    assert!(doc_mut(&mut h).group_layers(&[child]));
+    let g = doc(&h).active;
+    doc_mut(&mut h).layers[g].locks.position = true;
+    h.state_mut().select_layer(g - 1);
+    let (count, n) = (doc(&h).layers.len(), steps(&h));
+    h.state_mut().place_path(&path, false);
+    assert_eq!((doc(&h).layers.len(), steps(&h)), (count, n));
+    assert!(!h.state().transform_pending());
+    // Over a layer with Lock Position of its own, it can be placed.
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks.position = true;
+    h.state_mut().place_path(&path, false);
+    assert!(h.state().transform_pending());
+}
+
+#[test]
+fn the_fill_dialog_shows_the_lock_keeps_the_opacity() {
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks.transparent = true;
+    h.state_mut().selection = Some(sel(10, 10, 20, 20));
+    h.state_mut().run(Action::ClearSelection);
+    h.run_steps(2);
+    assert!(h.state().fill_dialog.unwrap().preserve_transparency);
+    let label = t!("dialog-fill-preserve-transparency");
+    assert!(h.get_by_label(&label).accesskit_node().is_disabled());
+}
+
+#[test]
+fn a_cut_under_lock_transparent_pixels_is_a_cut_in_the_history() {
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks.transparent = true;
+    h.state_mut().selection = Some(sel(10, 10, 20, 20));
+    h.state_mut().run(Action::Cut);
+    h.run_steps(1);
+    assert_eq!(doc(&h).history().0.last().copied(), Some(&*t!("menu-edit-cut")));
+}
+
+#[test]
+fn stroke_path_with_the_eraser_paints_the_background_under_the_lock() {
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks.transparent = true;
+    h.state_mut().selection = Some(sel(10, 10, 60, 60));
+    h.state_mut().run(Action::Path(paths_panel::PathCommand::MakeWorkPath, false));
+    h.run_steps(1);
+    h.state_mut().set_tool(Tool::Eraser);
+    h.state_mut().secondary = Color32::from_rgb(0, 0, 255);
+    (h.state_mut().brush_size, h.state_mut().hardness) = (10.0, 1.0);
+    h.state_mut().vector.panel.stroke_with_eraser();
+    let before = doc(&h).layers[a].image().clone();
+    h.state_mut().run(Action::Path(paths_panel::PathCommand::StrokePath, false));
+    h.run_steps(2);
+    let after = doc(&h).layers[a].image();
+    let changed = before.pixels().zip(after.pixels()).filter(|(x, y)| x != y).count();
+    assert!(changed > 0, "the stroke shows");
+    assert!(before.pixels().zip(after.pixels()).all(|(x, y)| x[3] == y[3]));
+    assert!(after.pixels().any(|p| p[2] > 200 && p[3] == RED[3]), "the background color");
+}
+
+#[test]
+fn show_transform_controls_is_disabled_when_it_would_do_nothing() {
+    let mut h = app();
+    let a = doc(&h).active;
+    h.state_mut().set_tool(Tool::Transform);
+    h.run_steps(2);
+    let label = t!("tools4-show-transform-controls");
+    assert!(!h.get_by_label(&label).accesskit_node().is_disabled());
+    doc_mut(&mut h).layers[a].locks.pixels = true;
+    h.run_steps(2);
+    assert!(h.get_by_label(&label).accesskit_node().is_disabled());
+}
+
+#[test]
+fn lock_all_looks_solid_and_a_partial_lock_hollow() {
+    // Lit pixels of the glyph at the end of the layer's row.
+    let lit = |locked: bool, locks: Locks, tip: String| {
+        let mut h = app();
+        let a = doc(&h).active;
+        doc_mut(&mut h).layers[a].locked = locked;
+        doc_mut(&mut h).layers[a].locks = locks;
+        h.run_steps(2);
+        let r = h.get_by_label(&tip).rect();
+        let shot = h.render().unwrap();
+        shot.enumerate_pixels()
+            .filter(|&(x, y, p)| {
+                let (x, y) = (x as f32, y as f32);
+                r.contains(pos2(x, y)) && p[0] > 120
+            })
+            .count()
+    };
+    let partial = Locks { position: true, ..Default::default() };
+    let all = lit(true, Locks::default(), t!("panel-unlock-tip"));
+    let part = lit(false, partial, t!("layers8-partial-unlock-tip"));
+    assert!(part > 0 && all > part + 10, "{all} {part}");
+}
+
+#[test]
+fn content_aware_fill_keeps_the_opacity_under_lock_transparent_pixels() {
+    use retouch_tools::{FillRequest, Output};
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks.transparent = true;
+    h.state_mut().selection = Some(sel(90, 20, 20, 20));
+    let before = doc(&h).layers[a].image().clone();
+    let mut settings = h.state().retouch.settings;
+    (settings.ai, settings.output) = (false, Output::CurrentLayer);
+    let n = steps(&h);
+    h.state_mut().start_content_aware(FillRequest {
+        settings,
+        opacity: 1.0,
+        keep_alpha: false,
+        from_fill: false,
+    });
+    settle(&mut h);
+    assert_eq!(steps(&h), n + 1);
+    let after = doc(&h).layers[a].image();
+    assert!(before.pixels().zip(after.pixels()).all(|(x, y)| x[3] == y[3]));
+    assert_eq!(after.dimensions(), before.dimensions());
+}
+
+// ------------------------------------------------------------------ Actions
+
+fn one_action(h: &mut Harness<'static, AtelierApp>, steps: Vec<crate::actions::Step>) {
+    use crate::actions::{Sequence, Set};
+    h.state_mut().actions.library.sets = vec![Set {
+        name: "s".into(),
+        actions: vec![Sequence {
+            name: "a".into(),
+            key: None,
+            steps,
+            expanded: true,
+        }],
+        expanded: true,
+    }];
+}
+
+/// Plays `steps` as an action to its end; the error it stopped at.
+fn play(h: &mut Harness<'static, AtelierApp>, commands: Vec<crate::actions::Recorded>) -> Option<String> {
+    use crate::actions::Step;
+    let steps = commands.into_iter().map(Step::new).collect();
+    one_action(h, steps);
+    h.state_mut().play_row(actions_panel::Row::Action(0, 0));
+    for _ in 0..200 {
+        h.run_steps(1);
+        if let Some(text) = h.state().actions.error_shown() {
+            return Some(text);
+        }
+        if !h.state().actions.playing() {
+            return None;
+        }
+    }
+    panic!("the action never ended (dialog open: {})", h.state().fill_dialog.is_some());
+}
+
+#[test]
+fn an_action_plays_what_the_locks_allow_like_the_command() {
+    use crate::actions::{MenuItem, Recorded};
+    let menu = |item| Recorded::Menu { item };
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks.pixels = true;
+    let r = play(&mut h, vec![menu(MenuItem::RevealAllMask), menu(MenuItem::ClippingMask)]);
+    assert_eq!(r, None);
+    assert!(doc(&h).layers[a].mask.is_some() && doc(&h).layers[a].clipped);
+    // What the command refuses stops the action.
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks.pixels = true;
+    let image = doc(&h).layers[a].image().clone();
+    doc_mut(&mut h).add_mask(NewMask::HideAll, None);
+    let r = play(&mut h, vec![menu(MenuItem::ApplyMask)]);
+    assert!(r.is_some(), "stopped");
+    assert_eq!(*doc(&h).layers[a].image(), image);
+}
+
+#[test]
+fn clear_in_an_action_under_the_lock_fails_instead_of_asking() {
+    use crate::actions::{MenuItem, Recorded};
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks.transparent = true;
+    h.state_mut().selection = Some(sel(10, 10, 20, 20));
+    let r = play(&mut h, vec![Recorded::Menu { item: MenuItem::Clear }]);
+    assert!(r.is_some());
+    assert!(h.state().fill_dialog.is_none());
+}
+
+#[test]
+fn locks_are_recorded_as_what_they_turn_to() {
+    use crate::actions::Recorded;
+    let mut h = app();
+    one_action(&mut h, Vec::new());
+    h.state_mut().actions.start_recording((0, 0));
+    h.state_mut().run(Action::Lock(LockKind::Pixels));
+    h.state_mut().run(Action::Lock(LockKind::Pixels));
+    h.state_mut().run(Action::ToggleLock);
+    let steps: Vec<Recorded> = h.state().actions.library.sets[0].actions[0]
+        .steps
+        .iter()
+        .map(|s| s.command.clone())
+        .collect();
+    assert_eq!(steps.len(), 3, "{steps:?}");
+    // The file reads back.
+    let json = serde_json::to_string(&steps).unwrap();
+    let back: Vec<Recorded> = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, steps);
+
+    // Played on a layer already in that state: the same end, no toggling.
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks.pixels = true;
+    let on = |pixels: bool| Recorded::Locks {
+        transparent: false,
+        pixels,
+        position: false,
+        all: false,
+        on: true,
+    };
+    let n = doc(&h).history().1;
+    assert_eq!(play(&mut h, vec![on(true)]), None);
+    assert!(doc(&h).layers[a].locks.pixels);
+    assert_eq!(doc(&h).history().1, n);
+    // Unavailable on the layer: the step fails.
+    let mut h = app();
+    doc_mut(&mut h).add_shape_layer("R".into(), "R", shape());
+    assert!(play(&mut h, vec![on(true)]).is_some());
+}
+
+#[test]
+fn unlocking_from_the_row_is_recorded_for_the_active_layer() {
+    use crate::actions::Recorded;
+    let mut h = app();
+    one_action(&mut h, Vec::new());
+    h.state_mut().actions.start_recording((0, 0));
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks.position = true;
+    h.state_mut().unlock_layer(a);
+    let steps = &h.state().actions.library.sets[0].actions[0].steps;
+    assert!(matches!(steps[0].command, Recorded::Locks { on: false, .. }));
 }

@@ -455,6 +455,27 @@ fn transform_preview_keeps_its_place_and_effects() {
     assert!(near(shown(&shot, &h, 30, 30), [128, 128, 128]));
 }
 
+/// The preview of a group being transformed keeps what its styles draw
+/// beyond its layers.
+#[test]
+fn group_transform_preview_keeps_its_styles() {
+    let mut doc = Document::new(solid(400, 300, [255, 255, 255, 255]), None);
+    doc.add_group();
+    doc.add_layer("A".into(), solid(40, 40, [255, 0, 0, 255]), (20, 20));
+    let g = doc.layers.iter().position(|l| l.is_group()).unwrap();
+    doc.layers[g].effects.stroke.enabled = true;
+    doc.layers[g].effects.stroke.color = [0, 0, 255, 255];
+    doc.layers[g].effects.stroke.width = 6.0;
+    doc.layers[g].effects.stroke.opacity = 1.0;
+    doc.active = g;
+    let mut h = app_with(doc, Tool::Transform, 2048);
+    h.state_mut().transform_rect = Some(Rect::from_min_size(pos2(110.0, 110.0), vec2(40.0, 40.0)));
+    h.run_steps(2);
+    let shot = h.render().unwrap();
+    assert!(near(shown(&shot, &h, 125, 125), [255, 0, 0]), "the content moved");
+    assert!(near(shown(&shot, &h, 107, 125), [0, 0, 255]), "its stroke too");
+}
+
 /// At 100 %, one image pixel is one physical pixel, on the pixel grid,
 /// whatever the display scaling and the image's size.
 #[test]

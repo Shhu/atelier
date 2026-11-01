@@ -372,9 +372,10 @@ impl Filter {
     /// How far from a pixel the filter looks, in pixels; `None`: anywhere in
     /// the processed area (Offset, the distortions).
     pub fn reach(&self) -> Option<u32> {
+        let this = self.in_range();
         let whole = |r: f32| r.max(0.0).ceil() as u32;
         let passes = |p: &[Pass]| p.iter().map(Pass::reach).sum::<usize>() as u32;
-        Some(match *self {
+        Some(match this {
             Filter::GaussianBlur { radius }
             | Filter::UnsharpMask { radius, .. }
             | Filter::HighPass { radius } => passes(&gaussian_passes(radius)),
@@ -416,6 +417,113 @@ impl Filter {
         })
     }
 
+    /// The settings kept to what the dialogs allow at most (below that, what
+    /// the filter can take): a file of actions or a document could hold
+    /// anything, and 1e39 reads as infinity. The Distort filters limit theirs.
+    fn in_range(self) -> Self {
+        let to = |v: f32, low: f32, high: f32| {
+            if v.is_nan() { low } else { v.clamp(low, high) }
+        };
+        let fade = |f: ToneFade| ToneFade {
+            fade: to(f.fade, 0.0, 100.0),
+            tonal_width: to(f.tonal_width, 0.0, 100.0),
+            radius: to(f.radius, 0.0, 100.0),
+        };
+        let morphology = |m: Morphology| Morphology {
+            radius: to(m.radius, 0.0, 500.0),
+            ..m
+        };
+        match self {
+            Filter::GaussianBlur { radius } => Filter::GaussianBlur {
+                radius: to(radius, 0.0, 1000.0),
+            },
+            Filter::BoxBlur { radius } => Filter::BoxBlur {
+                radius: to(radius, 0.0, 2000.0),
+            },
+            Filter::MotionBlur { angle, distance } => Filter::MotionBlur {
+                angle: to(angle, -360.0, 360.0),
+                distance: to(distance, 0.0, 2000.0),
+            },
+            Filter::SurfaceBlur { radius, threshold } => Filter::SurfaceBlur {
+                radius: to(radius, 0.0, 100.0),
+                threshold: to(threshold, 0.0, 255.0),
+            },
+            Filter::UnsharpMask {
+                amount,
+                radius,
+                threshold,
+            } => Filter::UnsharpMask {
+                amount: to(amount, 0.0, 500.0),
+                radius: to(radius, 0.0, 1000.0),
+                threshold: to(threshold, 0.0, 255.0),
+            },
+            Filter::SmartSharpen(s) => Filter::SmartSharpen(SmartSharpen {
+                amount: to(s.amount, 0.0, 500.0),
+                radius: to(s.radius, 0.0, 64.0),
+                reduce_noise: to(s.reduce_noise, 0.0, 100.0),
+                angle: to(s.angle, -360.0, 360.0),
+                shadows: fade(s.shadows),
+                highlights: fade(s.highlights),
+                ..s
+            }),
+            Filter::AddNoise(n) => Filter::AddNoise(AddNoise {
+                amount: to(n.amount, 0.0, 400.0),
+                ..n
+            }),
+            Filter::ReduceNoise(n) => Filter::ReduceNoise(ReduceNoise {
+                strength: to(n.strength, 0.0, 10.0),
+                preserve_details: to(n.preserve_details, 0.0, 100.0),
+                color_noise: to(n.color_noise, 0.0, 100.0),
+                sharpen_details: to(n.sharpen_details, 0.0, 100.0),
+            }),
+            Filter::Median { radius } => Filter::Median {
+                radius: to(radius, 0.0, 500.0),
+            },
+            Filter::DustAndScratches { radius, threshold } => Filter::DustAndScratches {
+                radius: to(radius, 0.0, 500.0),
+                threshold: to(threshold, 0.0, 255.0),
+            },
+            Filter::HighPass { radius } => Filter::HighPass {
+                radius: to(radius, 0.0, 1000.0),
+            },
+            Filter::Offset(o) => Filter::Offset(Offset {
+                horizontal: to(o.horizontal, -1e7, 1e7),
+                vertical: to(o.vertical, -1e7, 1e7),
+                ..o
+            }),
+            Filter::Minimum(m) => Filter::Minimum(morphology(m)),
+            Filter::Maximum(m) => Filter::Maximum(morphology(m)),
+            Filter::Emboss {
+                angle,
+                height,
+                amount,
+            } => Filter::Emboss {
+                angle: to(angle, -360.0, 360.0),
+                height: to(height, 0.0, 100.0),
+                amount: to(amount, 0.0, 500.0),
+            },
+            Filter::Mosaic { cell } => Filter::Mosaic {
+                cell: to(cell, 0.0, 200.0),
+            },
+            other => other,
+        }
+    }
+
+    /// The filter fits its geometry to the area it works on (a center, a
+    /// width): without a selection that must be the canvas, not however far
+    /// the layer's hidden pixels go.
+    pub fn fits_the_area(&self) -> bool {
+        matches!(
+            self,
+            Filter::Twirl { .. }
+                | Filter::Spherize { .. }
+                | Filter::PolarCoordinates { .. }
+                | Filter::Pinch { .. }
+                | Filter::ZigZag { .. }
+                | Filter::Shear(_)
+        )
+    }
+
     /// Applies the filter to `image`, whose top-left pixel is at `origin`
     /// in the canvas: noise, clouds and mosaic cells are anchored to the
     /// canvas, so a part of an image gets what the whole image would.
@@ -423,7 +531,7 @@ impl Filter {
         if image.width() == 0 || image.height() == 0 {
             return;
         }
-        match *self {
+        match self.in_range() {
             Filter::GaussianBlur { radius } => blur(image, &gaussian_passes(radius)),
             Filter::BoxBlur { radius } => blur(image, &[moving_average(radius)]),
             Filter::MotionBlur { angle, distance } => motion_blur(image, angle, distance),
@@ -482,18 +590,19 @@ impl Filter {
             Filter::FindEdges => by_tiles(image, 1, find_edges_tile),
             Filter::Clouds(c) => clouds(image, &c, origin),
             Filter::Mosaic { cell } => mosaic(image, cell.round().max(1.0) as i64, origin),
-            Filter::Ripple { amount, size } => distort::ripple(image, amount, size, origin),
-            Filter::Wave(w) => distort::wave(image, &w, origin),
-            Filter::Twirl { angle } => distort::twirl(image, angle),
-            Filter::Spherize { amount, mode } => distort::spherize(image, amount, mode),
-            Filter::PolarCoordinates { conversion } => distort::polar(image, conversion),
-            Filter::Pinch { amount } => distort::pinch(image, amount),
-            Filter::ZigZag {
-                amount,
-                ridges,
-                style,
-            } => distort::zigzag(image, amount, ridges, style),
-            Filter::Shear(s) => distort::shear(image, &s),
+            Filter::Ripple { .. }
+            | Filter::Wave(_)
+            | Filter::Twirl { .. }
+            | Filter::Spherize { .. }
+            | Filter::PolarCoordinates { .. }
+            | Filter::Pinch { .. }
+            | Filter::ZigZag { .. }
+            | Filter::Shear(_) => {
+                let all = [0, 0, image.width(), image.height()];
+                if let Some(out) = distort::render(self, image, origin, all) {
+                    *image = out;
+                }
+            }
         }
     }
 }
@@ -510,9 +619,26 @@ pub struct Target {
     pub clip: Option<Clip>,
     /// Position of the image in the canvas.
     pub offset: (i64, i64),
+    /// Lock Transparent Pixels: what is computed has the opacity the image
+    /// has, as the result will.
+    pub alpha_locked: bool,
+    /// The filter works on all of the image, whatever `clip`, which only
+    /// cuts its result (a smart filter through its mask).
+    pub whole_source: bool,
 }
 
 impl Target {
+    /// What the pixels of a layer give: all of them, nothing locked.
+    pub fn of(image: Arc<RgbaImage>, offset: (i64, i64)) -> Self {
+        Self {
+            image,
+            clip: None,
+            offset,
+            alpha_locked: false,
+            whole_source: false,
+        }
+    }
+
     /// Box of the editable pixels: x0, y0, x1, y1 (exclusive).
     pub fn area(&self) -> [u32; 4] {
         let (w, h) = self.image.dimensions();
@@ -536,14 +662,67 @@ impl Target {
         reach: Option<u32>,
         op: impl FnOnce(&mut RgbaImage, (i64, i64)),
     ) -> RgbaImage {
+        self.region_with(region, reach, |window, _| {
+            let [x0, y0, x1, y1] = window;
+            let mut part =
+                image::imageops::crop_imm(&*self.image, x0, y0, x1 - x0, y1 - y0).to_image();
+            op(&mut part, self.at(window));
+            (part, [x0, y0])
+        })
+    }
+
+    /// [`Self::process_region`] with `filter`; a filter that reads anywhere
+    /// but can compute any part computes only what the region shows.
+    pub fn filter_region(&self, region: [u32; 4], filter: &Filter) -> RgbaImage {
+        if filter.reach().is_some() {
+            return self.process_region(region, filter.reach(), |image, origin| {
+                filter.apply(image, origin)
+            });
+        }
+        self.region_with(region, None, |window, changed| {
+            let [x0, y0, x1, y1] = window;
+            let cropped;
+            let src = if window == [0, 0, self.image.width(), self.image.height()] {
+                &*self.image
+            } else {
+                cropped = image::imageops::crop_imm(&*self.image, x0, y0, x1 - x0, y1 - y0)
+                    .to_image();
+                &cropped
+            };
+            let part = [changed[0] - x0, changed[1] - y0, changed[2] - x0, changed[3] - y0];
+            match distort::render(filter, src, self.at(window), part) {
+                Some(out) => (out, [changed[0], changed[1]]),
+                None => {
+                    let mut all = src.clone();
+                    filter.apply(&mut all, self.at(window));
+                    (all, [x0, y0])
+                }
+            }
+        })
+    }
+
+    /// Canvas position of a box of the image.
+    fn at(&self, [x0, y0, ..]: [u32; 4]) -> (i64, i64) {
+        (self.offset.0 + x0 as i64, self.offset.1 + y0 as i64)
+    }
+
+    /// The region through what `compute` gives (the box of the image it
+    /// reads and the box to change): pixels, and the place of their top-left
+    /// corner in the image.
+    fn region_with(
+        &self,
+        region: [u32; 4],
+        reach: Option<u32>,
+        compute: impl FnOnce([u32; 4], [u32; 4]) -> (RgbaImage, [u32; 2]),
+    ) -> RgbaImage {
         let (w, h) = self.image.dimensions();
         let region = intersect(region, [0, 0, w, h]).unwrap_or([0, 0, 0, 0]);
-        let [rx0, ry0, rx1, _] = region;
-        let crop = |[x0, y0, x1, y1]: [u32; 4]| {
-            image::imageops::crop_imm(&*self.image, x0, y0, x1 - x0, y1 - y0).to_image()
+        let [rx0, ry0, rx1, ry1] = region;
+        let crop = || {
+            image::imageops::crop_imm(&*self.image, rx0, ry0, rx1 - rx0, ry1 - ry0).to_image()
         };
         let Some(changed) = intersect(self.area(), region) else {
-            return crop(region);
+            return crop();
         };
         let window = match reach {
             Some(m) => {
@@ -555,35 +734,38 @@ impl Target {
                     y1.saturating_add(m).min(h),
                 ]
             }
+            None if self.whole_source => [0, 0, w, h],
             None => self.area(),
         };
-        let at = |[x0, y0, ..]: [u32; 4]| (self.offset.0 + x0 as i64, self.offset.1 + y0 as i64);
-        if self.clip.is_none() && window == [0, 0, w, h] && region == window {
-            let mut out = (*self.image).clone();
-            op(&mut out, self.offset);
-            return out;
+        let (part, [left, top]) = compute(window, changed);
+        // All of it, nothing to blend: no third copy of the pixels.
+        if self.clip.is_none() && !self.alpha_locked && part.dimensions() == (rx1 - rx0, ry1 - ry0) {
+            return part;
         }
-        let mut part = crop(window);
-        op(&mut part, at(window));
-        let mut out = crop(region);
+        let mut out = crop();
         let [cx0, cy0, cx1, cy1] = changed;
         let row = (rx1 - rx0) as usize * 4;
         let part_row = part.width() as usize * 4;
         let (part, clip) = (part.as_raw(), self.clip.as_ref());
+        let keep_alpha = self.alpha_locked;
         par_rows(out.as_mut(), row, |first, band| {
             for (i, line) in band.chunks_exact_mut(row).enumerate() {
                 let y = ry0 + (first + i) as u32;
                 if y < cy0 || y >= cy1 {
                     continue;
                 }
-                let src = &part[(y - window[1]) as usize * part_row..];
+                let src = &part[(y - top) as usize * part_row..];
                 for x in cx0..cx1 {
                     let coverage = clip.map_or(255, |c| c.coverage(x, y));
                     let d = (x - rx0) as usize * 4;
-                    let s = (x - window[0]) as usize * 4;
+                    let s = (x - left) as usize * 4;
                     let from = [line[d], line[d + 1], line[d + 2], line[d + 3]];
                     let to = [src[s], src[s + 1], src[s + 2], src[s + 3]];
-                    line[d..d + 4].copy_from_slice(&mix(from, to, coverage));
+                    let mut mixed = mix(from, to, coverage);
+                    if keep_alpha {
+                        crate::pixel_ops::keep_opacity(&mut mixed, &from);
+                    }
+                    line[d..d + 4].copy_from_slice(&mixed);
                 }
             }
         });
@@ -2666,6 +2848,8 @@ mod tests {
         let mask =
             image::GrayImage::from_fn(2, 4, |x, _| image::Luma([if x == 0 { 255 } else { 128 }]));
         let target = Target {
+            alpha_locked: false,
+            whole_source: false,
             image: Arc::clone(&image),
             clip: Some(Clip {
                 rect: [10, 0, 12, 4],

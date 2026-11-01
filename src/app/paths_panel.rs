@@ -85,6 +85,13 @@ pub(super) struct PathsPanel {
     rename: Option<(usize, String)>,
 }
 
+impl PathsPanel {
+    #[cfg(test)]
+    pub(super) fn stroke_with_eraser(&mut self) {
+        self.stroke.eraser = true;
+    }
+}
+
 impl Default for PathsPanel {
     fn default() -> Self {
         Self {
@@ -263,10 +270,9 @@ impl AtelierApp {
             return;
         };
         if s.content == FillContent::Pattern {
-            let library = &self.patterns.library;
-            let pattern = match library.get(s.pattern) {
-                Some(p) => p.clone(),
-                None => self.last_pattern(),
+            let Some(pattern) = self.patterns.library.get(s.pattern).cloned() else {
+                self.status = t!("pattern8-why-missing");
+                return;
             };
             let Some(doc) = &mut self.doc else { return };
             if !doc.fill_active_pattern(&pattern, Some(&sel), s.opacity, s.preserve) {
@@ -310,11 +316,17 @@ impl AtelierApp {
         (settings.tip, settings.spacing) = (p.tip.clone(), p.spacing);
         (settings.angle, settings.roundness, settings.flow) = (p.angle, p.roundness, p.flow);
         settings.pressure_size = s.pressure;
-        let mode = if s.eraser {
+        // As the Eraser tool: on what must keep its opacity, the background
+        // color is painted instead.
+        let keeps_alpha = self.doc.as_ref().is_some_and(Document::alpha_locked);
+        let mode = if s.eraser && !keeps_alpha {
             StrokeMode::Erase
         } else {
             StrokeMode::Paint
         };
+        if s.eraser && keeps_alpha {
+            settings.color = self.secondary.to_srgba_unmultiplied();
+        }
         let Some(doc) = &mut self.doc else { return };
         doc.checkpoint(t!("vector-hist-stroke-path"));
         if !doc.begin_paint() {

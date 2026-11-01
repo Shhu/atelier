@@ -52,6 +52,8 @@ pub struct GroupNode {
     pub fill: f32,
     pub mask: Option<MaskSrc>,
     pub board: Option<Board>,
+    /// It has styles, drawn yet or not: composited apart.
+    pub styled: bool,
     /// Drawn under it, on what is below.
     pub exterior: Vec<FxSrc>,
     /// Drawn over its layers, within their shape.
@@ -555,7 +557,7 @@ fn draw_group(g: &GroupNode, ctx: &Ctx, buf: &mut Buf) {
     if let Some(board) = &g.board {
         return draw_board(g, board, ctx, buf);
     }
-    if !g.exterior.is_empty() || !g.interior.is_empty() {
+    if g.styled {
         return draw_styled_group(g, ctx, buf);
     }
     if g.blend == BlendMode::PassThrough {

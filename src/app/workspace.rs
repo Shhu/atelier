@@ -312,38 +312,57 @@ impl AtelierApp {
         ]
     }
 
-    /// In Full Screen, for a moment on entering it, how to leave it; and the
-    /// messages the hidden status bar would show.
+    /// What Full Screen says over the image: for a moment on entering it, how
+    /// to leave it; and the message the hidden status bar would show, for as
+    /// long. Each with how visible it is, and its color.
+    pub(super) fn full_screen_notices(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Vec<(String, f32, Color32)> {
+        if self.workspace.screen != ScreenMode::Full {
+            return Vec::new();
+        }
+        let mut notices = Vec::new();
+        let now = ctx.input(|i| i.time);
+        if self.workspace.full_since.is_some_and(|t| now - t < NOTICE) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(NOTICE));
+            notices.push((t!("panels8-screen-notice"), 1.0, ui_kit::color::TEXT));
+        }
+        let (alpha, error) = self.status_fade(ctx);
+        if alpha > 0.0 && !self.status.is_empty() {
+            notices.push(if error {
+                (
+                    format!("{}  {}", icon::WARNING, self.status),
+                    alpha,
+                    WARNING,
+                )
+            } else {
+                (self.status.clone(), alpha, ui_kit::color::TEXT)
+            });
+        }
+        notices
+    }
+
     pub(super) fn draw_full_screen_notice(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         painter: &egui::Painter,
         area: Rect,
     ) {
-        if self.workspace.screen != ScreenMode::Full {
-            return;
+        let mut top = area.top() + 12.0;
+        for (message, alpha, color) in self.full_screen_notices(ctx) {
+            let font = ui_kit::medium(ui_kit::TEXT_SIZE);
+            let galley = painter.layout_no_wrap(message, font, color);
+            let size = galley.size() + vec2(24.0, 12.0);
+            let r = Rect::from_center_size(pos2(area.center().x, top + size.y / 2.0), size);
+            painter.rect_filled(r, 6.0, Color32::from_black_alpha(190).gamma_multiply(alpha));
+            painter.galley(
+                r.center() - galley.size() / 2.0,
+                galley,
+                color.gamma_multiply(alpha),
+            );
+            top = r.bottom() + 6.0;
         }
-        let now = ctx.input(|i| i.time);
-        let fresh = self.workspace.full_since.is_some_and(|t| now - t < NOTICE);
-        let error = self.workspace.error_status.as_deref();
-        let message = match (fresh, error) {
-            (_, Some(error)) => error.to_owned(),
-            (true, None) => t!("panels8-screen-notice"),
-            (false, None) => return,
-        };
-        if fresh {
-            ctx.request_repaint_after(std::time::Duration::from_secs_f64(NOTICE));
-        }
-        let at = pos2(area.center().x, area.top() + 24.0);
-        let font = ui_kit::medium(ui_kit::TEXT_SIZE);
-        let galley = painter.layout_no_wrap(message, font, ui_kit::color::TEXT);
-        let r = Rect::from_center_size(at, galley.size() + vec2(24.0, 12.0));
-        painter.rect_filled(r, 6.0, Color32::from_black_alpha(190));
-        painter.galley(
-            r.center() - galley.size() / 2.0,
-            galley,
-            ui_kit::color::TEXT,
-        );
     }
 
     /// The tool bar and options bar are shown.
@@ -419,6 +438,8 @@ impl AtelierApp {
     /// `message` in the status bar, in the warning color, and in the alert
     /// window (only the status in Batch runs).
     fn show_alert(&mut self, message: String) {
+        // (The same message again is news again.)
+        self.status_shown.clear();
         self.status = message.clone();
         self.workspace.error_status = Some(message.clone());
         if !self.automate.running() {
@@ -440,8 +461,21 @@ impl AtelierApp {
         let message = message.into();
         crate::diag::error(message.clone());
         let message = message.shown;
+        self.status_shown.clear();
         self.status = message.clone();
         self.workspace.error_status = Some(message);
+    }
+
+    /// A lock refused what was asked: in the status bar with the lock's
+    /// glyph, in the warning color. Nothing failed: a warning in the log,
+    /// in words only.
+    pub(super) fn status_refused(&mut self, message: impl Into<crate::i18n::Message>) {
+        let message = message.into();
+        crate::diag::warn(message.clone());
+        let shown = format!("{} {}", icon::LOCK_SIMPLE, message.shown);
+        self.status_shown.clear();
+        self.status = shown.clone();
+        self.workspace.error_status = Some(shown);
     }
 
     /// File › Open Recent: the recent files (by name, with their folder
@@ -477,6 +511,16 @@ impl AtelierApp {
             Action::Workspace(Command::ClearRecent),
         ));
         entries
+    }
+
+    /// An action was given F8, which otherwise opens the Info panel.
+    pub(super) fn f8_has_action(&self) -> bool {
+        let f8 = crate::actions::FnKey {
+            number: 8,
+            shift: false,
+            ctrl: false,
+        };
+        self.actions.library.with_key(f8).is_some()
     }
 
     /// Window menu: every panel, in the alphabetical order of the
@@ -517,7 +561,8 @@ impl AtelierApp {
                 t!("panels8-menu-info"),
                 true,
                 self.info.open,
-                Some(&SHORTCUT_INFO),
+                // An action given F8 keeps the key (see `keyboard`).
+                (!self.f8_has_action()).then_some(&SHORTCUT_INFO),
                 Action::Workspace(Command::Info),
             ),
             Check(
@@ -772,7 +817,7 @@ impl AtelierApp {
     }
 
     /// (section, what, keys) of every shortcut.
-    fn shortcut_rows(&self, ctx: &egui::Context) -> Vec<(String, String, String)> {
+    pub(super) fn shortcut_rows(&self, ctx: &egui::Context) -> Vec<(String, String, String)> {
         fn walk(
             ctx: &egui::Context,
             entries: &[MenuEntry],
@@ -836,6 +881,11 @@ impl AtelierApp {
                 keys::shortcut(ctx, &SHORTCUT_SIDE_PANEL),
             ),
             (t!("panels8-shortcut-screen-mode"), "F".to_owned()),
+            (
+                t!("ui9-shortcut-screen-mode-back"),
+                keys::shortcut(ctx, &KeyboardShortcut::new(Modifiers::SHIFT, Key::F)),
+            ),
+            (t!("ui9-shortcut-rotate-view-hold"), "R".to_owned()),
             (t!("panel-swap-colors"), "X".to_owned()),
             (t!("panel-default-colors"), "D".to_owned()),
             (t!("ui3-shortcuts-brush-size"), "[ ]".to_owned()),

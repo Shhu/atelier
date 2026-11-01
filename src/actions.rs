@@ -166,6 +166,14 @@ pub enum Recorded {
         #[serde(default)]
         pattern: Option<u64>,
     },
+    /// Edit › Define Pattern, from the canvas or the selection.
+    DefinePattern {
+        name: String,
+    },
+    /// Layer › New Fill Layer › Pattern: which one of the library.
+    NewPatternFill {
+        pattern: u64,
+    },
     /// Edit › Fade, of the step before it.
     Fade {
         /// 0..1.
@@ -219,6 +227,19 @@ pub enum Recorded {
         #[serde(default)]
         linked: bool,
         corners: [[f64; 2]; 4],
+    },
+    /// Layer › Lock Layers: these locks on or off, whichever the layer had
+    /// (the command toggles; the step says what it ended as).
+    Locks {
+        #[serde(default)]
+        transparent: bool,
+        #[serde(default)]
+        pixels: bool,
+        #[serde(default)]
+        position: bool,
+        #[serde(default)]
+        all: bool,
+        on: bool,
     },
     /// A menu command without settings.
     Menu {
@@ -623,7 +644,7 @@ impl Load {
 }
 
 /// `path` renamed to "name.bak", "name.bak-2"…: its new path.
-fn set_aside(path: &Path) -> Option<PathBuf> {
+pub(crate) fn set_aside(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?.to_string_lossy().into_owned();
     let backup = (1..1000)
         .map(|n| match n {

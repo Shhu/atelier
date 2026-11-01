@@ -244,10 +244,7 @@ impl Document {
             .iter()
             .map(|l| {
                 self.next_id += 1;
-                let mut c = Layer {
-                    id: self.next_id,
-                    ..l.clone()
-                };
+                let mut c = l.copy_as(self.next_id);
                 c.translate(dx, dy);
                 c
             })

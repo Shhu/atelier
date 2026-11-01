@@ -232,7 +232,7 @@ pub(super) struct Artboards {
     drag: Option<BoardDrag>,
     /// Names drawn above the artboards in the last frame: layer id, box
     /// (screen).
-    labels: Vec<(u64, Rect)>,
+    pub(super) labels: Vec<(u64, Rect)>,
     /// Canvas area the next Fit on Screen shows (an artboard).
     pub fit_to: Option<PixelRect>,
     dialog: Option<BoardDialog>,
@@ -411,21 +411,26 @@ impl AtelierApp {
         }
     }
 
-    /// The artboard whose name is at `p` (screen), as drawn last.
+    /// The artboard whose name is at `p` (upright), as drawn last. On a turned
+    /// view the name stays level around its turned center.
     fn label_at(&self, p: Pos2) -> Option<usize> {
         let doc = self.doc.as_ref()?;
-        let (id, _) = self.artboards.labels.iter().find(|(_, r)| r.contains(p))?;
+        let turn = self.view_turn;
+        let on_screen = turn.to_screen(p);
+        let (id, _) = (self.artboards.labels.iter())
+            .find(|(_, r)| Rect::from_center_size(turn.to_screen(r.center()), r.size()).contains(on_screen))?;
         doc.layers.iter().position(|l| l.id == *id)
     }
 
     /// Selects artboard `b` and starts moving it with its layers.
     fn start_board_move(&mut self, b: usize, ip: Pos2) {
         self.select_layer(b);
-        let Some(doc) = &self.doc else { return };
-        if doc.layers[b].locked {
+        if self.refuse_position_locked() {
             return;
         }
-        let layers = doc.block(b).map(|i| (i, doc.layers[i].offset)).collect();
+        let Some(doc) = &self.doc else { return };
+        // Its layers under Lock Position stay, as when a group moves.
+        let layers = doc.movable_block(b).into_iter().map(|i| (i, doc.layers[i].offset)).collect();
         self.artboards.drag = Some(BoardDrag::Move {
             start: ip,
             layers,
@@ -472,7 +477,7 @@ impl AtelierApp {
         // The active artboard's "+" buttons and handles.
         let active = doc
             .artboard_of(doc.active)
-            .filter(|&a| !doc.layers[a].locked && doc.layers[a].visible);
+            .filter(|&a| doc.can_move(a) && doc.layers[a].visible);
         if let Some(a) = active
             && let Some(r) = doc.layers[a].artboard_rect()
         {
@@ -670,7 +675,7 @@ impl AtelierApp {
         let screen = view.rect_to_screen(to_rect(r));
         let stroke = UiStroke::new(1.5, ui_kit::color::ACCENT);
         painter.rect_stroke(screen, 0.0, stroke, egui::StrokeKind::Outside);
-        if doc.layers[a].locked {
+        if !doc.can_move(a) {
             return;
         }
         for (_, p) in handle_positions(screen) {
