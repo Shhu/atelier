@@ -70,6 +70,11 @@
     <display_length compare="ge">768</display_length>
   </requires>
   <releases>
+    <release version="0.5.0" date="2026-11-01">
+      <description>
+        <p>Partial layer locks, layer styles on groups and fill layers, patterns, Rotate View, Info, Histogram and Navigator panels, Color Sampler and Ruler tools, screen modes, Auto Tone/Contrast/Color, Exposure, Channel Mixer, Selective Color, Fade, Stroke, Distort filters, new Crop options and Layer › Align, with a clearer interface font.</p>
+      </description>
+    </release>
     <release version="0.4.3" date="2026-10-25">
       <description>
         <p>A third review pass: crop asks before any command applies it, nothing typed or painted is lost during background work, locked groups lock their layers, Layer › Align and Distribute, opacity and blend for all selected layers, new layer shortcuts, safer handling of large and unusual files, and many fixes to selections, Quick Mask, filters and smart objects.</p>
