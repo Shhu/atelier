@@ -70,6 +70,11 @@
     <display_length compare="ge">768</display_length>
   </requires>
   <releases>
+    <release version="0.5.1" date="2026-11-03">
+      <description>
+        <p>A review of 0.5.0: closing during background work asks to save, PSD keeps disabled layer styles, Cancel and Esc always stop background work, actions stop only on real refusals, Fade without seams, layer styles follow previews, faster Distort previews and resampling, a Golden Spiral crop overlay, an Adjustment Composite histogram, and better layouts on small windows.</p>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-11-01">
       <description>
         <p>Partial layer locks, layer styles on groups and fill layers, patterns, Rotate View, Info, Histogram and Navigator panels, Color Sampler and Ruler tools, screen modes, Auto Tone/Contrast/Color, Exposure, Channel Mixer, Selective Color, Fade, Stroke, Distort filters, new Crop options and Layer › Align, with a clearer interface font.</p>
