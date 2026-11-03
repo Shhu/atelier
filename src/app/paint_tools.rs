@@ -515,7 +515,7 @@ impl AtelierApp {
                 "status-hardness",
                 value = format!("{:.0}", self.hardness * 100.0)
             );
-            self.status = format!("{size} — {hardness}");
+            self.status.set(format!("{size} — {hardness}"));
         }
         true
     }
@@ -575,12 +575,12 @@ impl AtelierApp {
             _ => return false,
         };
         *target = value;
-        self.status = match key {
+        self.status.set(match key {
             "opacity" => t!("status-tool-opacity", percent = percent),
             "flow" => t!("paint-status-flow", percent = percent),
             "exposure" => t!("paint-status-exposure", percent = percent),
             _ => t!("paint-status-strength", percent = percent),
-        };
+        });
         true
     }
 

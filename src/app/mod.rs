@@ -46,6 +46,8 @@ mod measure_tools;
 mod measure_tests;
 #[cfg(test)]
 mod panels11_tests;
+#[cfg(test)]
+mod status12_tests;
 mod menus;
 mod models_window;
 mod navigator;
@@ -1062,9 +1064,10 @@ pub struct AtelierApp {
     /// Fit the canvas in the view at the next frame, up to this zoom.
     fit_pending: Option<f32>,
     hover_pixel: Option<(i64, i64)>,
-    status: String,
-    /// Last message shown and since when (to clear it).
-    status_shown: String,
+    status: status_bar::Status,
+    /// The last `Status::said` seen by the status bar, and since when
+    /// (to fade the message out).
+    status_seen: u64,
     status_since: f64,
     title: String,
 
@@ -1685,8 +1688,8 @@ impl AtelierApp {
             pan: Vec2::ZERO,
             fit_pending: Some(1.0),
             hover_pixel: None,
-            status: String::new(),
-            status_shown: String::new(),
+            status: Default::default(),
+            status_seen: 0,
             status_since: 0.0,
             title: String::new(),
             canvas_view: None,
@@ -2044,12 +2047,12 @@ impl AtelierApp {
         let Some(doc) = &self.doc else { return };
         let layer = doc.active_layer();
         let (x, y) = layer.offset;
-        self.status = t!(
+        self.status.set(t!(
             "canvas-status-layer-moved",
             name = layer.name.as_str(),
             x = signed(x as f32),
             y = signed(y as f32)
-        );
+        ));
     }
 
     /// Alt+arrow with the Move tool and a selection: a copy of the selected
@@ -2088,10 +2091,10 @@ impl AtelierApp {
         let hex = hex_color([r, g, b]);
         if to_background {
             self.secondary = color;
-            self.status = t!("status-background-color", hex = hex);
+            self.status.set(t!("status-background-color", hex = hex));
         } else {
             self.primary = color;
-            self.status = t!("status-foreground-color", hex = hex);
+            self.status.set(t!("status-foreground-color", hex = hex));
         }
     }
 
@@ -2108,7 +2111,7 @@ impl AtelierApp {
         self.resize_filter = d.filter;
         // The selection's coordinates no longer make sense.
         self.forget_selection();
-        self.status = t!("status-image-size", width = d.width, height = d.height);
+        self.status.set(t!("status-image-size", width = d.width, height = d.height));
         self.fit_pending = Some(1.0);
         self.reset_pending();
     }
@@ -2119,11 +2122,11 @@ impl AtelierApp {
         let selection = self.selection.as_ref();
         if doc.fill_active(color.to_srgba_unmultiplied(), selection, opacity, preserve) {
             doc.mark_fade();
-            self.status = t!(
+            self.status.set(t!(
                 "status-filled",
                 name = doc.active_layer().name.as_str(),
                 content = which
-            );
+            ));
             self.reset_pending();
         } else {
             // Nothing changed: a Fade after it has nothing to fade.
@@ -2354,7 +2357,7 @@ impl AtelierApp {
             Ok(()) => {
                 let name = doc.active_layer().name.clone();
                 self.reset_pending();
-                self.status = t!("status-layers-merged", name = name.as_str());
+                self.status.set(t!("status-layers-merged", name = name.as_str()));
                 return;
             }
             Err(MergeError::Locked(i)) => return self.refuse_any_lock_of(i),
@@ -2782,14 +2785,14 @@ impl AtelierApp {
                 };
                 match bounds {
                     Some(b) if b == doc.full_rect() => {
-                        self.status = if matches!(action, Action::CropToElement) {
+                        self.status.set(if matches!(action, Action::CropToElement) {
                             t!(
                                 "status-element-fills-canvas",
                                 name = doc.active_layer().name.as_str()
                             )
                         } else {
                             t!("status-content-fills-canvas")
-                        };
+                        });
                     }
                     Some(b) => self.apply_crop(crop_tool::CropPlan::plain(b)),
                     None => self.status_cannot(t!("status-nothing-to-crop")),
@@ -2867,10 +2870,10 @@ impl AtelierApp {
                 if let Some(doc) = &mut self.doc
                     && doc.rasterize_active()
                 {
-                    self.status = t!(
+                    self.status.set(t!(
                         "vector-status-rasterized",
                         name = doc.active_layer().name.as_str()
-                    );
+                    ));
                 }
             }
             Action::Select(command) => self.select_command(command),
@@ -2959,12 +2962,12 @@ impl AtelierApp {
         };
         if self.fit_canvas {
             self.forget_selection();
-            self.status = t!(
+            self.status.set(t!(
                 "status-canvas-fit-element",
                 width = w,
                 height = h,
                 rotated = turned
-            );
+            ));
             self.after_geometry_change(frame.center() - old_center);
         } else {
             // Where the element is: the corner of its turned box.
@@ -2976,14 +2979,14 @@ impl AtelierApp {
             ]
             .map(|p| canvas::rotate_around(p, frame.center(), angle));
             let corner = round_rect(Rect::from_points(&corners)).min;
-            self.status = t!(
+            self.status.set(t!(
                 "status-element-placed",
                 width = w,
                 height = h,
                 x = corner.x as i64,
                 y = corner.y as i64,
                 rotated = turned
-            );
+            ));
             // The canvas doesn't change: a crop frame being prepared stays.
             self.reset_transform();
         }
@@ -3300,7 +3303,7 @@ impl AtelierApp {
         {
             self.run(Action::Delete);
         } else if delete && quick_mask && self.transform_rect.is_none() {
-            self.status = t!("input4-quick-mask-delete", delete = keys::key(Key::Delete));
+            self.status.set(t!("input4-quick-mask-delete", delete = keys::key(Key::Delete)));
         }
         // Fills, like Photoshop, with Backspace or Delete. (On Windows,
         // egui-winit turns Shift+Delete into a cut: see `clipboard_action`.)
@@ -3572,16 +3575,16 @@ impl AtelierApp {
         } else if m.shift {
             let step = if up { 0.25 } else { -0.25 };
             self.hardness = (self.hardness + step).clamp(0.0, 1.0);
-            self.status = t!(
+            self.status.set(t!(
                 "status-hardness",
                 value = format!("{:.0}", self.hardness * 100.0)
-            );
+            ));
         } else {
             self.brush_size = brush_size_step(self.brush_size, up);
-            self.status = t!(
+            self.status.set(t!(
                 "status-brush-size",
                 value = format!("{:.0}", self.brush_size)
-            );
+            ));
         }
     }
 
@@ -3610,10 +3613,10 @@ impl AtelierApp {
                 percent = percent
             ),
         };
-        self.status = match locked {
+        self.status.set(match locked {
             0 => status,
             n => format!("{status} · {}", t!("input6-status-locked-left", count = n)),
-        };
+        });
     }
 
     /// Opacity and blend mode changes go to every selected layer, as in

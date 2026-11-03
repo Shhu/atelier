@@ -737,13 +737,13 @@ impl AtelierApp {
                     doc.active_layer_mut().replace_pixels(image);
                     doc.end_paint();
                     doc.mark_fade();
-                    self.status = t!("filter-applied", name = name.as_str());
+                    self.status.set(t!("filter-applied", name = name.as_str()));
                     self.liquify_applied(a.mesh);
                 }
                 Ok(None) => {
                     doc.end_paint();
                     doc.discard_step();
-                    self.status = t!("retouch-status-cancelled", name = name.as_str());
+                    self.status.set(t!("retouch-status-cancelled", name = name.as_str()));
                     self.actions.step_stopped(Stopped::Cancelled);
                     self.shrink_after_preview();
                 }
@@ -918,10 +918,10 @@ impl AtelierApp {
         }
         let file = path.file_name().map(|n| n.to_string_lossy().into_owned());
         let file = file.unwrap_or_default();
-        self.status = match std::fs::write(&path, mesh.to_bytes()) {
+        self.status.set(match std::fs::write(&path, mesh.to_bytes()) {
             Ok(()) => t!("liquify-status-mesh-saved", file = file.as_str()),
             Err(e) => t!("liquify-status-mesh-error", error = e.to_string()),
-        };
+        });
     }
 
     /// Load Mesh…: a mesh saved earlier (stretched to the layer).

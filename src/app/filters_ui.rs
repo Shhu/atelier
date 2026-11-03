@@ -789,11 +789,11 @@ impl AtelierApp {
                     doc.active_layer_mut().replace_pixels(image);
                     doc.end_paint();
                     doc.mark_fade();
-                    self.status = t!("filter-applied", name = name.as_str());
+                    self.status.set(t!("filter-applied", name = name.as_str()));
                     if a.rasterized {
                         let layer = doc.active_layer().name.as_str();
                         let note = t!("canvas-status-text-rasterized", name = layer);
-                        self.status = format!("{} — {note}", self.status);
+                        self.status.set(format!("{} — {note}", self.status));
                     }
                     self.filters.last = Some(a.filter);
                     self.filters.settings.insert(a.filter.kind(), a.filter);
@@ -948,7 +948,7 @@ impl AtelierApp {
             || doc.adjust_active(&adjustment, self.selection.as_ref())
         {
             doc.mark_fade();
-            self.status = t!("dialog-adjust-applied", name = adjustment.title());
+            self.status.set(t!("dialog-adjust-applied", name = adjustment.title()));
         } else {
             doc.mark_fade_nothing();
         }
@@ -966,7 +966,7 @@ impl AtelierApp {
                 let name = a.adjustment.title();
                 if cancellable_indicator(ctx, "adjust_busy", &name, a.started, None) {
                     self.filters.adjusting = None;
-                    self.status = t!("retouch-status-cancelled", name = name.as_str());
+                    self.status.set(t!("retouch-status-cancelled", name = name.as_str()));
                     self.actions.step_stopped(Stopped::Cancelled);
                     self.reset_pending();
                     return false;
@@ -1085,7 +1085,7 @@ impl AtelierApp {
         // A layer the dialog enlarged is put back as it was.
         self.shrink_after_preview();
         let name = title(a.filter.kind());
-        self.status = t!("retouch-status-cancelled", name = name.as_str());
+        self.status.set(t!("retouch-status-cancelled", name = name.as_str()));
         self.actions.step_stopped(Stopped::Cancelled);
         self.end_layer_preview();
         self.reset_pending();
@@ -2831,8 +2831,8 @@ mod tests {
             app.status.clear();
             app.run(action);
             assert_eq!(
-                Some(&app.status),
-                app.hidden_target(false).as_ref(),
+                Some(app.status.to_string()),
+                app.hidden_target(false),
                 "{action:?}"
             );
         }

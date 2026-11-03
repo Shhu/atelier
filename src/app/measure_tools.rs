@@ -121,7 +121,6 @@ impl AtelierApp {
             return None;
         }
         if doc.samplers.len() >= MAX_SAMPLERS {
-            self.status_shown.clear();
             self.status_cannot(t!("panels8-status-samplers-full", count = MAX_SAMPLERS));
             return None;
         }
@@ -406,7 +405,7 @@ impl AtelierApp {
             applied = true;
         } else if entered {
             self.reset_pending();
-            self.say(t!("panels9-status-already-level"));
+            self.status.set(t!("panels9-status-already-level"));
         }
         self.fit_canvas = fit;
         if self.selection.is_none() {

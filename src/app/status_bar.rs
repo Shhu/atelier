@@ -10,13 +10,54 @@ const MESSAGE_TIME: f64 = 5.0;
 /// The same for an error, shown in the warning color.
 const ERROR_TIME: f64 = 20.0;
 
+/// The last message, for the status bar (and Full Screen's notices).
+/// Each `set` is news: the message shows for its full time again, even
+/// when its text is the one shown last.
+#[derive(Debug, Default)]
+pub(super) struct Status {
+    text: String,
+    /// Bumped by each `set` (the status bar restarts its timer on it).
+    said: u64,
+}
+
+impl Status {
+    pub(super) fn set(&mut self, text: impl Into<String>) {
+        self.text = text.into();
+        self.said += 1;
+    }
+
+    /// No message (nothing to restart).
+    pub(super) fn clear(&mut self) {
+        self.text.clear();
+    }
+}
+
+impl std::ops::Deref for Status {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl<T: AsRef<str> + ?Sized> PartialEq<T> for Status {
+    fn eq(&self, other: &T) -> bool {
+        self.text == other.as_ref()
+    }
+}
+
 impl AtelierApp {
     /// How visible the last message is (0: gone), and whether it is an
     /// error: wherever it shows, it lasts as long.
     pub(super) fn status_fade(&mut self, ctx: &egui::Context) -> (f32, bool) {
         let now = ctx.input(|i| i.time);
-        if self.status != self.status_shown {
-            self.status_shown = self.status.clone();
+        if self.status.said != self.status_seen {
+            self.status_seen = self.status.said;
             self.status_since = now;
         }
         let age = now - self.status_since;
@@ -24,7 +65,7 @@ impl AtelierApp {
             .workspace
             .error_status
             .as_ref()
-            .is_some_and(|e| *e == self.status);
+            .is_some_and(|e| *e == *self.status);
         let time = if error { ERROR_TIME } else { MESSAGE_TIME };
         let alpha = (1.0 - (age - time).max(0.0)).clamp(0.0, 1.0) as f32;
         // Repaints only when the message starts fading, then while it fades.
@@ -33,13 +74,6 @@ impl AtelierApp {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
         (alpha, error)
-    }
-
-    /// `message` in the status bar for its full time, even if it is the
-    /// one shown last: said again, it is news again.
-    pub(super) fn say(&mut self, message: String) {
-        self.status_shown.clear();
-        self.status = message;
     }
 
     pub(super) fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -57,7 +91,7 @@ impl AtelierApp {
                 )
             } else {
                 (
-                    self.status.clone(),
+                    self.status.to_string(),
                     ui_kit::color::ACCENT_TEXT.gamma_multiply(alpha),
                 )
             }

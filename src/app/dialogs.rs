@@ -34,11 +34,11 @@ impl AtelierApp {
         let Some(doc) = &mut self.doc else { return };
         let name = doc.active_layer().name.clone();
         let n = doc.split_active(gap);
-        self.status = match n {
+        self.status.set(match n {
             0 => t!("dialog-split-empty", name = name),
             1 => t!("dialog-split-single", name = name),
             n => t!("dialog-split-done", name = name, count = n),
-        };
+        });
         if n >= 2 {
             self.split_open = false;
             self.tool = Tool::Transform;
@@ -210,7 +210,7 @@ impl AtelierApp {
                     self.selection.as_ref(),
                 )
             {
-                self.status = t!("dialog-transparency-done", color = hex_color([r, g, b]));
+                self.status.set(t!("dialog-transparency-done", color = hex_color([r, g, b])));
             }
         }
         self.end_layer_preview();
@@ -685,7 +685,7 @@ impl AtelierApp {
             {
                 doc.fill_canvas_extension(old, color.to_srgba_unmultiplied());
             }
-            self.status = t!("status-canvas-resized", width = w, height = h);
+            self.status.set(t!("status-canvas-resized", width = w, height = h));
             self.forget_selection();
             self.reset_pending();
         }

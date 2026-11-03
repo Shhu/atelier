@@ -617,7 +617,7 @@ impl AtelierApp {
             |ui| window.body(ui, presets, &mut status),
         );
         if let Some(status) = status {
-            self.status = status;
+            self.status.set(status);
         }
         if std::mem::take(&mut window.preview.failure) {
             self.status_failed(tm!("fx4-preview-failed-any"));
@@ -834,7 +834,7 @@ impl AtelierApp {
             }
             Destination::Document { path, .. } => file_label(&path),
         };
-        self.status = t!("retouch-status-cancelled", name = name.as_str());
+        self.status.set(t!("retouch-status-cancelled", name = name.as_str()));
     }
 
     /// The development is done: the layer's new pixels, or a new document.
@@ -866,11 +866,11 @@ impl AtelierApp {
                             doc.active_layer_mut().replace_pixels(image);
                             doc.end_paint();
                             doc.mark_fade();
-                            self.status = t!("filter-applied", name = name.as_str());
+                            self.status.set(t!("filter-applied", name = name.as_str()));
                             if rasterized {
                                 let layer = doc.active_layer().name.as_str();
                                 let note = t!("canvas-status-text-rasterized", name = layer);
-                                self.status = format!("{} — {note}", self.status);
+                                self.status.set(format!("{} — {note}", self.status));
                             }
                             self.camera_raw_applied(*settings);
                         }
@@ -897,12 +897,12 @@ impl AtelierApp {
                     return;
                 };
                 let shown = path.display().to_string();
-                self.status = if preview_only {
+                self.status.set(if preview_only {
                     let notes = t!("raw-note-preview-only");
                     t!("xchg-status-opened-simplified", path = shown, notes = notes)
                 } else {
                     t!("status-opened", path = shown)
-                };
+                });
                 if !self.automate.running() {
                     self.recent.add(&path);
                 }

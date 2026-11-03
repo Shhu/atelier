@@ -612,6 +612,56 @@ fn the_selection_and_the_selected_layer_limit_it() {
     assert_eq!(h.state().hist_panel.counts().unwrap().green[255], 200);
 }
 
+/// The source the Source menu shows.
+fn shown_source(h: &Harness<'static, AtelierApp>) -> String {
+    let name = t!("panels8-histogram-source");
+    h.get_by_label(&name).value().unwrap_or_default()
+}
+
+#[test]
+fn adjustment_composite_counts_up_to_the_active_adjustment_layer() {
+    use crate::pixel_ops::Adjustment;
+    let mut h = histogram_open(Tool::Brush);
+    counted(&mut h);
+    let white = image::RgbaImage::from_pixel(400, 300, image::Rgba([255, 255, 255, 255]));
+    let d = h.state_mut().doc.as_mut().unwrap();
+    d.add_adjustment_layer(Adjustment::Invert, None);
+    d.add_layer("over".into(), white.clone(), (0, 0));
+    d.add_layer("top".into(), white, (0, 0));
+    // In a group with the adjustment, above it: left out too, as what is
+    // above the group.
+    d.group_layers(&[1, 2]);
+    let shape: Vec<_> = d.layers.iter().map(|l| (l.is_group(), l.depth)).collect();
+    let grouped = [(false, 0), (false, 1), (false, 1), (true, 0), (false, 0)];
+    assert_eq!(shape, grouped);
+    d.active = 1;
+    h.state_mut().hist_panel.source = histogram_panel::Source::AdjustmentComposite;
+    // The image under the Invert, inverted; the white layers left out.
+    wait(&mut h, |a| {
+        a.hist_panel.counts().is_some_and(|c| c.red[255 - 200] == 60_000)
+    });
+    let c = h.state().hist_panel.counts().unwrap();
+    assert_eq!(c.red[255 - 10], 60_000);
+    assert_eq!(c.green[255 - 20], 120_000);
+    // Shown in the menu.
+    assert_eq!(shown_source(&h), t!("histogram12-source-adjustment"));
+    // Another layer: the entire image, all white.
+    h.state_mut().doc.as_mut().unwrap().active = 0;
+    wait(&mut h, |a| {
+        a.hist_panel.counts().is_some_and(|c| c.red[255] == 120_000)
+    });
+    assert_eq!(
+        h.state().histogram_source(),
+        histogram_panel::Source::EntireImage
+    );
+    assert_eq!(shown_source(&h), t!("panels8-source-image"));
+    // The adjustment again: as chosen before.
+    h.state_mut().doc.as_mut().unwrap().active = 1;
+    wait(&mut h, |a| {
+        a.hist_panel.counts().is_some_and(|c| c.red[255 - 200] == 60_000)
+    });
+}
+
 #[test]
 fn a_large_image_keeps_the_interface_going_while_counted_and_closing_stops_it() {
     let mut h = app(Tool::Brush);

@@ -76,6 +76,8 @@ pub struct Placed<'a> {
     pub at: (i64, i64),
     /// Canvas area it covers.
     pub rect: PixelRect,
+    /// The plan's level (see [`Sources::level`]).
+    pub level: u32,
 }
 
 /// See [`Options::placed_mask`].
@@ -88,6 +90,8 @@ pub struct PlacedMask<'a> {
     pub at: (i64, i64),
     /// Canvas area it covers.
     pub rect: PixelRect,
+    /// The plan's level (see [`Sources::level`]).
+    pub level: u32,
 }
 
 /// Index ranges of the layers of one level of the stack, from the bottom
@@ -431,7 +435,7 @@ impl Builder<'_, '_> {
         // the mask leaves of the canvas.
         let content_box = match l.has_pixels() {
             true => l.content_bounds().unwrap_or(l.rect()),
-            false => crate::document::styles_area(self.layers, i, self.canvas)
+            false => crate::document::styles_area_with(self.layers, i, self.canvas, self.opts)
                 .unwrap_or(self.canvas),
         };
         let fx = &l.effects;
@@ -470,12 +474,14 @@ impl Builder<'_, '_> {
                 blend: c.blend,
             });
         }
-        if let Some(styles) = crate::document::styles_of(
+        // Drawn from the shape as previewed.
+        if let Some(styles) = crate::document::styles_with(
                 self.layers,
                 i,
                 self.canvas,
                 self.opts.held,
                 self.opts.later_styles,
+                self.opts,
             ) {
             let mut slot = 2;
             let mut src = |s: &mut Self, f: &crate::compose::styles::FxImage| {
@@ -640,10 +646,14 @@ pub fn signatures(layers: &[Layer], opts: &Options) -> Vec<Sig> {
             _ => l.blend,
         };
         // The styles shown (a hidden layer: as last drawn).
-        let styles = match opts.canvas.filter(|_| !l.has_pixels()) {
+        // The styles shown (a hidden layer: as last drawn), as the plan
+        // draws them (previews included).
+        let styles = match opts.canvas {
             _ if !shown[i] => l.styles_cached(),
-            _ if l.has_pixels() => l.styles_shown(opts.held, opts.later_styles),
-            Some(c) => crate::document::styles_of(layers, i, c, opts.held, opts.later_styles),
+            Some(c) => {
+                crate::document::styles_with(layers, i, c, opts.held, opts.later_styles, opts)
+            }
+            None if l.has_pixels() => l.styles_shown(opts.held, opts.later_styles),
             None => l.styles_cached(),
         };
         let state = hash_of((

@@ -698,6 +698,7 @@ pub(super) struct PlacedImage {
     image: Arc<RgbaImage>,
     at: (i64, i64),
     rect: PixelRect,
+    level: u32,
 }
 
 /// What the compositing shows differently from the document: the layer
@@ -784,6 +785,7 @@ impl AtelierApp {
                 image: &p.image,
                 at: p.at,
                 rect: p.rect,
+                level: p.level,
             })
             .collect();
         opts.placed_mask = xform.mask_preview.as_ref().map(|p| p.placed());
@@ -1390,7 +1392,14 @@ impl AtelierApp {
         let block_styles: Vec<_> = block
             .clone()
             .map(|j| {
-                crate::document::styles_of(&layers, j, canvas, opts.held, opts.later_styles)
+                crate::document::styles_with(
+                    &layers,
+                    j,
+                    canvas,
+                    opts.held,
+                    opts.later_styles,
+                    &opts,
+                )
             })
             .collect();
         // What it looks like, wherever it is.
@@ -1534,6 +1543,7 @@ impl AtelierApp {
                         w: iw * b as u32,
                         h: ih * b as u32,
                     },
+                    level: l.level,
                 });
             }
             if l.placed.as_ref().is_none_or(|p| p.key != key) {
@@ -1557,6 +1567,7 @@ impl AtelierApp {
                         w: grid.w * b,
                         h: grid.h * b,
                     },
+                    level: l.level,
                 });
             }
             l.placed.clone()

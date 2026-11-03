@@ -191,7 +191,7 @@ impl AtelierApp {
         };
         let step = t!("adjust8-hist-fade", name = name.as_str());
         if doc.fade_put(step.clone(), image) {
-            self.status = step;
+            self.status.set(step);
             self.record(recorded_fade(fade));
             self.reset_pending();
         }
@@ -435,7 +435,7 @@ impl AtelierApp {
                 if cancellable_indicator(ctx, "processing_busy", &name, p.started, None) {
                     let p = self.filters.processing.take().expect("checked above");
                     self.end_stroke_step(&p);
-                    self.status = t!("retouch-status-cancelled", name = name.as_str());
+                    self.status.set(t!("retouch-status-cancelled", name = name.as_str()));
                     self.actions.step_stopped(Stopped::Cancelled);
                     self.reset_pending();
                 }
@@ -486,7 +486,7 @@ impl AtelierApp {
                     doc.mark_fade_nothing();
                 } else if doc.put_processed_active(name.clone(), image) {
                     doc.mark_fade();
-                    self.status = t!("dialog-adjust-applied", name = name.as_str());
+                    self.status.set(t!("dialog-adjust-applied", name = name.as_str()));
                 }
                 self.record(Recorded::Menu {
                     item: match mode {
@@ -503,11 +503,11 @@ impl AtelierApp {
                     doc.discard_step();
                     doc.mark_fade_nothing();
                     let soft = self.selection.as_ref().is_some_and(barely_selected);
-                    self.status = if soft {
+                    self.status.set(if soft {
                         t!("adjust9-stroke-soft")
                     } else {
                         t!("adjust9-stroke-nothing")
-                    };
+                    });
                 } else {
                     doc.active_layer_mut().replace_pixels(image);
                     doc.end_paint();
@@ -516,7 +516,7 @@ impl AtelierApp {
                         Some((mask, at)) => doc.mark_fade_painted(mask.clone(), *at),
                         None => doc.mark_fade_changed(),
                     }
-                    self.status = t!("adjust8-stroke-title");
+                    self.status.set(t!("adjust8-stroke-title"));
                 }
                 self.record(recorded_stroke(s));
             }

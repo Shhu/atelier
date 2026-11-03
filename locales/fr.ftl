@@ -3389,3 +3389,8 @@ pattern11-step-new-gradient-fill = Nouveau calque de remplissage de dégradé
 
 ## Title bar: the menu holding the menus a narrow window has no room for
 ui11-menu-more = Autres menus
+
+## Histogram panel: Source menu, the image up to the selected adjustment layer
+histogram12-source-adjustment = Composite de réglage
+## Crop tool: Overlay menu, golden rectangle squares and spiral (Shift+O turns it)
+histogram12-spiral-overlay = Spirale d'or

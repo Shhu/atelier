@@ -1075,6 +1075,66 @@ fn o_and_x_belong_to_the_crop_tool() {
 }
 
 #[test]
+fn shift_o_turns_the_golden_spiral_and_the_triangle() {
+    let mut h = crop_app();
+    // O goes to the spiral, after Golden Ratio.
+    h.state_mut().crop.overlay = CropOverlay::GoldenRatio;
+    key(&mut h, Key::O, Modifiers::NONE);
+    assert_eq!(h.state().crop.overlay, CropOverlay::GoldenSpiral);
+    let lines = |a: &AtelierApp| a.crop.overlay.lines(4.0 / 3.0, a.crop.overlay_turn);
+    let first = lines(h.state());
+    assert!(first.len() > 100, "the squares and the arcs");
+    for [a, b] in &first {
+        for (u, v) in [a, b] {
+            assert!((-1e-4..=1.0001).contains(u) && (-1e-4..=1.0001).contains(v));
+        }
+    }
+    // One continuous curve: each arc starts where the one before ends.
+    let arcs: Vec<_> = first.iter().filter(|[a, b]| a.0 != b.0 && a.1 != b.1).collect();
+    for pair in arcs.windows(2) {
+        let (end, start) = (pair[0][1], pair[1][0]);
+        assert!((end.0 - start.0).abs() < 1e-3 && (end.1 - start.1).abs() < 1e-3);
+    }
+    // Shift + O: its four turns, the eye in each corner, then back.
+    let eye = |l: &[[(f32, f32); 2]]| l.last().unwrap()[1];
+    let mut corners = Vec::new();
+    for _ in 0..4 {
+        let (u, v) = eye(&lines(h.state()));
+        corners.push((u > 0.5, v > 0.5));
+        key(&mut h, Key::O, Modifiers::SHIFT);
+        assert_eq!(h.state().tool, Tool::Canvas);
+        assert_eq!(h.state().crop.overlay, CropOverlay::GoldenSpiral);
+    }
+    corners.sort();
+    corners.dedup();
+    assert_eq!(corners.len(), 4, "{corners:?}");
+    assert_eq!(lines(h.state()), first, "back to the first");
+    // A portrait box: the spiral lies along its height.
+    let tall = CropOverlay::GoldenSpiral.lines(0.75, 0);
+    assert_eq!(tall[0][0].1, tall[0][1].1, "the first cut is across");
+    // The triangle's diagonal flips.
+    h.state_mut().crop.overlay = CropOverlay::Triangle;
+    let before = lines(h.state());
+    key(&mut h, Key::O, Modifiers::SHIFT);
+    let after = lines(h.state());
+    assert_ne!(after, before);
+    assert_eq!(after[0], [(1.0, 0.0), (0.0, 1.0)]);
+    key(&mut h, Key::O, Modifiers::SHIFT);
+    assert_eq!(lines(h.state()), before);
+    // The others don't turn.
+    h.state_mut().crop.overlay = CropOverlay::Thirds;
+    let thirds = lines(h.state());
+    key(&mut h, Key::O, Modifiers::SHIFT);
+    assert_eq!(lines(h.state()), thirds);
+    // Kept for the next session.
+    h.state_mut().crop.overlay_turn = 3;
+    let saved = h.state().session_settings();
+    let mut h = crop_app();
+    h.state_mut().restore_session(&saved);
+    assert_eq!(h.state().crop.overlay_turn, 3);
+}
+
+#[test]
 fn the_presets_list_has_a_name_and_empty_shows_empty() {
     let h = crop_app();
     assert!(h.query_by_label(&t!("crop9-preset-name")).is_some(), "named for screen readers");

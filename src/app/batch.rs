@@ -996,7 +996,7 @@ impl AtelierApp {
                 if self.tab_of(&path).is_some() {
                     (self.current_document(!was_open), None)
                 } else {
-                    (None, Some(self.status.clone()))
+                    (None, Some(self.status.to_string()))
                 }
             }
         };
@@ -1262,7 +1262,7 @@ impl AtelierApp {
         let Some(run) = self.automate.run.take() else {
             return;
         };
-        self.status = match (&run.log, run.errors) {
+        self.status.set(match (&run.log, run.errors) {
             (Some(log), n) if n > 0 => t!(
                 "actions-batch-done-errors",
                 count = run.done as u32,
@@ -1270,7 +1270,7 @@ impl AtelierApp {
                 path = log.display().to_string()
             ),
             _ => t!("actions-batch-done", count = run.done as u32),
-        };
+        });
     }
 
     /// Batch's progress, and its Cancel: the document being processed is
@@ -1329,7 +1329,7 @@ impl AtelierApp {
             self.close_by_uid(uid);
         }
         self.stop_playing();
-        self.status = t!("actions-batch-cancelled", count = done);
+        self.status.set(t!("actions-batch-cancelled", count = done));
     }
 
     fn alert_window(&mut self, ctx: &egui::Context) {

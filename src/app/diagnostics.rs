@@ -680,12 +680,12 @@ impl AtelierApp {
         }
         if copy {
             ctx.copy_text(self.diagnostics_report());
-            self.status = t!("diag-status-copied");
+            self.status.set(t!("diag-status-copied"));
         }
         // The report copied, then the page where problems are reported.
         if report {
             ctx.copy_text(self.diagnostics_report());
-            self.status = t!("ui4-diag-status-report");
+            self.status.set(t!("ui4-diag-status-report"));
             ctx.open_url(egui::OpenUrl::new_tab(workspace::ISSUES_URL));
         }
         if open_logs && let Err(e) = models_window::open_folder(&diag::log_dir()) {

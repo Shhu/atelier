@@ -67,7 +67,9 @@ pub use smart::{
     SmartFilterKind,
     SmartObject, SmartRender,
 };
-pub use styles_jobs::{styles_area, styles_of, styles_pending, watch_styles_only};
+pub use styles_jobs::{
+    styles_area_with, styles_of, styles_pending, styles_with, watch_styles_only,
+};
 pub use transform::{Target as TransformTarget, Transformed, transformed_selection};
 pub use vectors::{PathRef, SavedPath};
 
@@ -229,6 +231,10 @@ pub struct Layer {
     /// Box of the visible pixels (layer coordinates) for a revision.
     bounds: Cell<Option<(u64, Option<[u32; 4]>)>>,
     styles_cache: RefCell<Option<StylesCache>>,
+    /// The last styles drawn from a preview of its shape (see
+    /// `styles_jobs::styles_with`), apart: its own stay for when the
+    /// preview ends. Shared by its copies.
+    preview_styles: styles_jobs::PreviewSlot,
     /// Styles being drawn for the display (see [`Layer::styles_later`]).
     styles_job: styles_jobs::JobSlot,
     /// Position of the top-left corner in the canvas.
@@ -321,19 +327,13 @@ impl Layer {
             Some(m) => Cow::Owned(m.apply_to(&self.image, self.offset)),
             None => Cow::Borrowed(&*self.image),
         };
-        let styles = Arc::new(Styles {
-            version: next_rev(),
-            ..render_styles(&shape, &self.effects)
-        });
-        *self.styles_cache.borrow_mut() = Some(StylesCache {
+        let key = styles_jobs::Key {
             rev: self.rev,
             mask,
             effects: self.effects.clone(),
-            styles: Arc::clone(&styles),
-            offset: self.offset.into(),
-            moved: Default::default(),
-        });
-        Some(styles)
+            previewed: false,
+        };
+        Some(self.keep_styles(&key, render_styles(&shape, &self.effects)))
     }
 
     /// The styles as drawn with `later` (the display, see
@@ -1742,6 +1742,7 @@ impl Document {
             rev: next_rev(),
             bounds: Cell::new(None),
             styles_cache: RefCell::new(None),
+            preview_styles: Default::default(),
             styles_job: Default::default(),
             offset,
             visible: true,
@@ -2890,8 +2891,9 @@ impl Document {
         self.resize_image_unless(width, height, filter, &std::sync::atomic::AtomicBool::new(false))
     }
 
-    /// [`Self::resize_image`], the layers resampled in parallel; `cancel` set
-    /// stops it at its next layer (what is left is then to throw away).
+    /// [`Self::resize_image`], the layers resampled in parallel (and each one
+    /// over bands of rows); `cancel` set stops it within a few rows (what is
+    /// left is then to throw away).
     pub(super) fn resize_image_unless(
         &mut self,
         width: u32,
@@ -2961,10 +2963,7 @@ impl Document {
             .collect();
         let images: Vec<Option<RgbaImage>> = sources
             .par_iter()
-            .map(|(image, w, h)| {
-                (!cancel.load(Ordering::Relaxed))
-                    .then(|| crate::pixel_ops::resize(image, *w, *h, filter))
-            })
+            .map(|(image, w, h)| crate::pixel_ops::resize_unless(image, *w, *h, filter, cancel))
             .collect();
         for (&(i, ..), image) in resampled.iter().zip(images) {
             let Some(image) = image else { return true };

@@ -1,5 +1,6 @@
-//! Histogram panel (Window › Histogram): the levels of the image, or of the
-//! active layer, within the selection. Counted on another thread, cancelled
+//! Histogram panel (Window › Histogram): the levels of the image, of the
+//! active layer, or of the image up to the active adjustment layer, within
+//! the selection. Counted on another thread, cancelled
 //! as soon as what it counts changes; until then the last result stays shown.
 
 use std::sync::Arc;
@@ -92,15 +93,37 @@ pub(super) enum Source {
     #[default]
     EntireImage,
     SelectedLayer,
+    /// The image as composited up to the active adjustment layer, it
+    /// included: what is above is left out.
+    AdjustmentComposite,
 }
 
 impl Source {
-    pub(super) const ALL: [Source; 2] = [Source::EntireImage, Source::SelectedLayer];
+    pub(super) const ALL: [Source; 3] = [
+        Source::EntireImage,
+        Source::SelectedLayer,
+        Source::AdjustmentComposite,
+    ];
 
     fn label(self) -> String {
         match self {
             Source::EntireImage => t!("panels8-source-image"),
             Source::SelectedLayer => t!("panels8-source-layer"),
+            Source::AdjustmentComposite => t!("histogram12-source-adjustment"),
+        }
+    }
+}
+
+/// The layers composited up to layer `active`, it included: the others
+/// above it, but its groups, are hidden.
+fn up_to(layers: &mut [Layer], active: usize) {
+    let mut depth = layers.get(active).map_or(0, |l| l.depth);
+    for l in layers.iter_mut().skip(active + 1) {
+        // The first one above that is less deep holds what is kept.
+        if l.depth < depth {
+            depth = l.depth;
+        } else {
+            l.visible = false;
         }
     }
 }
@@ -279,6 +302,18 @@ impl AtelierApp {
         self.canvas_edit_held && ctx.input(|i| i.pointer.primary_down())
     }
 
+    /// The source counted: Adjustment Composite counts the entire image
+    /// while the active layer isn't an adjustment.
+    pub(super) fn histogram_source(&self) -> Source {
+        let adjustment = self.doc.as_ref().is_some_and(|d| {
+            matches!(d.active_layer().kind, crate::document::LayerKind::Adjustment(_))
+        });
+        match self.hist_panel.source {
+            Source::AdjustmentComposite if !adjustment => Source::EntireImage,
+            s => s,
+        }
+    }
+
     /// What is to be counted, as a fingerprint.
     fn histogram_key(&self) -> u64 {
         let Some(doc) = &self.doc else { return 0 };
@@ -289,16 +324,18 @@ impl AtelierApp {
                 s.mask.as_ref().map(|m| Arc::as_ptr(m) as usize),
             )
         });
-        let layer = match self.hist_panel.source {
+        let source = self.histogram_source();
+        let layer = match source {
             Source::EntireImage => None,
             Source::SelectedLayer => {
                 let l = doc.active_layer();
                 Some((l.id, l.offset))
             }
+            Source::AdjustmentComposite => Some((doc.active_layer().id, (0, 0))),
         };
         hash_of((
             self.composite_key(),
-            self.hist_panel.source,
+            source,
             layer,
             selection,
         ))
@@ -336,9 +373,12 @@ impl AtelierApp {
         let canvas = doc.full_rect();
         let selection = self.selection.clone();
         let held = doc.effects_held();
-        let layers = doc.render_layers().to_vec();
-        let source = self.hist_panel.source;
+        let mut layers = doc.render_layers().to_vec();
+        let source = self.histogram_source();
         let active = doc.active;
+        if source == Source::AdjustmentComposite {
+            up_to(&mut layers, active);
+        }
         let thread = std::thread::Builder::new()
             .name("histogram".into())
             .spawn(move || {
@@ -362,7 +402,7 @@ impl AtelierApp {
                             );
                         }
                     }
-                    Source::EntireImage => {
+                    Source::EntireImage | Source::AdjustmentComposite => {
                         let options = compose::Options {
                             held,
                             later_styles: true,
@@ -408,6 +448,10 @@ impl AtelierApp {
         let counts = self.hist_panel.shown.as_ref().map(|s| Arc::clone(&s.1));
         let mut channel = self.hist_panel.channel;
         let mut source = self.hist_panel.source;
+        let shown_source = self.histogram_source();
+        let adjustment = self.doc.as_ref().is_some_and(|d| {
+            matches!(d.active_layer().kind, crate::document::LayerKind::Adjustment(_))
+        });
         let pos = dialogs::panel_pos(ctx, "histogram");
         let out = floating_dialog(
             ctx,
@@ -436,10 +480,15 @@ impl AtelierApp {
                     );
                     let levels = counts.as_ref().map(|c| c.of(channel));
                     let hovered = draw_graph(ui, counts.as_deref(), channel);
-                    let (name, value) = (t!("panels8-histogram-source"), source.label());
+                    let (name, value) = (t!("panels8-histogram-source"), shown_source.label());
                     ui_kit::combo(ui, "histogram-source", Some(&name), &value, 190.0, |ui| {
                         for s in Source::ALL {
-                            ui.selectable_value(&mut source, s, s.label());
+                            // Only for an adjustment layer.
+                            let on = s != Source::AdjustmentComposite || adjustment;
+                            let item = egui::Button::selectable(shown_source == s, s.label());
+                            if ui.add_enabled(on, item).clicked() {
+                                source = s;
+                            }
                         }
                     });
                     let Some(levels) = levels else {

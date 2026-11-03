@@ -373,7 +373,7 @@ impl AtelierApp {
         });
         os.analysing = Some((current, result));
         os.reset_hover();
-        self.status = t!("objsel-analysing");
+        self.status.set(t!("objsel-analysing"));
     }
 
     /// Asks for the preview of the object under the pointer, when it goes
@@ -441,7 +441,7 @@ impl AtelierApp {
                 // shown again if it fails again).
                 os.failed = None;
                 os.queued.push(pick);
-                self.status = t!("objsel-analysing");
+                self.status.set(t!("objsel-analysing"));
             }
         }
     }
@@ -460,7 +460,7 @@ impl AtelierApp {
         let os = &mut self.object_select;
         if !tool && !os.queued.is_empty() {
             os.queued.clear();
-            self.status = t!("sel5-objsel-tool-left");
+            self.status.set(t!("sel5-objsel-tool-left"));
         }
         let current = self.doc.as_ref().map(fingerprint);
         let uid = self.doc.as_ref().map(Document::uid);
@@ -485,7 +485,7 @@ impl AtelierApp {
                         _ => Message::of(|| t!("ai-error-internal")),
                     };
                     let failed = tm!("objsel-failed", error = error);
-                    self.status = failed.shown.clone();
+                    self.status.set(failed.shown.clone());
                     crate::diag::error(failed);
                 }
             }
@@ -498,7 +498,7 @@ impl AtelierApp {
             let before = queued.len();
             queued.retain(|pick| Some(pick.fingerprint) == current);
             if queued.len() < before {
-                self.status = t!("sel4-objsel-dropped");
+                self.status.set(t!("sel4-objsel-dropped"));
             }
             os.picking += queued.len();
             let ctx = self.ctx.clone();

@@ -138,7 +138,7 @@ impl AtelierApp {
             self.after_download.retain(|t| t.model() != model);
             match result {
                 Ok(()) => {
-                    self.status = t!("models-status-downloaded", name = model.name());
+                    self.status.set(t!("models-status-downloaded", name = model.name()));
                     if model == Model::Objects {
                         // New files: an analysis that failed is tried again.
                         self.object_select.forget();
@@ -147,7 +147,7 @@ impl AtelierApp {
                         self.model_downloaded(then);
                     }
                 }
-                Err(e @ DownloadError::Cancelled) => self.status = e.to_string(),
+                Err(e @ DownloadError::Cancelled) => self.status.set(e.to_string()),
                 Err(e) => {
                     let error = e.to_string();
                     self.status_failed(tm!(
@@ -172,7 +172,7 @@ impl AtelierApp {
                     self.find_subject(then == AfterDownload::RemoveBackground);
                 } else {
                     let name = Model::Subject.name();
-                    self.status = t!("fx3-model-ready-run-again", name = name);
+                    self.status.set(t!("fx3-model-ready-run-again", name = name));
                 }
             }
             // The Object Selection tool starts its analysis here.
@@ -464,7 +464,7 @@ impl AtelierApp {
                 self.object_select.forget();
             }
             match model.delete() {
-                Ok(()) => self.status = t!("models-status-deleted", name = model.name()),
+                Ok(()) => self.status.set(t!("models-status-deleted", name = model.name())),
                 Err(e) => self.status_failed(tm!(
                     "models-status-delete-failed",
                     name = model.name(),

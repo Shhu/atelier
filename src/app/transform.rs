@@ -274,6 +274,7 @@ pub(super) struct MaskPreview {
     image: Arc<GrayImage>,
     at: (i64, i64),
     rect: PixelRect,
+    level: u32,
 }
 
 impl MaskPreview {
@@ -284,6 +285,7 @@ impl MaskPreview {
             image: &self.image,
             at: self.at,
             rect: self.rect,
+            level: self.level,
         }
     }
 }
@@ -1887,13 +1889,13 @@ impl AtelierApp {
             Map::Warp(w) => Last::Warp(c.t.src, w),
         });
         let (name, layer) = (c.name.as_str(), c.layer.as_str());
-        self.status = t!("xform-status-done", what = name, name = layer);
+        self.status.set(t!("xform-status-done", what = name, name = layer));
         if let Some((w, h, angle)) = c.placed {
             self.placed_status(c.layers[0], (w, h, angle), fitted.is_some());
         }
         if c.rasterized {
             let note = t!("canvas-status-text-rasterized", name = layer);
-            self.status = format!("{} — {note}", self.status);
+            self.status.set(format!("{} — {note}", self.status));
         }
         if let Some(r) = fitted {
             let old_center = pos2(c.canvas.w as f32, c.canvas.h as f32) / 2.0;
@@ -1912,21 +1914,26 @@ impl AtelierApp {
             a => t!("status-rotated", angle = i18n::short_decimal(f64::from(a))),
         };
         if fitted {
-            self.status = t!("status-canvas-fit-element", width = w, height = h, rotated = turned);
+            self.status.set(t!(
+                "status-canvas-fit-element",
+                width = w,
+                height = h,
+                rotated = turned
+            ));
             return;
         }
         let Some(layer) = self.doc.as_ref().and_then(|d| d.layers.get(index)) else {
             return;
         };
         let (id, r) = (layer.id, layer.content_bounds().unwrap_or(layer.rect()));
-        self.status = t!(
+        self.status.set(t!(
             "status-element-placed",
             width = w,
             height = h,
             x = r.x,
             y = r.y,
             rotated = turned
-        );
+        ));
         self.artboards_after_move(&[id]);
     }
 
@@ -2487,6 +2494,7 @@ impl AtelierApp {
                 w: grid.w * b,
                 h: grid.h * b,
             },
+            level,
         });
         Some(())
     }

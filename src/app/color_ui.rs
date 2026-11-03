@@ -407,7 +407,7 @@ fn intent_combo(ui: &mut egui::Ui, id: &str, intent: &mut Intent) {
 
 /// A profile file the user picks; `None` if cancelled, or not of `space`
 /// (said in the status).
-fn load_profile(space: Space, status: &mut String) -> Option<(PathBuf, Profile)> {
+fn load_profile(space: Space, status: &mut super::status_bar::Status) -> Option<(PathBuf, Profile)> {
     let path = rfd::FileDialog::new()
         .set_title(t!("color-load-title"))
         .add_filter(t!("color-filter-profiles"), &["icc", "icm"])
@@ -416,7 +416,7 @@ fn load_profile(space: Space, status: &mut String) -> Option<(PathBuf, Profile)>
         Some(p) => Some((path, p)),
         None => {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
-            *status = t!("color-status-not-a-profile", name = name.into_owned());
+            status.set(t!("color-status-not-a-profile", name = name.into_owned()));
             None
         }
     }
@@ -913,10 +913,10 @@ impl AtelierApp {
         }
         let Some(doc) = &mut self.doc else { return };
         doc.assign_profile(profile.as_ref());
-        self.status = match &profile {
+        self.status.set(match &profile {
             Some(p) => t!("color-status-assigned", name = shown_name(p)),
             None => t!("color-status-unmanaged"),
-        };
+        });
         let profile = profile.map(|p| p.icc().to_vec());
         self.record(crate::actions::Recorded::AssignProfile { profile });
     }
@@ -948,7 +948,7 @@ impl AtelierApp {
             bpc,
         };
         doc.convert_to_profile(&c);
-        self.status = t!("color-status-converted", name = shown_name(&to));
+        self.status.set(t!("color-status-converted", name = shown_name(&to)));
         let profile = to.icc().to_vec();
         self.record(crate::actions::Recorded::ConvertToProfile {
             profile,

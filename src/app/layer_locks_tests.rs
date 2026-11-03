@@ -1249,7 +1249,7 @@ fn a_refused_merge_names_the_locked_layer() {
     doc_mut(&mut h).add_layer("top".into(), RgbaImage::from_pixel(20, 20, Rgba(RED)), (5, 5));
     doc_mut(&mut h).layers[lower].locks.position = true;
     h.state_mut().run(Action::MergeDown);
-    let status = h.state().status.clone();
+    let status = h.state().status.to_string();
     assert!(status.contains("half") && status.contains(icon::LOCK_SIMPLE), "{status}");
     h.state_mut().run(Action::MergeVisible);
     assert!(h.state().status.contains("half"), "{}", h.state().status);
@@ -1318,6 +1318,6 @@ fn ctrl_slash_names_the_group_that_already_has_the_lock() {
     h.key_press_modifiers(Modifiers::COMMAND, Key::Slash);
     h.run_steps(1);
     assert_eq!(steps(&h), n);
-    let status = h.state().status.clone();
+    let status = h.state().status.to_string();
     assert!(status.contains("Outer") && status.contains(&t!("layers8-lock-position")), "{status}");
 }

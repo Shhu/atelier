@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use image::RgbaImage;
+use image::{GrayImage, RgbaImage};
 
 use super::{Fill, Layer, LayerKind, PixelRect, StylesCache, intersect, next_rev};
 use crate::compose;
@@ -29,13 +29,19 @@ fn work(w: u32, h: u32, fx: &Effects) -> u64 {
     (u64::from(w) + m) * (u64::from(h) + m)
 }
 
-/// What styles are drawn from: pixel revision, mask fingerprint, settings.
+/// What styles are drawn from: pixel revision, mask fingerprint, settings;
+/// whether from a preview of the shape (kept apart, see
+/// [`Layer::preview_styles`]).
 #[derive(Clone, PartialEq)]
-struct Key {
-    rev: u64,
-    mask: u64,
-    effects: Effects,
+pub(super) struct Key {
+    pub(super) rev: u64,
+    pub(super) mask: u64,
+    pub(super) effects: Effects,
+    pub(super) previewed: bool,
 }
+
+/// See [`Layer::preview_styles`].
+pub(super) type PreviewSlot = Arc<Mutex<Option<StylesCache>>>;
 
 /// Styles being drawn for a layer (`None` until done), and the layer's
 /// place then.
@@ -123,6 +129,7 @@ impl Layer {
             rev: self.rev,
             mask: self.mask_key(),
             effects: self.effects.clone(),
+            previewed: false,
         };
         if let Some(c) = self.styles_cache.borrow().as_ref()
             && c.effects == key.effects
@@ -172,22 +179,14 @@ impl Layer {
                 }
                 // Still drawing (for these settings or older ones): the
                 // former styles meanwhile.
-                return Ok(self.styles_cached());
+                return Ok(self.former(key.previewed));
             };
-            *self.styles_cache.borrow_mut() = Some(StylesCache {
-                rev: job.key.rev,
-                mask: job.key.mask,
-                effects: job.key.effects.clone(),
-                styles: Arc::clone(&styles),
-                // Drawn for the same shape, they follow the layer.
-                offset: if job.key == key {
-                    self.offset
-                } else {
-                    job.offset
-                }
-                .into(),
-                moved: Default::default(),
-            });
+            // Drawn for the same shape, they follow the layer.
+            let offset = match job.key == key {
+                true => self.offset,
+                false => job.offset,
+            };
+            self.store(&job.key, Arc::clone(&styles), offset);
             if job.key == key {
                 return Ok(Some(styles));
             }
@@ -205,8 +204,9 @@ impl Layer {
     where
         M: FnOnce(&Effects) -> Styles + Send + 'static,
     {
+        let previewed = key.previewed;
         if WATCHING.with(Cell::get) {
-            return Ok(self.styles_cached());
+            return Ok(self.former(previewed));
         }
         let make = prepare();
         let job = Arc::new(Job {
@@ -252,7 +252,7 @@ impl Layer {
         }
         *slot = Some(job);
         drop(slot);
-        Ok(self.styles_cached())
+        Ok(self.former(previewed))
     }
 
     /// Its pixels are about to change: the styles drawn for them stay
@@ -292,6 +292,53 @@ impl Layer {
         cache.as_ref().map(|c| self.placed_styles(c))
     }
 
+    /// The styles to show while those of `previewed` (see [`Key`]) are
+    /// drawn: the last ones drawn from a preview, else its own.
+    fn former(&self, previewed: bool) -> Option<Arc<Styles>> {
+        if previewed && self.effects.rendered() {
+            let slot = self.preview_styles.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = slot.as_ref() {
+                return Some(self.placed_styles(c));
+            }
+        }
+        self.styles_cached()
+    }
+
+    /// Runs `f` on the last styles drawn from a preview (`previewed`), or
+    /// from the layer itself.
+    fn with_cache<R>(&self, previewed: bool, f: impl FnOnce(&mut Option<StylesCache>) -> R) -> R {
+        match previewed {
+            true => f(&mut self.preview_styles.lock().unwrap_or_else(|e| e.into_inner())),
+            false => f(&mut self.styles_cache.borrow_mut()),
+        }
+    }
+
+    /// `styles`, drawn for `key` with the layer at `offset`, as the last ones
+    /// drawn. Its own changed: those of a former preview are forgotten
+    /// (not by a thread watching, whose copy can be older).
+    fn store(&self, key: &Key, styles: Arc<Styles>, offset: (i64, i64)) {
+        let entry = StylesCache {
+            rev: key.rev,
+            mask: key.mask,
+            effects: key.effects.clone(),
+            styles,
+            offset: offset.into(),
+            moved: Default::default(),
+        };
+        if key.previewed {
+            *self.preview_styles.lock().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+            return;
+        }
+        let mut own = self.styles_cache.borrow_mut();
+        let changed = own.as_ref().is_none_or(|c| {
+            (c.rev, c.mask) != (key.rev, key.mask) || c.effects != key.effects
+        });
+        *own = Some(entry);
+        if changed && !WATCHING.with(Cell::get) {
+            *self.preview_styles.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
     /// Styles drawn for other pixels stay where they were in the canvas
     /// (a shape edited: its image's box, so the layer's place, changes);
     /// those of the same pixels move with the layer. A group's always do:
@@ -326,21 +373,39 @@ impl Layer {
 /// for what reaches into it.
 const SHAPE_MARGIN: u32 = 512;
 
-/// The canvas area the shape of layer `i`, without pixels of its own, can
-/// take: what a group's layers show, or what its mask leaves of the canvas.
-/// The styles of its layers are taken as last drawn (they are drawn before
-/// it: see [`compose::plan`]).
-pub fn styles_area(layers: &[Layer], i: usize, canvas: PixelRect) -> Option<PixelRect> {
-    shape_area(layers, i, canvas, false)
+/// [`styles_area_with`] without previews.
+#[cfg(test)]
+fn styles_area(layers: &[Layer], i: usize, canvas: PixelRect) -> Option<PixelRect> {
+    styles_area_with(layers, i, canvas, &compose::Options::default())
 }
 
-/// See [`styles_area`]. `fresh`: the styles of its layers drawn now.
-fn shape_area(layers: &[Layer], i: usize, canvas: PixelRect, fresh: bool) -> Option<PixelRect> {
+/// The canvas area the shape of layer `i`, without pixels of its own, can
+/// take as `shown` previews it (see [`styles_with`]): what a group's layers
+/// show, or what its mask leaves of the canvas. The styles of its layers
+/// are taken as last drawn (they are drawn before it: see
+/// [`compose::plan`]).
+pub fn styles_area_with(
+    layers: &[Layer],
+    i: usize,
+    canvas: PixelRect,
+    shown: &compose::Options,
+) -> Option<PixelRect> {
+    shape_area(layers, i, canvas, false, shown)
+}
+
+/// See [`styles_area_with`]. `fresh`: the styles of its layers drawn now.
+fn shape_area(
+    layers: &[Layer],
+    i: usize,
+    canvas: PixelRect,
+    fresh: bool,
+    shown: &compose::Options,
+) -> Option<PixelRect> {
     let l = &layers[i];
-    let hiding = l.active_mask().filter(|m| m.default == 0);
+    let hiding = hiding_rect(l, shown);
     if !l.is_group() {
         return match hiding {
-            Some(m) => intersect(m.rect(l.offset), canvas),
+            Some(r) => intersect(r, canvas),
             None => Some(canvas),
         };
     }
@@ -354,22 +419,26 @@ fn shape_area(layers: &[Layer], i: usize, canvas: PixelRect, fresh: bool) -> Opt
         if c.depth != l.depth + 1 || !c.visible || c.clipped {
             continue;
         }
-        let e = if c.is_group() {
-            let inner = shape_area(layers, j, canvas, fresh);
+        let former = || c.former(previews_key(layers, j, shown).is_some());
+        let e = if let Some(p) = shown.placed.iter().find(|p| p.layer == j) {
+            // The image of its transform, its styles in it.
+            Some(p.rect)
+        } else if c.is_group() {
+            let inner = shape_area(layers, j, canvas, fresh, shown);
             let styles = match fresh {
-                true => styles_for(layers, j, canvas, false, false, inner),
-                false => c.styles_cached(),
+                true => styles_for(layers, j, canvas, false, false, inner, shown),
+                false => former(),
             };
             inner.map(|a| c.with_styles_extent(a, styles.as_deref()))
         } else {
             let styles = match fresh {
-                true => styles_of(layers, j, canvas, false, false),
-                false => c.styles_cached(),
+                true => styles_with(layers, j, canvas, false, false, shown),
+                false => former(),
             };
             match c.kind {
                 // It adds no opacity, only what its styles draw.
                 LayerKind::Adjustment(_) => c.styles_box(styles.as_deref()),
-                _ => Some(c.extent_with(styles.as_deref()).unwrap_or(canvas)),
+                _ => Some(extent_shown(c, styles.as_deref(), shown).unwrap_or(canvas)),
             }
         };
         if let Some(e) = e.filter(|e| e.w > 0 && e.h > 0) {
@@ -385,8 +454,208 @@ fn shape_area(layers: &[Layer], i: usize, canvas: PixelRect, fresh: bool) -> Opt
     };
     let area = intersect(area?, grown)?;
     match hiding {
-        Some(m) => intersect(area, m.rect(l.offset)),
+        Some(r) => intersect(area, r),
         None => Some(area),
+    }
+}
+
+/// The canvas box of an image of `(w, h)` at `origin`.
+fn rect_at((w, h): (u32, u32), origin: (i64, i64)) -> PixelRect {
+    PixelRect {
+        x: origin.0,
+        y: origin.1,
+        w,
+        h,
+    }
+}
+
+/// The box outside which the mask of `l`, as `shown` previews it, hides
+/// it, if it does.
+fn hiding_rect(l: &Layer, shown: &compose::Options) -> Option<PixelRect> {
+    let m = l.active_mask().filter(|m| m.default == 0)?;
+    Some(match (shown.placed_mask, shown.mask) {
+        (Some(p), _) if p.layer == l.id => p.rect,
+        (_, Some(p)) if p.layer == l.id => rect_at(p.image.dimensions(), p.origin),
+        _ => m.rect(l.offset),
+    })
+}
+
+/// The pixels previewed for `l` in `shown`, if any.
+fn pixels_shown<'a>(
+    l: &Layer,
+    shown: &compose::Options<'a>,
+) -> Option<compose::Preview<'a, RgbaImage>> {
+    shown.pixels.filter(|p| p.layer == l.id && l.has_pixels())
+}
+
+/// [`Layer::extent_with`] as `shown` previews `l`.
+fn extent_shown(l: &Layer, styles: Option<&Styles>, shown: &compose::Options) -> Option<PixelRect> {
+    let own = match (l.has_pixels(), hiding_rect(l, shown)) {
+        (true, hiding) => {
+            let r = pixels_shown(l, shown).map_or(l.rect(), |p| rect_at(p.image.dimensions(), p.origin));
+            Some(match hiding {
+                Some(m) => intersect(r, m).unwrap_or(PixelRect { w: 0, h: 0, ..r }),
+                None => r,
+            })
+        }
+        (false, hiding) => hiding,
+    };
+    own.map(|r| l.with_styles_extent(r, styles))
+}
+
+/// The first layer of the block of layer `i`: the layers of a group, or
+/// the layer alone.
+fn block_start(layers: &[Layer], i: usize) -> usize {
+    let l = &layers[i];
+    match l.is_group() {
+        true => i - (0..i).rev().take_while(|&j| layers[j].depth > l.depth).count(),
+        false => i,
+    }
+}
+
+/// Fingerprint of what the previews of `shown` change in the shape of
+/// layer `i` (a group: of its layers); `None` if they change nothing.
+/// Its own transform doesn't count: its image then stands for it whole.
+fn previews_key(layers: &[Layer], i: usize, shown: &compose::Options) -> Option<u64> {
+    if shown.pixels.is_none()
+        && shown.mask.is_none()
+        && shown.placed.is_empty()
+        && shown.placed_mask.is_none()
+    {
+        return None;
+    }
+    let mut h = DefaultHasher::new();
+    let mut any = false;
+    let start = block_start(layers, i);
+    for (j, c) in layers.iter().enumerate().take(i + 1).skip(start) {
+        let mut add = |what: u8, version: u64, at: (i64, i64)| {
+            any = true;
+            (i - j, what, version, at).hash(&mut h);
+        };
+        if let Some(p) = pixels_shown(c, shown) {
+            add(0, p.version, p.origin);
+        }
+        if c.active_mask().is_some() {
+            match (shown.placed_mask, shown.mask) {
+                (Some(p), _) if p.layer == c.id => add(1, p.version, (p.level.into(), 0)),
+                (_, Some(p)) if p.layer == c.id => add(2, p.version, p.origin),
+                _ => {}
+            }
+        }
+        if j != i
+            && let Some(p) = shown.placed.iter().find(|p| p.layer == j)
+        {
+            add(3, p.version, (p.level.into(), 0));
+        }
+    }
+    any.then(|| h.finish())
+}
+
+/// An image of a preview, owned (see [`Shown`]): its layer (an id, or an
+/// index for a transform), version, image, origin (a transform: its place
+/// in pixels of `level`, and its canvas box).
+struct Owned<I> {
+    layer: u64,
+    version: u64,
+    image: Arc<I>,
+    at: (i64, i64),
+    rect: PixelRect,
+    level: u32,
+}
+
+impl<I> Owned<I> {
+    fn preview(p: compose::Preview<'_, I>) -> Self {
+        Self {
+            layer: p.layer,
+            version: p.version,
+            image: Arc::clone(p.image),
+            at: p.origin,
+            rect: PixelRect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
+            level: 0,
+        }
+    }
+
+    fn shown(&self) -> compose::Preview<'_, I> {
+        compose::Preview {
+            layer: self.layer,
+            version: self.version,
+            image: &self.image,
+            origin: self.at,
+        }
+    }
+}
+
+/// The previews of a [`compose::Options`] that shape a block of layers,
+/// owned (for a worker thread), the transformed layers counted from the
+/// block's first.
+struct Shown {
+    pixels: Option<Owned<RgbaImage>>,
+    mask: Option<Owned<GrayImage>>,
+    placed: Vec<Owned<RgbaImage>>,
+    placed_mask: Option<Owned<GrayImage>>,
+}
+
+impl Shown {
+    fn of(shown: &compose::Options, block: std::ops::RangeInclusive<usize>) -> Self {
+        let start = *block.start();
+        Self {
+            pixels: shown.pixels.map(Owned::preview),
+            mask: shown.mask.map(Owned::preview),
+            placed: shown
+                .placed
+                .iter()
+                .filter(|p| block.contains(&p.layer))
+                .map(|p| Owned {
+                    layer: (p.layer - start) as u64,
+                    version: p.version,
+                    image: Arc::clone(p.image),
+                    at: p.at,
+                    rect: p.rect,
+                    level: p.level,
+                })
+                .collect(),
+            placed_mask: shown.placed_mask.map(|p| Owned {
+                layer: p.layer,
+                version: p.version,
+                image: Arc::clone(p.image),
+                at: p.at,
+                rect: p.rect,
+                level: p.level,
+            }),
+        }
+    }
+
+    fn options(&self) -> compose::Options<'_> {
+        compose::Options {
+            pixels: self.pixels.as_ref().map(Owned::shown),
+            mask: self.mask.as_ref().map(Owned::shown),
+            placed: self
+                .placed
+                .iter()
+                .map(|p| compose::Placed {
+                    layer: p.layer as usize,
+                    version: p.version,
+                    image: &p.image,
+                    at: p.at,
+                    rect: p.rect,
+                    level: p.level,
+                })
+                .collect(),
+            placed_mask: self.placed_mask.as_ref().map(|p| compose::PlacedMask {
+                layer: p.layer,
+                version: p.version,
+                image: &p.image,
+                at: p.at,
+                rect: p.rect,
+                level: p.level,
+            }),
+            ..Default::default()
+        }
     }
 }
 
@@ -415,9 +684,20 @@ fn hash_kind_shape(l: &Layer, frame: (i64, i64), h: &mut DefaultHasher) {
 /// everything relative to the layer: a whole group moved keeps its styles,
 /// which move with it (see [`styles_for`]), as long as it isn't cut
 /// differently.
-fn shape_key(layers: &[Layer], i: usize, canvas: PixelRect, area: Option<PixelRect>) -> u64 {
+fn shape_key(
+    layers: &[Layer],
+    i: usize,
+    canvas: PixelRect,
+    area: Option<PixelRect>,
+    previews: Option<u64>,
+) -> u64 {
     let mut h = DefaultHasher::new();
     let l = &layers[i];
+    previews.hash(&mut h);
+    if l.has_pixels() {
+        // Drawn from a preview of its pixels or mask (see `styles_with`).
+        l.rev.hash(&mut h);
+    }
     let at = |o: (i64, i64)| (o.0 - l.offset.0, o.1 - l.offset.1);
     let mask = |c: &Layer| {
         c.active_mask()
@@ -454,14 +734,43 @@ fn shape_key(layers: &[Layer], i: usize, canvas: PixelRect, area: Option<PixelRe
 }
 
 /// The shape of layer `i` over `area`: what it shows, whole and in Normal
-/// mode, an adjustment layer its mask.
-fn draw_shape(layers: &[Layer], i: usize, canvas: PixelRect, area: PixelRect) -> RgbaImage {
+/// mode, an adjustment layer its mask; as `shown` previews it. A transform
+/// previewed (at the view's level) makes it at that level, enlarged.
+fn draw_shape(
+    layers: &[Layer],
+    i: usize,
+    canvas: PixelRect,
+    area: PixelRect,
+    shown: &compose::Options,
+) -> RgbaImage {
+    let start = block_start(layers, i);
+    let placed: Vec<compose::Placed> = shown
+        .placed
+        .iter()
+        .filter(|p| (start..i).contains(&p.layer))
+        .copied()
+        .collect();
+    let placed_mask = shown
+        .placed_mask
+        .filter(|p| layers[start..=i].iter().any(|c| c.id == p.layer));
+    let level = placed
+        .first()
+        .map(|p| p.level)
+        .or(placed_mask.map(|p| p.level))
+        .unwrap_or(0);
     let options = compose::Options {
         only: Some(i),
         no_styles: Some(i),
+        pixels: shown.pixels,
+        mask: shown.mask,
+        placed,
+        placed_mask,
         ..Default::default()
     };
-    let mut plan = compose::plan(layers, canvas, &mut compose::FullSize, &options);
+    let mut plan = match level {
+        0 => compose::plan(layers, canvas, &mut compose::FullSize, &options),
+        level => compose::plan(layers, canvas, &mut compose::LevelCache::new(level), &options),
+    };
     for node in &mut plan.nodes {
         match node {
             compose::Node::Layer(n) => {
@@ -473,7 +782,39 @@ fn draw_shape(layers: &[Layer], i: usize, canvas: PixelRect, area: PixelRect) ->
             compose::Node::Group(g) => (g.opacity, g.fill) = (1.0, 1.0),
         }
     }
-    plan.render(area)
+    if level == 0 {
+        return plan.render(area);
+    }
+    let b = 1i64 << level;
+    let (x0, y0) = (area.x >> level, area.y >> level);
+    let small = PixelRect {
+        x: x0,
+        y: y0,
+        w: ((area.right() + b - 1) >> level).saturating_sub(x0) as u32,
+        h: ((area.bottom() + b - 1) >> level).saturating_sub(y0) as u32,
+    };
+    enlarged(&plan.render(small), small, area, level)
+}
+
+/// `area` (canvas pixels) of `small`, the pixels of `level` over `at`: each
+/// of its pixels covering a block of the canvas.
+fn enlarged(small: &RgbaImage, at: PixelRect, area: PixelRect, level: u32) -> RgbaImage {
+    let mut out = RgbaImage::new(area.w, area.h);
+    let (w, sw) = (area.w as usize, small.width() as usize);
+    let src = small.as_raw();
+    let column: Vec<usize> = (0..area.w as i64)
+        .map(|x| (((area.x + x) >> level) - at.x) as usize * 4)
+        .collect();
+    crate::mask_ops::par_rows(out.as_mut(), w.max(1) * 4, |first, band| {
+        for (k, row) in band.chunks_exact_mut(w * 4).enumerate() {
+            let sy = ((area.y + (first + k) as i64) >> level) - at.y;
+            let line = &src[sy as usize * sw * 4..];
+            for (px, &from) in row.chunks_exact_mut(4).zip(&column) {
+                px.copy_from_slice(&line[from..from + 4]);
+            }
+        }
+    });
+    out
 }
 
 /// Styles drawn from a shape over `area`, placed relative to the layer.
@@ -496,15 +837,34 @@ pub fn styles_of(
     held: bool,
     later: bool,
 ) -> Option<Arc<Styles>> {
-    let area = match layers[i].has_pixels() {
-        true => None,
-        false => shape_area(layers, i, canvas, !later && !held),
-    };
-    styles_for(layers, i, canvas, held, later, area)
+    styles_with(layers, i, canvas, held, later, &compose::Options::default())
 }
 
-/// [`styles_of`], the layer's shape taking `area` (see [`shape_area`]; for
-/// a layer without pixels).
+/// [`styles_of`] drawn from the shape as `shown` previews it (a dialog's
+/// pixels or mask, the transform being prepared of a layer in a group).
+/// Kept apart from the layer's own (see [`Layer::preview_styles`]).
+pub fn styles_with(
+    layers: &[Layer],
+    i: usize,
+    canvas: PixelRect,
+    held: bool,
+    later: bool,
+    shown: &compose::Options,
+) -> Option<Arc<Styles>> {
+    let l = &layers[i];
+    let area = match l.has_pixels() {
+        // Previewed: its whole image, as for its own pixels.
+        true => previews_key(layers, i, shown).map(|_| {
+            pixels_shown(l, shown).map_or(l.rect(), |p| rect_at(p.image.dimensions(), p.origin))
+        }),
+        false => shape_area(layers, i, canvas, !later && !held, shown),
+    };
+    let area = area.filter(|a| a.w > 0 && a.h > 0);
+    styles_for(layers, i, canvas, held, later, area, shown)
+}
+
+/// [`styles_with`], the layer's shape taking `area` (see [`shape_area`]; for
+/// a layer without pixels, or with previewed ones).
 fn styles_for(
     layers: &[Layer],
     i: usize,
@@ -512,31 +872,34 @@ fn styles_for(
     held: bool,
     later: bool,
     area: Option<PixelRect>,
+    shown: &compose::Options,
 ) -> Option<Arc<Styles>> {
     let l = &layers[i];
-    if l.has_pixels() {
+    let previews = previews_key(layers, i, shown);
+    if l.has_pixels() && previews.is_none() {
         return l.styles_shown(held, later);
     }
     if !l.styleable() || !l.effects.rendered() {
         return None;
     }
     let key = Key {
-        rev: shape_key(layers, i, canvas, area),
+        rev: shape_key(layers, i, canvas, area, previews),
         mask: 0,
         effects: l.effects.clone(),
+        previewed: previews.is_some(),
     };
-    if let Some(c) = l.styles_cache.borrow().as_ref()
-        && c.effects == key.effects
-    {
+    let cached = l.with_cache(key.previewed, |c| {
+        let c = c.as_ref().filter(|c| c.effects == key.effects)?;
         if c.rev == key.rev {
             // Drawn for this shape, wherever the layer is now.
             c.offset.set(l.offset);
             c.moved.set((0.0, 0.0));
             return Some(Arc::clone(&c.styles));
         }
-        if held {
-            return Some(l.placed_styles(c));
-        }
+        held.then(|| l.placed_styles(c))
+    });
+    if cached.is_some() {
+        return cached;
     }
     let Some(area) = area else {
         // No shape left: nothing to draw from, nothing shows.
@@ -544,23 +907,26 @@ fn styles_for(
     };
     if later && work(area.w, area.h, &l.effects) > SHAPE_AT_ONCE {
         // The layer and those it shows, on their own.
-        let held_below = (0..i).rev().take_while(|&j| layers[j].depth > l.depth);
-        let start = i - if l.is_group() { held_below.count() } else { 0 };
+        let start = block_start(layers, i);
         if layers[start..i].iter().any(Layer::styles_drawing) {
             // Theirs first: the job then draws its shape with them, not
             // again on its own.
-            return l.styles_cached();
+            return l.former(key.previewed);
         }
         let prepare = || {
             let part: Vec<Layer> = layers[start..=i].to_vec();
+            let previews = Shown::of(shown, start..=i);
             let (at, offset) = (i - start, l.offset);
-            move |fx: &Effects| styles_from(&draw_shape(&part, at, canvas, area), area, offset, fx)
+            move |fx: &Effects| {
+                let shape = draw_shape(&part, at, canvas, area, &previews.options());
+                styles_from(&shape, area, offset, fx)
+            }
         };
         if let Ok(styles) = l.draw_aside(key.clone(), prepare) {
             return styles;
         }
     }
-    let shape = draw_shape(layers, i, canvas, area);
+    let shape = draw_shape(layers, i, canvas, area, shown);
     Some(l.keep_styles(&key, styles_from(&shape, area, l.offset, &l.effects)))
 }
 
@@ -573,19 +939,12 @@ impl Layer {
     }
 
     /// `styles`, just drawn for `key`, as the last ones drawn.
-    fn keep_styles(&self, key: &Key, styles: Styles) -> Arc<Styles> {
+    pub(super) fn keep_styles(&self, key: &Key, styles: Styles) -> Arc<Styles> {
         let styles = Arc::new(Styles {
             version: next_rev(),
             ..styles
         });
-        *self.styles_cache.borrow_mut() = Some(StylesCache {
-            rev: key.rev,
-            mask: key.mask,
-            effects: key.effects.clone(),
-            styles: Arc::clone(&styles),
-            offset: self.offset.into(),
-            moved: Default::default(),
-        });
+        self.store(key, Arc::clone(&styles), self.offset);
         styles
     }
 
@@ -594,6 +953,7 @@ impl Layer {
         Layer {
             id,
             styles_job: Default::default(),
+            preview_styles: Default::default(),
             ..self.clone()
         }
     }
@@ -1484,5 +1844,198 @@ mod tests {
         .unwrap();
         assert!(!doc.layers[g].styles_drawing());
         settle(&doc);
+    }
+
+    /// The canvas box of `styles` of layer `i`.
+    fn styles_box(doc: &Document, i: usize, styles: &super::Styles) -> PixelRect {
+        doc.layers[i].styles_box(Some(styles)).expect("styles")
+    }
+
+    /// A group's styles follow a filter's preview of one of its layers;
+    /// its own styles stay apart, back without being drawn again.
+    #[test]
+    fn group_styles_follow_a_preview_of_its_layers() {
+        let mut doc = group_doc();
+        doc.active_layer_mut().effects.stroke = stroke();
+        let canvas = doc.full_rect();
+        let own = super::styles_of(&doc.layers, 2, canvas, false, false).unwrap();
+        let right = styles_box(&doc, 2, &own).right();
+        // The square widened to the right by the preview.
+        let image = std::sync::Arc::new(RgbaImage::from_pixel(20, 10, Rgba(RED)));
+        let opts = compose::Options {
+            pixels: Some(compose::Preview {
+                layer: doc.layers[1].id,
+                version: 1 << 63,
+                image: &image,
+                origin: (15, 15),
+            }),
+            canvas: Some(canvas),
+            ..Default::default()
+        };
+        let previewed = super::styles_with(&doc.layers, 2, canvas, false, false, &opts).unwrap();
+        assert_eq!(styles_box(&doc, 2, &previewed).right(), right + 10);
+        let flat = compose::plan(&doc.layers, canvas, &mut compose::FullSize, &opts).render(canvas);
+        assert_eq!(flat.get_pixel(36, 20).0, GREEN, "around the preview");
+        assert_eq!(flat.get_pixel(30, 20).0, RED);
+        let again = super::styles_with(&doc.layers, 2, canvas, false, false, &opts).unwrap();
+        assert_eq!(again.version, previewed.version, "drawn once");
+        // The preview gone (cancelled): its own, as they were.
+        let back = super::styles_of(&doc.layers, 2, canvas, false, false).unwrap();
+        assert_eq!(back.version, own.version);
+        assert_eq!(doc.flatten().get_pixel(26, 20).0, GREEN);
+    }
+
+    /// A layer's own styles follow the preview of its pixels, then are
+    /// back as they were.
+    #[test]
+    fn styles_follow_a_preview_of_the_layer_itself() {
+        let mut doc = Document::new(RgbaImage::from_pixel(40, 40, Rgba([255; 4])), None);
+        doc.add_layer("square".into(), RgbaImage::from_pixel(10, 10, Rgba(RED)), (15, 15));
+        doc.active_layer_mut().effects.stroke = stroke();
+        let canvas = doc.full_rect();
+        let own = doc.active_layer().styles(false).unwrap();
+        // Elsewhere in the preview (a layer grown for a dialog: its image
+        // starts elsewhere).
+        let image = std::sync::Arc::new(RgbaImage::from_pixel(10, 10, Rgba(RED)));
+        let opts = compose::Options {
+            pixels: Some(compose::Preview {
+                layer: doc.layers[1].id,
+                version: (1 << 63) + 1,
+                image: &image,
+                origin: (5, 15),
+            }),
+            canvas: Some(canvas),
+            ..Default::default()
+        };
+        let flat = compose::plan(&doc.layers, canvas, &mut compose::FullSize, &opts).render(canvas);
+        assert_eq!(flat.get_pixel(4, 20).0, GREEN, "around the preview");
+        assert_eq!(flat.get_pixel(14, 20).0, RED);
+        assert_eq!(flat.get_pixel(26, 20).0, [255; 4], "not where it was");
+        let previewed = super::styles_with(&doc.layers, 1, canvas, false, true, &opts).unwrap();
+        assert_eq!(styles_box(&doc, 1, &previewed).x, styles_box(&doc, 1, &own).x - 10);
+        let back = doc.active_layer().styles_shown(false, true).unwrap();
+        assert_eq!(back.version, own.version, "its own, not drawn again");
+    }
+
+    /// The styles of a fill layer follow a preview of its mask.
+    #[test]
+    fn styles_follow_a_preview_of_the_mask() {
+        let mut doc = Document::new(RgbaImage::from_pixel(40, 40, Rgba([255; 4])), None);
+        let area: Selection = PixelRect {
+            x: 15,
+            y: 15,
+            w: 10,
+            h: 10,
+        }
+        .into();
+        doc.add_fill_layer(Fill::Solid([255, 0, 0]), Some(&area));
+        doc.active_layer_mut().effects.stroke = stroke();
+        let canvas = doc.full_rect();
+        let mask = image::GrayImage::from_fn(40, 40, |x, y| {
+            image::Luma([if (5..15).contains(&x) && (15..25).contains(&y) { 255 } else { 0 }])
+        });
+        let mask = std::sync::Arc::new(mask);
+        let opts = compose::Options {
+            mask: Some(compose::Preview {
+                layer: doc.active_layer().id,
+                version: (1 << 63) + 2,
+                image: &mask,
+                origin: (0, 0),
+            }),
+            canvas: Some(canvas),
+            ..Default::default()
+        };
+        let flat = compose::plan(&doc.layers, canvas, &mut compose::FullSize, &opts).render(canvas);
+        assert_eq!(flat.get_pixel(10, 20).0, RED);
+        assert_eq!(flat.get_pixel(4, 20).0, GREEN, "around the preview");
+        assert_eq!(flat.get_pixel(25, 20).0, [255; 4], "not where it was");
+        assert_eq!(doc.flatten().get_pixel(25, 20).0, GREEN);
+    }
+
+    /// A group's styles follow the transform being prepared of one of its
+    /// layers, at full size and at a coarser level of the view.
+    #[test]
+    fn group_styles_follow_a_transformed_layer() {
+        let mut doc = group_doc();
+        doc.active_layer_mut().effects.stroke = stroke();
+        let canvas = doc.full_rect();
+        let own = super::styles_of(&doc.layers, 2, canvas, false, false).unwrap();
+        let o = styles_box(&doc, 2, &own);
+        for (level, image, at) in [(0, 10, (25, 15)), (1, 5, (12, 7))] {
+            let image = std::sync::Arc::new(RgbaImage::from_pixel(image, image, Rgba(RED)));
+            let b = 1i64 << level;
+            let opts = compose::Options {
+                placed: vec![compose::Placed {
+                    layer: 1,
+                    version: (1 << 63) + 3 + level as u64,
+                    image: &image,
+                    at,
+                    rect: PixelRect {
+                        x: at.0 * b,
+                        y: at.1 * b,
+                        w: 10,
+                        h: 10,
+                    },
+                    level,
+                }],
+                canvas: Some(canvas),
+                ..Default::default()
+            };
+            let moved = super::styles_with(&doc.layers, 2, canvas, false, false, &opts).unwrap();
+            let r = styles_box(&doc, 2, &moved);
+            let d = at.0 * b - 15;
+            assert_eq!((r.x, r.right()), (o.x + d, o.right() + d), "level {level}");
+            let again = super::styles_with(&doc.layers, 2, canvas, false, false, &opts).unwrap();
+            assert_eq!(again.version, moved.version, "drawn once");
+        }
+        let back = super::styles_of(&doc.layers, 2, canvas, false, false).unwrap();
+        assert_eq!(back.version, own.version);
+    }
+
+    /// Large: the styles of a transform being prepared are drawn aside,
+    /// once per preview; the group's own are back at once when it ends.
+    #[test]
+    fn previews_of_large_groups_are_drawn_aside() {
+        let (doc, g) = big_group();
+        settle(&doc);
+        let canvas = doc.full_rect();
+        let own = super::styles_of(&doc.layers, g, canvas, false, true).unwrap();
+        let image = std::sync::Arc::new(RgbaImage::from_pixel(300, 250, Rgba(RED)));
+        let opts = compose::Options {
+            placed: vec![compose::Placed {
+                layer: 1,
+                version: (1 << 63) + 9,
+                image: &image,
+                at: (50, 25),
+                rect: PixelRect {
+                    x: 200,
+                    y: 100,
+                    w: 1200,
+                    h: 1000,
+                },
+                level: 2,
+            }],
+            later_styles: true,
+            canvas: Some(canvas),
+            ..Default::default()
+        };
+        let meanwhile = super::styles_with(&doc.layers, g, canvas, false, true, &opts).unwrap();
+        assert_eq!(meanwhile.version, own.version, "the former ones meanwhile");
+        let start = std::time::Instant::now();
+        let moved = loop {
+            let s = super::styles_with(&doc.layers, g, canvas, false, true, &opts).unwrap();
+            if s.version != own.version {
+                break s;
+            }
+            assert!(start.elapsed().as_secs() < 120, "never drawn");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(styles_box(&doc, g, &moved).x, styles_box(&doc, g, &own).x + 100);
+        let again = super::styles_with(&doc.layers, g, canvas, false, true, &opts).unwrap();
+        assert_eq!(again.version, moved.version);
+        assert!(!doc.layers[g].styles_drawing(), "no other job");
+        let back = super::styles_of(&doc.layers, g, canvas, false, true).unwrap();
+        assert_eq!(back.version, own.version, "its own at once");
+        assert!(!doc.layers[g].styles_drawing());
     }
 }

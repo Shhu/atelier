@@ -53,7 +53,7 @@ impl AtelierApp {
                 });
             }
             Ok(opened) => {
-                self.status = if opened.animated {
+                self.status.set(if opened.animated {
                     t!("file-status-opened-first-frame", path = shown)
                 } else if !opened.notes.is_empty() {
                     let notes = opened.notes.join(" · ");
@@ -65,7 +65,7 @@ impl AtelierApp {
                     t!("xchg-status-opened-simplified", path = shown, notes = notes)
                 } else {
                     t!("status-opened", path = shown)
-                };
+                });
                 // Batch's files don't push the user's out of Open Recent.
                 if !self.automate.running() {
                     self.recent.add(path);
@@ -116,7 +116,7 @@ impl AtelierApp {
         if out.ok {
             self.open_path_within(&ask.path, crate::document::MemoryUse::Anyway);
         } else {
-            self.status = t!("files6-status-open-cancelled", name = name.as_str());
+            self.status.set(t!("files6-status-open-cancelled", name = name.as_str()));
         }
     }
 
@@ -159,7 +159,7 @@ impl AtelierApp {
                     let why = t!("files3-status-psd-would-lose", notes = notes);
                     // Cancelled: the reason stays in view.
                     if !self.save_as_asked() {
-                        self.status = why;
+                        self.status.set(why);
                     }
                 }
             }
@@ -225,7 +225,7 @@ impl AtelierApp {
         let saved = doc.save(path);
         crate::diag::record(format!("Save: {}", format_of(path)), started.elapsed());
         let mut failed = None;
-        self.status = match saved {
+        self.status.set(match saved {
             Ok(notes) => {
                 // Saved as a file of its own: no longer a smart object's
                 // contents.
@@ -258,7 +258,7 @@ impl AtelierApp {
                 failed = Some(message);
                 shown
             }
-        };
+        });
         // Not saved: said where it can't be missed.
         if let Some(message) = failed {
             self.report_error(message);
@@ -323,7 +323,7 @@ impl AtelierApp {
         match arboard::Clipboard::new().and_then(|mut c| c.set_image(data)) {
             Ok(()) => {
                 self.last_copy = Some(copied);
-                self.status = done;
+                self.status.set(done);
                 true
             }
             Err(e) => {
@@ -410,7 +410,7 @@ impl AtelierApp {
         if mode == PasteMode::Into {
             self.deselect();
         }
-        self.status = t!("status-pasted", width = w, height = h);
+        self.status.set(t!("status-pasted", width = w, height = h));
         self.reset_pending();
     }
 

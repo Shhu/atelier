@@ -833,7 +833,7 @@ fn reopened_missing_link_is_said() {
     d.save(&saved).unwrap();
     std::fs::remove_file(&path).unwrap();
     let mut h = app();
-    h.state_mut().status = String::new();
+    h.state_mut().status.clear();
     h.state_mut().open_path(&saved);
     h.run_steps(2);
     settle(&mut h, |app| !app.links_reading());
@@ -841,12 +841,12 @@ fn reopened_missing_link_is_said() {
     let said = |h: &Harness<'static, AtelierApp>| {
         let s = &h.state().status;
         (s.contains("logo") || s.contains("smart6-alert-links-not-found"))
-            && h.state().workspace.error_status.as_ref() == Some(s)
+            && h.state().workspace.error_status.as_deref() == Some(&**s)
     };
     assert!(said(&h), "said: {:?}", h.state().status);
     assert!(smart(&h).link.as_ref().unwrap().missing, "with its badge");
     // Looked at again (focus back): not said again.
-    h.state_mut().status = String::new();
+    h.state_mut().status.clear();
     h.state_mut().smart.focused = false;
     h.run_steps(1);
     settle(&mut h, |app| !app.links_reading());

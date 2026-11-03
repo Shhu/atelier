@@ -726,11 +726,11 @@ impl AtelierApp {
                     .and_then(|f| f.parent())
                     .map(|f| f.display().to_string())
                     .unwrap_or_default();
-                self.status = t!(
+                self.status.set(t!(
                     "artboard-status-exported",
                     count = files.len(),
                     folder = folder
-                );
+                ));
             }
             Ok(Err(error)) => {
                 self.report_error(tm!("artboard-status-export-failed", error = error))
@@ -989,7 +989,7 @@ impl AtelierApp {
             let _ = send.send(job());
         });
         self.artboards.job = Some(receive);
-        self.status = t!("artboard-status-exporting", count = count);
+        self.status.set(t!("artboard-status-exporting", count = count));
     }
 
     /// Export As: the artboards to export, each to its own file (all

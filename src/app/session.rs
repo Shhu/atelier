@@ -317,6 +317,7 @@ impl AtelierApp {
                 "h": self.crop.h,
                 "resolution": self.crop.resolution,
                 "overlay": name(self.crop.overlay),
+                "overlay_turn": self.crop.overlay_turn,
                 "shield": self.crop.shield,
                 "delete_cropped": self.crop.delete_cropped,
             }),
@@ -525,6 +526,7 @@ impl AtelierApp {
             set!(self.crop.h, c.number("h", 0.0..=MAX_DIMENSION as f32));
             set!(self.crop.resolution, c.number("resolution", 0.0..=crate::document::MAX_RESOLUTION));
             set!(self.crop.overlay, c.choice("overlay", &CropOverlay::ALL));
+            set!(self.crop.overlay_turn, c.number("overlay_turn", 0.0..=3.0).map(|t| t as u8));
             set!(self.crop.shield, c.fraction("shield"));
             set!(self.crop.delete_cropped, c.flag("delete_cropped"));
         }

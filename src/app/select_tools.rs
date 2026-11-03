@@ -1117,7 +1117,7 @@ impl AtelierApp {
             use_ai,
             found: None,
         });
-        self.status = t!("select-subject-searching");
+        self.status.set(t!("select-subject-searching"));
     }
 
     /// The subject search is done (its result may wait for a text).
@@ -1179,7 +1179,7 @@ impl AtelierApp {
         // a layer moved): found where it no longer is, searched again.
         if job.remove_from.is_none() && super::object_select::fingerprint(doc) != job.fingerprint {
             self.start_subject(false, job.use_ai);
-            self.status = t!("hist6-subject-searching-again");
+            self.status.set(t!("hist6-subject-searching-again"));
             return;
         }
         let remove_from = job.remove_from;
@@ -1196,9 +1196,9 @@ impl AtelierApp {
                     return;
                 }
                 let name = doc.active_layer().name.as_str();
-                self.status = t!("select-background-removed", name = name);
+                self.status.set(t!("select-background-removed", name = name));
                 if let Some(note) = note {
-                    self.status = format!("{} — {note}", self.status);
+                    self.status.set(format!("{} — {note}", self.status));
                 }
                 self.reset_pending();
             }
@@ -1207,10 +1207,10 @@ impl AtelierApp {
                 let found = Selection::from_mask(&mask, (0, 0)).and_then(|s| s.within(canvas));
                 self.sel.step_name = Some(t!("hist3-select-subject"));
                 self.apply_selection(found, SelectMode::Replace);
-                self.status = match note {
+                self.status.set(match note {
                     Some(note) => t!("select-subject-selected-note", note = note),
                     None => t!("select-subject-selected"),
-                };
+                });
             }
         }
     }

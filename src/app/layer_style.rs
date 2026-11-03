@@ -160,10 +160,10 @@ impl AtelierApp {
                 mode = mode.label()
             ),
         };
-        self.status = match locked {
+        self.status.set(match locked {
             0 => status,
             n => format!("{status} · {}", t!("input6-status-locked-left", count = n)),
-        };
+        });
     }
 
     /// Shift++ / Shift+-: next / previous blend mode; Alt+Shift+letter: a

@@ -224,7 +224,7 @@ impl AtelierApp {
         // The creation is in the history: the typing joins it.
         self.prop_session = Some(((id, "text"), doc.history_step()));
         self.type_tool.edit = Some(TypeEdit::new(id, 0, undo_len, true, now));
-        self.status = t!("type-status-typing");
+        self.status.set(t!("type-status-typing"));
     }
 
     /// Starts typing in the text layer `i`, the caret at the canvas point
@@ -243,7 +243,7 @@ impl AtelierApp {
         let mut edit = TypeEdit::new(id, caret, undo_len, false, now);
         edit.original = Some(t);
         self.type_tool.edit = Some(edit);
-        self.status = t!("type-status-typing");
+        self.status.set(t!("type-status-typing"));
     }
 
     /// Ends the edit, keeping the text. An empty text is removed.
@@ -270,7 +270,7 @@ impl AtelierApp {
             {
                 doc.rollback_to(edit.undo_len);
             }
-            self.status = t!("type-status-committed");
+            self.status.set(t!("type-status-committed"));
             return;
         }
         if !edit.created || !doc.rollback_to(edit.undo_len) {
@@ -293,7 +293,7 @@ impl AtelierApp {
             // (A new layer whose creation the history no longer reaches.)
             delete_layer(doc, edit.layer);
         }
-        self.status = t!("type-status-cancelled");
+        self.status.set(t!("type-status-cancelled"));
     }
 
     /// Changes the active text layer (and the caret of its edit), as one

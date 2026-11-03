@@ -209,7 +209,7 @@ impl AtelierApp {
                 all: l.locked,
             };
         }
-        self.status = lock_status(on, &name);
+        self.status.set(lock_status(on, &name));
     }
 
     /// What Ctrl+/ would do: the locks concerned, on or off.
@@ -260,7 +260,7 @@ impl AtelierApp {
         for (i, locked, locks) in changes {
             (doc.layers[i].locked, doc.layers[i].locks) = (locked, locks);
         }
-        self.status = lock_status(on, &name);
+        self.status.set(lock_status(on, &name));
         true
     }
 
@@ -287,7 +287,11 @@ impl AtelierApp {
         match groups.as_deref() {
             Some([g, ..]) if on => {
                 let group = doc.layers[*g].name.as_str();
-                self.status = t!("locks11-lock-held-by-group", lock = set.names(), group = group);
+                self.status.set(t!(
+                    "locks11-lock-held-by-group",
+                    lock = set.names(),
+                    group = group
+                ));
             }
             _ => self.status_cannot(t!("layers8-lock-unavailable", lock = set.names())),
         }
@@ -323,7 +327,7 @@ impl AtelierApp {
         };
         l.locked = false;
         l.locks = Locks::default();
-        self.status = lock_status(false, &l.name.clone());
+        self.status.set(lock_status(false, &l.name.clone()));
         // An action plays on the active layer: another one's can't be a step.
         if active {
             self.record(actions_panel::recorded_locks(LastLock::EVERY, false));

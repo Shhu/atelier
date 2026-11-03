@@ -299,7 +299,7 @@ impl AtelierApp {
         match written {
             Ok(notes) => {
                 let shown = path.display().to_string();
-                self.status = if notes.is_empty() {
+                self.status.set(if notes.is_empty() {
                     t!("file-status-exported", path = shown)
                 } else {
                     let notes = notes.join(" · ");
@@ -313,7 +313,7 @@ impl AtelierApp {
                         path = shown,
                         notes = notes
                     )
-                };
+                });
                 self.record(Recorded::Export {
                     options: options.clone(),
                     folder: path.parent().map(Path::to_path_buf),
@@ -386,7 +386,7 @@ impl AtelierApp {
         let path = unused_path(&folder, &self.file_stem(), options.format.extensions()[0]);
         self.commit_pending();
         self.write_export(options, &path)?;
-        self.status = t!("file-status-exported", path = path.display().to_string());
+        self.status.set(t!("file-status-exported", path = path.display().to_string()));
         Ok(path)
     }
 

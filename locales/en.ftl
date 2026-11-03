@@ -3384,3 +3384,8 @@ pattern11-step-new-gradient-fill = New Gradient Fill Layer
 
 ## Title bar: the menu holding the menus a narrow window has no room for
 ui11-menu-more = More menus
+
+## Histogram panel: Source menu, the image up to the selected adjustment layer
+histogram12-source-adjustment = Adjustment Composite
+## Crop tool: Overlay menu, golden rectangle squares and spiral (Shift+O turns it)
+histogram12-spiral-overlay = Golden Spiral

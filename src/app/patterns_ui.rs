@@ -400,10 +400,13 @@ impl AtelierApp {
             match job.try_recv() {
                 Ok(read) => {
                     if let Some(backup) = &read.set_aside {
-                        self.status = t!("pattern9-status-index-damaged", backup = backup.as_str());
+                        self.status.set(t!(
+                            "pattern9-status-index-damaged",
+                            backup = backup.as_str()
+                        ));
                         crate::diag::warn(format!("pattern index damaged, set aside: {backup}"));
                     } else if read.left_out > 0 {
-                        self.status = t!("pattern9-status-left-out", count = read.left_out);
+                        self.status.set(t!("pattern9-status-left-out", count = read.left_out));
                         crate::diag::warn(format!("{} patterns not read", read.left_out));
                     }
                     self.patterns.library.merge(read);
@@ -421,7 +424,7 @@ impl AtelierApp {
             }
         }
         if let Some(error) = self.patterns.saver.error() {
-            self.status = t!("pattern9-status-not-saved", error = error);
+            self.status.set(t!("pattern9-status-not-saved", error = error));
         }
         self.patterns.library.follow_language();
         let asked = ctx.data_mut(|d| d.remove_temp::<Option<Request>>(request_id()));
@@ -547,7 +550,7 @@ impl AtelierApp {
                         self.actions
                             .step_stopped(actions_panel::Stopped::Failed(text.clone()));
                     }
-                    self.status = text;
+                    self.status.set(text);
                     return;
                 }
                 Err(TryRecvError::Empty) => ctx.request_repaint(),
@@ -605,12 +608,12 @@ impl AtelierApp {
         self.patterns.last = p.id;
         match self.patterns.library.add(p.clone()) {
             Added::New => {
-                self.status = t!("pattern8-status-defined", name = p.name.as_str());
+                self.status.set(t!("pattern8-status-defined", name = p.name.as_str()));
                 let file = self.patterns.library.file_for(p.id);
                 self.patterns.saver.send(Change::Add { file, pattern: p });
             }
             Added::Already(name) => {
-                self.status = t!("pattern9-status-already", name = name);
+                self.status.set(t!("pattern9-status-already", name = name));
             }
         }
     }
@@ -692,11 +695,11 @@ impl AtelierApp {
         let done = doc.fill_active_pattern(&pattern, selection, opacity, preserve);
         if done {
             doc.mark_fade();
-            self.status = t!(
+            self.status.set(t!(
                 "status-filled",
                 name = doc.active_layer().name.as_str(),
                 content = pattern.name.as_str()
-            );
+            ));
             self.reset_pending();
         } else {
             doc.mark_fade_nothing();

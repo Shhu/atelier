@@ -280,7 +280,7 @@ impl AtelierApp {
         if add {
             let rgb = picker.picked.rgb8();
             self.colors.swatches.add(rgb);
-            self.status = t!("uip-status-swatch-added", hex = hex_color(rgb));
+            self.status.set(t!("uip-status-swatch-added", hex = hex_color(rgb)));
         }
         if picker.picked != before {
             ui_kit::send_picked(ctx, picker.target, picker.color());

@@ -717,7 +717,7 @@ impl AtelierApp {
             doc: doc.uid(),
         });
         self.retouch.overlay = None;
-        self.status = t!("retouch-status-source-set");
+        self.status.set(t!("retouch-status-source-set"));
     }
 
     /// Before a stroke of a retouching tool: refused (with a message) when
@@ -840,7 +840,7 @@ impl AtelierApp {
             SpotType::ContentAware => Method::Patches,
         };
         if ai_wanted && method != Method::Ai {
-            self.status = t!("fx3-ai-skipped-transparency");
+            self.status.set(t!("fx3-ai-skipped-transparency"));
         }
         // Made where it is computed: crops and coverage of megapixels.
         let make = move || FillTask {
@@ -880,11 +880,11 @@ impl AtelierApp {
             None => {
                 doc.end_paint();
                 doc.discard_step();
-                self.status = if unchanged {
+                self.status.set(if unchanged {
                     t!("tools5-status-unchanged")
                 } else {
                     t!("retouch-status-nothing-to-sample")
-                };
+                });
             }
         }
     }
@@ -1094,9 +1094,9 @@ impl AtelierApp {
                 .step_stopped(actions_panel::Stopped::Failed(text.shown.clone()));
             self.status_failed(text);
         } else if cancelled {
-            self.status = t!("retouch-status-cancelled", name = job.name.as_str());
+            self.status.set(t!("retouch-status-cancelled", name = job.name.as_str()));
         } else if unchanged {
-            self.status = t!("tools5-status-unchanged");
+            self.status.set(t!("tools5-status-unchanged"));
         }
         if let Some(record) = job.record.filter(|_| applied || (unchanged && !cancelled)) {
             self.record(record);
@@ -1200,7 +1200,7 @@ impl AtelierApp {
                 Method::Patches
             };
         if request.settings.ai && method != Method::Ai && Model::Inpaint.ready() {
-            self.status = t!("fx3-ai-skipped-transparency");
+            self.status.set(t!("fx3-ai-skipped-transparency"));
         }
         let (adapt, opacity, keep_alpha) =
             (request.settings.adapt, request.opacity, request.keep_alpha);
@@ -1241,7 +1241,7 @@ impl AtelierApp {
                 self.start_content_aware(request);
             } else {
                 let name = Model::Inpaint.name();
-                self.status = t!("fx3-model-ready-run-again", name = name);
+                self.status.set(t!("fx3-model-ready-run-again", name = name));
             }
         }
     }
@@ -1568,7 +1568,7 @@ impl AtelierApp {
         doc.end_paint();
         if !changed {
             doc.discard_step();
-            self.status = t!("retouch-status-no-red-eye");
+            self.status.set(t!("retouch-status-no-red-eye"));
         }
     }
 

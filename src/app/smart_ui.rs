@@ -319,7 +319,7 @@ impl AtelierApp {
                     if doc.convert_to_smart(&picked) {
                         self.layer_set.clear();
                         let name = doc.active_layer().name.as_str();
-                        self.status = t!("smart-status-converted", name = name);
+                        self.status.set(t!("smart-status-converted", name = name));
                         self.reset_pending();
                     } else {
                         // Refused for a locked layer: named.
@@ -364,7 +364,7 @@ impl AtelierApp {
                 let shown = path.display().to_string();
                 if let Some(doc) = &mut self.doc {
                     match doc.replace_contents(&path) {
-                        Ok(()) => self.status = t!("smart-status-replaced", path = shown),
+                        Ok(()) => self.status.set(t!("smart-status-replaced", path = shown)),
                         Err(e) => self.report_error(tm!(
                             "status-import-failed",
                             path = shown,
@@ -569,11 +569,11 @@ impl AtelierApp {
         let shown = path.display().to_string();
         match doc.place_file(path, linked) {
             Ok(animated) => {
-                self.status = if animated {
+                self.status.set(if animated {
                     t!("file-status-imported-first-frame", path = shown)
                 } else {
                     t!("smart-status-placed", path = shown)
-                };
+                });
                 self.reset_pending();
                 self.run(Action::Transform(transform::Command::Free));
                 if let Some(doc) = self.doc.as_ref().filter(|_| self.transform_pending()) {
@@ -810,11 +810,11 @@ impl AtelierApp {
         match parent.map(|p| p.doc.update_contents(e.contents, contents, embed)) {
             Some(ContentsUpdate::Updated) => {
                 doc.mark_saved();
-                self.status = if linked {
+                self.status.set(if linked {
                     t!("smart4-status-updated-embedded", name = e.name.as_str())
                 } else {
                     t!("smart-status-updated", name = e.name.as_str())
-                };
+                });
             }
             // Edited while its file was missing, which is back: these edits
             // or the file, asked (the file would replace them).
@@ -901,11 +901,11 @@ impl AtelierApp {
         let notes = std::mem::take(&mut doc.file_notes);
         match self.save_in_place(crate::export::ExportOptions::default().quality) {
             Ok(()) => {
-                self.status = if layered {
+                self.status.set(if layered {
                     t!("smart4-status-link-saved-flat", name = name.as_str())
                 } else {
                     t!("smart4-status-link-saved", name = name.as_str())
-                };
+                });
                 true
             }
             Err(e) => {
@@ -1008,7 +1008,7 @@ impl AtelierApp {
         };
         let shown = path.display().to_string();
         match contents.save(&path) {
-            Ok(_) => self.status = t!("status-saved", path = shown),
+            Ok(_) => self.status.set(t!("status-saved", path = shown)),
             Err(e) => self.report_error(tm!(
                 "file-status-save-failed",
                 name = files::file_name(&path),
@@ -1165,22 +1165,22 @@ impl AtelierApp {
             self.report_warning(text);
         }
         if !report.missing.is_empty() {
-            self.status = t!(
+            self.status.set(t!(
                 "smart-status-link-missing",
                 count = report.missing.len(),
                 names = report.missing.join(", ")
-            );
+            ));
         } else if !report.unreadable.is_empty() {
-            self.status = t!(
+            self.status.set(t!(
                 "smart4-status-link-unreadable",
                 count = report.unreadable.len(),
                 names = report.unreadable.join(", ")
-            );
+            ));
         } else if !report.updated.is_empty() {
-            self.status = t!(
+            self.status.set(t!(
                 "smart-status-links-updated",
                 names = report.updated.join(", ")
-            );
+            ));
         }
         if active && !report.updated.is_empty() {
             self.end_layer_preview();
@@ -1286,7 +1286,7 @@ impl AtelierApp {
         };
         r.job.stop();
         self.undo_smart_change(&r);
-        self.status = t!("retouch-status-cancelled", name = r.name.shown.as_str());
+        self.status.set(t!("retouch-status-cancelled", name = r.name.shown.as_str()));
         self.actions.step_stopped(Stopped::Cancelled);
         self.end_layer_preview();
         self.reset_pending();
@@ -1490,7 +1490,7 @@ impl AtelierApp {
         let mask = self.filter_mask_of_selection();
         // The dialog's preview of the same filters is the result.
         let ready = self.preview_of_smart(key);
-        self.status = t!("filter-applied", name = name.shown.as_str());
+        self.status.set(t!("filter-applied", name = name.shown.as_str()));
         let change = move |s: &mut SmartObject| {
             s.filters = filters;
             if mask.is_some() {

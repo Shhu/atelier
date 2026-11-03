@@ -146,6 +146,6 @@ impl AtelierApp {
         self.color.tag_new(&mut doc);
         self.commit_pending();
         self.add_tab(doc);
-        self.status = t!("artboard-status-new-document", width = w, height = h);
+        self.status.set(t!("artboard-status-new-document", width = w, height = h));
     }
 }

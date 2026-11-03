@@ -5,16 +5,18 @@
 use std::cell::Cell;
 use std::sync::Arc;
 
-use image::{GrayImage, Rgba, RgbaImage};
+use image::{GrayImage, RgbaImage};
 
 use crate::i18n::t;
 
 mod mixers;
+mod resample;
 mod tones;
 pub use mixers::{
     AutoMode, ChannelMixer, Exposure, Fade, FadeArea, SELECTIVE_RANGES, SelectiveColor,
     StrokeLocation, StrokeSettings, auto_levels_within, stroke_covering,
 };
+pub use resample::resize_unless;
 pub use tones::{BlackWhite, GradientMap, PhotoFilter, Posterize, Threshold};
 
 /// Distance between two colors: the largest difference on one channel (alpha
@@ -1467,25 +1469,10 @@ pub fn content_box(image: &RgbaImage) -> Option<[u32; 4]> {
 
 /// Resizes an image in premultiplied alpha, so that the colors hidden under
 /// transparent pixels do not bleed into the edges (no dark fringes).
+/// In parallel over bands of rows (see [`resize_unless`]).
 pub fn resize(image: &RgbaImage, w: u32, h: u32, filter: image::imageops::FilterType) -> RgbaImage {
-    // 16 bits: color × alpha (≤ 255 × 255) and alpha × 257 are exact.
-    let premultiplied = image::ImageBuffer::<Rgba<u16>, Vec<u16>>::from_fn(
-        image.width(),
-        image.height(),
-        |x, y| {
-            let [r, g, b, a] = image.get_pixel(x, y).0.map(u16::from);
-            Rgba([r * a, g * a, b * a, a * 257])
-        },
-    );
-    let resized = image::imageops::resize(&premultiplied, w, h, filter);
-    RgbaImage::from_fn(w, h, |x, y| {
-        let [r, g, b, a] = resized.get_pixel(x, y).0.map(u32::from);
-        if a < 129 {
-            return Rgba([0, 0, 0, 0]);
-        }
-        let c = |v: u32| ((v * 257 + a / 2) / a).min(255) as u8;
-        Rgba([c(r), c(g), c(b), ((a + 128) / 257) as u8])
-    })
+    let never = std::sync::atomic::AtomicBool::new(false);
+    resize_unless(image, w, h, filter, &never).unwrap_or_default()
 }
 
 /// "Source over" compositing in non-premultiplied colors: places `src` over
@@ -1509,6 +1496,7 @@ pub fn over(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::Rgba;
 
     const WHITE: Rgba<u8> = Rgba([255, 255, 255, 255]);
     const BLACK: Rgba<u8> = Rgba([0, 0, 0, 255]);

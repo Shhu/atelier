@@ -78,16 +78,19 @@ pub(super) enum CropOverlay {
     Triangle,
     /// Thirds at the golden ratio (0.382, 0.618).
     GoldenRatio,
+    /// The squares of a golden rectangle and the spiral through them.
+    GoldenSpiral,
     Never,
 }
 
 impl CropOverlay {
-    pub(super) const ALL: [Self; 6] = [
+    pub(super) const ALL: [Self; 7] = [
         Self::Thirds,
         Self::Grid,
         Self::Diagonal,
         Self::Triangle,
         Self::GoldenRatio,
+        Self::GoldenSpiral,
         Self::Never,
     ];
 
@@ -98,13 +101,42 @@ impl CropOverlay {
             Self::Diagonal => t!("crop11-overlay-diagonal"),
             Self::Triangle => t!("crop11-overlay-triangle"),
             Self::GoldenRatio => t!("crop11-overlay-golden-ratio"),
+            Self::GoldenSpiral => t!("histogram12-spiral-overlay"),
             Self::Never => t!("crop8-overlay-none"),
         }
     }
 
+    /// Shift + O changes how it is turned: Triangle and Golden Spiral.
+    pub(super) fn turns(self) -> bool {
+        matches!(self, Self::Triangle | Self::GoldenSpiral)
+    }
+
+    /// The next of its turns (see [`CropTool::overlay_turn`]): the
+    /// spiral's eye goes round the corners, the triangle's diagonal flips.
+    pub(super) fn next_turn(self, turn: u8) -> u8 {
+        match self {
+            Self::Triangle => turn ^ 1,
+            Self::GoldenSpiral => [1, 3, 0, 2][usize::from(turn & 3)],
+            _ => turn,
+        }
+    }
+
     /// Its lines in the box, from corner (0, 0) to (1, 1), for a box of
-    /// width / height `aspect`.
-    pub(super) fn lines(self, aspect: f32) -> Vec<[(f32, f32); 2]> {
+    /// width / height `aspect`, mirrored as `turn` says (bit 0: left to
+    /// right, bit 1: top to bottom) for those that turn.
+    pub(super) fn lines(self, aspect: f32, turn: u8) -> Vec<[(f32, f32); 2]> {
+        let mut lines = self.unturned_lines(aspect);
+        if self.turns() {
+            let flip = |f: bool, v: f32| if f { 1.0 - v } else { v };
+            let at = |(u, v): (f32, f32)| (flip(turn & 1 != 0, u), flip(turn & 2 != 0, v));
+            for l in &mut lines {
+                *l = l.map(at);
+            }
+        }
+        lines
+    }
+
+    fn unturned_lines(self, aspect: f32) -> Vec<[(f32, f32); 2]> {
         let parts = |fractions: &[f32]| {
             (fractions.iter())
                 .flat_map(|&f| [[(f, 0.0), (f, 1.0)], [(0.0, f), (1.0, f)]])
@@ -136,9 +168,71 @@ impl CropOverlay {
                 let (a, b) = (w2 / (w2 + h2), h2 / (w2 + h2));
                 vec![[(0.0, 0.0), (1.0, 1.0)], [(1.0, 0.0), (a, a)], [(0.0, 1.0), (b, b)]]
             }
+            Self::GoldenSpiral => golden_spiral(aspect),
             Self::Never => Vec::new(),
         }
     }
+}
+
+/// A golden rectangle stretched over the box (lying along its longer
+/// side): the squares cut off it one after the other, left, top, right,
+/// bottom and so on, and the quarter circles through them, the eye at the
+/// bottom right.
+fn golden_spiral(aspect: f32) -> Vec<[(f32, f32); 2]> {
+    const PHI: f32 = 1.618_034;
+    const SQUARES: usize = 12;
+    const ARC: usize = 16;
+    let mut out = Vec::new();
+    // In a PHI × 1 rectangle.
+    let (mut x, mut y, mut w, mut h) = (0.0f32, 0.0f32, PHI, 1.0f32);
+    for k in 0..SQUARES {
+        // The square, the cut, and the arc: from, to, around.
+        let (cut, from, to, center);
+        match k % 4 {
+            0 => {
+                cut = [(x + h, y), (x + h, y + h)];
+                (from, to, center) = ((x, y + h), (x + h, y), (x + h, y + h));
+                (x, w) = (x + h, w - h);
+            }
+            1 => {
+                cut = [(x, y + w), (x + w, y + w)];
+                (from, to, center) = ((x, y), (x + w, y + w), (x, y + w));
+                (y, h) = (y + w, h - w);
+            }
+            2 => {
+                cut = [(x + w - h, y), (x + w - h, y + h)];
+                (from, to, center) = ((x + w, y), (x + w - h, y + h), (x + w - h, y));
+                w -= h;
+            }
+            _ => {
+                cut = [(x, y + h - w), (x + w, y + h - w)];
+                (from, to, center) = ((x + w, y + h), (x, y + h - w), (x + w, y + h - w));
+                h -= w;
+            }
+        }
+        out.push(cut);
+        let angle = |p: (f32, f32)| (p.1 - center.1).atan2(p.0 - center.0);
+        let (a0, a1) = (angle(from), angle(to));
+        // The quarter turn between them.
+        let mut d = a1 - a0;
+        if d > std::f32::consts::PI {
+            d -= std::f32::consts::TAU;
+        } else if d < -std::f32::consts::PI {
+            d += std::f32::consts::TAU;
+        }
+        let r = (from.0 - center.0).hypot(from.1 - center.1);
+        let point = |i: usize| {
+            let a = a0 + d * i as f32 / ARC as f32;
+            (center.0 + r * a.cos(), center.1 + r * a.sin())
+        };
+        out.extend((0..ARC).map(|i| [point(i), point(i + 1)]));
+    }
+    // Into the box, upright when the box is.
+    let unit = |(u, v): (f32, f32)| match aspect >= 1.0 {
+        true => (u / PHI, v),
+        false => (v, u / PHI),
+    };
+    out.into_iter().map(|l| l.map(unit)).collect()
 }
 
 /// Crop tool's state, besides the box itself.
@@ -152,6 +246,8 @@ pub(super) struct CropTool {
     /// it is.
     pub(super) resolution: f32,
     pub(super) overlay: CropOverlay,
+    /// How the overlays that turn are turned (see [`CropOverlay::lines`]).
+    pub(super) overlay_turn: u8,
     /// How dark what the box leaves out is (0..=1).
     pub(super) shield: f32,
     pub(super) delete_cropped: bool,
@@ -262,6 +358,7 @@ impl Default for CropTool {
             h: 0.0,
             resolution: 0.0,
             overlay: CropOverlay::Thirds,
+            overlay_turn: 0,
             shield: 0.75,
             delete_cropped: false,
             angle: 0.0,
@@ -499,7 +596,7 @@ impl AtelierApp {
         let stroke = UiStroke::new(1.0, Color32::from_white_alpha(110));
         let aspect = nw.distance(ne) / nw.distance(sw).max(1e-3);
         let at = |(u, v): (f32, f32)| nw + (ne - nw) * u + (sw - nw) * v;
-        for [a, b] in self.crop.overlay.lines(aspect) {
+        for [a, b] in self.crop.overlay.lines(aspect, self.crop.overlay_turn) {
             painter.line_segment([at(a), at(b)], stroke);
         }
     }
@@ -1036,7 +1133,7 @@ impl AtelierApp {
         match done {
             Some(done) if same => self.put_whole(done, landing),
             Some(_) => {
-                self.status = t!("crop9-status-dropped", name = landing.name.as_str());
+                self.status.set(t!("crop9-status-dropped", name = landing.name.as_str()));
                 give_back(self, &landing.kind);
             }
             None => {
@@ -1044,7 +1141,7 @@ impl AtelierApp {
                 // What was given meanwhile was for its result: it goes too.
                 let held = &mut self.crop.held;
                 (held.frames, held.down) = (Default::default(), false);
-                self.status = t!("crop9-status-cancelled", name = landing.name.as_str());
+                self.status.set(t!("crop9-status-cancelled", name = landing.name.as_str()));
                 self.actions.step_stopped(actions_panel::Stopped::Cancelled);
                 give_back(self, &landing.kind);
                 // What was to follow the crop waited for it: it stops too.
@@ -1075,29 +1172,33 @@ impl AtelierApp {
         match landing.kind {
             LandingKind::Rotate(degrees) => {
                 let angle = i18n::short_decimal(f64::from(degrees.rem_euclid(360.0)));
-                self.status = t!("status-image-rotated", angle = angle);
+                self.status.set(t!("status-image-rotated", angle = angle));
                 self.reset_pending();
             }
             LandingKind::Flip => self.reset_pending(),
             LandingKind::Crop { shift, .. } => {
-                self.status = t!("status-canvas-resized", width = w, height = h);
+                self.status.set(t!("status-canvas-resized", width = w, height = h));
                 self.after_geometry_change(shift);
             }
         }
     }
 
-    /// The Crop tool's keys: O goes through the overlays, X swaps W and H.
-    /// Shift + O has nothing to change here, but stays in the tool. Returns
-    /// whether it took `key`.
+    /// The Crop tool's keys: O goes through the overlays, Shift + O turns
+    /// the one shown (Triangle, Golden Spiral; the others stay, but the
+    /// key stays in the tool), X swaps W and H. Returns whether it took
+    /// `key`.
     pub(super) fn crop_key(&mut self, key: Key, shift: bool) -> bool {
         if self.tool != Tool::Canvas {
             return false;
         }
         match key {
             Key::O => {
-                if !shift {
+                let overlay = self.crop.overlay;
+                if shift {
+                    self.crop.overlay_turn = overlay.next_turn(self.crop.overlay_turn);
+                } else {
                     let all = CropOverlay::ALL;
-                    let i = all.iter().position(|o| *o == self.crop.overlay).unwrap_or(0);
+                    let i = all.iter().position(|o| *o == overlay).unwrap_or(0);
                     self.crop.overlay = all[(i + 1) % all.len()];
                 }
                 true

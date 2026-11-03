@@ -227,7 +227,7 @@ fn alt_digit_picks_the_channel_by_physical_key() {
 #[test]
 fn paste_when_ctrl_is_released_before_v() {
     let mut h = app();
-    h.state_mut().status = "marker".into();
+    h.state_mut().status.set("marker");
     // The Ctrl+V press is swallowed by egui-winit (image clipboard); only
     // the release of V arrives, after Ctrl's.
     h.event(egui::Event::Key {
@@ -241,7 +241,7 @@ fn paste_when_ctrl_is_released_before_v() {
     assert_ne!(h.state().status, "marker", "paste attempted");
 
     // A plain V (Move tool) is not a paste.
-    h.state_mut().status = "marker".into();
+    h.state_mut().status.set("marker");
     h.key_press(Key::V);
     h.run_steps(2);
     assert_eq!(h.state().status, "marker");

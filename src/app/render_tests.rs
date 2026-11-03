@@ -1257,3 +1257,83 @@ fn a_tab_left_during_a_generation_drops_it() {
         "the change shows"
     );
 }
+
+/// A layer's styles follow its filter preview on the canvas; Cancel shows
+/// them as they were.
+#[test]
+fn styles_follow_a_filter_preview() {
+    let mut doc = Document::new(solid(400, 300, [255, 255, 255, 255]), None);
+    let image = RgbaImage::from_fn(200, 100, |x, y| match (20..60).contains(&x) && (20..60).contains(&y) {
+        true => Rgba([255, 0, 0, 255]),
+        false => Rgba([0, 0, 0, 0]),
+    });
+    doc.add_layer("A".into(), image, (0, 0));
+    doc.layers[1].effects.stroke.enabled = true;
+    doc.layers[1].effects.stroke.color = [0, 0, 255, 255];
+    doc.layers[1].effects.stroke.width = 4.0;
+    doc.layers[1].effects.stroke.opacity = 1.0;
+    doc.active = 1;
+    let mut h = app_with(doc, Tool::Hand, 2048);
+    let shot = h.render().unwrap();
+    assert!(near(shown(&shot, &h, 18, 40), [0, 0, 255]));
+    h.state_mut().open_filter_dialog(crate::filters::Filter::Offset(crate::filters::Offset {
+        horizontal: 60.0,
+        vertical: 0.0,
+        undefined: crate::filters::Undefined::Transparent,
+    }));
+    let start = std::time::Instant::now();
+    let shot = loop {
+        h.run_steps(1);
+        let shot = h.render().unwrap();
+        if near(shown(&shot, &h, 100, 40), [255, 0, 0]) {
+            break shot;
+        }
+        assert!(start.elapsed().as_secs() < 30, "no preview shown");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(near(shown(&shot, &h, 78, 40), [0, 0, 255]), "around the preview");
+    assert!(near(shown(&shot, &h, 18, 40), [255, 255, 255]), "not where it was");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.state().preview_shown.is_none());
+    let shot = h.render().unwrap();
+    assert!(near(shown(&shot, &h, 18, 40), [0, 0, 255]), "back");
+}
+
+/// A group's styles follow the transform being prepared of one of its
+/// layers (drawn from its new shape, not scaled with it), at 100 % and at
+/// 50 % (the preview made at the view's level); Escape puts them back.
+#[test]
+fn group_styles_follow_a_transformed_layer() {
+    for zoom in [1.0, 0.5] {
+        let mut doc = Document::new(solid(400, 300, [255, 255, 255, 255]), None);
+        doc.add_group();
+        doc.add_layer("A".into(), solid(40, 40, [255, 0, 0, 255]), (20, 20));
+        let g = doc.layers.iter().position(|l| l.is_group()).unwrap();
+        doc.layers[g].effects.stroke.enabled = true;
+        doc.layers[g].effects.stroke.color = [0, 0, 255, 255];
+        doc.layers[g].effects.stroke.width = 6.0;
+        doc.layers[g].effects.stroke.opacity = 1.0;
+        doc.active = 1;
+        let mut h = app_with(doc, Tool::Transform, 2048);
+        h.state_mut().zoom = zoom;
+        h.run_steps(3);
+        let shot = h.render().unwrap();
+        assert!(near(shown(&shot, &h, 16, 40), [0, 0, 255]), "{zoom}");
+        h.state_mut().transform_rect =
+            Some(Rect::from_min_size(pos2(110.0, 110.0), vec2(80.0, 80.0)));
+        h.run_steps(2);
+        let shot = h.render().unwrap();
+        // (Away from the frame's handles.)
+        assert!(near(shown(&shot, &h, 130, 170), [255, 0, 0]), "{zoom}: moved");
+        assert!(near(shown(&shot, &h, 107, 130), [0, 0, 255]), "{zoom}: the stroke with it");
+        assert!(near(shown(&shot, &h, 170, 193), [0, 0, 255]), "{zoom}: drawn, not scaled");
+        assert!(near(shown(&shot, &h, 170, 198), [255, 255, 255]), "{zoom}");
+        assert!(near(shown(&shot, &h, 16, 40), [255, 255, 255]), "{zoom}: not where it was");
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert!(h.state().transform_rect.is_none());
+        let shot = h.render().unwrap();
+        assert!(near(shown(&shot, &h, 16, 40), [0, 0, 255]), "{zoom}: back");
+    }
+}

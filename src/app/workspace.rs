@@ -337,7 +337,7 @@ impl AtelierApp {
                     WARNING,
                 )
             } else {
-                (self.status.clone(), alpha, ui_kit::color::TEXT)
+                (self.status.to_string(), alpha, ui_kit::color::TEXT)
             });
         }
         notices
@@ -439,9 +439,7 @@ impl AtelierApp {
     /// `message` in the status bar, in the warning color, and in the alert
     /// window (only the status in Batch runs).
     fn show_alert(&mut self, message: String) {
-        // (The same message again is news again.)
-        self.status_shown.clear();
-        self.status = message.clone();
+        self.status.set(message.clone());
         self.workspace.error_status = Some(message.clone());
         if !self.automate.running() {
             // Several at once (files dropped together): all of them.
@@ -463,8 +461,7 @@ impl AtelierApp {
         crate::diag::error(message.clone());
         let message = message.shown;
         self.actions.refused(&message);
-        self.status_shown.clear();
-        self.status = message.clone();
+        self.status.set(message.clone());
         self.workspace.error_status = Some(message);
     }
 
@@ -476,8 +473,7 @@ impl AtelierApp {
         crate::diag::warn(message.clone());
         self.actions.refused(&message.shown);
         let shown = format!("{} {}", icon::LOCK_SIMPLE, message.shown);
-        self.status_shown.clear();
-        self.status = shown.clone();
+        self.status.set(shown.clone());
         self.workspace.error_status = Some(shown);
     }
 
@@ -486,8 +482,7 @@ impl AtelierApp {
     /// that step. (A step that does nothing, and says so, writes `status`.)
     pub(super) fn status_cannot(&mut self, why: String) {
         self.actions.refused(&why);
-        self.status_shown.clear();
-        self.status = why;
+        self.status.set(why);
     }
 
     /// File › Open Recent: the recent files (by name, with their folder

@@ -130,10 +130,10 @@ impl AtelierApp {
         let name = t!("hist3-quick-mask");
         if doc.quick_mask().is_some() {
             doc.leave_quick_mask(name);
-            self.status = t!("sel-status-quick-mask-off");
+            self.status.set(t!("sel-status-quick-mask-off"));
         } else {
             doc.enter_quick_mask(name);
-            self.status = t!("sel-status-quick-mask-on", key = keys::key(Key::Q));
+            self.status.set(t!("sel-status-quick-mask-on", key = keys::key(Key::Q)));
         }
         self.prop_session = None;
         self.xform.quick.copy = None;
@@ -384,7 +384,7 @@ impl AtelierApp {
         let (dx, dy) = m.by;
         self.selection = m.selection.and_then(|s| s.translate(dx, dy).within(canvas));
         self.sync_selection();
-        self.status = moved_status((dx, dy));
+        self.status.set(moved_status((dx, dy)));
     }
 
     /// Whether what a move of the quick mask takes is empty (said in the
@@ -446,7 +446,7 @@ impl AtelierApp {
         if let Some(b) = bounds.filter(|_| hard) {
             self.seed_quick_mask_bounds(intersect(b.translate(d.0, d.1), canvas));
         }
-        self.status = moved_status(total);
+        self.status.set(moved_status(total));
     }
 
     /// Align in Quick Mask Mode: what a move of the mask takes (with a
@@ -541,7 +541,7 @@ impl AtelierApp {
             selection_key: selection_key(self.selection.as_ref()),
             ..copy
         });
-        self.status = moved_status(by);
+        self.status.set(moved_status(by));
         true
     }
 

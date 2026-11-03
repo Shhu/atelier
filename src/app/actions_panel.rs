@@ -750,7 +750,7 @@ impl AtelierApp {
         // Undo and Redo aren't commands; a transform records when applied.
         let pending = matches!(action, Action::Undo | Action::Redo) || self.transform_pending();
         if len.is_some() && changed && !pending && self.actions.recording_len() == len {
-            self.status = t!("smart3-actions-not-recorded");
+            self.status.set(t!("smart3-actions-not-recorded"));
         }
     }
 
@@ -957,7 +957,7 @@ impl AtelierApp {
     /// Plays the next step, once the previous one is done (every frame).
     pub(super) fn play_actions(&mut self) {
         if let Some(notice) = self.actions.notice.take() {
-            self.status = notice;
+            self.status.set(notice);
         }
         // Record Again's dialog closed without OK.
         if self.actions.again.is_some() && !self.actions_wait() && !self.transform_pending() {
@@ -971,7 +971,7 @@ impl AtelierApp {
         {
             let name = self.actions.player.as_ref().map(|p| p.name.clone());
             self.stop_playing();
-            self.status = t!("actions-status-stopped", name = name.unwrap_or_default());
+            self.status.set(t!("actions-status-stopped", name = name.unwrap_or_default()));
             return;
         }
         loop {
@@ -986,7 +986,7 @@ impl AtelierApp {
                     // Like Photoshop, a step cancelled stops the action
                     // (and a batch: a cancel is not a file's error).
                     Some(Stopped::Cancelled) if !p.batch => {
-                        self.status = t!("actions-status-stopped", name = c.action.as_str());
+                        self.status.set(t!("actions-status-stopped", name = c.action.as_str()));
                         return self.stop_playing();
                     }
                     Some(Stopped::Cancelled) => return self.cancel_batch(),
@@ -999,7 +999,7 @@ impl AtelierApp {
                     return self.step_error(&c.title, &c.action, c.row, error);
                 }
                 if c.dialog && !c.committed {
-                    self.status = t!("actions-status-stopped", name = c.action.as_str());
+                    self.status.set(t!("actions-status-stopped", name = c.action.as_str()));
                     return self.stop_playing();
                 }
                 // A frame to show the result.
@@ -1017,7 +1017,7 @@ impl AtelierApp {
                 if p.batch {
                     self.actions.batch_error = p.error;
                 } else {
-                    self.status = t!("actions-status-played", name = p.name.as_str());
+                    self.status.set(t!("actions-status-played", name = p.name.as_str()));
                 }
                 return;
             };
@@ -1247,7 +1247,7 @@ impl AtelierApp {
                         return Ok(());
                     };
                     if doc.adjust_active(adjustment, selection) {
-                        self.status = t!("dialog-adjust-applied", name = adjustment.title());
+                        self.status.set(t!("dialog-adjust-applied", name = adjustment.title()));
                         self.reset_pending();
                     } else {
                         // A neutral one: a Fade after it fades nothing.
@@ -1490,7 +1490,7 @@ impl AtelierApp {
             }
             Recorded::Transform { corners } => {
                 if !self.play_transform(*corners, dialog) {
-                    return Err(self.status.clone());
+                    return Err(self.status.to_string());
                 }
             }
             Recorded::Place {
@@ -1500,7 +1500,7 @@ impl AtelierApp {
             } => {
                 self.place_path(path, *linked);
                 if !self.transform_pending() || !self.set_transform_frame(*corners) {
-                    return Err(self.status.clone());
+                    return Err(self.status.to_string());
                 }
                 if !dialog {
                     self.apply_transform();
@@ -1891,7 +1891,7 @@ impl AtelierApp {
         self.actions.again = Some(row);
         if let Err(error) = self.play_step(&command, true) {
             self.actions.again = None;
-            self.status = error;
+            self.status.set(error);
         }
     }
 
@@ -1919,7 +1919,7 @@ impl AtelierApp {
                     a.library.sets.extend(sets);
                 }
                 a.changed();
-                self.status = t!("actions-status-loaded", path = path.display().to_string());
+                self.status.set(t!("actions-status-loaded", path = path.display().to_string()));
             }
             Err(e) => self.report_error(tm!("actions-status-load-failed", error = crate::i18n::Message::of(|| e.to_string()))),
         }
@@ -1955,7 +1955,10 @@ impl AtelierApp {
             return;
         };
         match act::write(&path, &sets) {
-            Ok(()) => self.status = t!("actions-status-saved", path = path.display().to_string()),
+            Ok(()) => self.status.set(t!(
+                "actions-status-saved",
+                path = path.display().to_string()
+            )),
             Err(e) => self.report_error(tm!("actions-status-save-failed", error = crate::i18n::Message::of(|| e.to_string()))),
         }
     }
@@ -4367,7 +4370,7 @@ mod tests {
         let doc = app.doc.as_ref().unwrap();
         let (w, tall) = (doc.width(), doc.height());
         let id = doc.state_id();
-        app.status = "before".into();
+        app.status.set("before");
         let rect = [0, 0, i64::from(w), i64::from(tall)];
         assert!(crop_step(app, rect, None, 0.0).is_ok());
         assert!(crop_step(app, rect, Some((w, tall)), 0.0).is_ok());
@@ -4415,7 +4418,7 @@ mod tests {
         let mut h = app();
         h.state_mut().run(Action::MergeDown);
         h.run_steps(1);
-        let said = h.state().status.clone();
+        let said = h.state().status.to_string();
         assert!(!said.is_empty());
         let before = flat(&h);
         let merge = Step::new(Recorded::Menu {
@@ -4433,7 +4436,7 @@ mod tests {
         h.state_mut().selection = Some(PixelRect { x: 0, y: 0, w: 10, h: 10 }.into());
         h.state_mut().run(Action::ClearSelection);
         h.run_steps(1);
-        let said = h.state().status.clone();
+        let said = h.state().status.to_string();
         let clear = Step::new(Recorded::Menu {
             item: MenuItem::Clear,
         });

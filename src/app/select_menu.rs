@@ -531,7 +531,7 @@ impl AtelierApp {
             generation: doc.history_generation(),
             name: self.sel.step_name.take(),
         });
-        self.status = t!("sel-status-working");
+        self.status.set(t!("sel-status-working"));
     }
 
     /// Applies the selection computed in the background, once ready (never
@@ -644,7 +644,7 @@ impl AtelierApp {
             generation,
             name: self.sel.step_name.take(),
         });
-        self.status = t!("sel-status-working");
+        self.status.set(t!("sel-status-working"));
         None
     }
 
@@ -693,7 +693,7 @@ impl AtelierApp {
         next.base = self.selection.clone();
         self.sel.job = Some(next);
         self.sel.chained = chained;
-        self.status = t!("sel-status-working");
+        self.status.set(t!("sel-status-working"));
     }
 
     /// A selection computed in the background is still to come.
@@ -712,7 +712,7 @@ impl AtelierApp {
             Then::Select(mode) => self.apply_selection(result, mode),
             Then::Modified => {
                 if result.is_none() {
-                    self.status = t!("sel-status-nothing-selected");
+                    self.status.set(t!("sel-status-nothing-selected"));
                 }
                 self.apply_selection(result, SelectMode::Replace);
             }
@@ -723,7 +723,7 @@ impl AtelierApp {
             }
         }
         if faint {
-            self.status = t!("sel-status-faint");
+            self.status.set(t!("sel-status-faint"));
         }
     }
 
@@ -952,7 +952,7 @@ impl AtelierApp {
                 c.name.clone()
             }
         };
-        self.status = t!("sel-status-saved", name = name);
+        self.status.set(t!("sel-status-saved", name = name));
     }
 
     fn load_selection_window(&mut self, ctx: &egui::Context) {

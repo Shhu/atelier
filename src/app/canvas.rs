@@ -1702,12 +1702,12 @@ impl AtelierApp {
                 && let Some(layer) = self.doc.as_ref().map(|d| &d.layers[drag.layers[0].0])
             {
                 let (x, y) = layer.offset;
-                self.status = t!(
+                self.status.set(t!(
                     "canvas-status-layer-moved",
                     name = layer.name.as_str(),
                     x = x,
                     y = y
-                );
+                ));
             }
             if drag.moved && self.fit_canvas && drag.layers.len() == 1 {
                 // Fit Canvas: the canvas takes the moved element's box, in
@@ -1718,12 +1718,12 @@ impl AtelierApp {
                     let old_center = pos2(doc.width() as f32, doc.height() as f32) / 2.0;
                     doc.fit_canvas_to(r);
                     self.forget_selection();
-                    self.status = t!(
+                    self.status.set(t!(
                         "status-canvas-fit-element",
                         width = r.w,
                         height = r.h,
                         rotated = String::new()
-                    );
+                    ));
                     self.after_geometry_change(to_rect(r).center() - old_center);
                 }
             } else if drag.moved {
