@@ -329,7 +329,7 @@ impl AtelierApp {
                     size: (r.w, r.h),
                 });
             }
-            Command::FromGroup => self.status = t!("artboard-status-not-group"),
+            Command::FromGroup => self.status_cannot(t!("artboard-status-not-group")),
             Command::FromLayers => {
                 let r = indices
                     .iter()
@@ -358,7 +358,7 @@ impl AtelierApp {
                 settings.folder = settings.folder.or_else(|| self.current_dir());
                 self.artboards.files = Some(settings);
             }
-            Command::ToFiles => self.status = t!("artboard-status-none"),
+            Command::ToFiles => self.status_cannot(t!("artboard-status-none")),
             Command::Fit(i) => {
                 if let Some(r) = doc.layers.get(i).and_then(|l| l.artboard_rect()) {
                     self.artboards.fit_to = Some(r);
@@ -644,7 +644,20 @@ impl AtelierApp {
             };
             let galley =
                 painter.layout_no_wrap(l.name.clone(), egui::FontId::proportional(12.0), color);
-            let at = screen.left_top() - vec2(0.0, galley.size().y + LABEL_GAP);
+            // Above the board as shown: on a turned view, above the box
+            // around the turned board (the name stays level and is drawn
+            // around its turned center).
+            let turn = self.view_turn;
+            let corners = [
+                screen.left_top(),
+                screen.right_top(),
+                screen.left_bottom(),
+                screen.right_bottom(),
+            ];
+            let shown = Rect::from_points(&corners.map(|p| turn.to_screen(p)));
+            let size = galley.size();
+            let shown_at = shown.left_top() - vec2(0.0, size.y + LABEL_GAP);
+            let at = turn.to_upright(shown_at + size / 2.0) - size / 2.0;
             self.artboards
                 .labels
                 .push((l.id, Rect::from_min_size(at, galley.size())));
@@ -794,7 +807,7 @@ impl AtelierApp {
             self.reset_pending();
             self.fit_pending = Some(MAX_ZOOM);
         } else {
-            self.status = t!("artboard-status-refused");
+            self.status_cannot(t!("artboard-status-refused"));
         }
     }
 
@@ -967,7 +980,7 @@ impl AtelierApp {
     ) {
         // One at a time: a second one would write the same files.
         if self.artboards.job.is_some() {
-            self.status = t!("files3-status-artboards-busy");
+            self.status_cannot(t!("files3-status-artboards-busy"));
             return;
         }
         let (send, receive) = channel();

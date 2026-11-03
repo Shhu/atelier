@@ -424,6 +424,7 @@ impl AtelierApp {
     pub(super) fn report_error(&mut self, message: impl Into<crate::i18n::Message>) {
         let message = message.into();
         crate::diag::error(message.clone());
+        self.actions.refused(&message.shown);
         self.show_alert(message.shown);
     }
 
@@ -461,6 +462,7 @@ impl AtelierApp {
         let message = message.into();
         crate::diag::error(message.clone());
         let message = message.shown;
+        self.actions.refused(&message);
         self.status_shown.clear();
         self.status = message.clone();
         self.workspace.error_status = Some(message);
@@ -472,10 +474,20 @@ impl AtelierApp {
     pub(super) fn status_refused(&mut self, message: impl Into<crate::i18n::Message>) {
         let message = message.into();
         crate::diag::warn(message.clone());
+        self.actions.refused(&message.shown);
         let shown = format!("{} {}", icon::LOCK_SIMPLE, message.shown);
         self.status_shown.clear();
         self.status = shown.clone();
         self.workspace.error_status = Some(shown);
+    }
+
+    /// What was asked can't be done here (nothing selected, no pixels to
+    /// change…): in the status bar, and an action being played stops at
+    /// that step. (A step that does nothing, and says so, writes `status`.)
+    pub(super) fn status_cannot(&mut self, why: String) {
+        self.actions.refused(&why);
+        self.status_shown.clear();
+        self.status = why;
     }
 
     /// File › Open Recent: the recent files (by name, with their folder

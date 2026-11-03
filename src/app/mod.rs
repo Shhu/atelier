@@ -17,6 +17,8 @@ mod dialogs;
 mod fade_stroke;
 #[cfg(test)]
 mod fade_stroke_tests;
+#[cfg(test)]
+mod adjust11_tests;
 mod downloads;
 #[cfg(test)]
 mod exchange_tests;
@@ -42,6 +44,8 @@ mod liquify_ui;
 mod measure_tools;
 #[cfg(test)]
 mod measure_tests;
+#[cfg(test)]
+mod panels11_tests;
 mod menus;
 mod models_window;
 mod navigator;
@@ -107,6 +111,8 @@ mod type_tool;
 mod ui_tests;
 #[cfg(test)]
 mod ui9_tests;
+#[cfg(test)]
+mod ui11_tests;
 #[cfg(test)]
 mod vector_tests;
 #[cfg(test)]
@@ -979,6 +985,10 @@ pub struct AtelierApp {
     /// The left button's drag in progress pans the view (Space or the Hand
     /// tool at its press).
     space_pan: bool,
+    /// The left button's press in progress started on the canvas with a
+    /// tool that may change the layers: the panels' jobs give the layers
+    /// back (a stroke would copy each one it touches) and wait.
+    canvas_edit_held: bool,
     /// The press in progress closed a menu or a drop-down: the canvas
     /// ignores it, up to its release.
     popup_press: bool,
@@ -1639,6 +1649,7 @@ impl AtelierApp {
             guides: Snap::default(),
             snap_off: false,
             space_pan: false,
+            canvas_edit_held: false,
             popup_press: false,
             auto_select: false,
             show_transform_controls: false,
@@ -1723,25 +1734,30 @@ impl AtelierApp {
             if !self.commit_pending_aside() {
                 self.commit_pending();
             }
-            let (size, hardness) = (self.brush_size, self.hardness);
-            match self.tool_brushes.iter_mut().find(|b| b.0 == self.tool) {
-                Some(b) => (b.1, b.2) = (size, hardness),
-                None => self.tool_brushes.push((self.tool, size, hardness)),
-            }
-            if let Some(&(_, size, hardness)) = self.tool_brushes.iter().find(|b| b.0 == tool) {
-                (self.brush_size, self.hardness) = (size, hardness);
-            }
-            self.tool = tool;
-            self.retouch.forget_composites();
-            // Gestures of the previous tool don't resume when it comes back.
-            self.lasso = None;
-            self.edges.cancel_click();
-            self.marquee = None;
-            self.marquee_preview = None;
-            self.sel.free_lasso = None;
-            self.object_select.cancel_press();
+            self.switch_tool(tool);
         }
         self.group_tool.insert(tool.group(), tool);
+    }
+
+    /// Makes `tool` the current one, with nothing left to apply.
+    fn switch_tool(&mut self, tool: Tool) {
+        let (size, hardness) = (self.brush_size, self.hardness);
+        match self.tool_brushes.iter_mut().find(|b| b.0 == self.tool) {
+            Some(b) => (b.1, b.2) = (size, hardness),
+            None => self.tool_brushes.push((self.tool, size, hardness)),
+        }
+        if let Some(&(_, size, hardness)) = self.tool_brushes.iter().find(|b| b.0 == tool) {
+            (self.brush_size, self.hardness) = (size, hardness);
+        }
+        self.tool = tool;
+        self.retouch.forget_composites();
+        // Gestures of the previous tool don't resume when it comes back.
+        self.lasso = None;
+        self.edges.cancel_click();
+        self.marquee = None;
+        self.marquee_preview = None;
+        self.sel.free_lasso = None;
+        self.object_select.cancel_press();
     }
 
     /// The tool a group's slot shows: the current one if it belongs to the
@@ -2050,7 +2066,7 @@ impl AtelierApp {
         }
         let Some(doc) = &mut self.doc else { return };
         let Some(id) = doc.lift_region(&selection, true) else {
-            self.status = t!("status-selection-empty");
+            self.status_cannot(t!("status-selection-empty"));
             return;
         };
         let layer = doc.active_layer_mut();
@@ -2064,7 +2080,7 @@ impl AtelierApp {
     fn pick_color(&mut self, at: Pos2, to_background: bool) {
         let Some(doc) = &self.doc else { return };
         let Some([r, g, b, _]) = doc.color_at(at.x.floor() as i64, at.y.floor() as i64) else {
-            self.status = t!("status-no-color");
+            self.status_cannot(t!("status-no-color"));
             return;
         };
         // Like Photoshop: the picked color is always opaque.
@@ -2109,6 +2125,9 @@ impl AtelierApp {
                 content = which
             );
             self.reset_pending();
+        } else {
+            // Nothing changed: a Fade after it has nothing to fade.
+            doc.mark_fade_nothing();
         }
     }
 
@@ -2141,7 +2160,7 @@ impl AtelierApp {
         let found =
             Selection::from_mask(&alpha, layer.offset).and_then(|s| s.within(doc.full_rect()));
         if found.is_none() {
-            self.status = t!("status-no-visible-pixel");
+            self.status_cannot(t!("status-no-visible-pixel"));
             return;
         }
         let (shift, alt) = self.ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
@@ -2267,6 +2286,10 @@ impl AtelierApp {
         }
         let doc = self.doc.as_ref()?;
         let layer = doc.active_layer();
+        // A Pattern Fill covers the canvas: its tile takes the transform.
+        if matches!(layer.kind, LayerKind::Fill(Fill::Pattern(_))) {
+            return Some(to_rect(doc.full_rect()));
+        }
         if !layer.has_pixels() && !layer.is_group() {
             return None;
         }
@@ -2327,19 +2350,21 @@ impl AtelierApp {
                 Ok(())
             }
         };
-        self.status = match merged {
+        let why = match merged {
             Ok(()) => {
                 let name = doc.active_layer().name.clone();
                 self.reset_pending();
-                t!("status-layers-merged", name = name.as_str())
+                self.status = t!("status-layers-merged", name = name.as_str());
+                return;
             }
-            Err(MergeError::Locked) => t!("doc-merge-locked"),
+            Err(MergeError::Locked(i)) => return self.refuse_any_lock_of(i),
             Err(MergeError::TooLarge) => t!("doc-merge-too-large"),
             Err(MergeError::Nothing) if matches!(action, Action::MergeDown) => {
                 t!("status-merge-down-failed")
             }
             Err(MergeError::Nothing) => t!("status-merge-visible-failed"),
         };
+        self.status_cannot(why);
     }
 
     /// Ends the stroke in progress (the previous state was recorded at its
@@ -2360,10 +2385,19 @@ impl AtelierApp {
             // a little beyond the dabs.
             let margin = self.brush_size.ceil() as u32;
             let changed = stroke.painted() && stroke.changes(doc.active_layer().image(), margin);
+            let origin = doc.target_layer().map(|l| l.offset);
             // A targeted mask gets its place back.
             doc.end_paint();
             if changed {
-                doc.mark_fade_changed();
+                // Fade blends where the dabs went (the healing reaches
+                // beyond them: where it changed pixels).
+                let heals = matches!(self.tool, Tool::HealingBrush | Tool::SpotHealing);
+                match (stroke.covered().filter(|_| !heals), origin) {
+                    (Some((mask, (x, y))), Some((ox, oy))) => {
+                        doc.mark_fade_painted(mask, (ox + i64::from(x), oy + i64::from(y)));
+                    }
+                    _ => doc.mark_fade_changed(),
+                }
             } else {
                 doc.discard_step();
                 self.stroke_dirty = None;
@@ -2372,7 +2406,7 @@ impl AtelierApp {
                         Tool::CloneStamp => self.retouch.clone_sample,
                         _ => self.retouch.heal_sample,
                     };
-                    self.status = t!("tools3-status-source-empty", sample = sample.label());
+                    self.status_cannot(t!("tools3-status-source-empty", sample = sample.label()));
                 }
             }
         }
@@ -2511,7 +2545,7 @@ impl AtelierApp {
                     if doc.layer_via_cut(sel) {
                         self.reset_pending();
                     } else {
-                        self.status = t!("status-selection-empty");
+                        self.status_cannot(t!("status-selection-empty"));
                     }
                 }
             }
@@ -2520,7 +2554,7 @@ impl AtelierApp {
                     if doc.stamp_visible() {
                         self.reset_pending();
                     } else {
-                        self.status = t!("input6-status-nothing-visible");
+                        self.status_cannot(t!("input6-status-nothing-visible"));
                     }
                 }
             }
@@ -2549,7 +2583,7 @@ impl AtelierApp {
                     if doc.layer_from_region(sel) {
                         self.reset_pending();
                     } else {
-                        self.status = t!("status-selection-empty");
+                        self.status_cannot(t!("status-selection-empty"));
                     }
                 }
             }
@@ -2647,7 +2681,7 @@ impl AtelierApp {
                         if doc.delete_layers(&selected) {
                             self.layer_set.clear();
                         } else {
-                            self.status = t!("tools4-status-last-layer");
+                            self.status_cannot(t!("tools4-status-last-layer"));
                         }
                     }
                     Action::Raise => {
@@ -2738,16 +2772,7 @@ impl AtelierApp {
             Action::LastFilter => self.last_filter(),
             Action::CameraRawFilter => self.camera_raw_filter(None),
             Action::Liquify => self.open_liquify(),
-            Action::FlipCanvas(horizontal) => {
-                let texts = self.texts_before();
-                if let Some(doc) = &mut self.doc {
-                    doc.flip_canvas(horizontal);
-                    let map = type_tool::canvas_flip((doc.width(), doc.height()), horizontal);
-                    self.texts_after(texts, map);
-                    self.forget_selection();
-                    self.reset_pending();
-                }
-            }
+            Action::FlipCanvas(horizontal) => self.start_flip(horizontal),
             Action::CropToElement | Action::CropToContent => {
                 let Some(doc) = &self.doc else { return };
                 let bounds = if matches!(action, Action::CropToElement) {
@@ -2767,7 +2792,7 @@ impl AtelierApp {
                         };
                     }
                     Some(b) => self.apply_crop(crop_tool::CropPlan::plain(b)),
-                    None => self.status = t!("status-nothing-to-crop"),
+                    None => self.status_cannot(t!("status-nothing-to-crop")),
                 }
             }
             Action::CenterElement | Action::BringToFront | Action::SendToBack => {
@@ -2875,7 +2900,7 @@ impl AtelierApp {
         let (w, h) = (frame.width() as u32, frame.height() as u32);
         let (w, h) = (w.max(1), h.max(1));
         if !fits_max_dimension(vec2(w as f32, h as f32), angle) {
-            self.status = t!("select-element-too-large", max = MAX_DIMENSION);
+            self.status_cannot(t!("select-element-too-large", max = MAX_DIMENSION));
             self.reset_transform();
             return;
         }
@@ -3334,7 +3359,7 @@ impl AtelierApp {
         if let Some((tool, shift)) = tool
             && !tool.shortcut().is_some_and(|k| self.crop_key(k, shift))
         {
-            let from = self.tool;
+            let from = self.shown_tool();
             self.set_tool(self.tool_for_key(tool, shift));
             if self.shown_tool() == Tool::RotateView {
                 self.arm_rotate_spring(from);
@@ -4179,6 +4204,7 @@ impl eframe::App for AtelierApp {
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         swallow_popup_closing_press(ctx, raw_input, &mut self.swallowed_press);
+        self.hold_input(ctx, raw_input);
     }
 }
 
@@ -4358,8 +4384,13 @@ impl AtelierApp {
         egui::CentralPanel::no_frame().show(ui, |ui| self.canvas(ui));
 
         // Closing the window with unsaved changes: asks for each document,
-        // one after the other (see `confirm_window`).
-        if ctx.input(|i| i.viewport().close_requested())
+        // one after the other (see `confirm_window`). A change computed
+        // aside lands first (the document isn't modified before), then the
+        // close goes on as Quit does; cancelled, the window stays.
+        if ctx.input(|i| i.viewport().close_requested()) && self.transform_busy() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_after_job();
+        } else if ctx.input(|i| i.viewport().close_requested())
             && self.crop_asks(canvas::CropThen::Run(Action::Quit))
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);

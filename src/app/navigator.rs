@@ -139,6 +139,7 @@ impl AtelierApp {
         let Some(doc) = &self.doc else { return };
         let (lut_key, lut) = self.color.shown();
         let key = hash_of((self.composite_key(), lut_key));
+        let held = self.edit_held(ctx);
         let nav = &mut self.navigator;
         if let Some((made_for, job)) = nav.job.take_if(|(_, j)| j.is_finished())
             && let Ok(mut image) = job.join()
@@ -158,7 +159,7 @@ impl AtelierApp {
             return;
         }
         let other_doc = nav.shown_doc != doc.uid();
-        if !nav.settle.ready(ctx, key, nav.shown.is_none() || other_doc) {
+        if !nav.settle.ready(ctx, key, nav.shown.is_none() || other_doc, held) {
             return;
         }
         nav.job_doc = doc.uid();
@@ -166,7 +167,10 @@ impl AtelierApp {
         let (canvas, held) = (doc.full_rect(), doc.effects_held());
         let job = std::thread::Builder::new()
             .name("navigator".into())
-            .spawn(move || make_thumbnail(&layers, canvas, held));
+            .spawn(move || {
+                crate::document::watch_styles_only();
+                make_thumbnail(&layers, canvas, held)
+            });
         if let Ok(job) = job {
             nav.job = Some((key, job));
         }
@@ -316,7 +320,7 @@ impl AtelierApp {
                         "",
                         &mut percent,
                         MIN_ZOOM * 100.0..=MAX_ZOOM * 100.0,
-                        "%",
+                        &i18n::percent(""),
                         62.0,
                     );
                     ui_kit::name_control(

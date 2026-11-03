@@ -232,7 +232,7 @@ impl AtelierApp {
             _ => false,
         };
         if refused {
-            self.status = t!("sel6-status-quick-mask-no-layers", key = keys::key(Key::Q));
+            self.status_cannot(t!("sel6-status-quick-mask-no-layers", key = keys::key(Key::Q)));
         }
         refused
     }
@@ -393,7 +393,7 @@ impl AtelierApp {
         if self.quick_mask_source().is_some_and(|b| b.is_some()) {
             return false;
         }
-        self.status = t!("xform-status-nothing", name = t!("qm6-quick-mask-name"));
+        self.status_cannot(t!("xform-status-nothing", name = t!("qm6-quick-mask-name")));
         true
     }
 

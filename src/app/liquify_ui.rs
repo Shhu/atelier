@@ -571,7 +571,7 @@ impl AtelierApp {
         let smart = self.smart_filter_input();
         let Some(doc) = &mut self.doc else { return };
         if !doc.can_paint() && smart.is_none() {
-            self.status = t!("filter-no-pixels");
+            self.status_cannot(t!("filter-no-pixels"));
             return;
         }
         // As for the other filters, the layer is enlarged to the canvas
@@ -582,7 +582,7 @@ impl AtelierApp {
         let Some(target) = smart.or_else(|| active_target(doc, selection.as_ref())) else {
             // The layer enlarged above is put back as it was.
             self.shrink_after_preview();
-            self.status = t!("status-selection-empty");
+            self.status_cannot(t!("status-selection-empty"));
             return;
         };
         let (w, h) = target.image.dimensions();
@@ -661,13 +661,13 @@ impl AtelierApp {
         doc.checkpoint(t!("liquify-title"));
         if !doc.begin_paint() {
             doc.discard_step();
-            self.status = t!("filter-no-pixels");
+            self.status_cannot(t!("filter-no-pixels"));
             return;
         }
         let Some(target) = active_target(doc, self.selection.as_ref()) else {
             doc.end_paint();
             doc.discard_step();
-            self.status = t!("status-selection-empty");
+            self.status_cannot(t!("status-selection-empty"));
             return;
         };
         let (w, h) = target.image.dimensions();
@@ -938,12 +938,12 @@ impl AtelierApp {
             Ok(bytes) => {
                 let mesh = Mesh::from_bytes(&bytes);
                 if mesh.is_none() {
-                    self.status = t!("liquify-status-not-a-mesh");
+                    self.status_cannot(t!("liquify-status-not-a-mesh"));
                 }
                 mesh
             }
             Err(e) => {
-                self.status = t!("liquify-status-mesh-error", error = e.to_string());
+                self.status_cannot(t!("liquify-status-mesh-error", error = e.to_string()));
                 None
             }
         }

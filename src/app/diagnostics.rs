@@ -186,6 +186,10 @@ pub(super) fn static_operation(name: &str) -> Option<String> {
         "History: go to step" => t!("ui4-op-history-go"),
         "Transform commit" => t!("ui4-op-transform-commit"),
         "Transform" => t!("ui4-op-transform"),
+        "Crop" => t!("menu-image-crop"),
+        "Image Rotation" => t!("menu-image-rotation"),
+        "Flip Canvas Horizontal" => t!("menu-image-flip-horizontal"),
+        "Flip Canvas Vertical" => t!("menu-image-flip-vertical"),
         "Selection" => t!("ui4-op-selection"),
         "Color Range: reduce" => t!("ui4-op-color-range"),
         "Export As: flatten" => t!("ui4-op-export-flatten"),
@@ -223,6 +227,8 @@ pub(super) fn dialog_label(name: &str) -> String {
         "Fill" => trimmed(t!("menu-edit-fill")),
         "Define Pattern" => trimmed(t!("pattern8-menu-define")),
         "Rename Pattern" => t!("pattern8-rename-title"),
+        "Delete Pattern" => t!("pattern9-delete-title"),
+        "Camera Raw" => t!("raw-window-title"),
         "Content-Aware Fill" => trimmed(t!("retouch-menu-content-aware-fill")),
         "Image Size" => trimmed(t!("menu-image-image-size")),
         "Canvas Size" => trimmed(t!("menu-image-canvas-size")),
@@ -415,6 +421,7 @@ impl AtelierApp {
             (self.fill_dialog.is_some(), "Fill"),
             (self.patterns.define.is_some(), "Define Pattern"),
             (self.patterns.rename.is_some(), "Rename Pattern"),
+            (self.patterns.delete.is_some(), "Delete Pattern"),
             (self.retouch.dialog.is_some(), "Content-Aware Fill"),
             (self.image_size.is_some(), "Image Size"),
             (self.canvas_size.is_some(), "Canvas Size"),
@@ -1216,7 +1223,10 @@ fn cards(snap: &Snapshot) -> Vec<Card> {
             detail: if snap.jobs.is_empty() {
                 t!("diag-card-jobs-none")
             } else {
-                snap.jobs.join(" · ")
+                // Measured under English names, shown in the interface's.
+                let jobs: Vec<String> =
+                    snap.jobs.iter().map(|j| snap.names.operation(j)).collect();
+                jobs.join(" · ")
             },
             warn: false,
         },

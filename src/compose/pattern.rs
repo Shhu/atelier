@@ -1,7 +1,7 @@
 //! Patterns of Fill…, Pattern Fill layers and Pattern Overlay: a tile
 //! repeated over the canvas, at a scale and angle, from an origin.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use image::RgbaImage;
 
@@ -14,6 +14,10 @@ pub struct Pattern {
     pub image: Arc<RgbaImage>,
     /// Smaller versions, half the size each, computed when first needed.
     mips: Arc<OnceLock<Vec<RgbaImage>>>,
+    /// Its mirror images (horizontal, vertical) while some document holds
+    /// them: layers sharing a tile share its mirror, and a flip back finds
+    /// the tile it came from.
+    mirrors: Arc<Mutex<[Weak<Pattern>; 2]>>,
 }
 
 impl std::fmt::Debug for Pattern {
@@ -68,6 +72,7 @@ impl Pattern {
             name: name.into(),
             image: Arc::new(image),
             mips: Default::default(),
+            mirrors: Default::default(),
         };
         if p.image.width() as u64 * p.image.height() as u64 > 512 * 512 {
             p.mip(1);
@@ -82,17 +87,29 @@ impl Pattern {
             name: name.into(),
             image: self.image.clone(),
             mips: self.mips.clone(),
+            mirrors: self.mirrors.clone(),
         })
     }
 
-    /// This tile mirrored, under the same name.
-    pub fn mirrored(&self, horizontal: bool) -> Arc<Self> {
+    /// This tile mirrored, under the same name: made once while it is held.
+    pub fn mirrored(self: &Arc<Self>, horizontal: bool) -> Arc<Self> {
+        let k = usize::from(!horizontal);
+        let mut mirrors = self.mirrors.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = mirrors[k].upgrade() {
+            return match m.name == self.name {
+                true => m,
+                false => m.renamed(self.name.clone()),
+            };
+        }
         let image = if horizontal {
             image::imageops::flip_horizontal(&*self.image)
         } else {
             image::imageops::flip_vertical(&*self.image)
         };
-        Self::new(self.name.clone(), image)
+        let m = Self::new(self.name.clone(), image);
+        mirrors[k] = Arc::downgrade(&m);
+        m.mirrors.lock().unwrap_or_else(|e| e.into_inner())[k] = Arc::downgrade(self);
+        m
     }
 
     /// The memory it holds, for the history's budget: (address, bytes).
@@ -221,6 +238,20 @@ impl Default for PatternFill {
 /// Range of the Scale fields, as a factor.
 pub const SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.01..=10.0;
 
+/// Range of a stored scale: Image Size and transforms take it beyond what
+/// the fields offer, so that undoing them by another gives the same look.
+pub const STORED_SCALE: std::ops::RangeInclusive<f32> = 1e-4..=1e4;
+
+/// `scale` multiplied by `k`, within [`STORED_SCALE`].
+pub fn scaled(scale: f32, k: f32) -> f32 {
+    let s = scale * k;
+    if s.is_finite() {
+        s.clamp(*STORED_SCALE.start(), *STORED_SCALE.end())
+    } else {
+        scale
+    }
+}
+
 impl PatternFill {
     pub fn of(pattern: Arc<Pattern>) -> Self {
         Self {
@@ -246,6 +277,33 @@ impl PatternFill {
         };
         let (x, y) = map(before.0 + self.phase.0, before.1 + self.phase.1);
         self.phase = (x - after.0, y - after.1);
+    }
+
+    /// The tile under the affine map `m` of the canvas (x' = m0 x + m1 y +
+    /// m2, y' = m3 x + m4 y + m5), `anchor` as in [`Self::map_origin`]: it
+    /// takes the map's turn and mean scale, mirrored if the map mirrors (a
+    /// tile can't be stretched nor slanted).
+    pub fn transformed(&mut self, m: [f32; 6], anchor: ((f32, f32), (f32, f32))) {
+        let [a, b, c, d, e, f] = m;
+        self.map_origin(|x, y| (a * x + b * y + c, d * x + e * y + f), anchor);
+        let det = a * e - b * d;
+        if !det.is_finite() || det == 0.0 {
+            return;
+        }
+        // m = (m · mirror) · mirror, the mirror being x → -x.
+        let (a, d) = match det < 0.0 {
+            true => {
+                self.mirrored(true);
+                (-a, -d)
+            }
+            false => (a, d),
+        };
+        self.scale = scaled(self.scale, det.abs().sqrt());
+        // Clockwise on screen: its first column is (cos, sin).
+        let degrees = d.atan2(a).to_degrees();
+        if degrees != 0.0 {
+            self.turned(degrees);
+        }
     }
 
     /// The tile turned by `degrees` clockwise.
@@ -291,7 +349,7 @@ pub struct Sampler {
 impl Sampler {
     pub fn new(fill: &PatternFill, origin: (f32, f32), level: u32) -> Self {
         let scale = if fill.scale.is_finite() {
-            fill.scale.clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end())
+            fill.scale.clamp(*STORED_SCALE.start(), *STORED_SCALE.end())
         } else {
             1.0
         };

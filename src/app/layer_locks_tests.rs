@@ -500,19 +500,26 @@ fn a_group_command_respects_the_locks_of_its_layers() {
         assert_eq!(doc(&h).layers[child].offset, expected((1, 0)), "arrow");
         assert_eq!(doc(&h).layers[free].offset, (6, 5), "arrow");
 
+        // Center and Align place the group by the bounds of all it holds:
+        // with a layer that would stay, it doesn't move at all.
         let (mut h, child, free, _) = setup();
+        let n = steps(&h);
         h.state_mut().run(Action::CenterElement);
         let moved = doc(&h).layers[free].offset;
-        assert_ne!(moved, (5, 5), "center");
+        assert_eq!(moved != (5, 5), moves, "center");
         let d = (moved.0 - 5, moved.1 - 5);
         assert_eq!(doc(&h).layers[child].offset, expected(d), "center");
+        if !moves {
+            assert_eq!(steps(&h), n);
+            assert!(h.state().status.contains("half"), "names the layer: {}", h.state().status);
+        }
 
         // The stack is narrower than the canvas to the right of half: align
         // on a selection so that something must move.
         let (mut h, child, free, _) = setup();
         h.state_mut().selection = Some(sel(150, 0, 50, 100));
         h.state_mut().run(Action::Align(AlignOp::Right));
-        assert_ne!(doc(&h).layers[free].offset, (5, 5), "align");
+        assert_eq!(doc(&h).layers[free].offset != (5, 5), moves, "align");
         let d = (doc(&h).layers[free].offset.0 - 5, doc(&h).layers[free].offset.1 - 5);
         assert_eq!(doc(&h).layers[child].offset, expected(d), "align");
     }
@@ -795,9 +802,12 @@ fn the_fill_dialog_shows_the_lock_keeps_the_opacity() {
     h.state_mut().selection = Some(sel(10, 10, 20, 20));
     h.state_mut().run(Action::ClearSelection);
     h.run_steps(2);
-    assert!(h.state().fill_dialog.unwrap().preserve_transparency);
+    // Shown checked and disabled; the user's own choice is kept.
+    assert!(!h.state().fill_dialog.unwrap().preserve_transparency);
     let label = t!("dialog-fill-preserve-transparency");
-    assert!(h.get_by_label(&label).accesskit_node().is_disabled());
+    let node = h.get_by_label(&label);
+    assert!(node.accesskit_node().is_disabled());
+    assert_eq!(node.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
 }
 
 #[test]
@@ -1013,4 +1023,301 @@ fn unlocking_from_the_row_is_recorded_for_the_active_layer() {
     h.state_mut().unlock_layer(a);
     let steps = &h.state().actions.library.sets[0].actions[0].steps;
     assert!(matches!(steps[0].command, Recorded::Locks { on: false, .. }));
+}
+
+/// Waits for the filters, the retouch and the transforms in the background.
+fn settle_all(h: &mut Harness<'static, AtelierApp>) {
+    for _ in 0..1000 {
+        h.run_steps(1);
+        let app = h.state();
+        if !app.filters.busy() && !app.retouch.busy() && !app.transform_busy() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("still busy");
+}
+
+/// A text "abc" typed at (20, 20), put in a group under Lock Image Pixels:
+/// (text, group).
+fn text_in_a_pixel_locked_group(h: &mut Harness<'static, AtelierApp>) -> (usize, usize) {
+    h.state_mut().set_tool(Tool::Text);
+    h.run_steps(2);
+    drag(h, (20.0, 20.0), (20.0, 20.0));
+    h.run_steps(2);
+    h.event(egui::Event::Text("abc".into()));
+    h.run_steps(3);
+    h.state_mut().set_tool(Tool::Transform);
+    h.run_steps(3);
+    let t = doc(h).active;
+    assert!(doc_mut(h).group_layers(&[t]));
+    let g = doc(h).active;
+    doc_mut(h).layers[g].name = "Locked".into();
+    doc_mut(h).layers[g].locks.pixels = true;
+    h.state_mut().select_layer(g - 1);
+    (g - 1, g)
+}
+
+fn texts(h: &Harness<'static, AtelierApp>) -> Vec<String> {
+    let d = doc(h);
+    d.layers.iter().filter_map(|l| l.text.as_ref().map(|t| t.text.clone())).collect()
+}
+
+#[test]
+fn reset_transform_follows_lock_position() {
+    let mut h = app();
+    h.state_mut().run(Action::Smart(smart_ui::Command::Convert));
+    settle_all(&mut h);
+    let half = [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.0, 0.5]];
+    assert!(h.state_mut().play_step(&crate::actions::Recorded::Transform { corners: half }, false).is_ok());
+    settle_all(&mut h);
+    let a = doc(&h).active;
+    let b = doc(&h).layers[a].content_bounds();
+    doc_mut(&mut h).layers[a].locks.position = true;
+    let n = steps(&h);
+    h.state_mut().run(Action::Smart(smart_ui::Command::ResetTransform));
+    settle_all(&mut h);
+    assert_eq!((doc(&h).layers[a].content_bounds(), steps(&h)), (b, n));
+    assert!(h.state().status.contains("half"), "{}", h.state().status);
+    // Unlocked, it resets.
+    doc_mut(&mut h).layers[a].locks.position = false;
+    h.state_mut().run(Action::Smart(smart_ui::Command::ResetTransform));
+    settle_all(&mut h);
+    assert_ne!(doc(&h).layers[a].content_bounds(), b);
+}
+
+#[test]
+fn new_smart_object_via_copy_works_on_a_locked_one_as_duplicate_does() {
+    let mut h = app();
+    h.state_mut().run(Action::Smart(smart_ui::Command::Convert));
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locked = true;
+    let n = doc(&h).layers.len();
+    h.state_mut().run(Action::Smart(smart_ui::Command::NewViaCopy));
+    assert_eq!(doc(&h).layers.len(), n + 1);
+    assert!(doc(&h).layers[a].locked, "the original stays locked");
+}
+
+#[test]
+fn both_converts_keep_the_pixel_locks_inside_and_rasterize_brings_them_back() {
+    for cmd in [smart_ui::Command::Convert, smart_ui::Command::ConvertForFilters] {
+        let mut h = app();
+        let a = doc(&h).active;
+        let locks = Locks { pixels: true, transparent: true, position: false };
+        doc_mut(&mut h).layers[a].locks = locks;
+        let n = steps(&h);
+        h.state_mut().run(Action::Smart(cmd));
+        settle_all(&mut h);
+        assert!(doc(&h).active_layer().is_smart(), "{cmd:?}: {}", h.state().status);
+        assert_eq!(steps(&h), n + 1);
+        h.state_mut().run(Action::Rasterize);
+        let l = doc(&h).active_layer();
+        assert!(!l.is_smart(), "{cmd:?}");
+        assert_eq!(l.locks, locks, "{cmd:?}");
+        assert!(doc(&h).pixels_locked());
+    }
+    // Under Lock All: refused, the layer named.
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locked = true;
+    h.state_mut().run(Action::Smart(smart_ui::Command::ConvertForFilters));
+    assert!(!doc(&h).active_layer().is_smart());
+    assert!(h.state().status.contains("half"), "{}", h.state().status);
+}
+
+#[test]
+fn the_type_tool_starts_nothing_on_a_locked_text_or_in_a_locked_group() {
+    let mut h = app();
+    let (t, _) = text_in_a_pixel_locked_group(&mut h);
+    let (n, count) = (steps(&h), doc(&h).layers.len());
+    h.state_mut().set_tool(Tool::Text);
+    h.run_steps(2);
+    // On the text: not typed in, no other text over it.
+    let r = doc(&h).layers[t].rect();
+    let (x, y) = (r.x as f32 + 3.0, r.y as f32 + r.h as f32 / 2.0);
+    drag(&mut h, (x, y), (x, y));
+    h.event(egui::Event::Text("zz".into()));
+    h.run_steps(3);
+    assert_eq!((steps(&h), doc(&h).layers.len()), (n, count));
+    assert_eq!(texts(&h), ["abc"]);
+    assert!(h.state().status.contains("Locked"), "{}", h.state().status);
+    // Elsewhere, the new text would land in the group: refused too.
+    h.state_mut().status.clear();
+    drag(&mut h, (150.0, 60.0), (150.0, 60.0));
+    h.event(egui::Event::Text("zz".into()));
+    h.run_steps(3);
+    h.state_mut().set_tool(Tool::Transform);
+    h.run_steps(3);
+    assert_eq!((steps(&h), doc(&h).layers.len()), (n, count));
+    assert!(h.state().status.contains("Locked"), "{}", h.state().status);
+
+    // Unlocked, the same clicks type.
+    let mut h = app();
+    let (t, g) = text_in_a_pixel_locked_group(&mut h);
+    doc_mut(&mut h).layers[g].locks.pixels = false;
+    h.state_mut().set_tool(Tool::Text);
+    h.run_steps(2);
+    let r = doc(&h).layers[t].rect();
+    let (x, y) = (r.x as f32 + 3.0, r.y as f32 + r.h as f32 / 2.0);
+    drag(&mut h, (x, y), (x, y));
+    h.event(egui::Event::Text("zz".into()));
+    h.run_steps(3);
+    h.state_mut().set_tool(Tool::Transform);
+    h.run_steps(3);
+    assert_eq!(texts(&h).len(), 1);
+    assert_ne!(texts(&h), ["abc"]);
+}
+
+#[test]
+fn text_options_on_a_locked_text_say_why_nothing_changes() {
+    let mut h = app();
+    let (t, _) = text_in_a_pixel_locked_group(&mut h);
+    h.state_mut().status.clear();
+    h.state_mut().change_text(|d, _| d.text.push_str("zz"));
+    assert_eq!(doc(&h).layers[t].text.as_ref().unwrap().text, "abc");
+    assert!(h.state().status.contains("Locked"), "{}", h.state().status);
+}
+
+#[test]
+fn the_shape_tool_draws_no_layer_in_a_pixel_locked_group() {
+    for locked in [true, false] {
+        let mut h = app();
+        let a = doc(&h).active;
+        assert!(doc_mut(&mut h).group_layers(&[a]));
+        let g = doc(&h).active;
+        doc_mut(&mut h).layers[g].name = "Locked".into();
+        doc_mut(&mut h).layers[g].locks.pixels = locked;
+        h.state_mut().select_layer(a);
+        let count = doc(&h).layers.len();
+        let tool = Tool::Shape(vector_tools::ShapeTool::Rectangle);
+        h.state_mut().set_tool(tool);
+        h.run_steps(2);
+        drag(&mut h, (20.0, 20.0), (60.0, 60.0));
+        assert_eq!(doc(&h).layers.len() == count, locked);
+        if locked {
+            assert!(h.state().status.contains("Locked"), "{}", h.state().status);
+        }
+    }
+}
+
+#[test]
+fn an_artboard_with_a_lock_position_layer_doesnt_move() {
+    use crate::document::ArtboardBackground as B;
+    for with_free in [false, true] {
+        let mut h = app();
+        let d = doc_mut(&mut h);
+        d.add_artboard("a".into(), "A".into(), PixelRect { x: 0, y: 0, w: 80, h: 60 }, B::Transparent);
+        let b = d.artboards()[0];
+        d.active = b;
+        let board = d.layers[b].id;
+        d.add_layer("kid".into(), RgbaImage::from_pixel(20, 20, Rgba(RED)), (10, 10));
+        let kid = d.active;
+        d.layers[kid].locks.position = true;
+        let kid = d.layers[kid].id;
+        if with_free {
+            d.add_layer("free".into(), RgbaImage::from_pixel(10, 10, Rgba(RED)), (50, 40));
+        }
+        d.active = d.layers.iter().position(|l| l.id == board).unwrap();
+        h.run_steps(3);
+        h.state_mut().set_tool(Tool::Artboard);
+        h.run_steps(3);
+        let find = |h: &Harness<'static, AtelierApp>, id: u64| {
+            let d = doc(h);
+            d.layers.iter().position(|l| l.id == id).unwrap()
+        };
+        let r = doc(&h).layers[find(&h, board)].artboard_rect().unwrap();
+        let k = doc(&h).layers[find(&h, kid)].offset;
+        let n = steps(&h);
+        let (cx, cy) = (r.x as f32 + r.w as f32 / 2.0, r.y as f32 + r.h as f32 / 2.0);
+        drag(&mut h, (cx, cy), (cx + 100.0, cy));
+        assert_eq!(doc(&h).layers[find(&h, board)].artboard_rect(), Some(r), "{with_free}");
+        assert_eq!(doc(&h).layers[find(&h, kid)].offset, k, "{with_free}");
+        assert_eq!(steps(&h), n);
+        assert!(h.state().status.contains("kid"), "{}", h.state().status);
+        // Unlocked, the same drag moves it.
+        let i = find(&h, kid);
+        doc_mut(&mut h).layers[i].locks.position = false;
+        drag(&mut h, (cx, cy), (cx + 100.0, cy));
+        assert_ne!(steps(&h), n, "{with_free}");
+    }
+}
+
+#[test]
+fn a_refused_merge_names_the_locked_layer() {
+    let mut h = app();
+    let lower = doc(&h).active;
+    doc_mut(&mut h).add_layer("top".into(), RgbaImage::from_pixel(20, 20, Rgba(RED)), (5, 5));
+    doc_mut(&mut h).layers[lower].locks.position = true;
+    h.state_mut().run(Action::MergeDown);
+    let status = h.state().status.clone();
+    assert!(status.contains("half") && status.contains(icon::LOCK_SIMPLE), "{status}");
+    h.state_mut().run(Action::MergeVisible);
+    assert!(h.state().status.contains("half"), "{}", h.state().status);
+}
+
+#[test]
+fn edit_contents_cant_update_a_locked_smart_object() {
+    let mut h = app();
+    h.state_mut().run(Action::Smart(smart_ui::Command::Convert));
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locked = true;
+    let before = doc(&h).flatten().get_pixel(150, 50).0;
+    h.state_mut().run(Action::Smart(smart_ui::Command::EditContents));
+    h.run_steps(2);
+    assert_eq!(h.state().tab_count(), 2);
+    h.state_mut().primary = Color32::from_rgb(255, 0, 0);
+    h.state_mut().run(Action::FillPrimary);
+    h.state_mut().run(Action::Save);
+    h.run_steps(2);
+    // The edits stay in their tab, unsaved; the reason given.
+    assert!(doc(&h).modified);
+    assert!(h.state().status.contains("half"), "{}", h.state().status);
+    h.state_mut().switch_tab(0);
+    h.run_steps(2);
+    assert_eq!(doc(&h).flatten().get_pixel(150, 50).0, before);
+}
+
+#[test]
+fn a_fill_under_lock_transparent_records_the_users_choice() {
+    use crate::actions::{Recorded, Sequence, Set};
+    let mut h = app();
+    let a = doc(&h).active;
+    doc_mut(&mut h).layers[a].locks.transparent = true;
+    let action = Sequence { name: "a".into(), key: None, steps: Vec::new(), expanded: true };
+    h.state_mut().actions.library.sets = vec![Set { name: "s".into(), actions: vec![action], expanded: true }];
+    h.state_mut().actions.start_recording((0, 0));
+    h.state_mut().apply_fill(FillDialog {
+        content: FillContent::Black,
+        color: Color32::BLACK,
+        opacity: 1.0,
+        preserve_transparency: false,
+        adapt: true,
+        pattern: 0,
+    });
+    // The opacity kept all the same.
+    assert_eq!(pixel(&h, 150, 50)[3], 0);
+    assert_eq!(pixel(&h, 50, 50), [0, 0, 0, 128]);
+    let steps = &h.state().actions.library.sets[0].actions[0].steps;
+    assert!(
+        matches!(steps[..], [ref s] if matches!(s.command, Recorded::Fill { preserve_transparency: false, .. })),
+        "{steps:?}"
+    );
+}
+
+#[test]
+fn ctrl_slash_names_the_group_that_already_has_the_lock() {
+    let mut h = app();
+    let child = doc(&h).active;
+    assert!(doc_mut(&mut h).group_layers(&[child]));
+    let g = doc(&h).active;
+    doc_mut(&mut h).layers[g].name = "Outer".into();
+    doc_mut(&mut h).layers[g].locks.position = true;
+    h.state_mut().select_layer(g - 1);
+    h.state_mut().last_lock = LastLock::only(LockKind::Position);
+    let n = steps(&h);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::Slash);
+    h.run_steps(1);
+    assert_eq!(steps(&h), n);
+    let status = h.state().status.clone();
+    assert!(status.contains("Outer") && status.contains(&t!("layers8-lock-position")), "{status}");
 }

@@ -230,7 +230,7 @@ impl AtelierApp {
             false => match self.selection.clone() {
                 Some(sel) => Some(sel),
                 None => {
-                    self.status = t!("sel4-mask-needs-selection");
+                    self.status_cannot(t!("sel4-mask-needs-selection"));
                     return;
                 }
             },
@@ -300,7 +300,7 @@ impl AtelierApp {
         // Another layer, an undo, a change behind the window: what it
         // refines is no longer what it shows; it closes.
         if !self.doc.as_ref().is_some_and(|d| sm.opened_on(d)) {
-            self.status = t!("sel4-mask-target-changed");
+            self.status_cannot(t!("sel4-mask-target-changed"));
             return;
         }
         // Its own mask is refined, not replaced.
@@ -465,7 +465,7 @@ impl AtelierApp {
         // What it was opened on is no longer there: its result would land
         // on something else.
         if !sm.opened_on(doc) {
-            self.status = t!("sel4-mask-target-changed");
+            self.status_cannot(t!("sel4-mask-target-changed"));
             return;
         }
         // Its own mask, untouched: nothing to do.
@@ -508,7 +508,7 @@ impl AtelierApp {
         // Only on the layer it was opened on.
         let source = doc.active;
         if doc.active_layer().id != to.layer {
-            self.status = t!("sel4-mask-target-changed");
+            self.status_cannot(t!("sel4-mask-target-changed"));
             return;
         }
         let canvas = doc.full_rect();
@@ -538,7 +538,7 @@ impl AtelierApp {
             }
             Output::NewLayer => {
                 if !doc.layer_from_region(&sel) {
-                    self.status = t!("status-selection-empty");
+                    self.status_cannot(t!("status-selection-empty"));
                     return;
                 }
                 doc.layers[source].visible = false;

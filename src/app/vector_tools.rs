@@ -542,6 +542,17 @@ impl AtelierApp {
         if self.doc.is_none() {
             return;
         }
+        // A new shape layer can't go where its path couldn't be drawn (a
+        // group under Lock Image Pixels or Lock All).
+        let draws = matches!(self.tool, Tool::Shape(_) | Tool::Pen(PenTool::Pen | PenTool::Freeform))
+            && !m.command;
+        if draws
+            && self.mode() == ToolMode::Shape
+            && self.vector.drawing.is_none()
+            && self.refuse_new_layer_locked()
+        {
+            return;
+        }
         match self.tool {
             // Ctrl: Direct Selection for a moment.
             Tool::Pen(_) if m.command => self.direct_press(p, tol, m),

@@ -331,12 +331,16 @@ fn shape_map(t: &Transform) -> Option<xform::Homography> {
 
 impl Document {
     /// Whether Edit › Transform changes the active layer's mask alone:
-    /// the mask of an adjustment or fill layer, or a targeted mask that
-    /// isn't linked to its layer.
+    /// the mask of an adjustment or fill layer (a Pattern Fill's tile takes
+    /// the transform, as pixels would), or a targeted mask that isn't linked
+    /// to its layer.
     pub fn transforms_mask(&self) -> bool {
         let l = &self.layers[self.active];
         let Some(m) = &l.mask else { return false };
         match l.kind {
+            super::LayerKind::Fill(super::Fill::Pattern(_)) => {
+                self.mask_target == Some(l.id) && !m.linked()
+            }
             super::LayerKind::Adjustment(_) | super::LayerKind::Fill(_) => true,
             _ => self.mask_target == Some(l.id) && !m.linked(),
         }
@@ -513,6 +517,18 @@ impl Document {
         self.put_quick_mask(moved);
     }
 
+    /// The first of `layers` whose tile can't follow `t`: a Pattern Fill
+    /// layer, `t` not being affine (perspective, warp).
+    pub fn tile_cant_follow(&self, layers: &[usize], t: &Transform) -> Option<usize> {
+        if shape_map(t).is_some_and(|h| h.is_affine()) {
+            return None;
+        }
+        layers
+            .iter()
+            .copied()
+            .find(|&i| matches!(self.layers[i].kind, super::LayerKind::Fill(super::Fill::Pattern(_))))
+    }
+
     /// Puts the result of [`Self::transform_job`] in place, as the undo
     /// step `name`: texts become pixels, shapes follow as vectors, smart
     /// objects stay smart.
@@ -580,6 +596,17 @@ impl Document {
                 layer.put_smart(r);
             }
             let new = layer.offset;
+            // A Pattern Fill has no pixels: its tile takes the map (an
+            // affine one: see `Document::tile_cant_follow`).
+            if target == Target::Layer
+                && let super::LayerKind::Fill(super::Fill::Pattern(f)) = &mut layer.kind
+                && let Some(h) = shape_map(t).filter(xform::Homography::is_affine)
+            {
+                let [a, b, c, d, e, g, .., k] = h.0;
+                let m = [a, b, c, d, e, g].map(|v| (v / k) as f32);
+                let point = |p: (i64, i64)| (p.0 as f32, p.1 as f32);
+                f.transformed(m, (point(old), point(new)));
+            }
             if let Some(m) = &mut layer.mask {
                 match &result.mask {
                     Some((image, origin)) => m.replace(image.clone(), *origin, new),

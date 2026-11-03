@@ -46,6 +46,18 @@ impl Contents {
         [0.0, 0.0, self.canvas.0 as f64, self.canvas.1 as f64]
     }
 
+    /// The pixel locks of its one pixel layer, if that is all it holds
+    /// (what Convert to Smart Object kept inside, back on Rasterize).
+    pub fn pixel_locks(&self) -> Locks {
+        match &self.layers[..] {
+            [l] if l.has_pixels() && !l.is_live() => Locks {
+                position: false,
+                ..l.locks
+            },
+            _ => Locks::default(),
+        }
+    }
+
     /// The same contents (instances share them; a copy shows the same,
     /// down to its hidden layers).
     pub fn same_as(&self, other: &Contents) -> bool {
@@ -1000,11 +1012,20 @@ impl Document {
         let bounds = tops
             .iter()
             .flat_map(|r| r.clone())
-            .map(|i| {
+            .filter_map(|i| {
                 let l = &self.layers[i];
                 let styles = super::styles_of(&self.layers, i, canvas, false, false);
-                let e = l.extent_with(styles.as_deref()).unwrap_or(canvas);
-                l.with_styles_extent(e, styles.as_deref())
+                // A group's layers count on their own, an adjustment covers
+                // only what its mask leaves; a fill without one, the canvas.
+                let own = match l.kind {
+                    LayerKind::Group { .. } => None,
+                    LayerKind::Adjustment(_) => l.extent_with(None),
+                    _ => Some(l.extent_with(None).unwrap_or(canvas)),
+                };
+                match (own, l.styles_box(styles.as_deref())) {
+                    (Some(a), Some(b)) => Some(a.union(b)),
+                    (a, b) => a.or(b),
+                }
             })
             .filter(|r| r.w > 0 && r.h > 0)
             .reduce(PixelRect::union)
@@ -1608,6 +1629,31 @@ mod tests {
         assert!(doc.undo());
         assert!(!doc.active_layer().is_smart());
         assert_eq!(doc.flatten(), before);
+    }
+
+    /// A group becomes a smart object the size of what it holds (and its
+    /// styles reach), not of the canvas.
+    #[test]
+    fn a_converted_group_is_the_size_of_its_content() {
+        let mut doc = Document::new(RgbaImage::from_pixel(400, 300, Rgba([255; 4])), None);
+        doc.add_group();
+        doc.add_layer("a".into(), RgbaImage::from_pixel(20, 20, Rgba([255, 0, 0, 255])), (100, 100));
+        doc.add_adjustment_layer(crate::pixel_ops::Adjustment::Invert, None);
+        let g = doc.layers.iter().position(Layer::is_group).unwrap();
+        doc.active = g;
+        // (The adjustment, without a mask of its own, adds nothing.)
+        assert!(doc.convert_to_smart(&[g]));
+        let l = doc.active_layer();
+        assert_eq!((l.offset, l.image().dimensions()), ((100, 100), (20, 20)));
+        // Its stroke counts.
+        assert!(doc.undo());
+        let g = doc.layers.iter().position(Layer::is_group).unwrap();
+        doc.layers[g].effects.stroke.enabled = true;
+        doc.layers[g].effects.stroke.width = 3.0;
+        assert!(doc.convert_to_smart(&[g]));
+        let l = doc.active_layer();
+        let r = l.rect();
+        assert!(r.x <= 97 && r.right() >= 123 && r.w <= 40, "{r:?}");
     }
 
     #[test]

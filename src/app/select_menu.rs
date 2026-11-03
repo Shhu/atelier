@@ -665,7 +665,7 @@ impl AtelierApp {
         // and recording it would wipe the redo list. Steps recorded forward
         // (a Layers panel change) don't matter.
         if !doc.history_follows(job.generation) {
-            self.status = t!("hist5-selection-undone");
+            self.status_cannot(t!("hist5-selection-undone"));
             return;
         }
         let unchanged = match (&job.base, &self.selection) {
@@ -674,7 +674,7 @@ impl AtelierApp {
             _ => false,
         };
         if !unchanged {
-            self.status = t!("hist3-selection-changed");
+            self.status_cannot(t!("hist3-selection-changed"));
             return;
         }
         // The name already given to what comes next stays its own.
@@ -1241,7 +1241,9 @@ impl AtelierApp {
     /// The mask over the canvas, if a mode shows one: Quick Mask, Select
     /// and Mask's view, Color Range's preview. Drawn at screen resolution
     /// over the visible part, again only when the view or the mask change.
-    pub(super) fn draw_select_overlay(&mut self, painter: &Painter, view: View) {
+    /// `area` is the canvas area on screen: on a turned view, only what
+    /// shows in it is computed.
+    pub(super) fn draw_select_overlay(&mut self, painter: &Painter, view: View, area: Rect) {
         let Some(canvas) = self.doc.as_ref().map(Document::full_rect) else {
             return;
         };
@@ -1266,9 +1268,16 @@ impl AtelierApp {
         if !shown.is_positive() {
             return;
         }
+        let turn = self.view_turn;
         let key = hash_of((
             [view.origin.x, view.origin.y, view.zoom, ppp].map(f32::to_bits),
             [shown.min.x, shown.min.y, shown.max.x, shown.max.y].map(f32::to_bits),
+            [turn.angle, turn.center.x, turn.center.y].map(f32::to_bits),
+            turn.flipped,
+            area.min.x.to_bits(),
+            area.min.y.to_bits(),
+            area.max.x.to_bits(),
+            area.max.y.to_bits(),
             source.key,
             format!("{:?}", source.style),
         ));
@@ -1276,7 +1285,9 @@ impl AtelierApp {
             let (x0, y0) = ((shown.min.x * ppp).floor(), (shown.min.y * ppp).floor());
             let (x1, y1) = ((shown.max.x * ppp).ceil(), (shown.max.y * ppp).ceil());
             let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
-            let image = overlay_image(&source, view, ppp, (x0, y0), (w, h));
+            // Pixels partly in the area are kept.
+            let shows = (!turn.is_identity()).then(|| (turn, area.expand(1.0)));
+            let image = overlay_image(&source, view, ppp, (x0, y0), (w, h), shows);
             let rect = Rect::from_min_max(pos2(x0, y0) / ppp, pos2(x1, y1) / ppp);
             let gpu = match self.sel.overlay.take() {
                 Some((_, mut gpu, _)) => {
@@ -1311,12 +1322,13 @@ fn segment(mesh: &mut egui::epaint::Mesh, a: Pos2, b: Pos2, width: f32, color: C
 
 /// Image of the overlay over `size` physical pixels from `origin` (physical
 /// pixels of the screen): each one shows the mask at its center, bilinear.
-fn overlay_image(
+pub(super) fn overlay_image(
     source: &OverlaySource,
     view: View,
     ppp: f32,
     origin: (f32, f32),
     (w, h): (u32, u32),
+    shows: Option<(super::view_turn::ViewTurn, Rect)>,
 ) -> RgbaImage {
     let mut image = RgbaImage::new(w, h);
     let (mw, mh, raw) = match &source.mask {
@@ -1327,42 +1339,91 @@ fn overlay_image(
     }
     let at = |x: i64, y: i64| raw[(y.clamp(0, mh - 1) * mw + x.clamp(0, mw - 1)) as usize] as f32;
     let row = w as usize;
+    if row == 0 {
+        return image;
+    }
     let checker_a = ui_kit::color::CHECKER_A.to_array();
     let checker_b = ui_kit::color::CHECKER_B.to_array();
-    par_rows(image.as_mut(), row * 4, |y0, band| {
-        for (i, px) in band.chunks_exact_mut(4).enumerate() {
-            let (sx, sy) = (
-                origin.0 + (i % row) as f32 + 0.5,
-                origin.1 + (y0 + i / row) as f32 + 0.5,
-            );
-            let screen = pos2(sx / ppp, sy / ppp);
-            let c = view.to_image(screen);
-            let (mx, my) = (
-                (c.x - source.origin.x) * source.scale - 0.5,
-                (c.y - source.origin.y) * source.scale - 0.5,
-            );
-            let (fx, fy) = (mx - mx.floor(), my - my.floor());
-            let (ix, iy) = (mx.floor() as i64, my.floor() as i64);
-            let top = at(ix, iy) * (1.0 - fx) + at(ix + 1, iy) * fx;
-            let bottom = at(ix, iy + 1) * (1.0 - fx) + at(ix + 1, iy + 1) * fx;
-            let cov = (top * (1.0 - fy) + bottom * fy) / 255.0;
-            let out = match source.style {
-                OverlayStyle::Tint([r, g, b], opacity) => {
-                    [r, g, b, ((1.0 - cov) * opacity * 255.0).round() as u8]
-                }
-                OverlayStyle::Checker(opacity) => {
-                    let p = screen - view.origin;
-                    let tile = ((p.x / 8.0).floor() + (p.y / 8.0).floor()) as i64;
-                    let [r, g, b, _] = if tile % 2 == 0 { checker_a } else { checker_b };
-                    [r, g, b, ((1.0 - cov) * opacity * 255.0).round() as u8]
-                }
-                OverlayStyle::Gray => {
-                    let v = (cov * 255.0).round() as u8;
-                    [v, v, v, 255]
-                }
-            };
-            px.copy_from_slice(&out);
-        }
+    // On a turned view, the canvas area as a polygon of this image's
+    // pixels: each row is only computed where it shows.
+    let polygon = shows.map(|(turn, area)| {
+        [
+            area.left_top(),
+            area.right_top(),
+            area.right_bottom(),
+            area.left_bottom(),
+        ]
+        .map(|p| {
+            let p = turn.to_upright(p);
+            pos2(p.x * ppp - origin.0, p.y * ppp - origin.1)
+        })
     });
+    let span = |y: usize| -> (usize, usize) {
+        let Some(polygon) = &polygon else {
+            return (0, row);
+        };
+        let cy = y as f32 + 0.5;
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for (i, &a) in polygon.iter().enumerate() {
+            let b = polygon[(i + 1) % 4];
+            if (a.y <= cy) != (b.y <= cy) {
+                let x = a.x + (cy - a.y) / (b.y - a.y) * (b.x - a.x);
+                (lo, hi) = (lo.min(x), hi.max(x));
+            }
+        }
+        if lo > hi {
+            return (0, 0);
+        }
+        let first = (lo - 0.5).ceil().clamp(0.0, row as f32) as usize;
+        let end = ((hi - 0.5).floor() + 1.0).clamp(0.0, row as f32) as usize;
+        (first, end.max(first))
+    };
+    let pixel = |sx: f32, sy: f32| -> [u8; 4] {
+        let screen = pos2(sx / ppp, sy / ppp);
+        let c = view.to_image(screen);
+        let (mx, my) = (
+            (c.x - source.origin.x) * source.scale - 0.5,
+            (c.y - source.origin.y) * source.scale - 0.5,
+        );
+        let (fx, fy) = (mx - mx.floor(), my - my.floor());
+        let (ix, iy) = (mx.floor() as i64, my.floor() as i64);
+        let top = at(ix, iy) * (1.0 - fx) + at(ix + 1, iy) * fx;
+        let bottom = at(ix, iy + 1) * (1.0 - fx) + at(ix + 1, iy + 1) * fx;
+        let cov = (top * (1.0 - fy) + bottom * fy) / 255.0;
+        match source.style {
+            OverlayStyle::Tint([r, g, b], opacity) => {
+                [r, g, b, ((1.0 - cov) * opacity * 255.0).round() as u8]
+            }
+            OverlayStyle::Checker(opacity) => {
+                let p = screen - view.origin;
+                let tile = ((p.x / 8.0).floor() + (p.y / 8.0).floor()) as i64;
+                let [r, g, b, _] = if tile % 2 == 0 { checker_a } else { checker_b };
+                [r, g, b, ((1.0 - cov) * opacity * 255.0).round() as u8]
+            }
+            OverlayStyle::Gray => {
+                let v = (cov * 255.0).round() as u8;
+                [v, v, v, 255]
+            }
+        }
+    };
+    // Small bands shared out as the cores get free: on a turned view, the
+    // rows' lengths differ.
+    const BAND: usize = 8;
+    use rayon::prelude::*;
+    image
+        .as_mut()
+        .par_chunks_mut((row * 4 * BAND).max(1))
+        .enumerate()
+        .for_each(|(k, band)| {
+            for (j, line) in band.chunks_exact_mut(row * 4).enumerate() {
+                let y = k * BAND + j;
+                let sy = origin.1 + y as f32 + 0.5;
+                let (first, end) = span(y);
+                for x in first..end {
+                    let out = pixel(origin.0 + x as f32 + 0.5, sy);
+                    line[x * 4..x * 4 + 4].copy_from_slice(&out);
+                }
+            }
+        });
     image
 }

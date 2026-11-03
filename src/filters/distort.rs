@@ -168,6 +168,21 @@ impl Shear {
 /// Most samples of a result pixel along each axis.
 const MOST_SAMPLES: usize = 4;
 
+thread_local! {
+    /// One sample per pixel on this thread (see [`drafted`]).
+    static DRAFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f`, the Distort filters it applies taking one sample per pixel
+/// while `draft`: a quick preview, thin detail breaking up where the source
+/// is compressed. Not for a result.
+pub fn drafted<T>(draft: bool, f: impl FnOnce() -> T) -> T {
+    let before = DRAFT.with(|d| d.replace(draft));
+    let out = f();
+    DRAFT.with(|d| d.set(before));
+    out
+}
+
 /// Samples along an axis of a pixel covering `span` source pixels: more than
 /// one only where the source is compressed (thin lines would break up).
 #[inline]
@@ -179,24 +194,101 @@ fn samples(span: f32) -> usize {
     }
 }
 
+/// A box of an image, read where it is: the source of a filter, its top-left
+/// corner being 0, 0.
+#[derive(Clone, Copy)]
+pub(super) struct Source<'a> {
+    raw: &'a [u8],
+    /// Pixels per row of `raw`.
+    stride: usize,
+    left: u32,
+    top: u32,
+    w: u32,
+    h: u32,
+}
+
+impl<'a> Source<'a> {
+    pub(super) fn of(image: &'a RgbaImage) -> Self {
+        Self::part(image, [0, 0, image.width(), image.height()])
+    }
+
+    /// `window` (x0, y0, x1, y1, within the image) of `image`.
+    pub(super) fn part(image: &'a RgbaImage, [x0, y0, x1, y1]: [u32; 4]) -> Self {
+        debug_assert!(x0 <= x1 && y0 <= y1 && x1 <= image.width() && y1 <= image.height());
+        Self {
+            raw: image.as_raw(),
+            stride: image.width() as usize,
+            left: x0,
+            top: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        }
+    }
+
+    fn width(&self) -> u32 {
+        self.w
+    }
+
+    fn height(&self) -> u32 {
+        self.h
+    }
+
+    fn dimensions(&self) -> (u32, u32) {
+        (self.w, self.h)
+    }
+
+    /// A copy of `region` (x0, y0, x1, y1) of the box.
+    fn copy(&self, [x0, y0, x1, y1]: [u32; 4]) -> RgbaImage {
+        let row = (x1 - x0) as usize * 4;
+        let mut out = Vec::with_capacity(row * (y1 - y0) as usize);
+        for y in y0..y1 {
+            let at = ((self.top + y) as usize * self.stride + (self.left + x0) as usize) * 4;
+            out.extend_from_slice(&self.raw[at..at + row]);
+        }
+        RgbaImage::from_raw(x1 - x0, y1 - y0, out).expect("whole rows")
+    }
+
+    /// Offset in `raw` of the pixel (x, y) of the box.
+    #[inline]
+    fn at(&self, x: i64, y: i64) -> usize {
+        ((self.top as usize + y as usize) * self.stride + self.left as usize + x as usize) * 4
+    }
+}
+
 /// `region` (x0, y0, x1, y1) of the result: every pixel takes its color at
 /// the place (in pixels, the top-left corner of the image being 0, 0) that
 /// `place` gives for the middle of the pixel; `None`: it stays as it is. Only
 /// the region is computed, and each of its pixels is what it is in the whole
 /// result. Stops early once cancelled.
 fn remap(
-    src: &RgbaImage,
+    src: Source<'_>,
     region: [u32; 4],
     edges: (Undefined, Undefined),
     place: impl Fn(f32, f32) -> Option<(f32, f32)> + Sync,
 ) -> RgbaImage {
-    let [x0, y0, x1, y1] = region;
-    let mut out = image::imageops::crop_imm(src, x0, y0, x1 - x0, y1 - y0).to_image();
+    let [x0, y0, x1, _] = region;
+    let mut out = src.copy(region);
     let (w, h) = src.dimensions();
-    let (raw, size) = (src.as_raw().as_slice(), (w as i64, h as i64));
     let row = (x1 - x0) as usize * 4;
     let count = (x1 - x0) as usize;
     if row == 0 {
+        return out;
+    }
+    if DRAFT.with(std::cell::Cell::get) {
+        par_rows(out.as_mut(), row, |first, band| {
+            let cancel = cancel_flag();
+            for (i, line) in band.chunks_exact_mut(row).enumerate() {
+                if cancelled(&cancel) {
+                    return;
+                }
+                let cy = (y0 + (first + i) as u32) as f32 + 0.5;
+                for (j, d) in line.chunks_exact_mut(4).enumerate() {
+                    if let Some((sx, sy)) = place((x0 as usize + j) as f32 + 0.5, cy) {
+                        d.copy_from_slice(&bilinear(&src, edges, sx - 0.5, sy - 0.5));
+                    }
+                }
+            }
+        });
         return out;
     }
     // Where a row of pixels reads, one more on the right, to tell how much
@@ -228,10 +320,10 @@ fn remap(
                 };
                 let (across, down) = (samples(span(here[j + 1])), samples(span(below[j])));
                 let c = if across == 1 && down == 1 {
-                    bilinear(raw, size, edges, sx - 0.5, sy - 0.5)
+                    bilinear(&src, edges, sx - 0.5, sy - 0.5)
                 } else {
                     let (cx, cy) = ((x0 as usize + j) as f32, y as f32);
-                    averaged(raw, size, edges, (across, down), |a, b| {
+                    averaged(&src, edges, (across, down), |a, b| {
                         let (px, py) = (cx + a, cy + b);
                         place(px, py).unwrap_or((px, py))
                     })
@@ -247,8 +339,7 @@ fn remap(
 /// The average, premultiplied, of `across` × `down` samples spread over a
 /// pixel: `place` gets the place inside it (0 to 1 on each axis).
 fn averaged(
-    raw: &[u8],
-    size: (i64, i64),
+    src: &Source<'_>,
     edges: (Undefined, Undefined),
     (across, down): (usize, usize),
     place: impl Fn(f32, f32) -> (f32, f32),
@@ -258,7 +349,7 @@ fn averaged(
         let v = (b as f32 + 0.5) / down as f32;
         for a in 0..across {
             let (sx, sy) = place((a as f32 + 0.5) / across as f32, v);
-            let c = bilinear(raw, size, edges, sx - 0.5, sy - 0.5);
+            let c = bilinear(src, edges, sx - 0.5, sy - 0.5);
             let alpha = f32::from(c[3]);
             sum[0] += f32::from(c[0]) * alpha;
             sum[1] += f32::from(c[1]) * alpha;
@@ -299,7 +390,7 @@ fn between(table: &[f32], first: u32, at: f32) -> f32 {
 /// canvas), if it is one of these filters.
 pub(super) fn render(
     filter: &Filter,
-    src: &RgbaImage,
+    src: Source<'_>,
     origin: (i64, i64),
     region: [u32; 4],
 ) -> Option<RgbaImage> {
@@ -336,8 +427,7 @@ fn along(i: i64, n: i64, edge: Undefined) -> Option<i64> {
 /// The color at (x, y), pixel coordinates; averaged premultiplied.
 #[inline]
 fn bilinear(
-    raw: &[u8],
-    (w, h): (i64, i64),
+    src: &Source<'_>,
     (edge_x, edge_y): (Undefined, Undefined),
     x: f32,
     y: f32,
@@ -345,6 +435,7 @@ fn bilinear(
     if !x.is_finite() || !y.is_finite() {
         return [0; 4];
     }
+    let (raw, w, h) = (src.raw, i64::from(src.w), i64::from(src.h));
     let (fx, fy) = (x.floor(), y.floor());
     let (tx, ty) = (x - fx, y - fy);
     let (x0, y0) = (fx as i64, fy as i64);
@@ -363,7 +454,7 @@ fn bilinear(
             let Some(sx) = along(x0 + dx, w, edge_x) else {
                 continue;
             };
-            let at = ((sy * w + sx) * 4) as usize;
+            let at = src.at(sx, sy);
             let weight = wx * wy;
             let alpha = f32::from(raw[at + 3]) * weight;
             sum[0] += f32::from(raw[at]) * alpha;
@@ -388,7 +479,7 @@ fn bilinear(
 /// ellipse (from −1 to 1 on each axis) and its distance to the center (below
 /// 1), and gives the place to read in the same units.
 fn in_ellipse(
-    src: &RgbaImage,
+    src: Source<'_>,
     region: [u32; 4],
     f: impl Fn(f32, f32, f32) -> (f32, f32) + Sync,
 ) -> RgbaImage {
@@ -413,14 +504,14 @@ fn turned(u: f32, v: f32, a: f32) -> (f32, f32) {
 
 /// Twirl: a positive angle turns clockwise, the most at the center, not at
 /// the rim.
-fn twirl(src: &RgbaImage, region: [u32; 4], angle: f32) -> RgbaImage {
+fn twirl(src: Source<'_>, region: [u32; 4], angle: f32) -> RgbaImage {
     let angle = limited(angle, -999.0, 999.0).to_radians();
     in_ellipse(src, region, |u, v, r| turned(u, v, -angle * (1.0 - r)))
 }
 
 /// Pinch: a positive amount squeezes toward the center, a negative one
 /// pushes out from it.
-fn pinch(src: &RgbaImage, region: [u32; 4], amount: f32) -> RgbaImage {
+fn pinch(src: Source<'_>, region: [u32; 4], amount: f32) -> RgbaImage {
     let k = -limited(amount / 100.0, -1.0, 1.0) / 2.0;
     in_ellipse(src, region, |u, v, r| {
         if r <= 0.0 {
@@ -433,7 +524,7 @@ fn pinch(src: &RgbaImage, region: [u32; 4], amount: f32) -> RgbaImage {
 
 /// Spherize: wraps the image around a sphere (a cylinder in the two
 /// one-axis modes); a negative amount, inside it.
-fn spherize(src: &RgbaImage, region: [u32; 4], amount: f32, mode: SpherizeMode) -> RgbaImage {
+fn spherize(src: Source<'_>, region: [u32; 4], amount: f32, mode: SpherizeMode) -> RgbaImage {
     let k = limited(amount / 100.0, -1.0, 1.0);
     // Distance to the center read for a distance (0 to 1).
     let bend = move |r: f32| {
@@ -470,7 +561,7 @@ fn spherize(src: &RgbaImage, region: [u32; 4], amount: f32, mode: SpherizeMode) 
 
 /// Polar Coordinates. Rectangular to Polar: the top row becomes the center,
 /// the bottom one the rim, the left and right edges meeting at the top.
-fn polar(src: &RgbaImage, region: [u32; 4], conversion: PolarConversion) -> RgbaImage {
+fn polar(src: Source<'_>, region: [u32; 4], conversion: PolarConversion) -> RgbaImage {
     let (w, h) = (src.width() as f32, src.height() as f32);
     let (hw, hh) = (w / 2.0, h / 2.0);
     match conversion {
@@ -495,7 +586,7 @@ fn polar(src: &RgbaImage, region: [u32; 4], conversion: PolarConversion) -> Rgba
 
 /// ZigZag: rings around the center, fading to nothing at the rim.
 fn zigzag(
-    src: &RgbaImage,
+    src: Source<'_>,
     region: [u32; 4],
     amount: f32,
     ridges: f32,
@@ -521,7 +612,7 @@ fn zigzag(
 
 /// Ripple: small irregular waves, the same each time.
 fn ripple(
-    src: &RgbaImage,
+    src: Source<'_>,
     region: [u32; 4],
     amount: f32,
     size: RippleSize,
@@ -595,7 +686,7 @@ impl Rng {
 /// up and down; computed per row and per column, so that many generators
 /// stay fast. The sum is reduced by the root of their number: more generators
 /// make the wave less regular, not wider.
-fn wave(src: &RgbaImage, region: [u32; 4], wave: &Wave, origin: (i64, i64)) -> RgbaImage {
+fn wave(src: Source<'_>, region: [u32; 4], wave: &Wave, origin: (i64, i64)) -> RgbaImage {
     let (w, h) = src.dimensions();
     let [x0, y0, x1, y1] = region;
     let generators = limited(wave.generators, 1.0, 999.0).round() as u32;
@@ -682,7 +773,7 @@ fn wave_shape(kind: WaveType, t: f32) -> f32 {
 }
 
 /// Shear: each row shifts by what the curve gives for its height.
-fn shear(src: &RgbaImage, region: [u32; 4], shear: &Shear) -> RgbaImage {
+fn shear(src: Source<'_>, region: [u32; 4], shear: &Shear) -> RgbaImage {
     let (w, h) = src.dimensions();
     let half = w as f32 / 2.0;
     let mut curve = *shear;
@@ -1152,7 +1243,7 @@ mod tests {
             Rgba([v, v, v, 255])
         });
         let e = Undefined::RepeatEdges;
-        let out = remap(&stripes, [0, 0, 50, 8], (e, e), |x, y| Some((x * 4.0, y)));
+        let out = remap(Source::of(&stripes), [0, 0, 50, 8], (e, e), |x, y| Some((x * 4.0, y)));
         for p in out.pixels() {
             assert!((90..=165).contains(&p[0]), "{p:?}");
         }
@@ -1169,6 +1260,40 @@ mod tests {
         let total = |i: &RgbaImage| i.pixels().map(|p| u64::from(p[0])).sum::<u64>();
         let (before, after) = (total(&line), total(&out));
         assert!(after * 3 > before, "{before} -> {after}");
+    }
+
+    #[test]
+    fn a_quick_preview_takes_one_sample_and_its_parts_agree() {
+        let stripes = RgbaImage::from_fn(200, 8, |x, _| {
+            let v = if x % 2 == 0 { 255 } else { 0 };
+            Rgba([v, v, v, 255])
+        });
+        let e = Undefined::RepeatEdges;
+        let out = drafted(true, || {
+            // On the middle of a source pixel: what it reads is that pixel.
+            remap(Source::of(&stripes), [0, 0, 50, 8], (e, e), |x, y| {
+                Some((x * 4.0 - 1.5, y))
+            })
+        });
+        assert!(out.pixels().all(|p| p[0] == 255), "one sample, not averaged");
+        // Only where it is asked, and the result is full again after it.
+        let image = Arc::new(gradient(200, 150));
+        for kind in KINDS {
+            let filter = strong(kind);
+            let target = Target::of(image.clone(), (13, -4));
+            let whole = drafted(true, || target.process(0, |i, o| filter.apply(i, o)));
+            let part = drafted(true, || target.filter_region([31, 57, 94, 121], &filter));
+            let expected = image::imageops::crop_imm(&whole, 31, 57, 63, 64).to_image();
+            assert_eq!(part, expected, "{kind:?}");
+        }
+        let line = RgbaImage::from_fn(100, 100, |x, _| {
+            let v = if x == 50 { 255 } else { 0 };
+            Rgba([v, v, v, 255])
+        });
+        let twirl = Filter::Twirl { angle: 999.0 };
+        let quick = drafted(true, || applied(twirl, &line));
+        assert_ne!(quick, applied(twirl, &line));
+        assert_eq!(drafted(false, || applied(twirl, &line)), applied(twirl, &line));
     }
 
     #[test]
@@ -1327,11 +1452,36 @@ mod tests {
     #[test]
     #[ignore = "timing, in release"]
     fn distort_speed() {
-        let mut image = gradient(6000, 4000);
-        for kind in KINDS {
-            let start = std::time::Instant::now();
-            kind.initial().apply(&mut image, (0, 0));
-            println!("{kind:?}: {:?}", start.elapsed());
+        let image = gradient(6000, 4000);
+        let mut filters: Vec<Filter> = KINDS.iter().map(|k| k.initial()).collect();
+        filters.extend([
+            Filter::Twirl { angle: 999.0 },
+            Filter::ZigZag {
+                amount: 100.0,
+                ridges: 20.0,
+                style: ZigZagStyle::PondRipples,
+            },
+            Filter::Ripple {
+                amount: 999.0,
+                size: RippleSize::Small,
+            },
+        ]);
+        for filter in filters {
+            for draft in [false, true] {
+                let mut out = image.clone();
+                let start = std::time::Instant::now();
+                drafted(draft, || filter.apply(&mut out, (0, 0)));
+                let quick = if draft { " (quick)" } else { "" };
+                println!("{filter:?}{quick}: {:?}", start.elapsed());
+            }
         }
+        // A square of the preview in a selection's box: not copied first.
+        let target = Target {
+            clip: Some([10, 10, 5990, 3990].into()),
+            ..Target::of(Arc::new(image), (0, 0))
+        };
+        let start = std::time::Instant::now();
+        let _ = target.filter_region([2856, 1856, 3144, 2144], &Filter::Twirl { angle: 50.0 });
+        println!("square in a selection: {:?}", start.elapsed());
     }
 }

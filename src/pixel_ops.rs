@@ -13,7 +13,7 @@ mod mixers;
 mod tones;
 pub use mixers::{
     AutoMode, ChannelMixer, Exposure, Fade, FadeArea, SELECTIVE_RANGES, SelectiveColor,
-    StrokeLocation, StrokeSettings, auto_levels_within, stroke,
+    StrokeLocation, StrokeSettings, auto_levels_within, stroke_covering,
 };
 pub use tones::{BlackWhite, GradientMap, PhotoFilter, Posterize, Threshold};
 
@@ -213,6 +213,7 @@ pub struct BucketStyle<'a> {
 /// painted whole; anti-aliased, the pixels just outside it (in the image
 /// and the selection) are painted by the share of their neighbours in it,
 /// like Photoshop: the image's and the selection's edges stay crisp.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn flood_fill_with(
     image: &mut RgbaImage,
@@ -224,6 +225,39 @@ pub fn flood_fill_with(
     contiguous: bool,
     style: &BucketStyle,
 ) -> Option<[u32; 4]> {
+    flood(image, (x, y), color, tolerance, clip, contiguous, style, false).map(|f| f.0)
+}
+
+/// [`flood_fill_with`], and what it covered (0..255, the region and its
+/// soft edge within the selection, not its opacity) over the rows it
+/// reached: the mask, as wide as the image, and its first row.
+#[allow(clippy::too_many_arguments)]
+pub fn flood_fill_covering(
+    image: &mut RgbaImage,
+    x: u32,
+    y: u32,
+    color: [u8; 4],
+    tolerance: u8,
+    clip: Option<Clip>,
+    contiguous: bool,
+    style: &BucketStyle,
+) -> Option<([u32; 4], GrayImage, u32)> {
+    let (changed, covered, top) =
+        flood(image, (x, y), color, tolerance, clip, contiguous, style, true)?;
+    Some((changed, covered?, top))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flood(
+    image: &mut RgbaImage,
+    (x, y): (u32, u32),
+    color: [u8; 4],
+    tolerance: u8,
+    clip: Option<Clip>,
+    contiguous: bool,
+    style: &BucketStyle,
+    cover: bool,
+) -> Option<([u32; 4], Option<GrayImage>, u32)> {
     let (w, h) = image.dimensions();
     let clip = clip.unwrap_or_else(|| Clip::all(image));
     if x >= w || y >= h || clip.coverage(x, y) == 0 {
@@ -363,7 +397,24 @@ pub fn flood_fill_with(
         }
     });
     let (x0, y0, x1, y1) = changed.into_inner().unwrap_or_else(|e| e.into_inner());
-    (x0 != u32::MAX).then(|| [x0, y0, x1 - x0 + 1, y1 - y0 + 1])
+    if x0 == u32::MAX {
+        return None;
+    }
+    let covered = cover.then(|| {
+        let mut m = GrayImage::new(w, (by1 - by0 + 1) as u32);
+        let raw: &mut [u8] = &mut m;
+        crate::mask_ops::par_rows(raw, wu, |first, band| {
+            for (j, row) in band.chunks_exact_mut(wu).enumerate() {
+                let py = (by0 + first + j) as u32;
+                for (px, v) in (0..w).zip(row.iter_mut()) {
+                    let c = coverage(px, py) * clip.coverage(px, py) as f32;
+                    *v = c.round() as u8;
+                }
+            }
+        });
+        m
+    });
+    Some(([x0, y0, x1 - x0 + 1, y1 - y0 + 1], covered, by0 as u32))
 }
 
 /// Magic Wand: pixels close (within `tolerance`, 0..=255) to the one at

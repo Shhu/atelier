@@ -53,11 +53,17 @@ fn settle(h: &mut Harness<'static, AtelierApp>, done: impl Fn(&AtelierApp) -> bo
     panic!("background work not done");
 }
 
-/// Opens the dialog of `filter` and waits for its preview on the canvas.
+/// The canvas shows the preview of the settings at their full quality.
+fn refined(a: &AtelierApp) -> bool {
+    a.preview_shown.is_some() && a.filters.dialog.as_ref().is_some_and(|d| d.drafted.is_none())
+}
+
+/// Opens the dialog of `filter` and waits for its preview on the canvas,
+/// the quick one replaced by the full one.
 fn previewed(h: &mut Harness<'static, AtelierApp>, filter: Filter) -> (Arc<RgbaImage>, (i64, i64)) {
     h.state_mut().open_filter_dialog(filter);
     h.run_steps(2);
-    settle(h, |a| a.preview_shown.is_some());
+    settle(h, refined);
     let shown = h.state().preview_shown.as_ref().unwrap();
     let origin = shown.origin.unwrap_or(doc(h).active_layer().offset);
     (shown.image.clone(), origin)
@@ -368,4 +374,83 @@ fn a_click_on_the_shear_line_adds_a_point() {
         panic!()
     };
     assert_eq!(s.used().len(), 3);
+}
+
+/// A thin vertical line on black, which a strong Twirl compresses.
+fn thin_line(h: &mut Harness<'static, AtelierApp>) -> RgbaImage {
+    let line = RgbaImage::from_fn(200, 200, |x, y| {
+        let v = if x == 100 && y < 100 { 255 } else { 0 };
+        Rgba([v, v, v, 255])
+    });
+    doc_mut(h).active_layer_mut().replace_pixels(line.clone());
+    h.run_steps(2);
+    line
+}
+
+#[test]
+fn the_canvas_shows_a_quick_preview_first_then_the_result() {
+    let mut h = app(200, 200);
+    let line = thin_line(&mut h);
+    let filter = Filter::Twirl { angle: 999.0 };
+    let mut full = line.clone();
+    filter.apply(&mut full, (0, 0));
+    let mut quick = line.clone();
+    crate::filters::drafted(true, || filter.apply(&mut quick, (0, 0)));
+    assert_ne!(quick, full, "the quick preview is cheaper, not the same");
+    h.state_mut().open_filter_dialog(filter);
+    h.run_steps(2);
+    settle(&mut h, |a| a.preview_shown.is_some());
+    let first = h.state().preview_shown.as_ref().unwrap().image.clone();
+    assert_eq!(*first, quick, "one sample per pixel while the settings move");
+    assert!(h.state().filters.dialog.as_ref().unwrap().drafted.is_some());
+    settle(&mut h, refined);
+    let then = h.state().preview_shown.as_ref().unwrap().image.clone();
+    assert_eq!(*then, full, "then the result itself");
+    ok(&mut h);
+    assert_eq!(*doc(&h).active_layer().image(), full);
+}
+
+#[test]
+fn ok_on_a_quick_preview_computes_the_result() {
+    let mut h = app(200, 200);
+    let line = thin_line(&mut h);
+    let filter = Filter::Twirl { angle: 999.0 };
+    let mut full = line.clone();
+    filter.apply(&mut full, (0, 0));
+    h.state_mut().open_filter_dialog(filter);
+    h.run_steps(2);
+    settle(&mut h, |a| a.preview_shown.is_some());
+    // OK at once: the quick preview shown is not taken for the result.
+    assert!(h.state().filters.dialog.as_ref().unwrap().drafted.is_some());
+    ok(&mut h);
+    assert_eq!(*doc(&h).active_layer().image(), full);
+}
+
+#[test]
+fn short_settings_stay_below_a_smaller_square_on_a_short_window() {
+    for kind in [FilterKind::Twirl, FilterKind::Pinch, FilterKind::PolarCoordinates] {
+        let mut h = app(100, 100);
+        h.set_size(egui::vec2(660.0, 500.0));
+        h.run_steps(3);
+        h.state_mut().run(Action::Filter(kind));
+        h.run_steps(4);
+        let area = h
+            .ctx
+            .memory(|m| m.area_rect(egui::Id::new("filter")))
+            .unwrap();
+        assert!(area.width() < 340.0, "{kind:?}: one column, {area:?}");
+        let ok = h.get_by_label(&t!("dialog-ok")).rect();
+        assert!(h.ctx.content_rect().contains_rect(ok), "{kind:?}");
+    }
+    // Taller settings than the square: beside it.
+    let mut h = app(100, 100);
+    h.set_size(egui::vec2(660.0, 500.0));
+    h.run_steps(3);
+    h.state_mut().run(Action::Filter(FilterKind::Wave));
+    h.run_steps(4);
+    let area = h
+        .ctx
+        .memory(|m| m.area_rect(egui::Id::new("filter")))
+        .unwrap();
+    assert!(area.width() > 400.0, "Wave: two columns, {area:?}");
 }

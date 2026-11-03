@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use image::RgbaImage;
+use image::{GrayImage, RgbaImage};
 
 use super::{
     AUTO_CLIP, Clip, Levels, LevelsChannel, MAX_GAMMA, MIN_GAMMA, distance_field, histogram_within,
@@ -304,10 +304,14 @@ fn auto_color(image: &RgbaImage, clip: Option<&Clip>) -> Levels {
 pub enum FadeArea {
     /// The whole frame.
     All,
-    /// The pixels that differ: a step that paints only where it paints.
+    /// The pixels that differ.
     Changed,
-    /// The selection it worked in, with its coverage.
+    /// What it worked in, with its coverage: the selection, or what a
+    /// brush, the Paint Bucket or a stroke covered.
     Within(Clip),
+    /// The pixels that differ and this area: what a transform moved, and
+    /// where it put it.
+    ChangedOr(Clip),
 }
 
 /// What Edit › Fade brings the last result back toward: the pixels before
@@ -366,6 +370,8 @@ impl Fade {
                     FadeArea::Changed if same => 0,
                     FadeArea::Changed => 255,
                     FadeArea::Within(clip) => clip.coverage(ix, iy),
+                    FadeArea::ChangedOr(clip) if same => clip.coverage(ix, iy),
+                    FadeArea::ChangedOr(_) => 255,
                 };
                 if coverage == 0 {
                     continue;
@@ -434,13 +440,27 @@ impl StrokeSettings {
 
 /// `image` (its corner at the canvas position `origin`) with the edge of
 /// `selection` stroked; without one, the edge of its visible pixels.
-pub fn stroke(
+#[cfg(test)]
+fn stroke(
     image: &RgbaImage,
     origin: (i64, i64),
     selection: Option<&Selection>,
     canvas: PixelRect,
     s: &StrokeSettings,
 ) -> RgbaImage {
+    stroke_covering(image, origin, selection, canvas, s).0
+}
+
+/// `image` (its corner at the canvas position `origin`) with the edge of
+/// `selection` stroked (without one, the edge of its visible pixels), and
+/// the coverage of the band (what Fade blends) with its canvas position.
+pub fn stroke_covering(
+    image: &RgbaImage,
+    origin: (i64, i64),
+    selection: Option<&Selection>,
+    canvas: PixelRect,
+    s: &StrokeSettings,
+) -> (RgbaImage, GrayImage, (i64, i64)) {
     let mut out = image.clone();
     let width = s.width.clamp(1, StrokeSettings::MAX_WIDTH) as f32;
     let (band_lo, band_hi) = match s.location {
@@ -489,6 +509,22 @@ pub fn stroke(
     let outside: Vec<bool> = inside.iter().map(|v| !v).collect();
     let to_inside = distance_field(&inside, w, h);
     let to_outside = distance_field(&outside, w, h);
+    // Coverage of the band at `at` in `area`.
+    let band_at = |at: usize| {
+        // Signed distance to the edge, between the pixels.
+        let distance = if inside[at] {
+            0.5 - to_outside[at]
+        } else {
+            to_inside[at] - 0.5
+        };
+        (0.5 + (distance - band_lo).min(band_hi - distance)).clamp(0.0, 1.0)
+    };
+    let mut covered = GrayImage::new(area.w, area.h);
+    par_rows(covered.as_mut(), w, |first, rows| {
+        for (i, v) in rows.iter_mut().enumerate() {
+            *v = (band_at(first * w + i) * 255.0).round() as u8;
+        }
+    });
     let (s, row) = (*s, frame.w as usize * 4);
     let color = s.color.map(|c| c as f32 / 255.0);
     let opacity = s.opacity.clamp(0.0, 1.0);
@@ -502,13 +538,7 @@ pub fn stroke(
                 continue;
             }
             let at = (y - area.y) as usize * w + (x - area.x) as usize;
-            // Signed distance to the edge, between the pixels.
-            let distance = if inside[at] {
-                0.5 - to_outside[at]
-            } else {
-                to_inside[at] - 0.5
-            };
-            let coverage = (0.5 + (distance - band_lo).min(band_hi - distance)).clamp(0.0, 1.0);
+            let coverage = band_at(at);
             if coverage <= 0.0 {
                 continue;
             }
@@ -539,7 +569,7 @@ pub fn stroke(
             p.copy_from_slice(&out);
         }
     });
-    out
+    (out, covered, (area.x, area.y))
 }
 
 #[cfg(test)]

@@ -213,7 +213,8 @@ fn points_read_what_is_shown_averaged_by_the_sample_size() {
     let r = h.state_mut().sampler_readings();
     assert_eq!(r[0].unwrap().rgb, [200, 20, 10]);
     assert_eq!(r[1].unwrap().rgb, [10, 20, 200]);
-    assert!(r[0].unwrap().cmyk.is_some());
+    // (Shown as levels only: no inks computed.)
+    assert!(r[0].unwrap().cmyk.is_none());
     h.state_mut().measure.sample = SampleSize::Average3;
     let r = h.state_mut().sampler_readings();
     // Two columns of three are red.

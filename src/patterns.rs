@@ -160,7 +160,7 @@ impl Library {
     }
 
     /// The user's patterns.
-    fn user(&self) -> &[Arc<Pattern>] {
+    pub fn user(&self) -> &[Arc<Pattern>] {
         &self.items[BUILTIN_COUNT.min(self.items.len())..]
     }
 
@@ -230,7 +230,12 @@ impl Library {
     /// it can't read, and those of other windows, stay as they are.
     pub fn apply(folder: &Path, changes: &[Change]) -> std::io::Result<()> {
         std::fs::create_dir_all(folder)?;
-        let lock = std::fs::File::create(folder.join(".lock"))?;
+        // Not truncated: another window may hold it.
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(folder.join(".lock"))?;
         // Where locks don't exist (some network drives), saving still works.
         let _ = lock.lock();
         // Under the lock, a temporary file is what a crash left.
@@ -329,11 +334,24 @@ impl Library {
             .filter(|name| name.ends_with(".png") && !listed.contains(name))
             .collect();
         unlisted.sort();
+        // Their names in the index set aside, where it still tells them.
+        let old_names = out
+            .set_aside
+            .as_ref()
+            .and_then(|b| std::fs::read(folder.join(b)).ok())
+            .map(|json| entries_in(&String::from_utf8_lossy(&json)))
+            .unwrap_or_default();
+        let old_name = |file: &str| {
+            old_names.iter().find(|e| e.file == file).map(|e| e.name.clone())
+        };
         for file in unlisted {
             match read_tile(folder, &file, &mut memory) {
                 Some(image) => {
-                    let number = out.patterns.len() + 1;
-                    let name = t!("pattern8-default-name", number = number);
+                    let name = old_name(&file).unwrap_or_else(|| {
+                        let names: Vec<&str> =
+                            out.patterns.iter().map(|(p, _)| p.name.as_str()).collect();
+                        default_name(&names, out.patterns.len())
+                    });
                     out.patterns.push((Pattern::new(name, image), file));
                 }
                 None => out.left_out += 1,
@@ -341,11 +359,30 @@ impl Library {
         }
         out
     }
+}
 
-    /// A copy of the user's patterns.
-    pub fn user_patterns(&self) -> Vec<Arc<Pattern>> {
-        self.user().to_vec()
+/// The entries still whole in a damaged index: each `{…}` that reads as one.
+fn entries_in(text: &str) -> Vec<IndexEntry> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('{') {
+        rest = &rest[start..];
+        let Some(end) = rest.find('}') else { break };
+        if let Ok(e) = serde_json::from_str::<IndexEntry>(&rest[..=end]) {
+            out.push(e);
+        }
+        rest = &rest[1..];
     }
+    out
+}
+
+/// "Pattern N" for a new pattern, `count` user patterns being there: N is
+/// `count` + 1, or the next number none of `names` has.
+pub fn default_name(names: &[&str], count: usize) -> String {
+    (count + 1..)
+        .map(|n| t!("pattern8-default-name", number = n))
+        .find(|name| !names.contains(&name.as_str()))
+        .unwrap_or_default()
 }
 
 /// The entries of the index, each as it is written (a bad one stays), and
@@ -391,12 +428,12 @@ fn read_tile(folder: &Path, file: &str, memory: &mut u64) -> Option<RgbaImage> {
     (w > 0 && h > 0).then_some(image)
 }
 
-/// Writes a tile's file, unless it is there and good. One that can't be read,
-/// or holds something else, is set aside.
+/// Writes a tile's file, unless it is there and good. One that is damaged,
+/// or holds something else, is set aside; one that can't be read for now
+/// (memory) is kept.
 fn write_tile(path: &Path, image: &RgbaImage) -> std::io::Result<()> {
     if path.exists() {
-        let same = image::open(path).is_ok_and(|d| d.into_rgba8() == *image);
-        if same {
+        if tile_there(path, image) != Some(false) {
             return Ok(());
         }
         crate::actions::set_aside(path)
@@ -407,6 +444,36 @@ fn write_tile(path: &Path, image: &RgbaImage) -> std::io::Result<()> {
         .save_with_format(&temp, image::ImageFormat::Png)
         .map_err(std::io::Error::other)?;
     std::fs::rename(&temp, path)
+}
+
+/// Whether the file at `path` holds `image`; `None` when that can't be told
+/// now (memory, or the file can't be opened). A file is opened before it is
+/// read, so an error reading it is in its data.
+fn tile_there(path: &Path, image: &RgbaImage) -> Option<bool> {
+    use image::ImageError;
+    let open = || image::ImageReader::open(path).ok()?.with_guessed_format().ok();
+    match open()?.into_dimensions() {
+        Ok(d) if d != image.dimensions() => return Some(false),
+        Ok(_) => {}
+        Err(ImageError::Limits(_)) => return None,
+        Err(_) => return Some(false),
+    }
+    let bytes = image.as_raw().len() as u64;
+    if bytes > crate::document::free_memory() {
+        return None;
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_SIDE);
+    limits.max_image_height = Some(MAX_SIDE);
+    limits.max_alloc = Some(2 * bytes + (1 << 20));
+    let mut reader = open()?;
+    reader.limits(limits);
+    match reader.decode() {
+        Ok(d) => Some(d.into_rgba8() == *image),
+        // Cut short or garbled reads as an IO error too: damaged.
+        Err(ImageError::Limits(_)) => None,
+        Err(_) => Some(false),
+    }
 }
 
 /// The changes of the library on their way to the disk: one thread, in order,
@@ -485,7 +552,8 @@ fn save_changes(folder: &Path, changes: &Receiver<Change>, report: &Sender<Strin
             Ok(()) => waiting.clear(),
             Err(e) => {
                 crate::diag::warn(format!("pattern library not saved: {e}"));
-                let _ = report.send(e.to_string());
+                // In the interface's language where it has words for it.
+                let _ = report.send(crate::document::FileError::Io(e).to_string());
             }
         }
     }

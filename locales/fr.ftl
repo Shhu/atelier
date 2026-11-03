@@ -660,7 +660,6 @@ file-error-format-limit = les images { $format } sont limitées à { $max } px p
 
 ## Layer merging
 
-doc-merge-locked = Fusion impossible : un calque est verrouillé.
 doc-merge-too-large = Fusion impossible : les calques sont trop éloignés.
 
 ## Flatten Image
@@ -3211,7 +3210,7 @@ panels8-screen-notice = Appuyez sur F ou Échap pour quitter le plein écran. Ta
 panels8-shortcut-screen-mode = Mode d'affichage suivant
 
 ## Command palette keywords
-panels8-keywords-sampler = échantillonnage couleur point valeurs mesure informations
+panels8-keywords-sampler = échantillonnage couleur point valeurs mesure informations échantillons effacer supprimer
 panels8-keywords-ruler = règle mesure distance angle redresser niveau rapporteur
 panels8-keywords-info = informations valeurs curseur rvb cmjn position taille
 panels8-keywords-histogram = histogramme niveaux statistiques couches moyenne
@@ -3250,7 +3249,7 @@ view8-flip-horizontal = Retournement horizontal de l'affichage
 view8-hint-rotate = Faire pivoter l'affichage
 view8-hint-steps = Par pas de 15°
 view8-hint-reset = Réinitialiser l'affichage
-view8-palette-keywords-rotate-view = tourner incliner angle pivoter vue rotation
+view8-palette-keywords-rotate-view = tourner incliner angle pivoter vue rotation affichage réinitialiser toutes fenêtres
 view8-palette-keywords-flip = miroir retourner inverser vue vérifier composition
 
 ## Filter menu: Distort group and filter names
@@ -3297,7 +3296,7 @@ distort8-out-from-center = En partant du centre
 distort8-pond-ripples = Ondes concentriques
 distort8-shear-curve = Courbe de cisaillement
 distort8-shear-default = Par défaut
-distort8-shear-tip = Faites glisser un point ou la ligne pour la courber. Faites glisser un point hors de la grille pour le supprimer.
+distort8-shear-tip = Cliquez sur la ligne pour ajouter un point, faites glisser un point pour la courber. Faites glisser un point hors de la grille pour le supprimer.
 
 ## Distort filters: command palette keywords
 
@@ -3316,8 +3315,8 @@ crop9-ratio-tip = Une proportion, pas des pixels. Vide : libre.
 ## Status bar: the image turned would be too large
 crop9-status-too-large = L'image tournée dépasserait la taille maximale.
 ## Status bar: { $name } is the command (Crop, Image Rotation)
-crop9-status-cancelled = { $name } annulé.
-crop9-status-dropped = { $name } non appliqué : le document a changé entre-temps.
+crop9-status-cancelled = { $name } : opération annulée.
+crop9-status-dropped = { $name } : opération non appliquée, le document a changé entre-temps.
 
 ## Edit > Fade: why it is unavailable
 adjust9-why-no-fade = Disponible uniquement juste après un filtre, un réglage, un remplissage, une étape de peinture ou une transformation
@@ -3370,3 +3369,23 @@ ui9-options-position-locked = Position verrouillée
 
 ## Navigator: what screen readers say of the picture
 ui9-navigator-image = Vue d'ensemble de l'image
+
+## Edit: Stroke, Image: Auto, an adjustment played, on a layer without pixels
+adjust11-no-pixels = Ce calque n'a pas de pixels à modifier : choisissez un calque de pixels, ou son masque.
+
+## Crop tool: Overlay menu, lines drawn over the box
+crop11-overlay-diagonal = Diagonale
+crop11-overlay-triangle = Triangle
+crop11-overlay-golden-ratio = Nombre d'or
+
+## Layer locks: Ctrl+/ when the lock it would put on is already on through a group ($lock: lock names; $group: group name)
+locks11-lock-held-by-group = { $lock } : déjà en place par le groupe « { $group } »
+
+## Free Transform of a Pattern Fill layer in perspective or warped
+pattern11-why-distort = Le motif de « { $name } » peut être déplacé, mis à l'échelle, pivoté ou retourné, mais pas mis en perspective ni déformé.
+## Steps of an action
+pattern11-step-new-solid-fill = Nouveau calque de remplissage de couleur unie
+pattern11-step-new-gradient-fill = Nouveau calque de remplissage de dégradé
+
+## Title bar: the menu holding the menus a narrow window has no room for
+ui11-menu-more = Autres menus

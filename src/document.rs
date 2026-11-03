@@ -39,7 +39,7 @@ mod smart;
 mod styles_jobs;
 mod transform;
 mod vectors;
-pub use crop::{CropOrder, WholeChange, WholeDone};
+pub use crop::{CropOrder, MAX_RESOLUTION, WholeChange, WholeDone};
 pub use artboards::{
     ARTBOARD_GAP, Artboard, ArtboardBackground, ArtboardExport, ArtboardFiles, Side,
     artboard_file_stem, artboard_path, existing_artboard_files, windows_device,
@@ -67,7 +67,7 @@ pub use smart::{
     SmartFilterKind,
     SmartObject, SmartRender,
 };
-pub use styles_jobs::{styles_area, styles_of, styles_pending};
+pub use styles_jobs::{styles_area, styles_of, styles_pending, watch_styles_only};
 pub use transform::{Target as TransformTarget, Transformed, transformed_selection};
 pub use vectors::{PathRef, SavedPath};
 
@@ -465,8 +465,7 @@ impl Layer {
 
     /// The tiles of its patterns after the image's geometry changed by `a`,
     /// the layer having been at `old`: their origin stays on the same point of
-    /// the image, and `change` turns or mirrors them. A group's overlay starts
-    /// from the box of what it holds, wherever that goes: only its offset turns.
+    /// the image, and `change` turns or mirrors them (a group's frame too).
     fn map_patterns(
         &mut self,
         old: (i64, i64),
@@ -480,10 +479,6 @@ impl Layer {
             change(f);
         }
         if self.effects.pattern_overlay.in_use() {
-            let anchors = match self.kind {
-                LayerKind::Group { .. } => ((0.0, 0.0), a.apply(0.0, 0.0)),
-                _ => anchors,
-            };
             let f = &mut self.effects.pattern_overlay.fill;
             f.map_origin(|x, y| a.apply(x, y), anchors);
             change(f);
@@ -581,6 +576,63 @@ impl Layer {
             (_, None) => None,
         };
         own.map(|r| self.with_styles_extent(r, styles))
+    }
+}
+
+/// What files add to the phase of group `i`'s linked Pattern Overlay: in a
+/// document it starts from the group's frame (which moves with the whole
+/// group only, not when a layer in it is painted), in files from the top
+/// left corner of what the group holds, as a layer's starts from its pixels.
+fn group_overlay_shift(layers: &[Layer], i: usize) -> (f32, f32) {
+    let l = &layers[i];
+    let fx = &l.effects.pattern_overlay;
+    if !l.is_group() || !fx.fill.linked || !fx.in_use() {
+        return (0.0, 0.0);
+    }
+    let d = l.depth;
+    let first = (0..i).rev().take_while(|&j| layers[j].depth > d).last().unwrap_or(i);
+    match (first..i).filter_map(|j| layers[j].content_bounds()).reduce(PixelRect::union) {
+        Some(b) => ((l.offset.0 - b.x) as f32, (l.offset.1 - b.y) as f32),
+        None => (0.0, 0.0),
+    }
+}
+
+/// `layers` as files keep them (see [`group_overlay_shift`]).
+pub fn group_overlays_for_files(layers: Cow<'_, [Layer]>) -> Cow<'_, [Layer]> {
+    let shifts: Vec<(f32, f32)> = (0..layers.len()).map(|i| group_overlay_shift(&layers, i)).collect();
+    if shifts.iter().all(|&s| s == (0.0, 0.0)) {
+        return layers;
+    }
+    let mut layers = layers.into_owned();
+    for (l, (dx, dy)) in layers.iter_mut().zip(shifts) {
+        let phase = &mut l.effects.pattern_overlay.fill.phase;
+        *phase = (phase.0 + dx, phase.1 + dy);
+    }
+    Cow::Owned(layers)
+}
+
+impl Document {
+    /// Groups that aren't artboards start at what they hold (see
+    /// `Document::group_layers`), once the layers and their depths are read.
+    pub(crate) fn frame_groups(&mut self) {
+        for i in 0..self.layers.len() {
+            if self.layers[i].is_group()
+                && self.layers[i].artboard.is_none()
+                && let Some(b) = self.element_bounds(i)
+            {
+                self.layers[i].offset = (b.x, b.y);
+            }
+        }
+    }
+
+    /// Back from what files keep (see [`group_overlay_shift`]), once the
+    /// layers and their depths are read.
+    pub(crate) fn group_overlays_from_files(&mut self) {
+        for i in 0..self.layers.len() {
+            let (dx, dy) = group_overlay_shift(&self.layers, i);
+            let phase = &mut self.layers[i].effects.pattern_overlay.fill.phase;
+            *phase = (phase.0 - dx, phase.1 - dy);
+        }
     }
 }
 
@@ -736,8 +788,8 @@ pub fn layer_clip(layer: &Layer, region: PixelRect) -> [u32; 4] {
 pub enum MergeError {
     /// Not enough visible layers.
     Nothing,
-    /// One of the layers is locked.
-    Locked,
+    /// A layer is locked (this one, the topmost).
+    Locked(usize),
     /// The result would be too large (contents far apart).
     TooLarge,
 }
@@ -1212,6 +1264,17 @@ impl Document {
         self.block(i)
             .filter_map(|j| self.layers[j].content_bounds())
             .reduce(PixelRect::union)
+    }
+
+    /// Where the visible pixels of layer `i` (a group: of its layers) start,
+    /// from its frame: the phase at which a linked tile starts at its top
+    /// left corner. Without pixels: its frame.
+    pub fn tile_corner(&self, i: usize) -> (f32, f32) {
+        let l = &self.layers[i];
+        match self.element_bounds(i) {
+            Some(b) => ((b.x - l.offset.0) as f32, (b.y - l.offset.1) as f32),
+            None => (0.0, 0.0),
+        }
     }
 
     /// Topmost visible and unlocked layer with a non-transparent pixel at
@@ -1940,12 +2003,19 @@ impl Document {
         all_layers: bool,
     ) -> bool {
         let all_layers = all_layers && !self.mask_targeted();
-        self.with_target(|doc| {
-            doc.fill_target_at(
-                x, y, color, tolerance, within, contiguous, style, all_layers,
-            )
-        })
-        .unwrap_or(false)
+        let covered = self
+            .with_target(|doc| {
+                doc.fill_target_at(
+                    x, y, color, tolerance, within, contiguous, style, all_layers,
+                )
+            })
+            .flatten();
+        let Some((mask, at)) = covered else {
+            return false;
+        };
+        // Fade blends what it covered.
+        self.mark_fade_painted(mask, at);
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1959,10 +2029,10 @@ impl Document {
         contiguous: bool,
         style: &crate::pixel_ops::BucketStyle,
         all_layers: bool,
-    ) -> bool {
+    ) -> Option<(GrayImage, (i64, i64))> {
         let canvas = self.full_rect();
         if x < canvas.x || y < canvas.y || x >= canvas.right() || y >= canvas.bottom() {
-            return false;
+            return None;
         }
         let before = self.state();
         self.expand_active_to_canvas();
@@ -1975,26 +2045,27 @@ impl Document {
                 Some(clip) => Some(clip),
                 None => {
                     self.restore(before);
-                    return false;
+                    return None;
                 }
             },
             None => None,
         };
+        let origin = layer.offset;
         let image = layer.pixels_mut();
         let style = crate::pixel_ops::BucketStyle {
             sample: visible.as_ref(),
             ..*style
         };
-        let filled = crate::pixel_ops::flood_fill_with(
+        let filled = crate::pixel_ops::flood_fill_covering(
             image, lx, ly, color, tolerance, clip, contiguous, &style,
         );
-        if filled.is_none() {
+        let Some((_, covered, top)) = filled else {
             self.restore(before);
-            return false;
-        }
+            return None;
+        };
         self.keep_alpha_of(kept.as_ref(), None);
         self.push_state(before, t!("tool-bucket"));
-        true
+        Some((covered, (origin.0, origin.1 + i64::from(top))))
     }
 
     /// The pixels of the active layer (of its mask's stand-in when the mask
@@ -2129,14 +2200,13 @@ impl Document {
 
     /// Aligns the layers `indices` (their visible pixels): to `to` (the
     /// selection's bounds) when given, else to the canvas if there is only
-    /// one, to each other otherwise. Locked layers don't move. Returns
+    /// one, to each other otherwise. Locked layers don't move, nor groups
+    /// holding one (aligned by the bounds of all they hold). Returns
     /// `false` if nothing moved.
     pub fn align(&mut self, indices: &[usize], op: AlignOp, to: Option<PixelRect>) -> bool {
         let items: Vec<(usize, PixelRect)> = indices
             .iter()
-            .filter(|&&i| {
-                i < self.layers.len() && self.can_move(i) && self.stuck_group_layer(i).is_none()
-            })
+            .filter(|&&i| i < self.layers.len() && self.can_move(i) && self.held_member(i).is_none())
             .filter_map(|&i| self.element_bounds(i).map(|b| (i, b)))
             .collect();
         if items.is_empty() {
@@ -2722,7 +2792,19 @@ impl Document {
 
     /// Flip Canvas Horizontal / Vertical: the whole image is mirrored.
     /// Texts become pixels.
+    #[cfg(test)]
     pub fn flip_canvas(&mut self, horizontal: bool) {
+        self.flip_canvas_unless(horizontal, &std::sync::atomic::AtomicBool::new(false));
+    }
+
+    /// [`Self::flip_canvas`], given up between two layers once `cancel` is
+    /// set (the document is then a work copy, thrown away). Layers sharing
+    /// a tile share its mirror image.
+    pub(super) fn flip_canvas_unless(
+        &mut self,
+        horizontal: bool,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) {
         self.checkpoint(if horizontal {
             t!("menu-image-flip-horizontal")
         } else {
@@ -2744,6 +2826,9 @@ impl Document {
         let limit = self.shape_limit();
         self.map_paths(&map);
         for layer in &mut self.layers {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
             let (old, r) = (layer.offset, layer.artboard_rect().unwrap_or(layer.rect()));
             let image = if horizontal {
                 layer.offset.0 = w - (r.x + r.w as i64);
@@ -2802,6 +2887,20 @@ impl Document {
     /// content, with a scaled font size; the caller can render them again
     /// for a sharp result.
     pub fn resize_image(&mut self, width: u32, height: u32, filter: FilterType) -> bool {
+        self.resize_image_unless(width, height, filter, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// [`Self::resize_image`], the layers resampled in parallel; `cancel` set
+    /// stops it at its next layer (what is left is then to throw away).
+    pub(super) fn resize_image_unless(
+        &mut self,
+        width: u32,
+        height: u32,
+        filter: FilterType,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> bool {
+        use rayon::prelude::*;
+        use std::sync::atomic::Ordering;
         if width == 0 || height == 0 || (width, height) == self.canvas {
             return false;
         }
@@ -2814,7 +2913,12 @@ impl Document {
         let map = mask_ops::Affine([sx as f32, 0.0, 0.0, 0.0, sy as f32, 0.0]);
         let limit = self.shape_limit();
         self.map_paths(&map);
-        for layer in &mut self.layers {
+        // The pixels to resample, all at once once the rest is done.
+        let mut resampled: Vec<(usize, u32, u32)> = Vec::new();
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                return true;
+            }
             let old = layer.offset;
             let (w, h) = layer.image.dimensions();
             let empty = w == 0 || h == 0;
@@ -2842,16 +2946,33 @@ impl Document {
                 && layer.has_pixels()
                 && !empty
             {
-                layer.replace_pixels(crate::pixel_ops::resize(layer.image(), nw, nh, filter));
+                resampled.push((i, nw, nh));
             }
             layer.text = text;
             layer.edit_mask(old, |m| m.scale((sx, sy), filter, (0, 0)));
             layer.effects.scale(s, sx as f32, sy as f32);
             if let LayerKind::Fill(Fill::Pattern(p)) = &mut layer.kind {
-                use crate::compose::pattern::SCALE_RANGE;
-                p.scale = (p.scale * s).clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end());
+                p.scale = crate::compose::pattern::scaled(p.scale, s);
                 p.phase = (p.phase.0 * sx as f32, p.phase.1 * sy as f32);
             }
+        }
+        let sources: Vec<(Arc<RgbaImage>, u32, u32)> = (resampled.iter())
+            .map(|&(i, w, h)| (self.layers[i].shared_image(), w, h))
+            .collect();
+        let images: Vec<Option<RgbaImage>> = sources
+            .par_iter()
+            .map(|(image, w, h)| {
+                (!cancel.load(Ordering::Relaxed))
+                    .then(|| crate::pixel_ops::resize(image, *w, *h, filter))
+            })
+            .collect();
+        for (&(i, ..), image) in resampled.iter().zip(images) {
+            let Some(image) = image else { return true };
+            // A text stays a text (its pixels were only its rendering).
+            let layer = &mut self.layers[i];
+            let text = layer.text.take();
+            layer.replace_pixels(image);
+            layer.text = text;
         }
         guides::scale(&mut self.guides, sx as f32, sy as f32);
         self.follow_measures((width, height), |x, y| (x * sx as f32, y * sy as f32));
@@ -2994,11 +3115,10 @@ impl Document {
                 && src.w > 0
                 && src.h > 0
             {
-                use crate::compose::pattern::SCALE_RANGE;
                 let point = |p: (i64, i64)| (p.0 as f32, p.1 as f32);
                 f.map_origin(|x, y| map.apply(x, y), (point(old), point(new)));
                 let k = (size.0 as f32 / src.w as f32 * size.1 as f32 / src.h as f32).sqrt();
-                f.scale = (f.scale * k).clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end());
+                f.scale = crate::compose::pattern::scaled(f.scale, k);
                 f.turned(angle);
             }
         }
@@ -4286,8 +4406,8 @@ mod tests {
         let mut doc = Document::new(RgbaImage::from_pixel(4, 4, RED), None);
         doc.add_layer("b".into(), RgbaImage::from_pixel(2, 2, RED), (0, 0));
         doc.active_layer_mut().locked = true;
-        assert_eq!(doc.merge_down(), Err(MergeError::Locked));
-        assert_eq!(doc.merge_visible(), Err(MergeError::Locked));
+        assert_eq!(doc.merge_down(), Err(MergeError::Locked(1)));
+        assert_eq!(doc.merge_visible(), Err(MergeError::Locked(1)));
     }
 
     #[test]

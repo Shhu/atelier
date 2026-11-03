@@ -1738,4 +1738,26 @@ mod tests {
         let groups = h.state().palette_groups(&h.ctx, "e");
         assert!(groups.iter().any(|(_, _, more)| *more > 0));
     }
+
+    /// What only an options bar does is found by its words, through its
+    /// tool.
+    #[test]
+    fn options_bar_commands_find_their_tool() {
+        let h = app(true, Lang::En);
+        let finds = |h: &Harness<'static, AtelierApp>, query: &str, tool: Tool| {
+            let hits = found(h, query);
+            assert!(
+                hits.iter().take(3).any(|(_, a)| matches!(a, Action::Tool(t) if *t == tool)),
+                "{query:?}: {hits:?}"
+            );
+        };
+        finds(&h, "reset view", Tool::RotateView);
+        finds(&h, "rotate all windows", Tool::RotateView);
+        finds(&h, "clear samplers", Tool::ColorSampler);
+        i18n::set_lang(Lang::Fr);
+        finds(&h, "réinitialiser affichage", Tool::RotateView);
+        finds(&h, "pivoter toutes les fenêtres", Tool::RotateView);
+        finds(&h, "effacer échantillons", Tool::ColorSampler);
+        i18n::set_lang(Lang::En);
+    }
 }

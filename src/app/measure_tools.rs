@@ -122,7 +122,7 @@ impl AtelierApp {
         }
         if doc.samplers.len() >= MAX_SAMPLERS {
             self.status_shown.clear();
-            self.status = t!("panels8-status-samplers-full", count = MAX_SAMPLERS);
+            self.status_cannot(t!("panels8-status-samplers-full", count = MAX_SAMPLERS));
             return None;
         }
         doc.checkpoint(t!("panels8-hist-add-sampler"));
@@ -368,18 +368,25 @@ impl AtelierApp {
     /// filled (`keep_canvas`, Alt: not cropped). The line goes. One step.
     pub(super) fn straighten_layer(&mut self, keep_canvas: bool) {
         if self.in_quick_mask() {
-            self.status = t!("panels8-status-straighten-quick-mask");
+            self.status_cannot(t!("panels8-status-straighten-quick-mask"));
             return;
         }
         let Some(doc) = &self.doc else { return };
         let Some(m) = doc.ruler else { return };
         let active = doc.active_layer();
         if active.is_group() {
-            self.status = t!("panels9-status-straighten-group");
+            self.status_cannot(t!("panels9-status-straighten-group"));
             return;
         }
+        // Like a transform: what can't be seen isn't turned (and cropped).
+        if let Some(why) = self.hidden_target(false) {
+            self.status_cannot(why);
+            return;
+        }
+        let Some(doc) = &self.doc else { return };
+        let active = doc.active_layer();
         if active.has_pixels() && !doc.transforms_mask() && active.content_bounds().is_none() {
-            self.status = t!("xform-status-nothing", name = active.name.clone());
+            self.status_cannot(t!("xform-status-nothing", name = active.name.clone()));
             return;
         }
         let uid = doc.uid();
@@ -399,7 +406,7 @@ impl AtelierApp {
             applied = true;
         } else if entered {
             self.reset_pending();
-            self.status = t!("panels9-status-already-level");
+            self.say(t!("panels9-status-already-level"));
         }
         self.fit_canvas = fit;
         if self.selection.is_none() {

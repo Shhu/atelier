@@ -39,7 +39,7 @@ impl AtelierApp {
             ctx.send_viewport_cmd(ViewportCommand::StartDrag);
         }
 
-        let menus = self.menus();
+        let mut menus = self.menus();
         let mut action = None;
         let facts = self.greyed_facts();
         let why = move |a: Action| Some(super::palette::unavailable_reason(&facts, a));
@@ -48,47 +48,68 @@ impl AtelierApp {
             if SYSTEM_BUTTONS {
                 ui.add_space(SYSTEM_BUTTONS_WIDTH);
             }
-            logo(ui);
-            ui.add_space(8.0);
+            // A narrow window brings the menus closer together, then drops
+            // the logo, then folds the last menus into "»": they stay clear
+            // of the window buttons, with room left to drag the window by.
+            let font = egui::TextStyle::Button.resolve(ui.style());
+            let width_of = |text: &str| {
+                let galley =
+                    ui.painter()
+                        .layout_no_wrap(text.to_owned(), font.clone(), Color32::PLACEHOLDER);
+                galley.size().x + MENU_SPACING
+            };
+            let titles: Vec<f32> = menus.iter().map(|(title, _)| width_of(title)).collect();
+            let buttons = if SYSTEM_BUTTONS {
+                10.0
+            } else {
+                3.0 * WINDOW_BUTTON_WIDTH + 10.0
+            };
+            let fit = fit_menu_bar(
+                ui.available_width() - buttons - DRAG_ROOM,
+                &titles,
+                width_of(MORE_MENUS),
+            );
+            if fit.logo {
+                logo(ui);
+                ui.add_space(8.0);
+            }
+            let folded = menus.split_off(fit.shown);
             ui.scope(|ui| {
                 menu_bar_style(ui.style_mut());
-                ui.spacing_mut().item_spacing.x = 1.0;
-                // A narrow window brings the menus closer together, clear
-                // of the window buttons.
-                let font = egui::TextStyle::Button.resolve(ui.style());
-                let text: f32 = menus
-                    .iter()
-                    .map(|(title, _)| {
-                        let galley = ui.painter().layout_no_wrap(
-                            title.clone(),
-                            font.clone(),
-                            Color32::PLACEHOLDER,
-                        );
-                        galley.size().x + 1.0
-                    })
-                    .sum();
-                let buttons = if SYSTEM_BUTTONS {
-                    10.0
-                } else {
-                    3.0 * WINDOW_BUTTON_WIDTH + 10.0
+                ui.spacing_mut().item_spacing.x = MENU_SPACING;
+                ui.spacing_mut().button_padding.x = fit.padding;
+                let config = || egui::containers::menu::MenuConfig::new().style(menu_style);
+                let popup = |ui: &mut egui::Ui,
+                             title: &str,
+                             entries: &[MenuEntry],
+                             action: &mut Option<Action>| {
+                    ui.set_min_width(200.0);
+                    // A menu taller than the window scrolls, rather than
+                    // covering the menu bar.
+                    // (It opens under the title bar, 40 px high.)
+                    let below = ui.ctx().content_rect().height() - 40.0;
+                    scrolling_menu(ui, title, below - 24.0, |ui| {
+                        explained_menu_entries(ui, entries, action, &why);
+                    });
                 };
-                let room = ui.available_width() - buttons - text;
-                let padding = room / (2.0 * menus.len() as f32);
-                ui.spacing_mut().button_padding.x = padding.clamp(4.0, 9.0);
                 for (title, entries) in &menus {
-                    let config = egui::containers::menu::MenuConfig::new().style(menu_style);
                     egui::containers::menu::MenuButton::new(title.as_str())
-                        .config(config)
-                        .ui(ui, |ui| {
-                            ui.set_min_width(200.0);
-                            // A menu taller than the window scrolls, rather
-                            // than covering the menu bar.
-                            // (It opens under the title bar, 40 px high.)
-                            let below = ui.ctx().content_rect().height() - 40.0;
-                            scrolling_menu(ui, title, below - 24.0, |ui| {
-                                explained_menu_entries(ui, entries, &mut action, &why);
-                            });
-                        });
+                        .config(config())
+                        .ui(ui, |ui| popup(ui, title, entries, &mut action));
+                }
+                if !folded.is_empty() {
+                    let entries: Vec<MenuEntry> = folded
+                        .into_iter()
+                        .map(|(title, entries)| MenuEntry::Submenu(title, entries))
+                        .collect();
+                    let name = t!("ui11-menu-more");
+                    let (response, _) = egui::containers::menu::MenuButton::new(MORE_MENUS)
+                        .config(config())
+                        .ui(ui, |ui| popup(ui, MORE_MENUS, &entries, &mut action));
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name)
+                    });
+                    response.on_hover_text(name);
                 }
             });
 
@@ -144,6 +165,63 @@ impl AtelierApp {
         if let Some(action) = action {
             self.run(action);
         }
+    }
+}
+
+/// Space between menu titles.
+const MENU_SPACING: f32 = 1.0;
+/// Empty title bar always left to drag the window by.
+const DRAG_ROOM: f32 = 24.0;
+/// Room taken by the logo and the space after it.
+const LOGO_ROOM: f32 = 22.0 + 4.0 + 8.0;
+/// Padding of the menu titles, at most and at least.
+const MENU_PADDING: std::ops::RangeInclusive<f32> = 3.0..=9.0;
+/// Padding below which the logo goes first.
+const LOGO_PADDING: f32 = 4.0;
+/// Title of the menu holding the menus that don't fit.
+const MORE_MENUS: &str = "»";
+
+/// How the menu bar fits in `width`.
+#[derive(Debug, PartialEq)]
+struct MenuBarFit {
+    logo: bool,
+    /// Menus shown as titles; the others go into "»".
+    shown: usize,
+    /// Padding on each side of a title.
+    padding: f32,
+}
+
+/// Fits the logo and menus whose titles take `titles` (text and spacing)
+/// into `width`: smaller padding, then no logo, then the last menus folded
+/// into a "»" menu (`more` wide).
+fn fit_menu_bar(width: f32, titles: &[f32], more: f32) -> MenuBarFit {
+    let (least, most) = (*MENU_PADDING.start(), *MENU_PADDING.end());
+    let n = titles.len().max(1) as f32;
+    let text: f32 = titles.iter().sum();
+    let padding = |room: f32| (room - text) / (2.0 * n);
+    let with_logo = padding(width - LOGO_ROOM);
+    if with_logo >= LOGO_PADDING {
+        return MenuBarFit {
+            logo: true,
+            shown: titles.len(),
+            padding: with_logo.min(most),
+        };
+    }
+    if padding(width) >= least {
+        return MenuBarFit {
+            logo: false,
+            shown: titles.len(),
+            padding: padding(width).min(LOGO_PADDING),
+        };
+    }
+    let shown = (0..titles.len())
+        .rev()
+        .find(|&k| titles[..k].iter().sum::<f32>() + more + 2.0 * least * (k + 1) as f32 <= width)
+        .unwrap_or(0);
+    MenuBarFit {
+        logo: false,
+        shown,
+        padding: least,
     }
 }
 
@@ -205,6 +283,8 @@ fn menu_bar_style(style: &mut egui::Style) {
 /// Menu popups and their submenus.
 fn menu_style(style: &mut egui::Style) {
     egui::containers::menu::menu_style(style);
+    // A menu is as wide as its widest row: no row wraps.
+    style.wrap_mode = Some(egui::TextWrapMode::Extend);
     style.spacing.button_padding = vec2(8.0, 3.0);
     style.spacing.interact_size.y = 26.0;
     style.spacing.item_spacing.y = 1.0;
@@ -422,5 +502,26 @@ fn resize_cursor(direction: ResizeDirection) -> CursorIcon {
         ResizeDirection::SouthEast => CursorIcon::ResizeSouthEast,
         ResizeDirection::NorthWest => CursorIcon::ResizeNorthWest,
         ResizeDirection::SouthWest => CursorIcon::ResizeSouthWest,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_narrow_bar_drops_the_logo_then_folds_the_last_menus() {
+        let titles = [40.0; 9];
+        let wide = fit_menu_bar(800.0, &titles, 12.0);
+        assert_eq!((wide.logo, wide.shown, wide.padding), (true, 9, 9.0));
+        // 360 of text: 72 px of padding with the logo is too little.
+        let no_logo = fit_menu_bar(360.0 + 72.0 + 10.0, &titles, 12.0);
+        assert!(!no_logo.logo && no_logo.shown == 9, "{no_logo:?}");
+        assert!(no_logo.padding >= 3.0);
+        let folded = fit_menu_bar(300.0, &titles, 12.0);
+        assert!(!folded.logo && folded.shown < 9, "{folded:?}");
+        let shown = folded.shown as f32;
+        assert!(40.0 * shown + 12.0 + 6.0 * (shown + 1.0) <= 300.0);
+        assert_eq!(fit_menu_bar(10.0, &titles, 12.0).shown, 0);
     }
 }

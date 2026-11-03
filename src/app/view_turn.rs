@@ -64,7 +64,7 @@ fn wrapped(angle: f32) -> f32 {
 }
 
 impl ViewTurn {
-    fn is_identity(self) -> bool {
+    pub(super) fn is_identity(self) -> bool {
         self.angle == 0.0 && !self.flipped
     }
 
@@ -86,7 +86,7 @@ impl ViewTurn {
         if self.flipped { vec2(-u.x, u.y) } else { u }
     }
 
-    fn vec_to_screen(self, v: Vec2) -> Vec2 {
+    pub(super) fn vec_to_screen(self, v: Vec2) -> Vec2 {
         let (c, s) = self.axes();
         let f = if self.flipped { vec2(-v.x, v.y) } else { v };
         vec2(f.x * c - f.y * s, f.x * s + f.y * c)
@@ -428,6 +428,19 @@ impl AtelierApp {
         self.transform_rect.is_some() || self.crop_box_pending() || self.sel.transform.is_some()
     }
 
+    /// What a view tool was chosen over has been applied or given up: the
+    /// view tool becomes the tool (with R held, its release still gives
+    /// back the tool it came from).
+    pub(super) fn view_tool_over_ended(&mut self) {
+        if self.view_tool_keeps_pending() {
+            return;
+        }
+        if let Some(tool) = self.rotate_view.over.take() {
+            self.switch_tool(tool);
+            self.group_tool.insert(tool.group(), tool);
+        }
+    }
+
     /// The tool that takes the pointer, for what the toolbar shows.
     pub(super) fn shown_tool(&self) -> Tool {
         self.rotate_view.over.unwrap_or(self.tool)
@@ -512,7 +525,8 @@ impl AtelierApp {
             return;
         }
         if self.rotate_view.over == Some(Tool::RotateView) {
-            self.rotate_view.over = None;
+            // Hand or Zoom chosen over the transform before comes back.
+            self.rotate_view.over = (from != self.tool).then_some(from);
         } else if self.tool == Tool::RotateView {
             self.set_tool(from);
         }

@@ -666,7 +666,7 @@ impl AtelierApp {
         match cmd {
             // Every command but Again (which repeats a layer's transform).
             _ if !matches!(cmd, Command::Again) && self.path_transform_wanted() => {
-                self.status = t!("tools5-status-path-transform");
+                self.status_cannot(t!("tools5-status-path-transform"));
             }
             Command::Free => {
                 self.enter_transform();
@@ -760,11 +760,11 @@ impl AtelierApp {
         let Some(src) = self.transform_source() else {
             if quick {
                 self.selection = self.xform.quick.selection.take();
-                self.status = t!("xform-status-nothing", name = t!("qm6-quick-mask-name"));
+                self.status_cannot(t!("xform-status-nothing", name = t!("qm6-quick-mask-name")));
                 return false;
             }
             let name = self.doc.as_ref().map(|d| d.active_layer().name.clone());
-            self.status = t!("xform-status-nothing", name = name.unwrap_or_default());
+            self.status_cannot(t!("xform-status-nothing", name = name.unwrap_or_default()));
             return false;
         };
         self.transform_rect = Some(src);
@@ -795,7 +795,7 @@ impl AtelierApp {
         };
         let mark = doc.history_mark();
         let Some(id) = doc.lift_region(&selection, false) else {
-            self.status = t!("xform-status-empty");
+            self.status_cannot(t!("xform-status-empty"));
             return false;
         };
         let step = doc.history_step();
@@ -1361,7 +1361,7 @@ impl AtelierApp {
     /// selected now.
     fn transform_again(&mut self) {
         let Some(last) = self.xform.last else {
-            self.status = t!("xform-status-no-again");
+            self.status_cannot(t!("xform-status-no-again"));
             return;
         };
         self.commit_pending();
@@ -1553,8 +1553,15 @@ impl AtelierApp {
         layers.dedup();
         let result = doc.transformed_bounds(&layers, &t);
         if result.is_some_and(|r| r.w > MAX_DIMENSION || r.h > MAX_DIMENSION) {
-            self.status = t!("select-element-too-large", max = MAX_DIMENSION);
+            self.status_cannot(t!("select-element-too-large", max = MAX_DIMENSION));
             self.reset_transform();
+            return true;
+        }
+        // A tile can't be put in perspective nor warped: the frame stays,
+        // to be changed or cancelled.
+        if let Some(i) = doc.tile_cant_follow(&layers, &t) {
+            let name = doc.layers[i].name.clone();
+            self.status_cannot(t!("pattern11-why-distort", name = name));
             return true;
         }
         let lift = self.xform.lift.take();
@@ -1654,6 +1661,16 @@ impl AtelierApp {
         self.xform.applying.is_some() || self.crop.whole.is_some()
     }
 
+    /// The indicator of what is computed aside, on the next frame.
+    pub(super) fn show_busy_at_once(&mut self) {
+        if let Some(run) = &mut self.crop.whole {
+            run.show_at_once();
+        }
+        if let Some(a) = &mut self.xform.applying {
+            a.started = f64::NEG_INFINITY;
+        }
+    }
+
     /// Waits for the transform being computed and puts it in place: what
     /// follows (a command, a save, another tab) works with its result.
     pub(super) fn wait_transform(&mut self) {
@@ -1672,7 +1689,7 @@ impl AtelierApp {
     pub(super) fn wait_transform_for_input(&mut self, ctx: &egui::Context) {
         self.wait_whole_for_input(ctx);
         if self.xform.applying.is_none()
-            || !ctx.input(|i| super::retouch_tools::input_waits(i, None))
+            || !ctx.input(|i| super::retouch_tools::input_waits(i, None, false))
         {
             return;
         }
@@ -1836,7 +1853,17 @@ impl AtelierApp {
                 || (c.layers.len() == 1
                     && doc.layers.get(c.layers[0]).is_some_and(|l| l.id == active.id)));
         if pixels || quick {
-            doc.mark_fade_transformed();
+            // Where its result went: Fade blends there too.
+            let to = c.t.bounds(c.t.src).map(|b| {
+                let g = Grid::covering(b, 1.0);
+                PixelRect {
+                    x: g.x,
+                    y: g.y,
+                    w: g.w,
+                    h: g.h,
+                }
+            });
+            doc.mark_fade_transformed(to);
         }
         let fitted = c
             .fit
@@ -1973,6 +2000,7 @@ impl AtelierApp {
         start: bool,
         down: bool,
         shift: bool,
+        double: bool,
     ) -> Option<CursorIcon> {
         if self.transform_locked() {
             return None;
@@ -1986,10 +2014,7 @@ impl AtelierApp {
             }
         }
         let src = self.transform_source()?;
-        let (ctrl, alt, double) = self.ctx.input(|i| {
-            let double = i.pointer.button_double_clicked(PointerButton::Primary);
-            (i.modifiers.command, i.modifiers.alt, double)
-        });
+        let (ctrl, alt) = self.ctx.input(|i| (i.modifiers.command, i.modifiers.alt));
         // A double click inside applies it, like Enter.
         if double
             && self.transform_pending()

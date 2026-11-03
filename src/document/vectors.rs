@@ -258,13 +258,19 @@ impl Document {
         }
     }
 
-    /// Layer › Rasterize: the active text or shape becomes plain pixels.
+    /// Layer › Rasterize: the active text or shape becomes plain pixels. A
+    /// smart object made of one pixel layer gets that layer's pixel locks
+    /// back.
     pub fn rasterize_active(&mut self) -> bool {
         if !self.active_layer().is_live() {
             return false;
         }
         self.checkpoint(t!("vector-hist-rasterize"));
         let layer = self.active_layer_mut();
+        if let Some(s) = layer.smart.as_deref() {
+            let inner = s.contents.pixel_locks();
+            layer.locks = layer.locks.union(inner);
+        }
         (layer.text, layer.shape, layer.smart) = (None, None, None);
         true
     }

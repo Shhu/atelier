@@ -103,7 +103,7 @@ impl AtelierApp {
                 ui,
                 &t!("crop8-resolution"),
                 &mut self.crop.resolution,
-                0.0..=100_000.0,
+                0.0..=crate::document::MAX_RESOLUTION,
                 " ppi",
                 110.0,
             )

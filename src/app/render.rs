@@ -545,6 +545,7 @@ fn reduce_later(
     let job = std::thread::Builder::new()
         .name("level".into())
         .spawn(move || {
+            crate::document::watch_styles_only();
             let mut cache = match seed {
                 Some(finer) => finer.coarser(),
                 None => compose::LevelCache::new(level),

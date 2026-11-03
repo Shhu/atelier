@@ -4,8 +4,9 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use image::RgbaImage;
 
@@ -13,12 +14,20 @@ use super::{Fill, Layer, LayerKind, PixelRect, StylesCache, intersect, next_rev}
 use crate::compose;
 use crate::compose::styles::{Effects, Styles, render_styles};
 
-/// Below this many pixels, styles are drawn at once (quick enough).
+/// Below this much work (see [`work`]), styles are drawn at once (quick
+/// enough).
 const AT_ONCE: u64 = 1 << 20;
 
 /// The same for a shape to composite first, which a drag can change on
 /// every frame.
 const SHAPE_AT_ONCE: u64 = 1 << 18;
+
+/// What drawing `fx` from a shape of `w` × `h` works on: the shape and
+/// what the styles reach around it.
+fn work(w: u32, h: u32, fx: &Effects) -> u64 {
+    let m = 2 * fx.margin() as u64;
+    (u64::from(w) + m) * (u64::from(h) + m)
+}
 
 /// What styles are drawn from: pixel revision, mask fingerprint, settings.
 #[derive(Clone, PartialEq)]
@@ -33,16 +42,63 @@ struct Key {
 pub(super) struct Job {
     key: Key,
     offset: (i64, i64),
+    /// Drawing (no longer waiting for its turn: see [`DRAWING_AT_ONCE`]).
+    started: std::sync::atomic::AtomicBool,
     done: Mutex<Option<Arc<Styles>>>,
 }
 
 /// The styles being drawn for a layer, shared by its copies (the display
 /// composites copies of the layers while a mask is painted): one job at a
-/// time, a newer request waits for it to end.
+/// time, a newer request waits for it to end (or replaces it while it
+/// waits for its turn).
 pub(super) type JobSlot = Arc<Mutex<Option<Arc<Job>>>>;
 
 /// Jobs still running.
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
+
+/// Jobs drawing at once: each already uses every core, and holds the
+/// shape and fields of a whole layer (about 1 GB at 24 MP).
+const DRAWING_AT_ONCE: usize = 2;
+
+static DRAWING: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+thread_local! {
+    /// This thread composites copies of the layers for something other
+    /// than the display: it shows the styles drawn for the display, and
+    /// starts no job (planned from older layers, it would replace newer
+    /// ones).
+    static WATCHING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// From now on, this thread starts no styles job (see `WATCHING`): for the
+/// workers that composite the navigator, histogram, channels or reduced
+/// levels.
+pub fn watch_styles_only() {
+    WATCHING.with(|w| w.set(true));
+}
+
+/// A place among the jobs drawing (see [`DRAWING_AT_ONCE`]), until dropped.
+struct Drawing;
+
+impl Drawing {
+    fn wait() -> Drawing {
+        let (count, freed) = &DRAWING;
+        let mut n = count.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= DRAWING_AT_ONCE {
+            n = freed.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+        Drawing
+    }
+}
+
+impl Drop for Drawing {
+    fn drop(&mut self) {
+        let (count, freed) = &DRAWING;
+        *count.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        freed.notify_one();
+    }
+}
 
 /// Whether styles (or feathered masks) are being drawn (the display then
 /// looks again soon).
@@ -60,7 +116,7 @@ impl Layer {
             return None;
         }
         let (w, h) = self.image.dimensions();
-        if u64::from(w) * u64::from(h) <= AT_ONCE {
+        if work(w, h, &self.effects) <= AT_ONCE {
             return self.styles(held);
         }
         let key = Key {
@@ -105,10 +161,15 @@ impl Layer {
     where
         M: FnOnce(&Effects) -> Styles + Send + 'static,
     {
-        let mut slot = self.styles_job.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = self.styles_job.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(job) = slot.as_ref() {
             let done = job.done.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let waiting = !job.started.load(Ordering::Relaxed) && job.key != key;
             let Some(styles) = done else {
+                if waiting {
+                    // Not begun, for older settings: replaced (see below).
+                    return self.spawn_aside(slot, key, prepare);
+                }
                 // Still drawing (for these settings or older ones): the
                 // former styles meanwhile.
                 return Ok(self.styles_cached());
@@ -131,13 +192,31 @@ impl Layer {
                 return Ok(Some(styles));
             }
         }
+        self.spawn_aside(slot, key, prepare)
+    }
+
+    /// Starts the job of [`Self::draw_aside`] in `slot` (locked).
+    fn spawn_aside<M>(
+        &self,
+        mut slot: std::sync::MutexGuard<'_, Option<Arc<Job>>>,
+        key: Key,
+        prepare: impl FnOnce() -> M,
+    ) -> Result<Option<Arc<Styles>>, ()>
+    where
+        M: FnOnce(&Effects) -> Styles + Send + 'static,
+    {
+        if WATCHING.with(Cell::get) {
+            return Ok(self.styles_cached());
+        }
         let make = prepare();
         let job = Arc::new(Job {
             key,
             offset: self.offset,
+            started: Default::default(),
             done: Mutex::new(None),
         });
         let work = Arc::clone(&job);
+        let slot_of = Arc::downgrade(&self.styles_job);
         RUNNING.fetch_add(1, Ordering::Relaxed);
         let spawned = std::thread::Builder::new()
             .name("styles".into())
@@ -150,6 +229,17 @@ impl Layer {
                     }
                 }
                 let _running = Running;
+                let _drawing = Drawing::wait();
+                // Replaced by a newer job while waiting (a drag): not needed.
+                let current = slot_of.upgrade().is_some_and(|slot| {
+                    let slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    let current = slot.as_ref().is_some_and(|j| Arc::ptr_eq(j, &work));
+                    work.started.store(current, Ordering::Relaxed);
+                    current
+                });
+                if !current {
+                    return;
+                }
                 let styles = Arc::new(Styles {
                     version: next_rev(),
                     ..make(&work.key.effects)
@@ -204,9 +294,10 @@ impl Layer {
 
     /// Styles drawn for other pixels stay where they were in the canvas
     /// (a shape edited: its image's box, so the layer's place, changes);
-    /// those of the same pixels move with the layer.
+    /// those of the same pixels move with the layer. A group's always do:
+    /// drawn relative to its frame, which only the whole group moves.
     pub(super) fn placed_styles(&self, c: &StylesCache) -> Arc<Styles> {
-        if c.rev == self.rev {
+        if c.rev == self.rev || self.is_group() {
             c.offset.set(self.offset);
             c.moved.set((0.0, 0.0));
             return Arc::clone(&c.styles);
@@ -299,16 +390,24 @@ fn shape_area(layers: &[Layer], i: usize, canvas: PixelRect, fresh: bool) -> Opt
     }
 }
 
-/// What the kind of `l` does to the opacity of a shape: a solid color and
-/// an adjustment don't change it, a gradient or pattern can, by its place
-/// in the canvas too.
-fn hash_kind_shape(l: &Layer, h: &mut DefaultHasher) {
+/// What the kind of `l` does to the opacity of a shape drawn in the frame
+/// at `frame`: a solid color and an adjustment don't change it, a gradient
+/// or pattern can. A linked pattern moves with its layer (whose place in
+/// the frame counts already); a gradient or a pattern laid from the canvas
+/// stays, so the frame's place counts, unless it is opaque.
+fn hash_kind_shape(l: &Layer, frame: (i64, i64), h: &mut DefaultHasher) {
     std::mem::discriminant(&l.kind).hash(h);
-    if let LayerKind::Fill(fill) = &l.kind
-        && !matches!(fill, Fill::Solid(_))
-    {
-        format!("{fill:?}").hash(h);
-        l.offset.hash(h);
+    let LayerKind::Fill(fill) = &l.kind else {
+        return;
+    };
+    let from_canvas = match fill {
+        Fill::Solid(_) => return,
+        Fill::Gradient(g) => g.gradient.opacities.iter().any(|s| s.opacity < 1.0),
+        Fill::Pattern(p) => !p.linked,
+    };
+    format!("{fill:?}").hash(h);
+    if from_canvas {
+        frame.hash(h);
     }
 }
 
@@ -325,14 +424,16 @@ fn shape_key(layers: &[Layer], i: usize, canvas: PixelRect, area: Option<PixelRe
             .map_or(0, |m| m.key_from(c.offset, l.offset))
     };
     (canvas, area.map(|a| (at((a.x, a.y)), a.w, a.h)), mask(l)).hash(&mut h);
-    hash_kind_shape(l, &mut h);
+    hash_kind_shape(l, l.offset, &mut h);
     if l.is_group() {
         let mut j = i;
         while j > 0 && layers[j - 1].depth > l.depth {
             j -= 1;
             let c = &layers[j];
+            // Its place in the block, not its id: a copy of the group
+            // keeps the styles drawn for the original.
             (
-                c.id,
+                i - j,
                 c.rev,
                 at(c.offset),
                 c.visible,
@@ -342,8 +443,11 @@ fn shape_key(layers: &[Layer], i: usize, canvas: PixelRect, area: Option<PixelRe
             )
                 .hash(&mut h);
             (c.opacity.to_bits(), c.fill.to_bits(), c.blend).hash(&mut h);
-            hash_kind_shape(c, &mut h);
-            format!("{:?}", c.effects).hash(&mut h);
+            hash_kind_shape(c, l.offset, &mut h);
+            // Styles that are off don't change the shape.
+            if c.effects.any() {
+                format!("{:?}", c.effects).hash(&mut h);
+            }
         }
     }
     h.finish()
@@ -438,11 +542,16 @@ fn styles_for(
         // No shape left: nothing to draw from, nothing shows.
         return Some(l.keep_styles(&key, Styles::default()));
     };
-    if later && u64::from(area.w) * u64::from(area.h) > SHAPE_AT_ONCE {
+    if later && work(area.w, area.h, &l.effects) > SHAPE_AT_ONCE {
+        // The layer and those it shows, on their own.
+        let held_below = (0..i).rev().take_while(|&j| layers[j].depth > l.depth);
+        let start = i - if l.is_group() { held_below.count() } else { 0 };
+        if layers[start..i].iter().any(Layer::styles_drawing) {
+            // Theirs first: the job then draws its shape with them, not
+            // again on its own.
+            return l.styles_cached();
+        }
         let prepare = || {
-            // The layer and those it shows, on their own.
-            let held_below = (0..i).rev().take_while(|&j| layers[j].depth > l.depth);
-            let start = i - if l.is_group() { held_below.count() } else { 0 };
             let part: Vec<Layer> = layers[start..=i].to_vec();
             let (at, offset) = (i - start, l.offset);
             move |fx: &Effects| styles_from(&draw_shape(&part, at, canvas, area), area, offset, fx)
@@ -456,6 +565,13 @@ fn styles_for(
 }
 
 impl Layer {
+    /// Whether a job is drawing styles for it.
+    fn styles_drawing(&self) -> bool {
+        let slot = self.styles_job.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref()
+            .is_some_and(|j| j.done.lock().unwrap_or_else(|e| e.into_inner()).is_none())
+    }
+
     /// `styles`, just drawn for `key`, as the last ones drawn.
     fn keep_styles(&self, key: &Key, styles: Styles) -> Arc<Styles> {
         let styles = Arc::new(Styles {
@@ -1191,5 +1307,182 @@ mod tests {
             &doc.layers[copy].styles_job,
         );
         assert!(!same);
+    }
+
+    /// A big group: a 1200 × 1000 square at (100, 100) with a 20 px green
+    /// stroke, on 3000 × 2000.
+    fn big_group() -> (Document, usize) {
+        let mut doc = Document::new(RgbaImage::from_pixel(3000, 2000, Rgba([255; 4])), None);
+        doc.add_group();
+        doc.add_layer(
+            "s".into(),
+            RgbaImage::from_pixel(1200, 1000, Rgba(RED)),
+            (100, 100),
+        );
+        let g = doc.layers.iter().position(|l| l.is_group()).unwrap();
+        doc.active = g;
+        doc.layers[g].effects.stroke = colored(GREEN, 20.0);
+        (doc, g)
+    }
+
+    /// A copy of a group moved away shows the original's styles at its own
+    /// place at once, not drawn again.
+    #[test]
+    fn a_moved_copy_of_a_group_keeps_its_styles() {
+        let (mut doc, g) = big_group();
+        settle(&doc);
+        let canvas = doc.full_rect();
+        let original = super::styles_of(&doc.layers, g, canvas, false, true).unwrap();
+        doc.duplicate_active();
+        let copy = doc.active;
+        for j in doc.moving_with(copy) {
+            doc.layers[j].offset.0 += 1500;
+        }
+        let first = shown(&doc);
+        let styles = super::styles_of(&doc.layers, copy, canvas, false, true).unwrap();
+        assert_eq!(styles.version, original.version, "not drawn again");
+        assert_eq!(first.get_pixel(1590, 600).0, GREEN, "the copy's stroke");
+        assert_eq!(first.get_pixel(1310, 600).0, GREEN, "the original's");
+        assert_eq!(first.get_pixel(1340, 600).0, [255; 4]);
+    }
+
+    /// Styles still being drawn again for a group follow it while the whole
+    /// group moves.
+    #[test]
+    fn pending_group_styles_follow_a_whole_group_move() {
+        let (mut doc, g) = big_group();
+        settle(&doc);
+        // A layer of the group edited: its styles are drawn again aside.
+        doc.layers[1].pixels_mut().put_pixel(0, 0, Rgba([0, 0, 0, 0]));
+        let _ = shown(&doc);
+        for j in doc.moving_with(g) {
+            doc.layers[j].offset.0 += 1500;
+        }
+        let f = shown(&doc);
+        assert_eq!(f.get_pixel(1590, 600).0, GREEN, "at its new place");
+        assert_eq!(f.get_pixel(90, 600).0, [255; 4], "nothing left behind");
+        settle(&doc);
+        assert!(shown(&doc).as_raw() == doc.flatten().as_raw());
+    }
+
+    /// An opaque gradient or a linked pattern in a group moves with it; a
+    /// gradient fading out stays in the canvas, which changes the shape.
+    #[test]
+    fn fills_in_a_group_moved_whole() {
+        use crate::compose::pattern::{Pattern, PatternFill};
+        let area: Selection = PixelRect {
+            x: 50,
+            y: 50,
+            w: 40,
+            h: 40,
+        }
+        .into();
+        let transparent = {
+            let mut g = crate::compose::gradient::GradientFill::default();
+            g.gradient.opacities[0].opacity = 0.0;
+            g
+        };
+        let tile = Pattern::new("t", RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 128])));
+        let unlinked = PatternFill {
+            linked: false,
+            ..PatternFill::of(tile.clone())
+        };
+        let cases = [
+            (Fill::Gradient(Default::default()), false),
+            (Fill::Pattern(PatternFill::of(tile)), false),
+            (Fill::Gradient(transparent), true),
+            (Fill::Pattern(unlinked), true),
+        ];
+        for (fill, redrawn) in cases {
+            let mut doc = Document::new(RgbaImage::from_pixel(300, 300, Rgba([255; 4])), None);
+            doc.add_group();
+            doc.add_fill_layer(fill, Some(&area));
+            let g = doc.layers.iter().position(|l| l.is_group()).unwrap();
+            doc.layers[g].effects.stroke = colored(GREEN, 4.0);
+            let c = doc.full_rect();
+            let before = super::styles_of(&doc.layers, g, c, false, false).unwrap();
+            for j in doc.moving_with(g) {
+                doc.layers[j].offset.0 += 10;
+            }
+            let after = super::styles_of(&doc.layers, g, c, false, false).unwrap();
+            assert_eq!(before.version != after.version, redrawn);
+        }
+    }
+
+    /// Styles that are off on a group's layer don't change its shape.
+    #[test]
+    fn settings_of_styles_off_keep_the_shape() {
+        let mut doc = square_group(100, 20, (40, 40));
+        let g = doc.active;
+        doc.layers[g].effects.stroke = stroke();
+        let c = doc.full_rect();
+        let first = super::styles_of(&doc.layers, g, c, false, false).unwrap();
+        doc.layers[1].effects.shadow.blur = 30.0;
+        let after = super::styles_of(&doc.layers, g, c, false, false).unwrap();
+        assert_eq!(first.version, after.version);
+    }
+
+    /// Small shapes with styles reaching far are drawn aside: what counts
+    /// is what drawing them works on.
+    #[test]
+    fn far_reaching_styles_are_drawn_aside() {
+        let mut doc = square_group(3000, 256, (1000, 1000));
+        let g = doc.active;
+        let fx = &mut doc.layers[g].effects;
+        fx.stroke = colored(GREEN, 50.0);
+        fx.outer_glow.enabled = true;
+        fx.outer_glow.size = 150.0;
+        let canvas = doc.full_rect();
+        let area = super::styles_area(&doc.layers, g, canvas).unwrap();
+        assert!(u64::from(area.w) * u64::from(area.h) <= super::SHAPE_AT_ONCE);
+        assert!(super::styles_of(&doc.layers, g, canvas, false, true).is_none());
+        assert!(doc.layers[g].styles_drawing());
+        settle(&doc);
+    }
+
+    /// Nested styled groups are drawn from the inside out: the outer one
+    /// waits for the inner one, then draws its shape with those styles.
+    #[test]
+    fn nested_group_styles_are_drawn_from_the_inside_out() {
+        let mut doc = Document::new(RgbaImage::from_pixel(2000, 1500, Rgba([255; 4])), None);
+        doc.add_layer("a".into(), RgbaImage::from_pixel(100, 100, Rgba(RED)), (100, 100));
+        doc.add_layer("b".into(), RgbaImage::from_pixel(100, 100, Rgba(RED)), (1700, 1300));
+        for _ in 0..3 {
+            let n = doc.layers.len();
+            doc.group_layers(&(1..n).collect::<Vec<_>>());
+            doc.active_layer_mut().effects.stroke = colored(GREEN, 5.0);
+        }
+        let groups: Vec<usize> = (0..doc.layers.len())
+            .filter(|&i| doc.layers[i].is_group())
+            .collect();
+        assert_eq!(groups.len(), 3);
+        let opts = compose::Options {
+            later_styles: true,
+            canvas: Some(doc.full_rect()),
+            ..Default::default()
+        };
+        let _ = compose::signatures(&doc.layers, &opts);
+        let drawing: Vec<bool> = groups.iter().map(|&g| doc.layers[g].styles_drawing()).collect();
+        assert_eq!(drawing, [true, false, false], "the innermost first");
+        settle(&doc);
+        assert!(shown(&doc).as_raw() == doc.flatten().as_raw());
+    }
+
+    /// A thread compositing for something else than the display starts no
+    /// job: it shows what the display had drawn.
+    #[test]
+    fn watching_threads_start_no_job() {
+        let (doc, g) = big_group();
+        let layers = doc.layers.clone();
+        let canvas = doc.full_rect();
+        std::thread::spawn(move || {
+            super::watch_styles_only();
+            assert!(super::styles_of(&layers, g, canvas, false, true).is_none());
+            assert!(!layers[g].styles_drawing());
+        })
+        .join()
+        .unwrap();
+        assert!(!doc.layers[g].styles_drawing());
+        settle(&doc);
     }
 }

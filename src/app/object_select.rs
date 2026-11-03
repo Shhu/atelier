@@ -553,7 +553,7 @@ impl AtelierApp {
                         // another state (never recorded over it, nor over
                         // the redo list). The steps of earlier picks (a
                         // quick Shift+click) don't count.
-                        self.status = t!("hist5-selection-undone");
+                        self.status_cannot(t!("hist5-selection-undone"));
                     } else if Some(pick.fingerprint) == current {
                         self.apply_object(mask, pick.shift, pick.alt);
                     } else if let Some(now) = current
@@ -568,7 +568,7 @@ impl AtelierApp {
                         crate::diag::warn(tm!("ui4-log-objsel-picked-again"));
                         self.pick_object(pick.prompt, pick.shift, pick.alt, now);
                     } else if uid == Some(pick.doc) {
-                        self.status = t!("sel4-objsel-dropped");
+                        self.status_cannot(t!("sel4-objsel-dropped"));
                     }
                 }
             }
@@ -605,7 +605,7 @@ impl AtelierApp {
             }
         };
         let Some(found) = found.and_then(|s| s.within(canvas)) else {
-            self.status = t!("objsel-not-found");
+            self.status_cannot(t!("objsel-not-found"));
             return;
         };
         // A selection made before it lands first, in order.

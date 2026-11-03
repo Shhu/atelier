@@ -277,8 +277,19 @@ impl AtelierApp {
             self.refuse_if_locked();
             return;
         }
-        if !self.apply_locks(set, on) {
-            self.status = t!("layers8-lock-unavailable", lock = set.names());
+        if self.apply_locks(set, on) {
+            return;
+        }
+        // Already on through a group: nothing to do, and the group said.
+        let doc = self.doc.as_ref().expect("a document has a lock change");
+        let kinds = LockKind::ROW.into_iter().filter(|&k| set.holds(k));
+        let groups: Option<Vec<usize>> = kinds.map(|k| k.group(doc, doc.active)).collect();
+        match groups.as_deref() {
+            Some([g, ..]) if on => {
+                let group = doc.layers[*g].name.as_str();
+                self.status = t!("locks11-lock-held-by-group", lock = set.names(), group = group);
+            }
+            _ => self.status_cannot(t!("layers8-lock-unavailable", lock = set.names())),
         }
     }
 
@@ -367,38 +378,48 @@ impl AtelierApp {
 
     /// Says that lock `kind` on layer `i` refuses what was asked, naming
     /// the layer or group that has it, where it can be turned off.
-    fn refuse_lock_of(&mut self, i: usize, kind: LockKind) {
-        let Some(doc) = &self.doc else { return };
-        let Some(l) = doc.layers.get(i) else { return };
-        let name = l.name.as_str();
-        let group = (!kind.on(l) && !l.locked)
-            .then(|| kind.group(doc, i))
-            .flatten()
-            .map(|g| &doc.layers[g]);
-        let message = match (kind, group) {
-            (_, Some(g)) if g.locked => {
-                tm!("tools6-status-group-locked", name = name, group = g.name.as_str())
-            }
-            (_, None) if l.locked => tm!("status-layer-is-locked", name = name),
-            (LockKind::Pixels, Some(g)) => {
-                tm!("locks9-status-group-pixels-locked", name = name, group = g.name.as_str())
-            }
-            (LockKind::Transparent, Some(g)) => {
-                tm!("locks9-status-group-transparent-locked", name = name, group = g.name.as_str())
-            }
-            (LockKind::Position, Some(g)) => {
-                tm!("locks9-status-group-position-locked", name = name, group = g.name.as_str())
-            }
-            (LockKind::Pixels, None) => tm!("layers8-status-pixels-locked", name = name),
-            (LockKind::Transparent, None) => tm!("layers8-status-transparent-locked", name = name),
-            (LockKind::Position | LockKind::All, None) => {
-                tm!("layers8-status-position-locked", name = name)
-            }
-            (LockKind::All, Some(g)) => {
-                tm!("tools6-status-group-locked", name = name, group = g.name.as_str())
-            }
+    pub(super) fn refuse_lock_of(&mut self, i: usize, kind: LockKind) {
+        let Some(message) = self.doc.as_ref().and_then(|d| lock_refusal(d, i, kind)) else {
+            return;
         };
         self.status_refused(message);
+    }
+
+    /// Says that a lock of layer `i` (whichever it has, Lock All first)
+    /// refuses what was asked.
+    pub(super) fn refuse_any_lock_of(&mut self, i: usize) {
+        let Some(doc) = &self.doc else { return };
+        let locks = doc.locks(i);
+        let kind = if doc.is_locked(i) {
+            LockKind::All
+        } else if locks.position {
+            LockKind::Position
+        } else if locks.pixels {
+            LockKind::Pixels
+        } else {
+            LockKind::Transparent
+        };
+        self.refuse_lock_of(i, kind);
+    }
+
+    /// What layer `i` holds (text, path, smart object) may not be edited:
+    /// says so and returns `true`.
+    pub(super) fn refuse_content_locked_at(&mut self, i: usize) -> bool {
+        if !self.doc.as_ref().is_some_and(|d| d.content_locked(i)) {
+            return false;
+        }
+        self.refuse_lock_of(i, LockKind::Pixels);
+        true
+    }
+
+    /// A new text or shape layer would land in a group under Lock Image
+    /// Pixels (or Lock All), where it could not be typed or drawn: says so
+    /// and returns `true`.
+    pub(super) fn refuse_new_layer_locked(&mut self) -> bool {
+        match self.doc.as_ref().and_then(Document::landing_group) {
+            Some(g) => self.refuse_content_locked_at(g),
+            None => false,
+        }
     }
 
     /// Lock Image Pixels on what is about to be edited (not a targeted
@@ -513,7 +534,18 @@ impl AtelierApp {
             Action::Rasterize => self.refuse_pixels_locked(),
             Action::MakeTransparent => self.refuse_alpha_locked(),
             Action::Transform(_) => self.refuse_transform_locked(),
-            Action::CenterElement => self.refuse_position_locked(),
+            // Centered from the bounds of all it holds: refused when some of
+            // them would stay.
+            Action::CenterElement => {
+                self.refuse_position_locked()
+                    || match self.doc.as_ref().and_then(|d| d.held_member(d.active)) {
+                        Some(j) => {
+                            self.refuse_lock_of(j, LockKind::Position);
+                            true
+                        }
+                        None => false,
+                    }
+            }
             // Delete can't take the pixels away: it fills them, asking how
             // (an action can't ask: the step fails).
             Action::ClearSelection
@@ -559,4 +591,38 @@ fn lock_status(on: bool, name: &str) -> String {
             t!("status-layer-unlocked", name = name)
         )
     }
+}
+
+/// Why lock `kind` on layer `i` refuses what was asked, naming the layer
+/// or group that has it, where it can be turned off.
+pub(super) fn lock_refusal(doc: &Document, i: usize, kind: LockKind) -> Option<crate::i18n::Message> {
+    let l = doc.layers.get(i)?;
+    let name = l.name.as_str();
+    let group = (!kind.on(l) && !l.locked)
+        .then(|| kind.group(doc, i))
+        .flatten()
+        .map(|g| &doc.layers[g]);
+    Some(match (kind, group) {
+        (_, Some(g)) if g.locked => {
+            tm!("tools6-status-group-locked", name = name, group = g.name.as_str())
+        }
+        (_, None) if l.locked => tm!("status-layer-is-locked", name = name),
+        (LockKind::Pixels, Some(g)) => {
+            tm!("locks9-status-group-pixels-locked", name = name, group = g.name.as_str())
+        }
+        (LockKind::Transparent, Some(g)) => {
+            tm!("locks9-status-group-transparent-locked", name = name, group = g.name.as_str())
+        }
+        (LockKind::Position, Some(g)) => {
+            tm!("locks9-status-group-position-locked", name = name, group = g.name.as_str())
+        }
+        (LockKind::Pixels, None) => tm!("layers8-status-pixels-locked", name = name),
+        (LockKind::Transparent, None) => tm!("layers8-status-transparent-locked", name = name),
+        (LockKind::Position | LockKind::All, None) => {
+            tm!("layers8-status-position-locked", name = name)
+        }
+        (LockKind::All, Some(g)) => {
+            tm!("tools6-status-group-locked", name = name, group = g.name.as_str())
+        }
+    })
 }

@@ -395,6 +395,43 @@ mod tests {
         );
     }
 
+    /// 16.16 points near the top left of a large canvas, which would fall
+    /// inside it in 1/16 too, are not taken for far away ones.
+    #[test]
+    fn small_16_16_sampler_positions_are_not_read_as_sixteenths() {
+        use crate::document::ColorSampler;
+        let block = |by: f32, points: &[(f32, f32)]| {
+            samplers_block(1, points, &|x, y, d| {
+                d.extend(((y * by) as i32).to_be_bytes());
+                d.extend(((x * by) as i32).to_be_bytes());
+                d.extend([0xff, 0xff]);
+            })
+        };
+        let read = |data: Vec<u8>| {
+            let mut doc = Document::new(RgbaImage::new(2100, 2100), None);
+            doc.file_metadata.psd_resources = Arc::new(vec![crate::document::PsdResource {
+                id: 1038,
+                name: Vec::new(),
+                data,
+            }]);
+            write_read(&doc).0.doc.samplers
+        };
+        let small = [(0.5, 0.5), (1.5, 0.5)];
+        assert_eq!(
+            read(block(65536.0, &small)),
+            [ColorSampler { x: 0.5, y: 0.5 }, ColorSampler { x: 1.5, y: 0.5 }]
+        );
+        // Points of Photoshop's 1/16 stay where they are.
+        let centers = [(0.5, 0.5), (2048.5, 1024.5)];
+        assert_eq!(
+            read(block(16.0, &centers)),
+            [
+                ColorSampler { x: 0.5, y: 0.5 },
+                ColorSampler { x: 2048.5, y: 1024.5 }
+            ]
+        );
+    }
+
     /// What is written: only the current block, version 2, its bytes known.
     #[test]
     fn color_samplers_are_written_in_the_current_block() {
@@ -1216,6 +1253,7 @@ mod tests {
 mod pattern_files {
     use super::*;
     use crate::compose::pattern::{Pattern, PatternFill};
+    use crate::compose::styles::Effects;
     use crate::document::{Document, Fill, LayerKind};
     use image::{Rgba, RgbaImage};
 
@@ -1304,5 +1342,40 @@ mod pattern_files {
         let (data, _) = write::document(&doc, None).unwrap();
         let back = read::document(&data).unwrap().doc;
         assert_eq!(doc.flatten(), back.flatten());
+    }
+
+    #[test]
+    fn styles_turned_off_keep_their_settings_through_a_file() {
+        let mut doc = Document::new(RgbaImage::from_pixel(20, 20, Rgba([255; 4])), None);
+        doc.add_layer("x".into(), RgbaImage::from_pixel(8, 8, Rgba([9, 8, 7, 255])), (4, 4));
+        let fx = &mut doc.active_layer_mut().effects;
+        fx.pattern_overlay.fill = PatternFill::of(tile());
+        fx.pattern_overlay.fill.scale = 2.0;
+        fx.pattern_overlay.opacity = 0.3;
+        fx.shadow.blur = 11.0;
+        fx.shadow.opacity = 0.25;
+        fx.bevel.depth = 3.0;
+        fx.stroke.enabled = true;
+        fx.stroke.width = 2.0;
+        let before = fx.clone();
+        assert!(doc.psd_losses().is_empty());
+        let (data, notes) = write::document(&doc, None).unwrap();
+        assert!(notes.is_empty());
+        let opened = read::document(&data).unwrap();
+        assert!(opened.notes.is_empty(), "{:?}", opened.notes);
+        let back = &opened.doc.active_layer().effects;
+        assert!(!back.pattern_overlay.enabled && !back.shadow.enabled && !back.bevel.enabled);
+        assert!(back.stroke.enabled);
+        let p = &back.pattern_overlay;
+        assert_eq!(
+            (&*p.fill.pattern.image, p.fill.scale, p.opacity),
+            (&*before.pattern_overlay.fill.pattern.image, 2.0, 0.3)
+        );
+        assert_eq!((back.shadow.blur, back.shadow.opacity), (11.0, 0.25));
+        assert_eq!(back.bevel, before.bevel);
+        assert_eq!(back.stroke, before.stroke);
+        // Untouched styles that are off stay out of the file.
+        assert_eq!(back.inner_glow, Effects::default().inner_glow);
+        assert_eq!(doc.flatten(), opened.doc.flatten());
     }
 }

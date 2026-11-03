@@ -302,10 +302,10 @@ impl AtelierApp {
         self.sync_type_edit();
         let Some(doc) = &self.doc else { return };
         let layer = doc.active_layer();
-        let (Some(old), false) = (layer.text.clone(), doc.content_locked(doc.active)) else {
+        let Some(old) = layer.text.clone() else {
             return;
         };
-        let id = layer.id;
+        let (id, locked) = (layer.id, doc.content_locked(doc.active));
         let mut data = old.clone();
         let now = self.ctx.input(|i| i.time);
         let edit = self.type_tool.edit.as_mut();
@@ -315,6 +315,11 @@ impl AtelierApp {
             edit.moved = now;
         }
         if data == old {
+            return;
+        }
+        // Its group's Lock Image Pixels (or Lock All): said, not changed.
+        if locked {
+            self.refuse_content_locked();
             return;
         }
         if let (Some(edit), Some((caret, anchor))) = (&mut self.type_tool.edit, before) {
@@ -840,7 +845,7 @@ impl AtelierApp {
             // A click elsewhere commits; on another text, edits it.
             self.commit_text();
             match self.text_layer_at(ip) {
-                Some(i) if !shift => {
+                Some(i) if !shift && !self.refuse_content_locked_at(i) => {
                     self.edit_text_layer(i, ip);
                     self.type_tool.drag = Some(TypeDrag::Select);
                 }
@@ -852,22 +857,27 @@ impl AtelierApp {
         if start {
             let target = (!shift).then(|| self.text_layer_at(ip)).flatten();
             match target {
+                // A locked text isn't typed in, nor is another one started
+                // over it.
+                Some(i) if self.refuse_content_locked_at(i) => {}
                 Some(i) => {
                     self.edit_text_layer(i, ip);
                     self.type_tool.drag = Some(TypeDrag::Select);
                 }
+                // Nor where it couldn't be typed (a locked group).
+                None if self.refuse_new_layer_locked() => {}
                 None => self.type_tool.drag = Some(TypeDrag::New { start: ip, now: ip }),
             }
         }
         CursorIcon::Text
     }
 
-    /// Topmost visible, unlocked text layer under the canvas point.
+    /// Topmost visible text layer under the canvas point.
     fn text_layer_at(&self, ip: Pos2) -> Option<usize> {
         let doc = self.doc.as_ref()?;
         (0..doc.layers.len()).rev().find(|&i| {
             let l = &doc.layers[i];
-            l.visible && !doc.content_locked(i) && l.text.is_some() && to_rect(l.rect()).contains(ip)
+            l.visible && l.text.is_some() && to_rect(l.rect()).contains(ip)
         })
     }
 
@@ -1433,13 +1443,4 @@ impl AtelierApp {
             self.transform_text(i, map);
         }
     }
-}
-
-/// Canvas map of Flip Canvas.
-pub(super) fn canvas_flip((w, h): (u32, u32), horizontal: bool) -> Affine {
-    Affine(if horizontal {
-        [-1.0, 0.0, w as f32, 0.0, 1.0, 0.0]
-    } else {
-        [1.0, 0.0, 0.0, 0.0, -1.0, h as f32]
-    })
 }

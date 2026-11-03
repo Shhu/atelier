@@ -361,16 +361,35 @@ impl AtelierApp {
         let (canvas, whole) = self.rulers.area?;
         let settings = self.rulers.settings;
         let doc = self.doc.as_ref()?;
-        let cursor = |o: Orientation| match o {
-            Orientation::Horizontal => CursorIcon::ResizeRow,
-            Orientation::Vertical => CursorIcon::ResizeColumn,
+        // On a turned view, by the direction the guide shows on screen.
+        let turn = self.view_turn;
+        let cursor = |o: Orientation| {
+            let along = match o {
+                Orientation::Horizontal => vec2(1.0, 0.0),
+                Orientation::Vertical => vec2(0.0, 1.0),
+            };
+            let shown = turn.vec_to_screen(along);
+            if shown.x.abs() >= shown.y.abs() {
+                CursorIcon::ResizeRow
+            } else {
+                CursorIcon::ResizeColumn
+            }
         };
 
-        // A press on a ruler pulls out a new guide.
+        // A press on a ruler pulls out a new guide, along that ruler on
+        // screen: the image axis the other ruler reads is constant on it.
         if settings.rulers {
+            let along = |axis: view_turn::RulerAxis| {
+                if axis.image_x {
+                    Orientation::Horizontal
+                } else {
+                    Orientation::Vertical
+                }
+            };
+            let [top, left] = turn.ruler_axes();
             for (rect, orientation, salt) in [
-                (top_ruler(canvas, whole), Orientation::Horizontal, "top"),
-                (left_ruler(canvas, whole), Orientation::Vertical, "left"),
+                (top_ruler(canvas, whole), along(top), "top"),
+                (left_ruler(canvas, whole), along(left), "left"),
             ] {
                 let response = ui.interact(rect, ui.id().with(("ruler", salt)), Sense::drag());
                 if response.drag_started() && self.rulers.drag.is_none() {

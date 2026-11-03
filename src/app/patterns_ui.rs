@@ -14,6 +14,9 @@ use crate::patterns::{Added, Change, Library, Loaded, Saver};
 /// Edit › Define Pattern…: its tile, computed on another thread, and name.
 pub(super) struct DefineDialog {
     name: String,
+    /// The name it proposed, while the library was still being read: a
+    /// better one once it is, unless typed over.
+    proposed: Option<String>,
     /// Played by an action, without showing the dialog.
     quiet: bool,
     job: Option<Receiver<Option<Arc<Pattern>>>>,
@@ -80,30 +83,43 @@ fn request_id() -> egui::Id {
     egui::Id::new("pattern_request")
 }
 
-/// Thumbnails, by pattern.
-type Thumbs = Arc<Mutex<std::collections::HashMap<u64, egui::TextureHandle>>>;
+/// Whether the user's patterns are still being read.
+fn loading_id() -> egui::Id {
+    egui::Id::new("pattern_loading")
+}
 
-/// Texture of a pattern's tile, reduced to at most 96 px.
-pub(super) fn thumbnail(ctx: &egui::Context, p: &Pattern) -> egui::TextureId {
+/// Thumbnails, by pattern and size.
+type Thumbs = Arc<Mutex<std::collections::HashMap<(u64, u32), egui::TextureHandle>>>;
+
+/// Texture of a pattern's tile for drawing it `side` physical pixels wide
+/// at most: the smallest of its reduced versions at least that size (drawn
+/// smaller by less than half, smooth), a small tile as it is (enlarged
+/// sharp).
+pub(super) fn thumbnail(ctx: &egui::Context, p: &Pattern, side: f32) -> egui::TextureId {
     let cache: Thumbs = ctx.data_mut(|d| {
         d.get_temp_mut_or_default::<Thumbs>(egui::Id::new("pattern_thumbs"))
             .clone()
     });
+    let tile = p.image.width().max(p.image.height());
+    let ratio = (tile as f32 / side.max(1.0)).max(1.0);
+    let k = ratio.log2().floor() as usize;
     let mut cache = cache.lock().expect("thumbnails");
     cache
-        .entry(p.id)
+        .entry((p.id, k as u32))
         .or_insert_with(|| {
-            let side = p.image.width().max(p.image.height());
-            let k = side.div_ceil(96).next_power_of_two().trailing_zeros() as usize;
             let image = p.mip(k);
             let color = egui::ColorImage::from_rgba_unmultiplied(
                 [image.width() as usize, image.height() as usize],
                 image.as_raw(),
             );
             ctx.load_texture(
-                format!("pattern-{:x}", p.id),
+                format!("pattern-{:x}-{k}", p.id),
                 color,
-                egui::TextureOptions::NEAREST,
+                egui::TextureOptions {
+                    magnification: egui::TextureFilter::Nearest,
+                    minification: egui::TextureFilter::Linear,
+                    ..egui::TextureOptions::NEAREST
+                },
             )
         })
         .id()
@@ -117,7 +133,8 @@ pub(super) fn paint_tile(painter: &egui::Painter, rect: Rect, p: &Pattern, corne
     let fitted = Rect::from_center_size(rect.center(), vec2(w * k, h * k));
     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
     let tint = Color32::WHITE;
-    painter.image(thumbnail(painter.ctx(), p), fitted, uv, tint);
+    let side = fitted.width().max(fitted.height()) * painter.ctx().pixels_per_point();
+    painter.image(thumbnail(painter.ctx(), p, side), fitted, uv, tint);
 }
 
 /// Tile and name of `current`, the library in a drop-down: `current` becomes the one
@@ -139,12 +156,26 @@ pub(super) fn pattern_picker(ui: &mut egui::Ui, current: &mut Arc<Pattern>) -> b
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
         paint_tile(ui.painter(), rect, current, 4.0);
         let width = (ui.available_width() - 8.0).max(40.0);
+        // A long name is cut, not the dialog widened: whole on hover.
+        let font = egui::FontId::proportional(ui_kit::TEXT_SIZE);
+        let text_w = |s: &str| {
+            ui.painter().layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE).size().x
+        };
+        let spacing = ui.spacing();
+        let room = width
+            - text_w(&label)
+            - 8.0
+            - 2.0 * spacing.button_padding.x
+            - spacing.icon_width
+            - spacing.icon_spacing
+            - 4.0;
+        let cut = elided(&shown, room, text_w);
         // Stays open on a right click, for the menu of a tile.
-        ui_kit::combo_closing(
+        let combo = ui_kit::combo_closing(
             ui,
             ("pattern_picker", ui.id()),
             Some(&label),
-            &shown,
+            &cut,
             width,
             egui::PopupCloseBehavior::CloseOnClickOutside,
             |ui| {
@@ -167,6 +198,10 @@ pub(super) fn pattern_picker(ui: &mut egui::Ui, current: &mut Arc<Pattern>) -> b
                 });
             },
         );
+        if cut != shown {
+            ui_kit::name_control(ui, combo.response.id, &label, &shown);
+            combo.response.on_hover_text(&shown);
+        }
     });
     match chosen {
         Some(p) if p.id != current.id || p.name != current.name => {
@@ -175,6 +210,25 @@ pub(super) fn pattern_picker(ui: &mut egui::Ui, current: &mut Arc<Pattern>) -> b
         }
         _ => false,
     }
+}
+
+/// `text` ending with "…" so as to be at most `max` wide (`width` measures).
+fn elided(text: &str, max: f32, width: impl Fn(&str) -> f32) -> String {
+    if width(text) <= max {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let cut = |n: usize| format!("{}…", chars[..n].iter().collect::<String>().trim_end());
+    let (mut lo, mut hi) = (0, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if width(&cut(mid)) <= max {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    cut(lo)
 }
 
 /// The menu of a tile, on a right click. Not a context menu: egui opens one
@@ -231,20 +285,25 @@ fn tile(ui: &mut egui::Ui, p: &Pattern, selected: bool, user: bool) -> egui::Res
     }
 }
 
-/// The picker for a choice kept as an id (Fill…): the first one if unknown.
+/// The picker for a choice kept as an id (Fill…): the first one if unknown,
+/// once the library is read (until then, the choice may still come).
 pub(super) fn pattern_choice(ui: &mut egui::Ui, id: &mut u64) {
     let list: Arc<Vec<Arc<Pattern>>> = ui.data(|d| d.get_temp(list_id())).unwrap_or_default();
-    let found = list.iter().find(|p| p.id == *id).or(list.first());
-    let Some(mut current) = found.cloned() else {
+    let loading = ui.data(|d| d.get_temp::<bool>(loading_id())).unwrap_or(false);
+    let found = list.iter().find(|p| p.id == *id);
+    let Some(mut current) = found.or(list.first()).cloned() else {
         return;
     };
-    pattern_picker(ui, &mut current);
-    *id = current.id;
+    if pattern_picker(ui, &mut current) || found.is_some() || !loading {
+        *id = current.id;
+    }
 }
 
 /// Pattern, angle, scale, Link with Layer, Snap to Origin of a Pattern Fill
-/// layer or Pattern Overlay.
-pub(super) fn pattern_fill_fields(ui: &mut egui::Ui, f: &mut PatternFill) {
+/// layer or Pattern Overlay. `corner`: where the layer's visible pixels
+/// start from its frame (see `Document::tile_corner`); a linked tile's
+/// offset is shown, and snapped, from there.
+pub(super) fn pattern_fill_fields(ui: &mut egui::Ui, f: &mut PatternFill, corner: (f32, f32)) {
     pattern_picker(ui, &mut f.pattern);
     let half = (ui.available_width() - 8.0) / 2.0;
     ui.horizontal(|ui| {
@@ -260,40 +319,47 @@ pub(super) fn pattern_fill_fields(ui: &mut egui::Ui, f: &mut PatternFill) {
         );
         let mut scale = (f.scale * 100.0).round();
         let unit = i18n::percent("");
-        let range = SCALE_RANGE.start() * 100.0..=SCALE_RANGE.end() * 100.0;
+        // Image Size may take it beyond what is typed: shown as it is.
+        let range = (SCALE_RANGE.start() * 100.0).min(scale)..=(SCALE_RANGE.end() * 100.0).max(scale);
         let label = t!("core-gradient-scale");
         if ui_kit::number_field(ui, &label, &mut scale, range, &unit, half).changed() {
             f.scale = scale / 100.0;
         }
     });
-    // Where the tile starts, from the layer or the document.
+    // Where the tile starts, from the layer's visible corner or the
+    // document's origin.
+    let base = if f.linked { corner } else { (0.0, 0.0) };
+    let mut shown = (f.phase.0 - base.0, f.phase.1 - base.1);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         let range =
             -(crate::document::MAX_DIMENSION as f32)..=crate::document::MAX_DIMENSION as f32;
         let tip = t!("pattern9-offset-tip");
-        ui_kit::number_field(
+        let x = ui_kit::number_field(
             ui,
             &t!("pattern9-offset-x"),
-            &mut f.phase.0,
+            &mut shown.0,
             range.clone(),
-            "px",
+            " px",
             half,
         )
         .on_hover_text(&tip);
-        ui_kit::number_field(
+        let y = ui_kit::number_field(
             ui,
             &t!("pattern9-offset-y"),
-            &mut f.phase.1,
+            &mut shown.1,
             range,
-            "px",
+            " px",
             half,
         )
         .on_hover_text(&tip);
+        if x.changed() || y.changed() {
+            f.phase = (shown.0 + base.0, shown.1 + base.1);
+        }
     });
     ui_kit::checkbox(ui, &mut f.linked, &t!("pattern8-link"))
         .on_hover_text(t!("pattern8-link-tip"));
-    let at_origin = f.phase == (0.0, 0.0);
+    let at_origin = shown == (0.0, 0.0);
     let snap = ui_kit::button(
         ui,
         &t!("pattern8-snap"),
@@ -302,7 +368,7 @@ pub(super) fn pattern_fill_fields(ui: &mut egui::Ui, f: &mut PatternFill) {
         !at_origin,
     );
     if snap.on_hover_text(t!("pattern8-snap-tip")).clicked() {
-        f.phase = (0.0, 0.0);
+        f.phase = base;
     }
 }
 
@@ -342,6 +408,13 @@ impl AtelierApp {
                     }
                     self.patterns.library.merge(read);
                     self.patterns.loading = None;
+                    let name = self.default_pattern_name();
+                    if let Some(d) = &mut self.patterns.define
+                        && let Some(proposed) = d.proposed.take()
+                        && d.name == proposed
+                    {
+                        d.name = name;
+                    }
                 }
                 Err(TryRecvError::Disconnected) => self.patterns.loading = None,
                 Err(TryRecvError::Empty) => {}
@@ -372,7 +445,18 @@ impl AtelierApp {
             None => {}
         }
         let list = Arc::new(self.patterns.library.items.clone());
-        ctx.data_mut(|d| d.insert_temp(list_id(), list));
+        let loading = self.patterns.loading.is_some();
+        ctx.data_mut(|d| {
+            d.insert_temp(list_id(), list);
+            d.insert_temp(loading_id(), loading);
+        });
+    }
+
+    /// "Pattern N", after the user's patterns and unlike their names.
+    fn default_pattern_name(&self) -> String {
+        let user = self.patterns.library.user();
+        let names: Vec<&str> = user.iter().map(|p| p.name.as_str()).collect();
+        crate::patterns::default_name(&names, user.len())
     }
 
     /// The pattern offered first: the last one chosen.
@@ -406,7 +490,7 @@ impl AtelierApp {
     /// Edit › Define Pattern…
     pub(super) fn open_define_pattern(&mut self) {
         if let Some(why) = self.define_pattern_refusal() {
-            self.status = why;
+            self.status_cannot(why);
             return;
         }
         let Some(doc) = &self.doc else { return };
@@ -421,9 +505,11 @@ impl AtelierApp {
             let tile = tile_of(&flatten(), area).map(|image| Pattern::new("", image));
             let _ = send.send(tile);
         });
-        let number = self.patterns.library.user_patterns().len() + 1;
+        let name = self.default_pattern_name();
+        let loading = self.patterns.loading.is_some();
         self.patterns.define = Some(DefineDialog {
-            name: t!("pattern8-default-name", number = number),
+            proposed: loading.then(|| name.clone()),
+            name,
             quiet: false,
             job: Some(recv),
             tile: None,
@@ -595,7 +681,7 @@ impl AtelierApp {
     /// Fills with library pattern `id` (see [`Document::fill_active_pattern`]).
     pub(super) fn fill_with_pattern(&mut self, id: u64, opacity: f32, preserve: bool) -> bool {
         let Some(pattern) = self.patterns.library.get(id).cloned() else {
-            self.status = t!("pattern8-why-missing");
+            self.status_cannot(t!("pattern8-why-missing"));
             return false;
         };
         self.patterns.last = id;
@@ -612,6 +698,8 @@ impl AtelierApp {
                 content = pattern.name.as_str()
             );
             self.reset_pending();
+        } else {
+            doc.mark_fade_nothing();
         }
         done
     }
@@ -620,3 +708,7 @@ impl AtelierApp {
 #[cfg(test)]
 #[path = "patterns_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "patterns11_tests.rs"]
+mod tests11;

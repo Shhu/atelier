@@ -52,7 +52,7 @@ use super::{
     Artboard, ArtboardBackground, BlendMode, Channel, Document, FileError, Fill, LayerKind, Mask,
 };
 use crate::compose::gradient::GradientFill;
-use crate::compose::pattern::{Pattern, PatternFill, SCALE_RANGE};
+use crate::compose::pattern::{Pattern, PatternFill, STORED_SCALE};
 use crate::compose::styles::{
     BevelFx, Effects, GlowFx, GradientFx, OverlayFx, PatternFx, ShadowFx, StrokeFx,
 };
@@ -565,7 +565,7 @@ fn pattern_fill_of(
     }
     Ok(PatternFill {
         pattern,
-        scale: finite_or(e.scale, 1.0).clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end()),
+        scale: finite_or(e.scale, 1.0).clamp(*STORED_SCALE.start(), *STORED_SCALE.end()),
         angle: finite_or(e.angle, 0.0),
         linked: e.linked,
         phase: (finite_or(e.phase.0, 0.0), finite_or(e.phase.1, 0.0)),
@@ -979,7 +979,7 @@ pub(super) fn write(
     out: impl Write + Seek,
     folder: Option<&Path>,
 ) -> Result<(), FileError> {
-    let layers = doc.render_layers();
+    let layers = crate::document::group_overlays_for_files(doc.render_layers());
     for layer in layers.iter() {
         let (w, h) = layer.image().dimensions();
         check_layer(layer, w, h)?;
@@ -1895,6 +1895,7 @@ fn read_archive(
         doc.layers.push(layer);
     }
     doc.fix_depths();
+    doc.group_overlays_from_files();
     doc.guides = manifest
         .guides
         .iter()

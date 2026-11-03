@@ -330,9 +330,9 @@ impl AtelierApp {
         let Some(mut d) = self.fill_dialog else {
             return;
         };
-        // Lock Transparent Pixels keeps the opacity whatever the box says.
+        // Lock Transparent Pixels keeps the opacity whatever the box says:
+        // shown checked, the user's own choice kept (and recorded).
         let alpha_locked = self.doc.as_ref().is_some_and(Document::alpha_locked);
-        d.preserve_transparency |= alpha_locked;
         let center = ctx.content_rect().center();
         // Content-Aware fills a selection.
         let content_aware = d.content == FillContent::ContentAware;
@@ -388,11 +388,12 @@ impl AtelierApp {
                 d.opacity = opacity / 100.0;
                 gap_between_blocks(ui);
                 ui.add_enabled_ui(!alpha_locked, |ui| {
-                    ui_kit::checkbox(
-                        ui,
-                        &mut d.preserve_transparency,
-                        &t!("dialog-fill-preserve-transparency"),
-                    )
+                    let mut forced = true;
+                    let shown = match alpha_locked {
+                        true => &mut forced,
+                        false => &mut d.preserve_transparency,
+                    };
+                    ui_kit::checkbox(ui, shown, &t!("dialog-fill-preserve-transparency"))
                     .on_hover_text(t!("dialog-fill-preserve-transparency-tip"));
                 });
             },
@@ -426,6 +427,9 @@ impl AtelierApp {
             preserve_transparency: d.preserve_transparency,
             pattern: (d.content == FillContent::Pattern).then_some(d.pattern),
         };
+        // Under Lock Transparent Pixels, whatever was asked.
+        let keep_alpha =
+            d.preserve_transparency || self.doc.as_ref().is_some_and(Document::alpha_locked);
         if d.content == FillContent::ContentAware {
             // The AI model only when it is there: no question here.
             let settings = retouch_tools::FillSettings {
@@ -438,14 +442,14 @@ impl AtelierApp {
             if self.start_content_aware(retouch_tools::FillRequest {
                 settings,
                 opacity: d.opacity,
-                keep_alpha: d.preserve_transparency,
+                keep_alpha,
                 from_fill: true,
             }) {
                 self.retouch.record_when_filled(recorded);
             }
         } else if d.content == FillContent::Pattern {
             if !self.refuse_if_target_locked()
-                && self.fill_with_pattern(d.pattern, d.opacity, d.preserve_transparency)
+                && self.fill_with_pattern(d.pattern, d.opacity, keep_alpha)
             {
                 self.record(recorded);
             }
@@ -464,7 +468,7 @@ impl AtelierApp {
                 FillContent::White => (Color32::WHITE, t!("dialog-fill-with-white")),
                 FillContent::ContentAware | FillContent::Pattern => unreachable!("filled above"),
             };
-            self.fill(color, &which, d.opacity, d.preserve_transparency);
+            self.fill(color, &which, d.opacity, keep_alpha);
         }
     }
 
@@ -918,11 +922,17 @@ pub(super) fn panel_pos(ctx: &egui::Context, id: &'static str) -> Pos2 {
     });
     // Closed panels give their place back.
     places.0.retain(|&(_, _, _, seen)| seen + 2 >= pass);
-    let own = ctx.memory(|m| m.area_rect(egui::Id::new(id)));
+    // (At the height it would have if not shortened.)
+    let cut = ctx.data(|d| d.get_temp::<f32>(egui::Id::new(id).with("cut")));
+    let own = ctx
+        .memory(|m| m.area_rect(egui::Id::new(id)))
+        .map(|r| r.with_max_y(r.max.y + cut.unwrap_or(0.0)));
+    // Around those placed before it only: placed again, a panel doesn't
+    // move away from those that were placed around it.
     let others: Vec<Rect> = places
         .0
         .iter()
-        .filter(|p| p.0 != id)
+        .take_while(|p| p.0 != id)
         .filter_map(|p| ctx.memory(|m| m.area_rect(egui::Id::new(p.0))))
         .collect();
     let pos = match places.0.iter_mut().find(|p| p.0 == id) {
@@ -978,9 +988,13 @@ fn free_place(ctx: &egui::Context, others: &[Rect], width: f32, height: f32) -> 
     let title = |r: &Rect| Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + CASCADE)).shrink(0.5);
     // How much a panel there would cover, if it is in bounds: the title bars
     // above all, then the panels (px²).
+    // Lower, it is shortened (and scrolls), down to `SHORTEST_PANEL`: what
+    // it can't show then counts as covered.
     let covers = |pos: Pos2| {
-        let body = Rect::from_min_max(pos2(pos.x - width, pos.y), pos2(pos.x, pos.y + height));
-        let inside = pos.y + height <= bottom && pos.x - width >= left;
+        let shown = height.min(bottom - pos.y);
+        let body = Rect::from_min_max(pos2(pos.x - width, pos.y), pos2(pos.x, pos.y + shown));
+        let short = (height - shown) * width;
+        let inside = shown >= height.min(SHORTEST_PANEL) && pos.x - width >= left;
         inside.then(|| {
             let area = |r: &Rect| {
                 let t = title(r);
@@ -1000,7 +1014,7 @@ fn free_place(ctx: &egui::Context, others: &[Rect], width: f32, height: f32) -> 
                 let touched = if over(t) > 0.0 { 1e9 } else { 0.0 };
                 hidden + touched + over(t) * 1000.0 + over(*r)
             };
-            others.iter().map(area).sum::<f32>()
+            short + others.iter().map(area).sum::<f32>()
         })
     };
     // Down and to the left, or straight down.
@@ -1054,6 +1068,9 @@ const PANEL_WIDTH: f32 = 284.0;
 
 /// Offset of a floating panel cascaded over another (px).
 const CASCADE: f32 = 28.0;
+
+/// The least height a floating panel is shortened to, to be placed lower.
+const SHORTEST_PANEL: f32 = 200.0;
 
 /// Modal dialogs that don't give the keyboard to their first field: those
 /// with none (confirmations, alerts, progress), and those whose keys go to
@@ -1258,11 +1275,19 @@ pub(super) fn floating_dialog(
     let footer_room = if footer { DIALOG_FOOTER + 8.0 } else { 0.0 };
     let body_max = (screen.height() - DIALOG_HEADER - footer_room - 10.0).max(0.0);
     // Its margins aside.
-    let body_height = resize.map(|h| {
+    let mut body_height = resize.map(|h| {
         resized_to
             .map_or(h, |s| s.y)
             .clamp(MIN_PANEL_BODY, (body_max - 34.0).max(MIN_PANEL_BODY))
     });
+    // A panel placed low (see `free_place`) is shortened to end in sight;
+    // how much, for the next placing.
+    if !modal && pivot.y() == egui::Align::Min {
+        let room = screen.bottom() - (pos.y + offset.y) - DIALOG_HEADER - footer_room - 44.0;
+        let cut = body_height.map_or(0.0, |h| (h - room.max(MIN_PANEL_BODY)).max(0.0));
+        body_height = body_height.map(|h| h - cut);
+        ctx.data_mut(|d| d.insert_temp(id.with("cut"), cut));
+    }
     let mut grip_drag = None;
     let area = egui::Area::new(id)
         .kind(if modal {

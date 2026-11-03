@@ -174,6 +174,36 @@ pub enum Recorded {
     NewPatternFill {
         pattern: u64,
     },
+    /// Layer › New Fill Layer › Solid Color.
+    NewSolidFill {
+        color: [u8; 3],
+    },
+    /// Layer › New Fill Layer › Gradient, from one color to the other.
+    NewGradientFill {
+        from: [u8; 3],
+        to: [u8; 3],
+    },
+    /// Paths panel › Fill Path, on the path the panel works on then; the
+    /// contents as Edit › Fill's.
+    FillPath {
+        contents: Contents,
+        /// For `Contents::Color`.
+        color: [u8; 3],
+        /// 0..1.
+        opacity: f32,
+        preserve_transparency: bool,
+        #[serde(default)]
+        pattern: Option<u64>,
+        /// Pixels.
+        feather: f32,
+        antialias: bool,
+    },
+    /// Paths panel › Stroke Path, with the Brush (or the Eraser) as it is
+    /// set when played.
+    StrokePath {
+        eraser: bool,
+        pressure: bool,
+    },
     /// Edit › Fade, of the step before it.
     Fade {
         /// 0..1.

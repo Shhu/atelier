@@ -8,6 +8,7 @@ use super::dialogs::{
 };
 use super::select_menu::Then;
 use super::*;
+use crate::actions::Recorded;
 use crate::document::{PathRef, SavedPath};
 use crate::mask_ops::Modify;
 use crate::paint::StrokeMode;
@@ -54,6 +55,21 @@ pub(super) struct FillSettings {
     preserve: bool,
     feather: f32,
     antialias: bool,
+}
+
+impl FillSettings {
+    /// Its step in an action.
+    fn recorded(&self) -> Recorded {
+        Recorded::FillPath {
+            contents: actions_panel::contents(self.content),
+            color: actions_panel::rgb(self.color),
+            opacity: self.opacity,
+            preserve_transparency: self.preserve,
+            pattern: (self.content == FillContent::Pattern).then_some(self.pattern),
+            feather: self.feather,
+            antialias: self.antialias,
+        }
+    }
 }
 
 /// Stroke Path: with the Brush or the Eraser, pressure simulated or not.
@@ -152,7 +168,7 @@ impl AtelierApp {
     fn command_path(&mut self) -> Option<VPath> {
         let path = self.target_path().map(|(_, p)| p).filter(|p| !p.is_empty());
         if path.is_none() {
-            self.status = t!("vector-status-no-path");
+            self.status_cannot(t!("vector-status-no-path"));
         }
         path
     }
@@ -271,14 +287,15 @@ impl AtelierApp {
         };
         if s.content == FillContent::Pattern {
             let Some(pattern) = self.patterns.library.get(s.pattern).cloned() else {
-                self.status = t!("pattern8-why-missing");
+                self.status_cannot(t!("pattern8-why-missing"));
                 return;
             };
             let Some(doc) = &mut self.doc else { return };
             if !doc.fill_active_pattern(&pattern, Some(&sel), s.opacity, s.preserve) {
-                self.status = self.nothing_to_paint();
+                self.status_cannot(self.nothing_to_paint());
+                return;
             }
-            return;
+            return self.record(s.recorded());
         }
         let color = match s.content {
             FillContent::Foreground | FillContent::ContentAware | FillContent::Pattern => {
@@ -293,7 +310,37 @@ impl AtelierApp {
         let Some(doc) = &mut self.doc else { return };
         let rgba = color.to_srgba_unmultiplied();
         if !doc.fill_active(rgba, Some(&sel), s.opacity, s.preserve) {
-            self.status = self.nothing_to_paint();
+            self.status_cannot(self.nothing_to_paint());
+            return;
+        }
+        self.record(s.recorded());
+    }
+
+    /// Fill Path or Stroke Path played by an action, on the path the panel
+    /// works on now.
+    pub(super) fn play_path_step(&mut self, step: &Recorded) {
+        match *step {
+            Recorded::FillPath {
+                contents,
+                color,
+                opacity,
+                preserve_transparency,
+                pattern,
+                feather,
+                antialias,
+            } => self.fill_path(FillSettings {
+                pattern: pattern.unwrap_or(0),
+                content: actions_panel::fill_content(contents),
+                color: Color32::from_rgb(color[0], color[1], color[2]),
+                opacity: opacity.clamp(0.0, 1.0),
+                preserve: preserve_transparency,
+                feather: if feather.is_finite() { feather.clamp(0.0, 1000.0) } else { 0.0 },
+                antialias,
+            }),
+            Recorded::StrokePath { eraser, pressure } => {
+                self.stroke_path(StrokeSettings { eraser, pressure });
+            }
+            _ => {}
         }
     }
 
@@ -331,7 +378,7 @@ impl AtelierApp {
         doc.checkpoint(t!("vector-hist-stroke-path"));
         if !doc.begin_paint() {
             doc.discard_step();
-            self.status = self.nothing_to_paint();
+            self.status_cannot(self.nothing_to_paint());
             return;
         }
         let mut painted = false;
@@ -360,13 +407,18 @@ impl AtelierApp {
         doc.end_paint();
         if !painted {
             doc.discard_step();
+            return;
         }
+        self.record(Recorded::StrokePath {
+            eraser: s.eraser,
+            pressure: s.pressure,
+        });
     }
 
     /// Make Work Path: the selection's outline, within `tolerance` px.
     fn make_work_path(&mut self, tolerance: f32) {
         let (Some(sel), Some(doc)) = (self.selection.clone(), &mut self.doc) else {
-            self.status = t!("vector-status-no-selection");
+            self.status_cannot(t!("vector-status-no-selection"));
             return;
         };
         let canvas = doc.full_rect();
@@ -375,7 +427,7 @@ impl AtelierApp {
         };
         let path = trace::trace(&sel.to_mask(area), (area.x, area.y), tolerance);
         if path.is_empty() {
-            self.status = t!("status-selection-empty");
+            self.status_cannot(t!("status-selection-empty"));
             return;
         }
         doc.checkpoint(t!("vector-hist-make-work-path"));

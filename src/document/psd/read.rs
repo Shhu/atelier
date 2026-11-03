@@ -12,7 +12,7 @@ use super::descriptor::Descriptor;
 use super::{Imported, adjust, artboard, blend_of, effects, vector};
 use crate::document::file_io::{Budget, check_size, layer_fits};
 use crate::document::native::par_map;
-use crate::document::{BlendMode, Channel, Document, FileError, LayerKind, Mask, PsdResource};
+use crate::document::{BlendMode, Channel, Document, FileError, Fill, LayerKind, Mask, PsdResource};
 use crate::guides::{Guide, Orientation};
 use crate::i18n::t;
 
@@ -131,6 +131,21 @@ const REWRITTEN: [u16; 26] = [
     1076, 1078, 1086, 1087, 1088, 1018, 1020, 1023, 1027, 1029,
 ];
 
+/// The resolution resource (1005, ResolutionInfo): horizontal and vertical
+/// resolutions in 16.16 fixed point, each followed by the units it shows in
+/// (display only: the value is in pixels per inch whatever they are).
+fn resolution_info(raw: &[u8]) -> Option<(f64, f64)> {
+    let mut d = Reader::new(raw);
+    let fixed = |d: &mut Reader| -> Option<f64> {
+        let v = f64::from(d.u32().ok()?) / 65536.0;
+        (v.is_finite() && v > 0.0).then_some(v)
+    };
+    let x = fixed(&mut d)?;
+    d.u32().ok()?;
+    let y = fixed(&mut d)?;
+    Some((x, y))
+}
+
 /// The color samplers resource (1038, or 1073 since CS3, which wins). A
 /// header (version 1 to 3, count), then for each point its vertical and
 /// horizontal positions (the order of Photoshop's files according to ag-psd,
@@ -179,9 +194,13 @@ fn color_samplers(raw: &[u8], canvas: (u32, u32)) -> Result<Vec<crate::document:
     };
     // A fixed position counts in 1/16 of a pixel in Photoshop's files (ag-psd,
     // from samples). The specification only says "fixed": 16.16 for others,
-    // which then land far off the canvas in 1/16.
-    let mut points = scaled(16.0);
-    if !points.iter().all(inside) {
+    // which then land far off the canvas in 1/16, or, near the top left,
+    // fall on 1/16 of a pixel in 16.16 (on multiples of 256 px in 1/16).
+    let sixteenths = scaled(16.0);
+    let coarse = fixed.iter().all(|&(h, v)| h % 4096 == 0 && v % 4096 == 0)
+        && fixed.iter().any(|&p| p != (0, 0));
+    let mut points = sixteenths;
+    if !points.iter().all(inside) || coarse {
         points = scaled(65536.0);
     }
     points.extend(floats);
@@ -1198,11 +1217,27 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
         if let Some(fx) = effects_of(rec) {
             let angle = f.resources.global_angle.unwrap_or(120.0);
             let (effects, simplified) = effects::read(&fx, angle, &patterns);
-            if simplified || (!layer.styleable() && effects.any()) {
+            if simplified || (!layer.styleable() && effects.any_kept()) {
                 notes.styles.push(rec.name.clone());
             }
             if layer.styleable() {
                 layer.effects = effects;
+            }
+        }
+        // A layer without pixels starts at the canvas origin, but its
+        // record may have a box (a vector-masked fill): linked tiles count
+        // from that box's corner, as the writer's `rebased` does.
+        if !layer.has_pixels() && !layer.is_group() {
+            let corner = (rec.rect[1] as f32, rec.rect[0] as f32);
+            let fills = match &mut layer.kind {
+                LayerKind::Fill(Fill::Pattern(p)) => Some(p),
+                _ => None,
+            };
+            let overlay = &mut layer.effects.pattern_overlay.fill;
+            for f in fills.into_iter().chain([overlay]) {
+                if f.linked {
+                    f.phase = (f.phase.0 + corner.0, f.phase.1 + corner.1);
+                }
             }
         }
         // A group's fill opacity acts on what it holds, as its opacity
@@ -1254,6 +1289,9 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
         doc.layers.push(layer);
     }
     doc.fix_depths();
+    // Files give a group no frame: it starts at what it holds.
+    doc.frame_groups();
+    doc.group_overlays_from_files();
     // A clipped layer needs one below it, in its group.
     for i in 0..doc.layers.len() {
         let below = i.checked_sub(1).map(|j| doc.layers[j].depth);
@@ -1337,6 +1375,12 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
         mode => crate::document::color::rgb_profile(f.resources.icc, matches!(mode, RGB | INDEXED)),
     }
     .map(Arc::new);
+    // The resolution, for what reads it (Crop's Resolution, exports).
+    let resolution = f.resources.kept.iter().find(|k| k.id == 1005);
+    if let Some(density) = resolution.and_then(|k| resolution_info(&k.data)) {
+        let meta = doc.file_metadata.image.get_or_insert_default();
+        Arc::make_mut(meta).density = Some(density);
+    }
     doc.file_metadata.psd_resources = Arc::new(f.resources.kept.clone());
     doc.file_metadata.psd_layout = Some(crate::document::PsdLayout {
         canvas,

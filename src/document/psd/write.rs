@@ -33,7 +33,7 @@ pub(super) fn document(
     doc: &Document,
     cmyk: Option<&Conversion>,
 ) -> Result<(Vec<u8>, Vec<String>), FileError> {
-    let layers = doc.render_layers();
+    let layers = crate::document::group_overlays_for_files(doc.render_layers());
     let flat = doc.flatten();
     let (w, h) = (doc.width(), doc.height());
     let transparent = flat.pixels().any(|p| p.0[3] < 255);

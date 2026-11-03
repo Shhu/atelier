@@ -24,10 +24,11 @@ const POLL: std::time::Duration = std::time::Duration::from_millis(40);
 /// again (seconds).
 const SETTLE: f64 = 0.15;
 
-/// When a panel may compute what changed. Not while a pointer is held: a job
-/// keeps the layers alive, and each dab of a stroke would then copy its whole
-/// layer on the UI thread. Not until it stops changing either, unless the
-/// panel has nothing to show.
+/// When a panel may compute what changed. Not while a press on the canvas
+/// may edit (`held`): a job keeps the layers alive, and each dab of a stroke
+/// would then copy its whole layer on the UI thread. Other presses (a pan, a
+/// dialog's slider) don't wait. Not until it stops changing either, unless
+/// the panel has nothing to show.
 #[derive(Default)]
 pub(super) struct Settle {
     key: u64,
@@ -35,13 +36,19 @@ pub(super) struct Settle {
 }
 
 impl Settle {
-    pub(super) fn ready(&mut self, ctx: &egui::Context, key: u64, nothing_shown: bool) -> bool {
-        let (now, down) = ctx.input(|i| (i.time, i.pointer.any_down()));
+    pub(super) fn ready(
+        &mut self,
+        ctx: &egui::Context,
+        key: u64,
+        nothing_shown: bool,
+        held: bool,
+    ) -> bool {
+        let now = ctx.input(|i| i.time);
         if self.key != key {
             self.key = key;
             self.since = now;
         }
-        !down && (nothing_shown || now - self.since >= SETTLE)
+        !held && (nothing_shown || now - self.since >= SETTLE)
     }
 }
 
@@ -244,6 +251,14 @@ impl HistogramPanel {
         self.job.is_some()
     }
 
+    /// The count going on was told to stop.
+    #[cfg(test)]
+    pub(super) fn cancelled(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|j| j.cancel.load(Ordering::Relaxed))
+    }
+
     /// A worker is still at it, even cancelled.
     #[cfg(test)]
     pub(super) fn is_running(&self) -> bool {
@@ -258,6 +273,12 @@ impl HistogramPanel {
 }
 
 impl AtelierApp {
+    /// A press on the canvas that may change the layers is held: the
+    /// panels' jobs are stopped and wait for its end.
+    pub(super) fn edit_held(&self, ctx: &egui::Context) -> bool {
+        self.canvas_edit_held && ctx.input(|i| i.pointer.primary_down())
+    }
+
     /// What is to be counted, as a fingerprint.
     fn histogram_key(&self) -> u64 {
         let Some(doc) = &self.doc else { return 0 };
@@ -286,6 +307,8 @@ impl AtelierApp {
     /// Lands a count that is over, starts the one needed.
     fn update_histogram(&mut self, ctx: &egui::Context) {
         let key = self.histogram_key();
+        // (A count still right goes on through other presses.)
+        let held = self.edit_held(ctx);
         let panel = &mut self.hist_panel;
         if let Some(job) = panel.job.take_if(|j| j.thread.is_finished())
             && let Ok(Some(counts)) = job.thread.join()
@@ -299,12 +322,12 @@ impl AtelierApp {
         }
         ctx.request_repaint_after(POLL);
         if let Some(job) = &panel.job {
-            if job.key != key || ctx.input(|i| i.pointer.any_down()) {
+            if job.key != key || held {
                 job.cancel.store(true, Ordering::Relaxed);
             }
             return;
         }
-        if !panel.settle.ready(ctx, key, panel.shown.is_none()) {
+        if !panel.settle.ready(ctx, key, panel.shown.is_none(), held) {
             return;
         }
         let Some(doc) = &self.doc else { return };
@@ -319,6 +342,7 @@ impl AtelierApp {
         let thread = std::thread::Builder::new()
             .name("histogram".into())
             .spawn(move || {
+                crate::document::watch_styles_only();
                 let selected = selection.map(|s| Selected {
                     mask: s.to_mask(canvas),
                 });
@@ -423,7 +447,7 @@ impl AtelierApp {
                         return;
                     };
                     let s = stats(&levels);
-                    let number = |v: f64| format!("{v:.2}");
+                    let number = |v: f64| i18n::decimal(v, 2);
                     ui.spacing_mut().item_spacing.y = 2.0;
                     ui.spacing_mut().interact_size.y = 18.0;
                     ui.columns(2, |c| {
@@ -449,7 +473,7 @@ impl AtelierApp {
                         let at = |f: &dyn Fn(usize) -> String| hovered.map_or_else(dash, f);
                         let below = |l: usize| levels[..=l].iter().sum::<u64>() as f64;
                         let percentile =
-                            |l: usize| format!("{:.2}", 100.0 * below(l) / (s.total.max(1) as f64));
+                            |l: usize| i18n::decimal(100.0 * below(l) / (s.total.max(1) as f64), 2);
                         readout(
                             &mut c[1],
                             &t!("panels8-histogram-level"),

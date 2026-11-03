@@ -424,10 +424,12 @@ impl AtelierApp {
         let Some(layer) = self.doc.as_ref().map(Document::active_layer) else {
             return false;
         };
-        if !layer.visible {
-            self.status = t!("select-layer-hidden", name = layer.name.as_str());
+        if layer.visible {
+            return true;
         }
-        layer.visible
+        let why = t!("select-layer-hidden", name = layer.name.as_str());
+        self.status_cannot(why);
+        false
     }
 
     /// Dragging of the current selection (Shift: horizontal or vertical).
@@ -453,7 +455,7 @@ impl AtelierApp {
                         .as_mut()
                         .and_then(|doc| doc.lift_region(&m.selection, copy))
                     else {
-                        self.status = t!("status-selection-empty");
+                        self.status_cannot(t!("status-selection-empty"));
                         return CursorIcon::NotAllowed;
                     };
                     let offset = self
@@ -514,7 +516,7 @@ impl AtelierApp {
             let Some(doc) = &mut self.doc else { return };
             let (before, layer_id) = (doc.history_step(), doc.active_layer().id);
             let Some(id) = doc.lift_region(&selection, false) else {
-                self.status = t!("status-selection-empty");
+                self.status_cannot(t!("status-selection-empty"));
                 return;
             };
             let layer = doc.active_layer_mut();
@@ -564,7 +566,7 @@ impl AtelierApp {
         };
         let (lx, ly) = (x - origin.0, y - origin.1);
         if lx < 0 || ly < 0 || lx >= w as i64 || ly >= h as i64 {
-            self.status = t!("select-wand-outside-layer");
+            self.status_cannot(t!("select-wand-outside-layer"));
             return;
         }
         let (shift, alt) = self.ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
@@ -1038,7 +1040,7 @@ impl AtelierApp {
                 .as_ref()
                 .is_some_and(|d| !d.active_layer().has_pixels())
         {
-            self.status = t!("tools3-status-remove-background-pixels");
+            self.status_cannot(t!("tools3-status-remove-background-pixels"));
             return;
         }
         let then = if remove_background {
@@ -1160,7 +1162,7 @@ impl AtelierApp {
         // Undone or redone meanwhile: found in another image, and recording
         // it would wipe the redo list. Steps recorded forward don't matter.
         if !doc.history_follows(job.generation) {
-            self.status = t!("hist5-subject-undone");
+            self.status_cannot(t!("hist5-subject-undone"));
             return;
         }
         // The user selected something else meanwhile: theirs stays.
@@ -1170,7 +1172,7 @@ impl AtelierApp {
             _ => false,
         };
         if job.remove_from.is_none() && !unchanged {
-            self.status = t!("hist5-subject-selection-changed");
+            self.status_cannot(t!("hist5-subject-selection-changed"));
             return;
         }
         // The image changed during the search (rotated, resized, painted,
@@ -1182,7 +1184,7 @@ impl AtelierApp {
         }
         let remove_from = job.remove_from;
         if mask.pixels().all(|p| p.0[0] == 0) {
-            self.status = t!("select-subject-not-found");
+            self.status_cannot(t!("select-subject-not-found"));
             return;
         }
         match remove_from {
@@ -1190,7 +1192,7 @@ impl AtelierApp {
                 // The layer must be the original one, still active and intact.
                 let layer = doc.active_layer();
                 if layer.id != id || layer.rev() != rev || !doc.mask_active(&mask) {
-                    self.status = t!("select-layer-changed");
+                    self.status_cannot(t!("select-layer-changed"));
                     return;
                 }
                 let name = doc.active_layer().name.as_str();

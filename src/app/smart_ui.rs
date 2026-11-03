@@ -282,7 +282,7 @@ impl AtelierApp {
     /// Image › Adjustments on a smart object: refused, as in Photoshop (an
     /// adjustment layer clipped to it does it).
     pub(super) fn refuse_on_smart(&mut self) {
-        self.status = t!("smart-status-no-adjustments");
+        self.status_cannot(t!("smart-status-no-adjustments"));
     }
 
     /// Why the painting tools refuse the active layer.
@@ -296,7 +296,12 @@ impl AtelierApp {
 
     pub(super) fn smart_command(&mut self, cmd: Command) {
         use Command::*;
-        let modifies = !matches!(cmd, PlaceLinked | EditContents | ExportContents | Convert);
+        // Converting leaves the pixels and the locks as they are (inside, on
+        // the contents' layers); a copy doesn't change the original.
+        let modifies = !matches!(
+            cmd,
+            PlaceLinked | EditContents | ExportContents | Convert | ConvertForFilters | NewViaCopy
+        );
         if self.doc.is_none() || (modifies && self.refuse_content_locked()) {
             return;
         }
@@ -317,7 +322,15 @@ impl AtelierApp {
                         self.status = t!("smart-status-converted", name = name);
                         self.reset_pending();
                     } else {
-                        self.status = t!("smart-status-locked");
+                        // Refused for a locked layer: named.
+                        let locked = picked
+                            .iter()
+                            .flat_map(|&i| doc.block(i))
+                            .find(|&i| doc.is_locked(i));
+                        match locked {
+                            Some(i) => self.refuse_lock_of(i, layer_locks::LockKind::All),
+                            None => self.status_cannot(t!("smart-status-locked")),
+                        }
                     }
                 }
             }
@@ -328,7 +341,12 @@ impl AtelierApp {
                     self.reset_pending();
                 }
             }
-            ResetTransform => self.reset_smart_transform(),
+            // It moves and resamples the object: the transform rule.
+            ResetTransform => {
+                if !self.refuse_transform_locked() {
+                    self.reset_smart_transform();
+                }
+            }
             UpdateModified => self.update_links(true, true),
             EditContents => self.edit_contents(),
             ExportContents => self.export_contents(),
@@ -744,6 +762,16 @@ impl AtelierApp {
         }
     }
 
+    /// Why the smart objects showing contents `e` may not take them: an
+    /// instance in its document whose contents are locked.
+    fn contents_locked(&self, e: &EmbeddedIn) -> Option<Message> {
+        let parent = self.parked.iter().find(|p| p.doc.uid() == e.parent)?;
+        let d = &parent.doc;
+        let shows = |i: usize| d.layers[i].smart.as_deref().is_some_and(|s| s.contents.id == e.contents);
+        let i = (0..d.layers.len()).find(|&i| shows(i) && d.content_locked(i))?;
+        layer_locks::lock_refusal(d, i, layer_locks::LockKind::Pixels)
+    }
+
     /// Save of a smart object's contents (Edit Contents): its smart object
     /// shows them. Returns whether the active document is such contents.
     pub(super) fn save_embedded(&mut self) -> bool {
@@ -754,10 +782,17 @@ impl AtelierApp {
     /// linked file show these edits too, unlinked (asked first).
     fn save_embedded_with(&mut self, embed: bool) -> bool {
         self.commit_pending();
-        let Some(doc) = &mut self.doc else {
+        let Some(e) = self.doc.as_ref().and_then(|d| d.embedded_in.clone()) else {
             return false;
         };
-        let Some(e) = doc.embedded_in.clone() else {
+        // Its smart object's contents may not change (Lock All, a group's
+        // Lock Image Pixels, as for Replace Contents): the edits stay here,
+        // unsaved, until it is unlocked.
+        if let Some(message) = self.contents_locked(&e) {
+            self.status_refused(message);
+            return true;
+        }
+        let Some(doc) = &mut self.doc else {
             return false;
         };
         let contents = doc.to_contents(e.contents, e.name.clone());
@@ -796,12 +831,12 @@ impl AtelierApp {
             // (still these contents until saved elsewhere: an undo there
             // may bring it back).
             Some(ContentsUpdate::Gone) => {
-                self.status = t!("smart6-status-contents-gone");
+                self.status_cannot(t!("smart6-status-contents-gone"));
                 self.save_as_dialog();
             }
             // Its document is closed: a file.
             None => {
-                self.status = t!("smart-status-parent-gone");
+                self.status_cannot(t!("smart-status-parent-gone"));
                 self.save_as_dialog();
             }
         }

@@ -35,6 +35,13 @@ impl AtelierApp {
         (alpha, error)
     }
 
+    /// `message` in the status bar for its full time, even if it is the
+    /// one shown last: said again, it is news again.
+    pub(super) fn say(&mut self, message: String) {
+        self.status_shown.clear();
+        self.status = message;
+    }
+
     pub(super) fn status_bar(&mut self, ui: &mut egui::Ui) {
         let (alpha, error) = self.status_fade(ui.ctx());
 
@@ -157,7 +164,10 @@ impl AtelierApp {
         let alt_click = keys::combo(ctx, Modifiers::ALT, &click);
         let pair = |key: &str, what: String| (key.to_owned(), what);
         let handle = t!("xform-hint-handle");
-        match self.tool {
+        // A view tool over a transform or a crop box: its keys, and Enter
+        // and Esc still for what it leaves pending.
+        let over = self.rotate_view.over.is_some();
+        let mut hints = match self.shown_tool() {
             // The Move tool: Alt copies, Ctrl picks (or not) the layer
             // under the pointer; in Free Transform, from the center, no
             // snapping.
@@ -363,11 +373,13 @@ impl AtelierApp {
                     keys::combo(ctx, Modifiers::SHIFT, &t!("hint-key-drag")),
                     t!("view8-hint-steps"),
                 ),
-                (keys::key(Key::Escape), t!("view8-hint-reset")),
-            ],
+            ]
+            .into_iter()
+            .chain((!over).then(|| (keys::key(Key::Escape), t!("view8-hint-reset"))))
+            .collect(),
             Tool::Hand | Tool::Zoom => {
                 let mut hints = Vec::new();
-                if self.tool == Tool::Zoom {
+                if self.shown_tool() == Tool::Zoom {
                     hints.push((click, t!("hint-zoom-in")));
                     hints.push((alt_click, t!("hint-zoom-out")));
                 } else {
@@ -385,6 +397,11 @@ impl AtelierApp {
                 hints.push((shortcut(&SHORTCUT_ACTUAL), t!("zoombar-actual-pixels")));
                 hints
             }
+        };
+        if over {
+            hints.push((keys::key(Key::Enter), t!("hint-apply")));
+            hints.push((keys::key(Key::Escape), t!("hint-cancel")));
         }
+        hints
     }
 }

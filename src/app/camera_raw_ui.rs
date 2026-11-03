@@ -444,7 +444,7 @@ impl AtelierApp {
         }
         let Some(doc) = &mut self.doc else { return };
         if !doc.can_paint() {
-            self.status = t!("filter-no-pixels");
+            self.status_cannot(t!("filter-no-pixels"));
             return;
         }
         // Developed over the whole layer, like the result.
@@ -453,7 +453,7 @@ impl AtelierApp {
         let Some(target) = filters_ui::active_target(doc, self.selection.as_ref()) else {
             // The layer enlarged above is put back as it was.
             self.shrink_after_preview();
-            self.status = t!("status-selection-empty");
+            self.status_cannot(t!("status-selection-empty"));
             return;
         };
         let purpose = Purpose::Filter {
@@ -751,13 +751,13 @@ impl AtelierApp {
         doc.checkpoint(t!("raw-filter-title"));
         if !doc.begin_paint() {
             doc.discard_step();
-            self.status = t!("filter-no-pixels");
+            self.status_cannot(t!("filter-no-pixels"));
             return;
         }
         let Some(target) = filters_ui::active_target(doc, self.selection.as_ref()) else {
             doc.end_paint();
             doc.discard_step();
-            self.status = t!("status-selection-empty");
+            self.status_cannot(t!("status-selection-empty"));
             return;
         };
         let destination = Destination::Layer {

@@ -432,6 +432,7 @@ impl AtelierApp {
             let job = std::thread::Builder::new()
                 .name("channels".into())
                 .spawn(move || {
+                    crate::document::watch_styles_only();
                     let mut cache = crate::compose::LevelCache::new(level);
                     let options = crate::compose::Options {
                         held,

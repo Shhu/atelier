@@ -131,10 +131,25 @@ impl Document {
         self.block(i).filter(|&j| self.can_move(j)).collect()
     }
 
-    /// A group with layers, none of which can move: moving it would do nothing.
-    pub fn stuck_group_layer(&self, i: usize) -> Option<usize> {
+    /// A layer of group `i` that a plain move of the group leaves where it
+    /// is (Lock Position), the topmost.
+    pub fn held_member(&self, i: usize) -> Option<usize> {
         if !self.layers.get(i)?.is_group() {
             return None;
+        }
+        self.block(i).rev().find(|&j| j != i && !self.can_move(j))
+    }
+
+    /// A group with layers, none of which can move: moving it would do
+    /// nothing. An artboard with any such layer: it would be left outside
+    /// the board's frame.
+    pub fn stuck_group_layer(&self, i: usize) -> Option<usize> {
+        let l = self.layers.get(i)?;
+        if !l.is_group() {
+            return None;
+        }
+        if l.artboard.is_some() {
+            return self.held_member(i);
         }
         let mut members = self.block(i).filter(|&j| !self.layers[j].is_group());
         let first = members.next()?;
@@ -159,9 +174,12 @@ impl Document {
     }
 
     /// A merge replaces layers: none of their locks can be kept, so any of
-    /// them refuses it.
-    fn merge_locked(&self, mut layers: impl Iterator<Item = usize>) -> bool {
-        layers.any(|i| self.locks(i).any())
+    /// them refuses it (the topmost so locked).
+    fn merge_locked(&self, layers: impl DoubleEndedIterator<Item = usize>) -> Result<(), MergeError> {
+        match layers.rev().find(|&i| self.locks(i).any()) {
+            Some(i) => Err(MergeError::Locked(i)),
+            None => Ok(()),
+        }
     }
 
     /// Whether layer `i` may move (Lock Position, Lock All).
@@ -363,6 +381,12 @@ impl Document {
         let name = self.unused_name(|n| t!("core-group-name", number = n));
         let mut group = self.empty_layer(name, LayerKind::Group { expanded: true });
         (group.depth, group.blend) = (depth, BlendMode::PassThrough);
+        // Its frame starts at what it holds (a linked Pattern Overlay starts
+        // there), then moves with the whole group.
+        let held = moved.iter().filter_map(Layer::content_bounds).reduce(PixelRect::union);
+        if let Some(b) = held {
+            group.offset = (b.x, b.y);
+        }
         moved.push(group);
         let n = moved.len();
         self.layers.splice(at..at, moved);
@@ -734,9 +758,7 @@ impl Document {
         if !below.visible || !above.visible || !below.has_pixels() {
             return Err(MergeError::Nothing);
         }
-        if self.merge_locked([lower, upper].into_iter()) {
-            return Err(MergeError::Locked);
-        }
+        self.merge_locked([lower, upper].into_iter())?;
         let region = self.merge_region([lower, upper])?;
         let base = Layer {
             blend: BlendMode::Normal,
@@ -769,9 +791,7 @@ impl Document {
     pub fn merge_group(&mut self) -> Result<(), MergeError> {
         let g = self.active;
         let r = self.block(g);
-        if self.merge_locked(r.clone()) {
-            return Err(MergeError::Locked);
-        }
+        self.merge_locked(r.clone())?;
         let group = self.layers[g].clone();
         let region = self.merge_region(r.clone())?;
         let mut part: Vec<Layer> = self.layers[r.clone()].to_vec();
@@ -805,9 +825,7 @@ impl Document {
         let [first, _, ..] = visible[..] else {
             return Err(MergeError::Nothing);
         };
-        if self.merge_locked(visible.iter().copied()) {
-            return Err(MergeError::Locked);
-        }
+        self.merge_locked(visible.iter().copied())?;
         let region = self.merge_region(visible.iter().copied())?;
         let image = self.render(&self.layers, region);
         let name = self.layers[first].name.clone();
@@ -1161,7 +1179,7 @@ mod lock_tests {
         let mut d = doc();
         d.active_layer_mut().locks = Locks::default();
         d.layers[0].locks.pixels = true;
-        assert!(matches!(d.merge_down(), Err(MergeError::Locked)));
+        assert_eq!(d.merge_down(), Err(MergeError::Locked(0)));
     }
 
     #[test]

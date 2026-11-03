@@ -9,7 +9,7 @@ use image::{GrayImage, RgbaImage};
 
 use super::BlendMode;
 use super::gradient::GradientFill;
-use super::pattern::{PatternFill, SCALE_RANGE};
+use super::pattern::PatternFill;
 use crate::i18n::t;
 use crate::pixel_ops::{blur, content_box, distance_field};
 
@@ -263,6 +263,65 @@ impl Effects {
         }
     }
 
+    /// How far the styles drawn from a shape reach beyond its box, in
+    /// pixels (what drawing them works on around it).
+    pub fn margin(&self) -> usize {
+        // Sizes as the dialog bounds them, whatever the file said. The shadows'
+        // offsets don't enlarge the buffers: the drop shadow is translated, and
+        // what the inner one moves in from beyond its blur is empty anyway.
+        let stroke_w = if self.stroke.enabled {
+            self.stroke.width.clamp(0.0, MAX_SIZE)
+        } else {
+            0.0
+        };
+        let reach = |s: &ShadowFx| s.blur.min(MAX_SIZE) * 1.5;
+        let mut outside = stroke_w;
+        if self.shadow.enabled {
+            outside += reach(&self.shadow);
+        }
+        if self.outer_glow.enabled {
+            outside = outside.max(stroke_w + self.outer_glow.size.min(MAX_SIZE) * 1.5);
+        }
+        let inner = [
+            self.inner_shadow.enabled.then(|| reach(&self.inner_shadow)),
+            self.inner_glow
+                .enabled
+                .then_some(self.inner_glow.size.min(MAX_SIZE) * 1.5),
+            self.bevel
+                .enabled
+                .then_some(self.bevel.size.min(MAX_SIZE) + self.bevel.soften.min(MAX_SIZE)),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(0.0f32, f32::max);
+        outside.max(inner).ceil() as usize + 2
+    }
+
+    /// Whether some style is on, or off with settings of its own.
+    pub fn any_kept(&self) -> bool {
+        Style::ALL.into_iter().any(|s| self.kept(s))
+    }
+
+    /// Whether `style` is on, or off with settings of its own that a file
+    /// must keep.
+    pub fn kept(&self, style: Style) -> bool {
+        if self.enabled(style) {
+            return true;
+        }
+        let d = Effects::default();
+        match style {
+            Style::Bevel => self.bevel != d.bevel,
+            Style::Stroke => self.stroke != d.stroke,
+            Style::InnerShadow => self.inner_shadow != d.inner_shadow,
+            Style::InnerGlow => self.inner_glow != d.inner_glow,
+            Style::ColorOverlay => self.color_overlay != d.color_overlay,
+            Style::GradientOverlay => self.gradient_overlay != d.gradient_overlay,
+            Style::PatternOverlay => self.pattern_overlay.in_use(),
+            Style::OuterGlow => self.outer_glow != d.outer_glow,
+            Style::DropShadow => self.shadow != d.shadow,
+        }
+    }
+
     pub fn enabled_mut(&mut self, style: Style) -> &mut bool {
         match style {
             Style::Bevel => &mut self.bevel.enabled,
@@ -301,7 +360,7 @@ impl Effects {
         self.bevel.size *= s;
         self.bevel.soften *= s;
         let p = &mut self.pattern_overlay.fill;
-        p.scale = (p.scale * s).clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end());
+        p.scale = super::pattern::scaled(p.scale, s);
         p.phase = (p.phase.0 * sx, p.phase.1 * sy);
     }
 
@@ -380,35 +439,12 @@ pub fn render_styles(image: &RgbaImage, fx: &Effects) -> Styles {
     let Some([bx, by, bw, bh]) = content_box(image) else {
         return out;
     };
-    // Sizes as the dialog bounds them, whatever the file said. The shadows'
-    // offsets don't enlarge the buffers: the drop shadow is translated, and
-    // what the inner one moves in from beyond its blur is empty anyway.
+    let margin = fx.margin();
     let stroke_w = if fx.stroke.enabled {
         fx.stroke.width.clamp(0.0, MAX_SIZE)
     } else {
         0.0
     };
-    let reach = |s: &ShadowFx| s.blur.min(MAX_SIZE) * 1.5;
-    let mut outside = stroke_w;
-    if fx.shadow.enabled {
-        outside += reach(&fx.shadow);
-    }
-    if fx.outer_glow.enabled {
-        outside = outside.max(stroke_w + fx.outer_glow.size.min(MAX_SIZE) * 1.5);
-    }
-    let inner = [
-        fx.inner_shadow.enabled.then(|| reach(&fx.inner_shadow)),
-        fx.inner_glow
-            .enabled
-            .then_some(fx.inner_glow.size.min(MAX_SIZE) * 1.5),
-        fx.bevel
-            .enabled
-            .then_some(fx.bevel.size.min(MAX_SIZE) + fx.bevel.soften.min(MAX_SIZE)),
-    ]
-    .into_iter()
-    .flatten()
-    .fold(0.0f32, f32::max);
-    let margin = outside.max(inner).ceil() as usize + 2;
     let (bx, by, bw, bh) = (bx as usize, by as usize, bw as usize, bh as usize);
     let (w, h) = (bw + 2 * margin, bh + 2 * margin);
     let iw = image.width() as usize;

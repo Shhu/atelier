@@ -374,7 +374,7 @@ impl AtelierApp {
             // The layer grows to the canvas, or its targeted mask stands in for it.
             if !doc.begin_paint() {
                 doc.discard_step();
-                self.status = self.nothing_to_paint();
+                self.status_cannot(self.nothing_to_paint());
                 return;
             }
             doc.hold_effects(true);
@@ -649,7 +649,7 @@ impl AtelierApp {
             .as_ref()
             .is_some_and(|d| !d.mask_targeted() && !d.active_layer().paintable())
         {
-            self.status = self.nothing_to_paint();
+            self.status_cannot(self.nothing_to_paint());
             return;
         }
         let color = self.primary.to_srgba_unmultiplied();
@@ -675,7 +675,6 @@ impl AtelierApp {
             &style,
             b.all_layers,
         ) {
-            doc.mark_fade_changed();
             self.reset_pending();
         }
     }
@@ -788,7 +787,7 @@ impl AtelierApp {
         doc.checkpoint(t!("paint-tool-gradient"));
         if !doc.begin_paint() {
             doc.discard_step();
-            self.status = self.nothing_to_paint();
+            self.status_cannot(self.nothing_to_paint());
             return;
         }
         let canvas = doc.full_rect();
@@ -811,6 +810,7 @@ impl AtelierApp {
         doc.end_paint();
         if !changed {
             doc.discard_step();
+            doc.mark_fade_nothing();
             return;
         }
         doc.mark_fade();

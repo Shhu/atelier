@@ -119,10 +119,11 @@ struct Current {
     dialog: bool,
     /// Its dialog's OK came (the command was committed).
     committed: bool,
-    edits: bool,
     before: Option<Before>,
     /// Its work was cancelled or failed (see [`ActionsState::step_stopped`]).
     stopped: Option<Stopped>,
+    /// What it was refused with (see [`ActionsState::refused`]).
+    refused: Option<String>,
 }
 
 /// How the work of the step being played ended early.
@@ -136,7 +137,6 @@ pub(super) enum Stopped {
 /// A document's state before a step.
 struct Before {
     doc: u64,
-    status: String,
     /// See `Document::state_id`.
     state: u64,
 }
@@ -211,6 +211,15 @@ impl ActionsState {
     pub(super) fn step_stopped(&mut self, how: Stopped) {
         if let Some(c) = self.player.as_mut().and_then(|p| p.current.as_mut()) {
             c.stopped.get_or_insert(how);
+        }
+    }
+
+    /// A command was refused (`status_cannot`, `status_refused`,
+    /// `status_failed`, `report_error`): the step being played stops there
+    /// if it changed nothing. Nothing while not playing.
+    pub(super) fn refused(&mut self, why: &str) {
+        if let Some(c) = self.player.as_mut().and_then(|p| p.current.as_mut()) {
+            c.refused.get_or_insert_with(|| why.to_owned());
         }
     }
 
@@ -529,7 +538,7 @@ pub(super) fn contents(c: FillContent) -> Contents {
     }
 }
 
-fn fill_content(c: Contents) -> FillContent {
+pub(super) fn fill_content(c: Contents) -> FillContent {
     match c {
         Contents::Foreground => FillContent::Foreground,
         Contents::Background => FillContent::Background,
@@ -678,6 +687,13 @@ impl AtelierApp {
             Action::FlipCanvas(horizontal) => Recorded::FlipCanvas { horizontal },
             Action::NewPatternFill => Recorded::NewPatternFill {
                 pattern: self.last_pattern().id,
+            },
+            Action::NewFillLayer(false) => Recorded::NewSolidFill {
+                color: rgb(self.primary),
+            },
+            Action::NewFillLayer(true) => Recorded::NewGradientFill {
+                from: rgb(self.primary),
+                to: rgb(self.secondary),
             },
             Action::Adjust(AdjustKind::Invert) => Recorded::Adjust {
                 adjustment: Adjustment::Invert,
@@ -1012,41 +1028,44 @@ impl AtelierApp {
             let dialog = q.step.dialog && has_dialog(&q.step.command);
             let before = self.doc.as_ref().map(|d| Before {
                 doc: d.uid(),
-                status: self.status.clone(),
                 state: d.state_id(),
             });
             self.actions.selected = Some(q.row);
-            match self.play_step(&q.step.command, dialog) {
-                Ok(()) => {
-                    if let Some(p) = &mut self.actions.player {
-                        p.current = Some(Current {
-                            title,
-                            action: q.action,
-                            row: q.row,
-                            dialog,
-                            committed: false,
-                            edits: edits(&q.step.command) && !dialog,
-                            before,
-                            stopped: None,
-                        });
-                    }
+            // Current while it runs: what refuses it tells it at once.
+            if let Some(p) = &mut self.actions.player {
+                p.current = Some(Current {
+                    title: title.clone(),
+                    action: q.action.clone(),
+                    row: q.row,
+                    dialog,
+                    committed: false,
+                    before,
+                    stopped: None,
+                    refused: None,
+                });
+            }
+            if let Err(error) = self.play_step(&q.step.command, dialog) {
+                if let Some(p) = &mut self.actions.player {
+                    p.current = None;
                 }
-                Err(error) => return self.step_error(&title, &q.action, q.row, error),
+                return self.step_error(&title, &q.action, q.row, error);
             }
             return;
         }
     }
 
-    /// A step that changed nothing while saying why (a locked layer, no
-    /// pixels…): its message.
+    /// A step that was refused (a locked layer, no pixels…) and changed
+    /// nothing: why. A step that changes nothing without being refused (a
+    /// stroke outside the layer, Auto on an image already at full range)
+    /// goes on.
     fn step_failed(&self, c: &Current) -> Option<String> {
-        let (true, Some(b), Some(doc)) = (c.edits, &c.before, &self.doc) else {
+        let (Some(why), Some(b), Some(doc)) = (&c.refused, &c.before, &self.doc) else {
             return None;
         };
         // A step recorded then discarded (it changed nothing) gives the
         // state back.
         let done = doc.state_id() != b.state;
-        (doc.uid() == b.doc && !done && self.status != b.status).then(|| self.status.clone())
+        (doc.uid() == b.doc && !done).then(|| why.clone())
     }
 
     /// Stops at a step that could not be played: says so (Batch takes the
@@ -1213,7 +1232,7 @@ impl AtelierApp {
                     return Err(t!("smart-status-no-adjustments"));
                 }
                 if !can_paint {
-                    return Err(t!("filter-no-pixels"));
+                    return Err(t!("adjust11-no-pixels"));
                 }
                 if dialog {
                     self.adjust = Some(AdjustDialog {
@@ -1224,11 +1243,15 @@ impl AtelierApp {
                     });
                 } else {
                     let selection = self.selection.as_ref();
-                    if let Some(doc) = &mut self.doc
-                        && doc.adjust_active(adjustment, selection)
-                    {
+                    let Some(doc) = &mut self.doc else {
+                        return Ok(());
+                    };
+                    if doc.adjust_active(adjustment, selection) {
                         self.status = t!("dialog-adjust-applied", name = adjustment.title());
                         self.reset_pending();
+                    } else {
+                        // A neutral one: a Fade after it fades nothing.
+                        doc.mark_fade_nothing();
                     }
                 }
             }
@@ -1246,22 +1269,64 @@ impl AtelierApp {
                 self.patterns.last = *pattern;
                 self.run(Action::NewPatternFill);
             }
+            Recorded::NewSolidFill { color } => {
+                self.new_fill_layer(crate::document::Fill::Solid(*color));
+            }
+            Recorded::NewGradientFill { from, to } => {
+                use crate::compose::gradient::GradientFill;
+                let gradient = crate::paint::gradient::Preset::ForegroundToBackground
+                    .gradient()
+                    .resolved(*from, *to);
+                self.new_fill_layer(crate::document::Fill::Gradient(GradientFill {
+                    gradient,
+                    ..Default::default()
+                }));
+            }
+            Recorded::FillPath {
+                contents, pattern, ..
+            } => {
+                if locked {
+                    return Err(lock_error());
+                }
+                if let Some(text) = hidden {
+                    return Err(text);
+                }
+                if *contents == Contents::Pattern
+                    && pattern.is_none_or(|p| self.patterns.library.get(p).is_none())
+                {
+                    return Err(t!("pattern8-why-missing"));
+                }
+                self.play_path_step(command);
+            }
+            Recorded::StrokePath { .. } => {
+                if locked {
+                    return Err(lock_error());
+                }
+                if let Some(text) = hidden {
+                    return Err(text);
+                }
+                self.play_path_step(command);
+            }
             Recorded::Fade { opacity, mode } => {
                 if locked {
                     return Err(lock_error());
                 }
                 let mode = fade_stroke::blend_named(mode);
+                // The command before it changed nothing on this image: no
+                // window, and the action goes on.
+                if self.doc.as_ref().is_some_and(Document::fade_of_nothing) {
+                    if let Some(c) = self.actions.player.as_mut().and_then(|p| p.current.as_mut()) {
+                        c.committed = true;
+                    }
+                    return Ok(());
+                }
                 if dialog {
                     self.open_fade();
-                    match &mut self.filters.fade {
-                        Some(d) => {
-                            d.fade.opacity = *opacity;
-                            d.fade.mode = mode;
-                        }
-                        // The command before it changed nothing on this image.
-                        None if self.doc.as_ref().is_some_and(Document::fade_of_nothing) => {}
-                        None => return Err(t!("adjust9-why-no-fade")),
-                    }
+                    let Some(d) = &mut self.filters.fade else {
+                        return Err(t!("adjust9-why-no-fade"));
+                    };
+                    d.fade.opacity = *opacity;
+                    d.fade.mode = mode;
                 } else {
                     self.fade_with(*opacity, mode)?;
                 }
@@ -1284,7 +1349,7 @@ impl AtelierApp {
                     return Err(t!("smart-status-no-adjustments"));
                 }
                 if !can_paint {
-                    return Err(t!("filter-no-pixels"));
+                    return Err(t!("adjust11-no-pixels"));
                 }
                 let location = fade_stroke::location_named(location);
                 let mode = fade_stroke::blend_named(mode);
@@ -2828,6 +2893,10 @@ pub(super) fn step_title(r: &Recorded) -> String {
         Recorded::Fade { .. } => t!("adjust8-fade-title"),
         Recorded::DefinePattern { .. } => t!("pattern9-step-define"),
         Recorded::NewPatternFill { .. } => t!("pattern9-step-new-fill"),
+        Recorded::NewSolidFill { .. } => t!("pattern11-step-new-solid-fill"),
+        Recorded::NewGradientFill { .. } => t!("pattern11-step-new-gradient-fill"),
+        Recorded::FillPath { .. } => t!("vector-fill-path-title"),
+        Recorded::StrokePath { .. } => t!("vector-stroke-path-title"),
         Recorded::Stroke { .. } => t!("adjust8-stroke-title"),
         Recorded::Select { .. } => t!("actions-step-select"),
         Recorded::SelectAll => t!("actions-step-select-all"),
@@ -2960,17 +3029,60 @@ pub(super) fn step_details(r: &Recorded) -> Vec<String> {
             ),
         ],
         Recorded::DefinePattern { name } => vec![line(&t!("pattern8-name"), name.as_str())],
-        Recorded::Stroke {
-            width,
-            mode,
+        Recorded::NewSolidFill { color: [r, g, b] } => {
+            vec![line(&t!("options-color"), format!("#{r:02X}{g:02X}{b:02X}"))]
+        }
+        Recorded::NewGradientFill {
+            from: [r, g, b],
+            to: [r2, g2, b2],
+        } => vec![line(
+            &t!("core-gradient"),
+            format!("#{r:02X}{g:02X}{b:02X} → #{r2:02X}{g2:02X}{b2:02X}"),
+        )],
+        Recorded::FillPath {
+            contents,
             opacity,
+            preserve_transparency,
+            feather,
             ..
         } => vec![
+            line(&t!("dialog-fill-contents"), fill_content(*contents).label()),
+            line(&t!("dialog-fill-opacity"), pct(f64::from(*opacity) * 100.0)),
+            line(
+                &t!("dialog-fill-preserve-transparency"),
+                yes_no(*preserve_transparency),
+            ),
+            line(&t!("sel-feather"), px(i18n::short_decimal(f64::from(*feather)))),
+        ],
+        Recorded::StrokePath { eraser, pressure } => vec![
+            line(
+                &t!("vector-stroke-tool"),
+                if *eraser { t!("tool-eraser") } else { t!("tool-brush") },
+            ),
+            line(&t!("vector-simulate-pressure"), yes_no(*pressure)),
+        ],
+        Recorded::Stroke {
+            width,
+            color: [r, g, b],
+            location,
+            mode,
+            opacity,
+            preserve_transparency,
+        } => vec![
             line(&t!("adjust8-stroke-width"), px(width.to_string())),
+            line(&t!("options-color"), format!("#{r:02X}{g:02X}{b:02X}")),
+            line(
+                &t!("adjust8-stroke-location"),
+                fade_stroke::location_label(fade_stroke::location_named(location)),
+            ),
             line(&t!("dialog-fill-opacity"), pct(f64::from(*opacity) * 100.0)),
             line(
                 &t!("adjust8-mode"),
                 fade_stroke::blend_named(mode).label().to_string(),
+            ),
+            line(
+                &t!("dialog-fill-preserve-transparency"),
+                yes_no(*preserve_transparency),
             ),
         ],
         Recorded::Filter { filter } => filter_details(filter),
@@ -4281,5 +4393,54 @@ mod tests {
         let doc = h.state().doc.as_ref().unwrap();
         assert_eq!((doc.width(), doc.height()), (1000, 800));
         assert_eq!(doc.flatten().get_pixel(500, 400).0[0], 246, "inverted after");
+    }
+
+    fn play_to_error(h: &mut Harness<'static, AtelierApp>) {
+        h.state_mut().panel_click(PanelClick::Play);
+        settle(h, |app| app.actions.message.is_some() || idle(app));
+    }
+
+    /// The step error shown, if any.
+    fn error(h: &Harness<'static, AtelierApp>) -> Option<String> {
+        match &h.state().actions.message {
+            Some(Message::Error { text }) => Some(text.clone()),
+            _ => None,
+        }
+    }
+
+    /// A refused step stops the action even when the status bar already
+    /// shows that refusal (the user tried the command by hand first).
+    #[test]
+    fn a_refused_step_stops_even_when_its_message_is_already_shown() {
+        let mut h = app();
+        h.state_mut().run(Action::MergeDown);
+        h.run_steps(1);
+        let said = h.state().status.clone();
+        assert!(!said.is_empty());
+        let before = flat(&h);
+        let merge = Step::new(Recorded::Menu {
+            item: MenuItem::MergeDown,
+        });
+        with_action(&mut h, vec![merge, invert()]);
+        play_to_error(&mut h);
+        let text = error(&h).expect("the step's error");
+        assert!(text.contains(&said), "{text}");
+        assert_eq!(flat(&h), before, "the Invert after it didn't run");
+
+        // A lock's refusal, the same way.
+        let mut h = app();
+        h.state_mut().doc.as_mut().unwrap().active_layer_mut().locks.pixels = true;
+        h.state_mut().selection = Some(PixelRect { x: 0, y: 0, w: 10, h: 10 }.into());
+        h.state_mut().run(Action::ClearSelection);
+        h.run_steps(1);
+        let said = h.state().status.clone();
+        let clear = Step::new(Recorded::Menu {
+            item: MenuItem::Clear,
+        });
+        with_action(&mut h, vec![clear, Step::new(Recorded::Menu { item: MenuItem::NewLayer })]);
+        play_to_error(&mut h);
+        assert_eq!(h.state().status, said, "the same refusal");
+        assert!(error(&h).is_some(), "stopped at the refused step");
+        assert_eq!(h.state().doc.as_ref().unwrap().layers.len(), 1, "no New Layer");
     }
 }

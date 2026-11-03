@@ -385,6 +385,7 @@ impl AtelierApp {
             let job = std::thread::Builder::new()
                 .name("histogram".into())
                 .spawn(move || {
+                    crate::document::watch_styles_only();
                     let opts = crate::compose::Options {
                         held,
                         later_styles: true,
@@ -1825,7 +1826,8 @@ fn fill_content_fields(ui: &mut Ui, fill: &mut Fill) {
             });
         }
         Fill::Gradient(g) => gradient_fill_fields(ui, g),
-        Fill::Pattern(p) => super::patterns_ui::pattern_fill_fields(ui, p),
+        // Without pixels: from its frame.
+        Fill::Pattern(p) => super::patterns_ui::pattern_fill_fields(ui, p, (0.0, 0.0)),
     }
 }
 

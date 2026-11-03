@@ -295,7 +295,7 @@ impl AtelierApp {
     pub(super) fn copy_to_clipboard(&mut self) -> bool {
         let Some(doc) = &self.doc else { return false };
         let Some((image, rect)) = doc.copied(self.selection.as_ref()) else {
-            self.status = t!("status-nothing-to-copy");
+            self.status_cannot(t!("status-nothing-to-copy"));
             return false;
         };
         let name = doc.active_layer().name.clone();
@@ -306,7 +306,7 @@ impl AtelierApp {
     pub(super) fn copy_merged(&mut self) -> bool {
         let Some(doc) = &self.doc else { return false };
         let Some((image, rect)) = doc.merged_pixels(self.selection.as_ref()) else {
-            self.status = t!("status-nothing-to-copy");
+            self.status_cannot(t!("status-nothing-to-copy"));
             return false;
         };
         self.put_on_clipboard(image, rect, t!("files3-status-copied-merged"))
@@ -358,7 +358,7 @@ impl AtelierApp {
             });
         match image {
             Some(image) => self.paste_image(image, mode),
-            None => self.status = t!("status-clipboard-no-image"),
+            None => self.status_cannot(t!("status-clipboard-no-image")),
         }
     }
 
@@ -369,7 +369,7 @@ impl AtelierApp {
             return;
         }
         if mode == PasteMode::Into && self.selection.is_none() {
-            self.status = t!("files3-status-paste-into-no-selection");
+            self.status_cannot(t!("files3-status-paste-into-no-selection"));
             return;
         }
         if self.crop_box_pending() {
@@ -723,7 +723,7 @@ mod tests {
     }
 
     fn folder(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("atelier-files-{name}"));
+        let dir = std::env::temp_dir().join(format!("atelier-files-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

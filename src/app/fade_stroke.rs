@@ -1,7 +1,9 @@
 //! Edit › Fade, Edit › Stroke and Image › Auto Tone, Auto Contrast and Auto
 //! Color: their windows and their work on another thread.
 
-use image::RgbaImage;
+use std::sync::{Arc, OnceLock};
+
+use image::{GrayImage, RgbaImage};
 
 use super::actions_panel::Stopped;
 use super::dialogs::{
@@ -69,8 +71,9 @@ pub(super) fn auto_title(mode: AutoMode) -> String {
 enum Work {
     Auto(AutoMode),
     Fade(Fade),
-    /// Its step is recorded and the layer ready for the result.
-    Stroke(StrokeSettings),
+    /// Its step is recorded and the layer ready for the result; the work
+    /// leaves the band's coverage (canvas position) for Fade.
+    Stroke(StrokeSettings, Arc<OnceLock<(GrayImage, (i64, i64))>>),
 }
 
 impl Work {
@@ -78,7 +81,7 @@ impl Work {
         match self {
             Work::Auto(mode) => auto_title(*mode),
             Work::Fade(_) => t!("adjust8-fade-title"),
-            Work::Stroke(_) => t!("adjust8-stroke-title"),
+            Work::Stroke(..) => t!("adjust8-stroke-title"),
         }
     }
 }
@@ -113,11 +116,11 @@ impl AtelierApp {
         }
         let Some(doc) = &self.doc else { return };
         if doc.target_layer().is_none() {
-            self.status = t!("filter-no-pixels");
+            self.status_cannot(t!("adjust11-no-pixels"));
             return;
         }
         let Some(target) = active_target(doc, self.selection.as_ref()) else {
-            self.status = t!("status-selection-empty");
+            self.status_cannot(t!("status-selection-empty"));
             return;
         };
         let job = Job::spawn(&self.ctx, 0, [0; 4], Some(format!("Auto {mode:?}")), move || {
@@ -133,7 +136,7 @@ impl AtelierApp {
         let Some(doc) = &mut self.doc else { return };
         match doc.fade_source(self.selection.as_ref()) {
             Some(fade) => self.filters.fade = Some(FadeDialog { fade, preview: true }),
-            None => self.status = t!("adjust9-why-no-fade"),
+            None => self.status_cannot(t!("adjust9-why-no-fade")),
         }
     }
 
@@ -272,7 +275,7 @@ impl AtelierApp {
         if self.can_stroke() {
             self.filters.stroke_open = true;
         } else {
-            self.status = t!("filter-no-pixels");
+            self.status_cannot(t!("adjust11-no-pixels"));
         }
     }
 
@@ -393,7 +396,7 @@ impl AtelierApp {
         let Some(doc) = &mut self.doc else { return };
         let canvas = doc.full_rect();
         if selection.as_ref().is_some_and(|sel| sel.bounds(canvas).is_none()) {
-            self.status = t!("status-selection-empty");
+            self.status_cannot(t!("status-selection-empty"));
             return;
         }
         doc.checkpoint(t!("adjust8-stroke-title"));
@@ -401,19 +404,24 @@ impl AtelierApp {
         // it, until the result is in.
         if !doc.begin_paint() {
             doc.discard_step();
-            self.status = t!("filter-no-pixels");
+            self.status_cannot(t!("adjust11-no-pixels"));
             return;
         }
         let Some((image, offset)) = doc.target_layer().map(|l| (l.shared_image(), l.offset)) else {
             doc.end_paint();
             doc.discard_step();
-            self.status = t!("filter-no-pixels");
+            self.status_cannot(t!("adjust11-no-pixels"));
             return;
         };
+        let band = Arc::new(OnceLock::new());
+        let covered = band.clone();
         let job = Job::spawn(&self.ctx, 0, [0; 4], Some("Stroke".to_owned()), move || {
-            crate::pixel_ops::stroke(&image, offset, selection.as_ref(), canvas, &s)
+            let (out, mask, at) =
+                crate::pixel_ops::stroke_covering(&image, offset, selection.as_ref(), canvas, &s);
+            let _ = covered.set((mask, at));
+            out
         });
-        self.start_processing(Work::Stroke(s), job);
+        self.start_processing(Work::Stroke(s, band), job);
     }
 
     /// The indicator of the work under way, then its result put in.
@@ -460,7 +468,7 @@ impl AtelierApp {
 
     /// A stroke given up: its step goes.
     fn end_stroke_step(&mut self, p: &Processing) {
-        if let (Work::Stroke(_), Some(doc)) = (&p.work, &mut self.doc)
+        if let (Work::Stroke(..), Some(doc)) = (&p.work, &mut self.doc)
             && (doc.uid(), doc.active_layer().id) == (p.doc, p.layer)
         {
             doc.end_paint();
@@ -489,7 +497,7 @@ impl AtelierApp {
                 });
             }
             Work::Fade(fade) => self.put_fade(fade, image),
-            Work::Stroke(s) => {
+            Work::Stroke(s, band) => {
                 if *doc.active_layer().image() == image {
                     doc.end_paint();
                     doc.discard_step();
@@ -503,7 +511,11 @@ impl AtelierApp {
                 } else {
                     doc.active_layer_mut().replace_pixels(image);
                     doc.end_paint();
-                    doc.mark_fade_changed();
+                    // Fade blends over the band.
+                    match band.get() {
+                        Some((mask, at)) => doc.mark_fade_painted(mask.clone(), *at),
+                        None => doc.mark_fade_changed(),
+                    }
                     self.status = t!("adjust8-stroke-title");
                 }
                 self.record(recorded_stroke(s));
@@ -549,6 +561,15 @@ pub(super) fn blend_named(name: &str) -> BlendMode {
 }
 
 /// A stroke's location by its recorded name.
+/// The name of a stroke's location, as the Stroke window shows it.
+pub(super) fn location_label(location: StrokeLocation) -> String {
+    match location {
+        StrokeLocation::Inside => t!("adjust8-stroke-inside"),
+        StrokeLocation::Center => t!("adjust8-stroke-center"),
+        StrokeLocation::Outside => t!("adjust8-stroke-outside"),
+    }
+}
+
 pub(super) fn location_named(name: &str) -> StrokeLocation {
     [
         StrokeLocation::Inside,

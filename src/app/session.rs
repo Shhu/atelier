@@ -523,7 +523,7 @@ impl AtelierApp {
             set!(self.crop.preset, c.choice("preset", &CropPreset::ALL));
             set!(self.crop.w, c.number("w", 0.0..=MAX_DIMENSION as f32));
             set!(self.crop.h, c.number("h", 0.0..=MAX_DIMENSION as f32));
-            set!(self.crop.resolution, c.number("resolution", 0.0..=100_000.0));
+            set!(self.crop.resolution, c.number("resolution", 0.0..=crate::document::MAX_RESOLUTION));
             set!(self.crop.overlay, c.choice("overlay", &CropOverlay::ALL));
             set!(self.crop.shield, c.fraction("shield"));
             set!(self.crop.delete_cropped, c.flag("delete_cropped"));

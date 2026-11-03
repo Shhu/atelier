@@ -9,7 +9,7 @@ use image::RgbaImage;
 
 use super::bytes::{Reader, Writer, pack_row, unpack_row};
 use super::descriptor::{Descriptor, Value, angle, percent};
-use crate::compose::pattern::{Pattern, PatternFill, SCALE_RANGE};
+use crate::compose::pattern::{Pattern, PatternFill, STORED_SCALE};
 use crate::document::file_io::Budget;
 use crate::document::{FileError, Layer, LayerKind, MAX_DIMENSION, PixelRect};
 
@@ -223,8 +223,11 @@ fn read_pattern(
     if kept.len() < colors {
         return Ok(None);
     }
-    // The tile, its smaller versions, and a channel while it is decoded.
-    budget.take(w, h, TILE_BYTES_PER_PIXEL)?;
+    // The tile, its smaller versions, and a channel while it is decoded (a
+    // deeper one first takes its own bytes); CMYK also keeps its inks.
+    let deepest = kept.iter().map(|c| (c.depth / 8).max(1)).max().unwrap_or(1) as u64;
+    let inks = if mode == CMYK { 4 } else { 0 };
+    budget.take(w, h, TILE_BYTES_PER_PIXEL + deepest - 1 + inks)?;
     let mut planes = vec![
         [0u8, 0, 0, 255];
         if mode == CMYK {
@@ -369,7 +372,7 @@ pub fn used(layers: &[Layer]) -> Vec<Arc<Pattern>> {
         let fx = l
             .effects
             .pattern_overlay
-            .enabled
+            .in_use()
             .then_some(&l.effects.pattern_overlay.fill);
         for f in kind.into_iter().chain(fx) {
             if all.iter().all(|p| p.id != f.pattern.id) {
@@ -425,7 +428,7 @@ pub fn fill_of(d: &Descriptor, patterns: &Patterns) -> Option<PatternFill> {
     Some(PatternFill {
         pattern,
         scale: (finite(d.num(b"Scl "), 100.0) / 100.0)
-            .clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end()),
+            .clamp(*STORED_SCALE.start(), *STORED_SCALE.end()),
         angle: finite(d.num(b"Angl"), 0.0),
         linked: d.bool(b"Lnkd").or(d.bool(b"Algn")).unwrap_or(true),
         phase: (x, y),

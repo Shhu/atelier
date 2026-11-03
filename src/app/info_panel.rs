@@ -21,7 +21,20 @@ pub(super) struct InfoPanel {
     cursor: Option<(u64, Option<Reading>)>,
     /// The points: what they are computed for.
     samplers: Option<(u64, Vec<Option<Reading>>)>,
+    /// When the points were last read (UI time, s).
+    samplers_at: f64,
 }
+
+#[cfg(test)]
+impl InfoPanel {
+    pub(super) fn samplers_at(&self) -> f64 {
+        self.samplers_at
+    }
+}
+
+/// How often the points are read again while a press on the canvas edits
+/// (s): not at each dab, the stroke would wait for them.
+const SAMPLERS_WHILE_HELD: f64 = 0.25;
 
 /// Height of a line of values, of a line between blocks.
 const ROW: f32 = 20.0;
@@ -74,22 +87,39 @@ impl AtelierApp {
     }
 
     /// The values under the pointer and of the points, computed again only
-    /// when the image, the pixel or the settings change.
+    /// when the image, the pixel or the settings change. Both average over
+    /// the Sample Size.
     fn update_readings(&mut self) {
-        let image = hash_of((self.composite_key(), self.inks_key()));
+        let composite = self.composite_key();
+        let image = hash_of((composite, self.inks_key()));
         let hover = self.hover_pixel;
-        let key = hash_of((image, hover));
+        let radius = self.measure.sample.radius();
+        let key = hash_of((image, hover, radius));
         if self.info.cursor.as_ref().is_none_or(|c| c.0 != key) {
-            let reading = hover.and_then(|p| self.reading_at(p, 0));
+            let reading = hover.and_then(|p| self.reading_at(p, radius));
             self.info.cursor = Some((key, reading));
         }
         let Some(doc) = &self.doc else { return };
         let spots: Vec<(i64, i64)> = doc.samplers.iter().map(|s| s.pixel()).collect();
-        let radius = self.measure.sample.radius();
-        let key = hash_of((image, &spots, radius));
-        if self.info.samplers.as_ref().is_none_or(|c| c.0 != key) {
-            let readings = spots.iter().map(|&p| self.reading_at(p, radius)).collect();
+        // (Their values are levels only: no inks.)
+        let key = hash_of((composite, &spots, radius));
+        let now = self.ctx.input(|i| i.time);
+        let edited = self.edit_held(&self.ctx);
+        let current = self.info.samplers.as_ref().filter(|c| {
+            c.0 == key
+                // While a stroke goes on: from time to time.
+                || (edited
+                    && c.1.len() == spots.len()
+                    && now - self.info.samplers_at < SAMPLERS_WHILE_HELD)
+        });
+        if current.is_none() {
+            let readings = doc
+                .sampled_all(&spots, radius)
+                .into_iter()
+                .map(|rgb| rgb.map(|rgb| Reading { rgb, cmyk: None }))
+                .collect();
             self.info.samplers = Some((key, readings));
+            self.info.samplers_at = now;
         }
     }
 

@@ -222,10 +222,47 @@ fn a_guide_pulled_from_a_ruler_lands_under_the_pointer() {
     let to = screen(&h, 200.0, 100.0);
     let from = pos2(to.x, canvas.top() - 8.0);
     drag(&mut h, from, to);
+    // At 90°, the top ruler reads image y: the guide along it is a constant x.
     let guides = &doc(&h).guides;
     assert_eq!(guides.len(), 1);
-    assert_eq!(guides[0].orientation, Orientation::Horizontal);
-    assert!((guides[0].position - 100.0).abs() <= 8.0, "{guides:?}");
+    assert_eq!(guides[0].orientation, Orientation::Vertical);
+    assert!((guides[0].position - 200.0).abs() <= 8.0, "{guides:?}");
+}
+
+/// A guide pulled from a ruler runs along that ruler on screen, whatever
+/// the turn, and its position is the one read on the other ruler.
+#[test]
+fn a_guide_pulled_from_a_ruler_runs_along_it() {
+    let turns = [(0.0, false), (90.0, false), (-90.0, false), (90.0, true), (30.0, false)];
+    for (angle, flipped) in turns {
+        for from_top in [true, false] {
+            let mut h = turned(Tool::Transform, angle, flipped);
+            h.key_press_modifiers(Modifiers::COMMAND, Key::R);
+            h.run_steps(3);
+            let canvas = h.state().rulers.canvas_area().expect("canvas");
+            let to = screen(&h, 200.0, 100.0);
+            let from = if from_top {
+                pos2(to.x, canvas.top() - 8.0)
+            } else {
+                pos2(canvas.left() - 8.0, to.y)
+            };
+            drag(&mut h, from, to);
+            let g = doc(&h).guides[0];
+            // Its direction on screen.
+            let along = match g.orientation {
+                Orientation::Horizontal => vec2(1.0, 0.0),
+                Orientation::Vertical => vec2(0.0, 1.0),
+            };
+            let shown = screen(&h, 200.0, 100.0) - screen(&h, 200.0 - along.x, 100.0 - along.y);
+            let level = shown.x.abs() >= shown.y.abs();
+            assert_eq!(level, from_top, "{angle} {flipped} {from_top}: {g:?}");
+            let expected = match g.orientation {
+                Orientation::Horizontal => 100.0,
+                Orientation::Vertical => 200.0,
+            };
+            assert!((g.position - expected).abs() <= 8.0, "{angle} {flipped}: {g:?}");
+        }
+    }
 }
 
 #[test]
@@ -803,7 +840,27 @@ fn a_drag_anywhere_on_an_artboard_name_takes_that_artboard() {
 
 /// A Free Transform with a dragged corner.
 fn free_transform() -> Harness<'static, AtelierApp> {
-    let mut h = app(Tool::Transform);
+    free_transform_on(app(Tool::Transform))
+}
+
+/// Frames of 20 ms: two clicks in a row make a double click.
+fn quick_app(tool: Tool) -> Harness<'static, AtelierApp> {
+    i18n::set_lang(Lang::En);
+    let mut h = Harness::builder()
+        .with_step_dt(0.02)
+        .with_size([1400.0, 1000.0])
+        .build_eframe(move |cc| {
+            let mut app = AtelierApp::new(cc, None);
+            let img = image::RgbaImage::from_pixel(400, 300, image::Rgba([255, 255, 255, 255]));
+            app.doc = Some(Document::new(img, None));
+            app.tool = tool;
+            app
+        });
+    h.run_steps(3);
+    h
+}
+
+fn free_transform_on(mut h: Harness<'static, AtelierApp>) -> Harness<'static, AtelierApp> {
     h.state_mut().auto_select = false;
     let img = image::RgbaImage::from_pixel(100, 100, image::Rgba([10, 20, 30, 255]));
     h.state_mut().doc.as_mut().expect("doc").add_layer("s".into(), img, (0, 0));
@@ -993,4 +1050,242 @@ fn the_center_within_a_rectangle_is_the_polygons_part() {
     let cut = view_turn::center_within(&square(pos2(100.0, 50.0), 20.0), r).expect("half");
     near(cut, pos2(90.0, 50.0), 0.001);
     assert!(view_turn::center_within(&square(pos2(300.0, 50.0), 20.0), r).is_none());
+}
+
+/// Two quick clicks at `p` (a double click with `quick_app`).
+fn double_click(h: &mut Harness<'static, AtelierApp>, p: Pos2) {
+    h.hover_at(p);
+    h.run_steps(1);
+    for _ in 0..2 {
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos: p,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            });
+        }
+        h.step();
+    }
+    h.run_steps(3);
+}
+
+fn space(h: &mut Harness<'static, AtelierApp>, pressed: bool) {
+    h.event(egui::Event::Key {
+        key: Key::Space,
+        physical_key: Some(Key::Space),
+        pressed,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    });
+    h.run_steps(1);
+}
+
+#[test]
+fn a_double_click_with_a_view_tool_or_space_leaves_a_transform_pending() {
+    // The control: a double click inside the frame applies it.
+    let mut h = free_transform_on(quick_app(Tool::Transform));
+    let at = screen(&h, 60.0, 60.0);
+    double_click(&mut h, at);
+    assert!(h.state().transform_rect.is_none(), "applied");
+    assert_eq!(doc(&h).active_layer().rect().w, 150);
+
+    for key in [Key::Z, Key::R, Key::H, Key::Space] {
+        let mut h = free_transform_on(quick_app(Tool::Transform));
+        let (frame, steps) = (h.state().transform_rect, doc(&h).history().1);
+        if key == Key::Space {
+            space(&mut h, true);
+        } else {
+            h.key_press(key);
+            h.run_steps(2);
+        }
+        let shown = h.state().shown_tool();
+        let at = screen(&h, 60.0, 60.0);
+        double_click(&mut h, at);
+        if key == Key::Space {
+            space(&mut h, false);
+        }
+        assert_eq!(h.state().transform_rect, frame, "{key:?}: still pending");
+        assert_eq!(doc(&h).history().1, steps, "{key:?}: no step");
+        assert_eq!(h.state().shown_tool(), shown, "{key:?}");
+    }
+}
+
+#[test]
+fn a_double_click_with_the_zoom_tool_leaves_a_crop_box_pending() {
+    for zoom in [false, true] {
+        let mut h = quick_app(Tool::Canvas);
+        h.state_mut().rulers.settings.snap = false;
+        h.run_steps(1);
+        let (a, b) = (screen(&h, 100.0, 80.0), screen(&h, 220.0, 170.0));
+        drag(&mut h, a, b);
+        let frame = h.state().canvas_rect.expect("a box");
+        if zoom {
+            h.key_press(Key::Z);
+            h.run_steps(2);
+        }
+        let before = h.state().zoom;
+        let at = screen(&h, 160.0, 120.0);
+        double_click(&mut h, at);
+        for _ in 0..20 {
+            h.run_steps(1);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if zoom {
+            assert_eq!(h.state().canvas_rect, Some(frame));
+            assert_eq!((doc(&h).width(), doc(&h).height()), (400, 300));
+            assert!(h.state().zoom > before * 1.5, "both clicks zoomed in");
+        } else {
+            // The control: it crops.
+            assert_eq!((doc(&h).width(), doc(&h).height()), (120, 90));
+        }
+    }
+}
+
+#[test]
+fn a_view_tool_tapped_over_a_transform_stays_when_it_ends() {
+    for (key, end, tool) in [
+        (Key::R, Key::Enter, Tool::RotateView),
+        (Key::Z, Key::Escape, Tool::Zoom),
+        (Key::H, Key::Enter, Tool::Hand),
+    ] {
+        let mut h = free_transform();
+        h.key_press(key);
+        h.run_steps(2);
+        assert_eq!(h.state().shown_tool(), tool);
+        h.key_press(end);
+        h.run_steps(3);
+        assert!(h.state().transform_rect.is_none(), "{key:?}");
+        assert_eq!(h.state().tool, tool, "{key:?} then {end:?}");
+        assert_eq!(h.state().shown_tool(), tool);
+    }
+}
+
+#[test]
+fn holding_r_after_a_view_tool_was_tapped_over_a_transform_comes_back_to_it() {
+    for (tapped, back) in [(Key::R, Tool::RotateView), (Key::H, Tool::Hand)] {
+        let mut h = free_transform();
+        let frame = h.state().transform_rect;
+        h.key_press(tapped);
+        h.run_steps(2);
+        r_key(&mut h, true);
+        let c = h.state().rulers.canvas_area().expect("canvas").center();
+        drag(&mut h, c + vec2(200.0, 0.0), c + vec2(0.0, 200.0));
+        r_key(&mut h, false);
+        assert!(h.state().view_turn.angle.abs() > 80.0, "{tapped:?}");
+        assert_eq!(h.state().shown_tool(), back, "{tapped:?}");
+        assert_eq!(h.state().tool, Tool::Transform);
+        assert_eq!(h.state().transform_rect, frame);
+    }
+}
+
+#[test]
+fn a_view_tool_over_a_transform_shows_its_hints_with_enter_and_esc() {
+    let mut h = free_transform();
+    h.key_press(Key::R);
+    h.run_steps(3);
+    assert!(h.query_by_label_contains(&t!("view8-hint-rotate")).is_some());
+    assert!(h.query_by_label_contains(&t!("hint-apply")).is_some());
+    assert!(h.query_by_label_contains(&t!("view8-hint-reset")).is_none(), "Esc cancels");
+}
+
+/// The name of an artboard shows outside it on screen, whatever the turn,
+/// and a press on the board there doesn't take it.
+#[test]
+fn an_artboard_name_stays_outside_its_board_on_a_turned_view() {
+    use crate::document::ArtboardBackground;
+    for angle in [0.0f32, 90.0, -90.0, 45.0, 180.0] {
+        let mut h = app(Tool::Transform);
+        let mut board = Document::with_artboard(300, 200, ArtboardBackground::White);
+        board.layers[1].name = "A rather long artboard name".into();
+        board.add_artboard(
+            "new".into(),
+            "B".into(),
+            PixelRect { x: 500, y: 0, w: 100, h: 100 },
+            ArtboardBackground::White,
+        );
+        h.state_mut().doc = Some(board);
+        h.state_mut().view_turn.angle = angle;
+        h.run_steps(3);
+        let (_, r) = h.state().artboards.labels[0];
+        let shown = Rect::from_center_size(h.state().view_turn.to_screen(r.center()), r.size());
+        for sy in (shown.top() as i32..shown.bottom() as i32).step_by(2) {
+            for sx in (shown.left() as i32..shown.right() as i32).step_by(2) {
+                let ip = image_at(&h, pos2(sx as f32, sy as f32));
+                let inside = ip.x > 1.0 && ip.x < 299.0 && ip.y > 1.0 && ip.y < 199.0;
+                assert!(!inside, "{angle}: the name covers the board at {ip:?}");
+            }
+        }
+    }
+}
+/// Frame cost while the view turns or pans, with and without Quick Mask.
+#[test]
+#[ignore]
+fn timing_turn_and_pan_with_quick_mask() {
+    for quick in [false, true] {
+        let mut h = app(Tool::Hand);
+        let img = image::RgbaImage::from_pixel(6000, 4000, image::Rgba([200, 180, 160, 255]));
+        h.state_mut().doc = Some(Document::new(img, None));
+        h.state_mut().zoom = 1.0;
+        h.state_mut().fit_pending = None;
+        h.state_mut().pan = Vec2::ZERO;
+        for _ in 0..40 {
+            h.run_steps(1);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if quick {
+            h.state_mut().run(Action::Select(select_menu::Command::QuickMask));
+            h.run_steps(10);
+        }
+        let time = |h: &mut Harness<'static, AtelierApp>, f: &dyn Fn(&mut AtelierApp, usize)| {
+            let t = std::time::Instant::now();
+            for i in 0..30 {
+                f(h.state_mut(), i);
+                h.run_steps(1);
+            }
+            t.elapsed().as_secs_f64() * 1000.0 / 30.0
+        };
+        let pan0 = time(&mut h, &|a, _| a.pan += vec2(3.0, 0.0));
+        let turning = time(&mut h, &|a, i| a.set_view_angle(i as f32 * 1.5 + 0.7));
+        h.state_mut().set_view_angle(45.0);
+        h.run_steps(5);
+        let pan45 = time(&mut h, &|a, _| a.pan += vec2(3.0, 0.0));
+        eprintln!("quick {quick}: pan0 {pan0:.1} ms, turning {turning:.1} ms, pan45 {pan45:.1} ms");
+    }
+}
+
+/// On a turned view, the Quick Mask overlay is only computed where the
+/// canvas area shows, and there it is the same.
+#[test]
+fn the_mask_overlay_is_computed_only_where_it_shows() {
+    use select_menu::{OverlayMask, OverlaySource, OverlayStyle, overlay_image};
+    let mask =
+        image::GrayImage::from_fn(64, 48, |x, y| image::Luma([((x * 4 + y * 3) % 256) as u8]));
+    let source = OverlaySource {
+        mask: OverlayMask::Gray(std::sync::Arc::new(mask)),
+        scale: 1.0,
+        origin: Pos2::ZERO,
+        style: OverlayStyle::Tint([255, 0, 0], 0.5),
+        key: 0,
+    };
+    let view = View { origin: pos2(-20.0, -10.0), zoom: 7.0 };
+    let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0));
+    let turn = view_turn::ViewTurn { angle: 30.0, flipped: true, center: area.center() };
+    let (origin, size) = ((-100.0, -100.0), (600, 500));
+    let full = overlay_image(&source, view, 1.0, origin, size, None);
+    let cut = overlay_image(&source, view, 1.0, origin, size, Some((turn, area.expand(1.0))));
+    let (mut computed, mut seen) = (0, 0);
+    for (x, y, px) in cut.enumerate_pixels() {
+        let upright = pos2(origin.0 + x as f32 + 0.5, origin.1 + y as f32 + 0.5);
+        let shown = turn.to_screen(upright);
+        if area.contains(shown) {
+            seen += 1;
+            assert_eq!(px, full.get_pixel(x, y), "{x} {y}");
+        } else if !area.expand(2.5).contains(shown) {
+            assert_eq!(px.0, [0; 4], "{x} {y} is never seen");
+        }
+        computed += usize::from(px.0 != [0; 4]);
+    }
+    assert!(seen > 100_000);
+    assert!(computed < seen * 11 / 10, "{computed} computed for {seen} seen");
 }

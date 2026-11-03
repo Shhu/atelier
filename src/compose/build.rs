@@ -447,13 +447,13 @@ impl Builder<'_, '_> {
         }
         if fx.pattern_overlay.enabled {
             let p = &fx.pattern_overlay;
-            // Linked: from the top left corner of the layer (see
-            // `Layer::reframe`: painting doesn't move it), of what a group
-            // holds; the phase keeps it where it was.
-            let origin = match (p.fill.linked, l.is_group()) {
-                (false, _) => (0.0, 0.0),
-                (true, true) => (content_box.x as f32, content_box.y as f32),
-                (true, false) => (l.offset.0 as f32, l.offset.1 as f32),
+            // Linked: from the layer's frame, which moves with it (see
+            // `Layer::reframe`: painting doesn't move it; a group's frame
+            // moves only with the whole group); the phase keeps it where
+            // it was.
+            let origin = match p.fill.linked {
+                false => (0.0, 0.0),
+                true => (l.offset.0 as f32, l.offset.1 as f32),
             };
             let level = self.sources.level();
             interior.push(Interior::Pattern {

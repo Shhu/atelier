@@ -725,7 +725,7 @@ impl AtelierApp {
     pub(super) fn retouch_refuses(&mut self) -> bool {
         if self.tool.clones() && self.clone_source().is_none() {
             let alt_click = keys::combo(&self.ctx, Modifiers::ALT, &t!("hint-key-click"));
-            self.status = t!("retouch-status-no-source", keys = alt_click);
+            self.status_cannot(t!("retouch-status-no-source", keys = alt_click));
             return true;
         }
         false
@@ -1006,7 +1006,7 @@ impl AtelierApp {
             return;
         };
         let shown = job.shown;
-        if !ctx.input(|i| input_waits(i, shown)) {
+        if !ctx.input(|i| input_waits(i, shown, shown.is_some())) {
             return;
         }
         let Some(job) = &self.retouch.job else { return };
@@ -1067,6 +1067,10 @@ impl AtelierApp {
             self.stroke_dirty = Some(self.stroke_dirty.map_or(r, |d| d.union(r)));
             doc.hold_effects(false);
             doc.end_paint();
+            // Edit › Fill (Content-Aware) can be faded, like the other fills.
+            if !job.stroke {
+                doc.mark_fade();
+            }
             if let Some(selection) = job.selection.clone() {
                 // Moved with the patch, in its step.
                 self.selection = selection;
@@ -1105,7 +1109,7 @@ impl AtelierApp {
     /// Edit › Content-Aware Fill…: its window, over a selection.
     pub(super) fn open_content_aware(&mut self) {
         if self.selection.is_none() {
-            self.status = t!("retouch-status-select-first");
+            self.status_cannot(t!("retouch-status-select-first"));
             return;
         }
         if self.refuse_if_target_locked() || self.refuse_hidden_layer() {
@@ -1145,7 +1149,7 @@ impl AtelierApp {
             t!("retouch-content-aware-fill")
         };
         let Some(selection) = self.selection.clone() else {
-            self.status = t!("retouch-status-select-first");
+            self.status_cannot(t!("retouch-status-select-first"));
             return false;
         };
         let Some(doc) = &mut self.doc else {
@@ -1160,12 +1164,12 @@ impl AtelierApp {
             doc.checkpoint(name.clone());
             if !doc.begin_paint() {
                 doc.discard_step();
-                self.status = self.nothing_to_paint();
+                self.status_cannot(self.nothing_to_paint());
                 return false;
             }
         }
         let Some(layer) = doc.target_layer() else {
-            self.status = self.nothing_to_paint();
+            self.status_cannot(self.nothing_to_paint());
             return false;
         };
         let image = layer.shared_image();
@@ -1177,7 +1181,7 @@ impl AtelierApp {
                 doc.end_paint();
                 doc.discard_step();
             }
-            self.status = t!("status-selection-empty");
+            self.status_cannot(t!("status-selection-empty"));
             return false;
         };
         let region = match request.settings.area {
@@ -1415,7 +1419,7 @@ impl AtelierApp {
         doc.checkpoint(name);
         if !doc.begin_paint() {
             doc.discard_step();
-            self.status = self.nothing_to_paint();
+            self.status_cannot(self.nothing_to_paint());
             return;
         }
         let canvas = doc.full_rect();
@@ -1535,7 +1539,7 @@ impl AtelierApp {
         doc.checkpoint(name);
         if !doc.begin_paint() {
             doc.discard_step();
-            self.status = self.nothing_to_paint();
+            self.status_cannot(self.nothing_to_paint());
             return;
         }
         let canvas = doc.full_rect();
@@ -1862,9 +1866,9 @@ fn coverage_of(clip: &crate::pixel_ops::Clip, region: DirtyRect) -> Vec<f32> {
 
 /// Whether input of this frame waits for a job (see
 /// `AtelierApp::wait_stroke_job`): a press (not on the job's window,
-/// `shown`), a key (not Esc while the window shows), text, a paste or a
-/// drop.
-pub(super) fn input_waits(i: &egui::InputState, shown: Option<egui::Rect>) -> bool {
+/// `shown`), a key (not Esc when `esc_own`: it cancels the job), text, a
+/// paste or a drop.
+pub(super) fn input_waits(i: &egui::InputState, shown: Option<egui::Rect>, esc_own: bool) -> bool {
     !i.raw.dropped_files.is_empty()
         || i.events.iter().any(|e| match e {
             egui::Event::PointerButton {
@@ -1872,7 +1876,7 @@ pub(super) fn input_waits(i: &egui::InputState, shown: Option<egui::Rect>) -> bo
             } => !shown.is_some_and(|r| r.contains(*pos)),
             egui::Event::Key {
                 pressed: true, key, ..
-            } => !(*key == Key::Escape && shown.is_some()),
+            } => !(*key == Key::Escape && esc_own),
             egui::Event::Text(_)
             | egui::Event::Paste(_)
             | egui::Event::Copy

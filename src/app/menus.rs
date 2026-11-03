@@ -938,8 +938,12 @@ pub(super) fn explained_menu_entries(
                 text.append(icon::CHECK, 0.0, format(Color32::TRANSPARENT));
                 text.append(label, 6.0, format(Color32::PLACEHOLDER));
                 let button = egui::Button::new(text);
-                ui.add_enabled(false, button)
-                    .on_disabled_hover_text(why.as_str());
+                let response = ui.add_enabled(false, button);
+                // Named without the room left for the mark.
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, false, label)
+                });
+                response.on_disabled_hover_text(why.as_str());
             }
             MenuEntry::Check(label, enabled, checked, shortcut, act) => {
                 // A check mark in front, room kept for it when off.
@@ -954,10 +958,20 @@ pub(super) fn explained_menu_entries(
                 text.append(icon::CHECK, 0.0, format(mark));
                 text.append(label, 6.0, format(Color32::PLACEHOLDER));
                 let mut button = egui::Button::new(text);
-                if let Some(s) = shortcut {
-                    button = button.shortcut_text(keys::shortcut(ui.ctx(), s));
+                let key = shortcut.map(|s| keys::shortcut(ui.ctx(), s));
+                if let Some(key) = &key {
+                    button = button.shortcut_text(key.as_str());
                 }
                 let response = ui.add_enabled(*enabled, button);
+                // An option, on or off, named without its mark (and with its
+                // keys, as egui names a button).
+                let name = match &key {
+                    Some(key) => format!("{label} {key}"),
+                    None => label.clone(),
+                };
+                response.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::WidgetType::Checkbox, *enabled, *checked, &name)
+                });
                 if !*enabled && let Some(text) = why(*act) {
                     response.clone().on_disabled_hover_text(text);
                 }

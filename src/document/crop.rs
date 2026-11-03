@@ -9,9 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use image::imageops::FilterType;
 use image::RgbaImage;
 
-use super::{Document, Layer, PixelRect, State, guides, intersect, next_rev, vectors};
+use super::{Document, Fill, Layer, LayerKind, PixelRect, State, guides, intersect, next_rev, vectors};
 use crate::i18n::t;
 use crate::mask_ops::Affine;
+
+/// The highest resolution a crop gives (pixels per inch): what a Photoshop
+/// document can hold.
+pub const MAX_RESOLUTION: f32 = 65000.0;
 
 /// A crop: the box in the canvas, turned by `angle` (degrees, clockwise),
 /// then what is left resampled to `size`, at `resolution` pixels per inch.
@@ -31,6 +35,8 @@ pub enum WholeChange {
     /// Image Rotation, in degrees, clockwise.
     Rotate(f32),
     Crop(CropOrder),
+    /// Flip Canvas, horizontal or vertical.
+    Flip(bool),
 }
 
 /// The work of a [`WholeChange`], to run on any thread.
@@ -75,6 +81,8 @@ impl Document {
         let mut state = done.state;
         state.id = next_rev();
         self.restore(state);
+        // Outside the state: the work copy's drop doesn't reach it.
+        self.ruler = None;
         true
     }
 
@@ -114,33 +122,39 @@ impl Document {
     }
 
     /// Cuts the plain pixel layers and every mask to the canvas, as its own
-    /// step. Texts, shapes, smart objects and artboards are not pixels to
-    /// cut, nor is what a board holds (the board stays as it was), nor what
-    /// styles are drawn from (they would change on what remains): they stay
-    /// whole. Returns whether anything went.
+    /// step. Returns whether anything went.
     fn delete_outside_canvas(&mut self) -> bool {
-        let canvas = self.full_rect();
-        let overhangs = |r: PixelRect| r.w > 0 && r.h > 0 && intersect(r, canvas) != Some(r);
-        let cuttable: Vec<usize> = (0..self.layers.len())
-            .filter(|&i| {
+        self.delete_outside(self.full_rect())
+    }
+
+    /// Cuts the plain pixel layers and every mask to `area`, as its own
+    /// step, keeping what still shows: a layer on an artboard keeps its
+    /// board (it shows only there, and the board is cut on its own), and
+    /// styled pixels keep how far their styles reach. Texts, shapes, smart
+    /// objects and artboards are not pixels to cut, nor what a gradient
+    /// overlay spans (its box would change): they stay whole. Returns
+    /// whether anything went.
+    fn delete_outside(&mut self, area: PixelRect) -> bool {
+        let overhangs = |r: PixelRect, k: PixelRect| r.w > 0 && r.h > 0 && intersect(r, k) != Some(r);
+        let cuttable: Vec<(usize, PixelRect)> = (0..self.layers.len())
+            .filter_map(|i| {
                 let l = &self.layers[i];
-                if self.artboard_of(i).is_some() || self.styled(i) {
-                    return false;
-                }
-                plain_pixels(l) && overhangs(l.rect())
-                    || l.mask.as_ref().is_some_and(|m| overhangs(m.rect(l.offset)))
+                let kept = self.kept_area(i, area)?;
+                let cut = plain_pixels(l) && overhangs(l.rect(), kept)
+                    || l.mask.as_ref().is_some_and(|m| overhangs(m.rect(l.offset), kept));
+                cut.then_some((i, kept))
             })
             .collect();
         if cuttable.is_empty() {
             return false;
         }
         self.checkpoint(t!("menu-image-crop"));
-        for i in cuttable {
+        for (i, kept) in cuttable {
             let layer = &mut self.layers[i];
             let old = layer.offset;
-            if plain_pixels(layer) && overhangs(layer.rect()) {
+            if plain_pixels(layer) && overhangs(layer.rect(), kept) {
                 let r = layer.rect();
-                let (image, offset) = match intersect(r, canvas) {
+                let (image, offset) = match intersect(r, kept) {
                     Some(k) => (
                         image::imageops::crop_imm(
                             layer.image(),
@@ -157,21 +171,46 @@ impl Document {
                 layer.replace_pixels(image);
                 layer.reframe(offset);
             }
-            layer.edit_mask(old, |m| m.cut_to(canvas));
+            layer.edit_mask(old, |m| m.cut_to(kept));
         }
         true
     }
 
-    /// Layer `i` or a group holding it draws styles from its shape.
-    fn styled(&self, i: usize) -> bool {
+    /// What of layer `i` cut to `area` still shows: `area`, or its board,
+    /// grown by the reach of the styles drawn from it (its own and the
+    /// groups' holding it). `None`: it must stay whole.
+    fn kept_area(&self, i: usize, area: PixelRect) -> Option<PixelRect> {
+        let mut reach = 0i64;
+        let mut kept = area;
         let mut at = Some(i);
         while let Some(j) = at {
-            if self.layers[j].effects.any() {
-                return true;
+            let l = &self.layers[j];
+            let fx = &l.effects;
+            if fx.any() {
+                // It spans the box of what it is drawn on.
+                if fx.gradient_overlay.enabled {
+                    return None;
+                }
+                let offset = |s: &crate::compose::styles::ShadowFx| match s.enabled {
+                    true => s.dx.abs().max(s.dy.abs()),
+                    false => 0.0,
+                };
+                let offset = offset(&fx.shadow).max(offset(&fx.inner_shadow));
+                reach += fx.margin() as i64 + offset.min(1e6).ceil() as i64;
+            }
+            if j != i
+                && let Some(board) = l.artboard_rect()
+            {
+                kept = board;
             }
             at = self.parent(j);
         }
-        false
+        Some(PixelRect {
+            x: kept.x - reach,
+            y: kept.y - reach,
+            w: kept.w + 2 * reach as u32,
+            h: kept.h + 2 * reach as u32,
+        })
     }
 
     /// The canvas turned by `degrees`: its map, once done.
@@ -217,7 +256,7 @@ impl WholeJob {
     /// Number of pixels it computes, about (to run small ones at once).
     pub fn size(&self) -> u64 {
         let turning = match self.change {
-            WholeChange::Rotate(_) => true,
+            WholeChange::Rotate(_) | WholeChange::Flip(_) => true,
             WholeChange::Crop(c) => c.angle != 0.0 || c.size.is_some() || c.delete,
         };
         if !turning {
@@ -233,14 +272,27 @@ impl WholeJob {
             area(l.image().width(), l.image().height()) + mask
         });
         let channels = d.channels.iter().map(|c| area(c.mask.width(), c.mask.height()));
-        layers.chain(channels).sum()
+        // Pattern tiles turn or mirror too.
+        let tiles = d.layers.iter().map(|l| {
+            let fill = match &l.kind {
+                LayerKind::Fill(Fill::Pattern(f)) => Some(f),
+                _ => None,
+            };
+            let fx = &l.effects.pattern_overlay;
+            let overlay = fx.in_use().then_some(&fx.fill);
+            fill.into_iter()
+                .chain(overlay)
+                .map(|f| area(f.pattern.image.width(), f.pattern.image.height()))
+                .sum::<u64>()
+        });
+        layers.chain(channels).chain(tiles).sum()
     }
 
     /// A smart object it renders again runs smart filters (whose cost its
     /// size can't tell).
     pub fn has_filters(&self) -> bool {
         let renders = match self.change {
-            WholeChange::Rotate(_) => true,
+            WholeChange::Rotate(_) | WholeChange::Flip(_) => true,
             WholeChange::Crop(c) => c.angle != 0.0 || c.size.is_some(),
         };
         let filtered = |l: &Layer| l.smart.as_ref().is_some_and(|s| !s.filters.is_empty());
@@ -268,6 +320,14 @@ impl WholeJob {
                     done.map = map;
                 }
             }
+            WholeChange::Flip(horizontal) => {
+                let (w, h) = (work.canvas.0 as f32, work.canvas.1 as f32);
+                work.flip_canvas_unless(horizontal, &cancel);
+                done.map = Affine(match horizontal {
+                    true => [-1.0, 0.0, w, 0.0, 1.0, 0.0],
+                    false => [1.0, 0.0, 0.0, 0.0, -1.0, h],
+                });
+            }
             WholeChange::Crop(c) => {
                 let center = (
                     c.rect.x as f32 + c.rect.w as f32 / 2.0,
@@ -276,6 +336,20 @@ impl WholeJob {
                 let mut r = c.rect;
                 let quarter = (c.angle / 90.0).fract() == 0.0;
                 let upright_guides = work.guides.clone();
+                if c.delete && c.angle != 0.0 {
+                    // What the turned box can't reach goes first: only the
+                    // rest is turned (a few pixels to spare for the filter).
+                    let (w, h) = crate::rotate::rotated_size(r.w as f32, r.h as f32, c.angle);
+                    let spare = 4.0;
+                    let (x0, y0) = (center.0 - w / 2.0 - spare, center.1 - h / 2.0 - spare);
+                    let reach = PixelRect {
+                        x: x0.floor() as i64,
+                        y: y0.floor() as i64,
+                        w: (w + 2.0 * spare).ceil() as u32 + 1,
+                        h: (h + 2.0 * spare).ceil() as u32 + 1,
+                    };
+                    work.delete_outside(reach);
+                }
                 if c.angle != 0.0
                     && let Some(map) = work.turn_for_whole(-c.angle, &cancel)
                 {
@@ -316,7 +390,7 @@ impl WholeJob {
                         )
                     };
                     if super::check_size(target.0, target.1).is_ok()
-                        && work.resize_image(target.0, target.1, c.filter)
+                        && work.resize_image_unless(target.0, target.1, c.filter, &cancel)
                     {
                         done.map = then(
                             done.map,
@@ -327,7 +401,7 @@ impl WholeJob {
                     }
                 }
                 if c.resolution > 0.0 && c.resolution.is_finite() {
-                    let density = f64::from(c.resolution);
+                    let density = f64::from(c.resolution.clamp(1.0, MAX_RESOLUTION));
                     let current = work.file_metadata.image.as_ref().and_then(|m| m.density);
                     if current != Some((density, density)) {
                         let meta = work.file_metadata.image.get_or_insert_default();

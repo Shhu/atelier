@@ -177,8 +177,11 @@ impl AtelierApp {
         let (bar, ..) = zoom_bar_geometry(ui, area);
         // (None in Full Screen.)
         let bar_shown = screen != workspace::ScreenMode::Full;
-        let hovered =
-            response.hovered() && !(bar_shown && screen_pointer.is_some_and(|p| bar.contains(p)));
+        // Nor under the indicator of a change computed aside (its Cancel),
+        // even on the frames it fades in.
+        let hovered = response.hovered()
+            && !(bar_shown && screen_pointer.is_some_and(|p| bar.contains(p)))
+            && !screen_pointer.is_some_and(|p| self.busy_indicator_at(p));
 
         // Mouse wheel, like Photoshop: scrolling (Shift: horizontal), zoom with
         // Alt; Ctrl+wheel or pinch zoom too. Centered on the cursor.
@@ -202,9 +205,7 @@ impl AtelierApp {
             && !ctx.egui_wants_keyboard_input()
             && !self.typing_on_canvas();
         // A view tool over a transform or a crop box being prepared.
-        if self.rotate_view.over.is_some() && !self.view_tool_keeps_pending() {
-            self.rotate_view.over = None;
-        }
+        self.view_tool_over_ended();
         let over = self.rotate_view.over;
         let space = space_key || self.tool == Tool::Hand || over == Some(Tool::Hand);
         let (press, zoom_keys) = ctx.input(|i| {
@@ -263,6 +264,22 @@ impl AtelierApp {
         // The view tool takes the press: what is being prepared stays as it is.
         let over_start = start && over.is_some();
         start &= over.is_none();
+        if start {
+            let reads = matches!(
+                self.tool,
+                Tool::Eyedropper | Tool::ColorSampler | Tool::Ruler
+            );
+            self.canvas_edit_held = !self.tool.only_views() && !reads;
+        }
+        self.canvas_edit_held &= down;
+        // A double click for the tool (closing a lasso, applying a transform
+        // or a crop): not while panning, nor with a view tool over the tool.
+        let double = hovered
+            && !space
+            && !panning
+            && !self.popup_press
+            && over.is_none()
+            && ctx.input(|i| i.pointer.button_double_clicked(PointerButton::Primary));
 
         // "Transparent color" dialog open: the click picks the color.
         if start
@@ -422,8 +439,6 @@ impl AtelierApp {
                 self.brush_input(view, pointer, start, down, released, shift);
             }
             Tool::Patch => {
-                let double = hovered
-                    && ctx.input(|i| i.pointer.button_double_clicked(PointerButton::Primary));
                 cursor = Some(self.patch_input(view, tool_pointer, start, down, double));
             }
             Tool::RedEye => {
@@ -465,8 +480,6 @@ impl AtelierApp {
                 cursor = Some(self.select_input(view, tool_pointer, start, down, shift, alt));
             }
             Tool::FreeLasso | Tool::PolyLasso => {
-                let double = hovered
-                    && ctx.input(|i| i.pointer.button_double_clicked(PointerButton::Primary));
                 cursor = Some(self.free_lasso_input(view, tool_pointer, start, down, double));
             }
             Tool::MagicWand => {
@@ -477,8 +490,6 @@ impl AtelierApp {
                 cursor = Some(self.object_select_input(view, tool_pointer, hovered, start, down));
             }
             Tool::Lasso => {
-                let double = hovered
-                    && ctx.input(|i| i.pointer.button_double_clicked(PointerButton::Primary));
                 cursor = Some(self.lasso_input(view, tool_pointer, start, double));
             }
             Tool::Bucket => {
@@ -514,7 +525,7 @@ impl AtelierApp {
                 cursor = Some(
                     label
                         .or_else(|| {
-                            self.handles_input(view, full, tool_pointer, start, down, shift)
+                            self.handles_input(view, full, tool_pointer, start, down, shift, double)
                         })
                         .unwrap_or(CursorIcon::Default),
                 );
@@ -528,9 +539,6 @@ impl AtelierApp {
             cursor = Some(CursorIcon::Progress);
         }
         if let Some(start) = transforming {
-            let double =
-                hovered && ctx.input(|i| i.pointer.button_double_clicked(PointerButton::Primary));
-            let double = double && over.is_none();
             cursor = Some(self.selection_transform_input(view, tool_pointer, start, down, double));
         }
         match over {
@@ -754,7 +762,7 @@ impl AtelierApp {
         {
             draw_split_preview(&painter, view, boxes);
         }
-        self.draw_select_overlay(&painter, view);
+        self.draw_select_overlay(&painter, view, area);
         if self.selection_outline_shown() {
             self.draw_selection(&painter, view);
         }
@@ -985,7 +993,8 @@ impl AtelierApp {
     }
 
     /// Handles the handles of the canvas and move/resize tools.
-    /// Returns the cursor to show.
+    /// Returns the cursor to show. `double`: a double click for the tool.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handles_input(
         &mut self,
         mut view: View,
@@ -994,13 +1003,15 @@ impl AtelierApp {
         start: bool,
         down: bool,
         shift: bool,
+        double: bool,
     ) -> Option<CursorIcon> {
         let is_canvas = self.tool == Tool::Canvas;
         if self.layer_drag.is_some() {
             return self.drag_layer_input(view, pointer, start, down, false);
         }
         // Distorted frames, warps, modifier drags, modes, reference point.
-        if !is_canvas && let Some(cursor) = self.transform_input(view, pointer, start, down, shift)
+        if !is_canvas
+            && let Some(cursor) = self.transform_input(view, pointer, start, down, shift, double)
         {
             return Some(cursor);
         }
@@ -1071,9 +1082,6 @@ impl AtelierApp {
                 hover = None;
             }
             // A double click inside the box applies it, like Enter.
-            let double = self
-                .ctx
-                .input(|i| i.pointer.button_double_clicked(PointerButton::Primary));
             if double && drawn && hover == Some(Handle::Move) {
                 self.drag = None;
                 self.apply_crop_box();

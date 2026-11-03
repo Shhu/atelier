@@ -15,7 +15,7 @@ use crate::pixel_ops::{Clip, mix, threads};
 
 mod distort;
 pub use distort::{
-    PolarConversion, RippleSize, Shear, SpherizeMode, Wave, WaveType, ZigZagStyle,
+    PolarConversion, RippleSize, Shear, SpherizeMode, Wave, WaveType, ZigZagStyle, drafted,
 };
 
 /// A filter and its settings, in Photoshop's units: radii, distances and
@@ -369,6 +369,21 @@ impl Filter {
         }
     }
 
+    /// A Distort filter: [`drafted`] makes it quicker, not the same.
+    pub fn has_draft(&self) -> bool {
+        matches!(
+            self,
+            Filter::Ripple { .. }
+                | Filter::Wave(_)
+                | Filter::Twirl { .. }
+                | Filter::Spherize { .. }
+                | Filter::PolarCoordinates { .. }
+                | Filter::Pinch { .. }
+                | Filter::ZigZag { .. }
+                | Filter::Shear(_)
+        )
+    }
+
     /// How far from a pixel the filter looks, in pixels; `None`: anywhere in
     /// the processed area (Offset, the distortions).
     pub fn reach(&self) -> Option<u32> {
@@ -599,7 +614,7 @@ impl Filter {
             | Filter::ZigZag { .. }
             | Filter::Shear(_) => {
                 let all = [0, 0, image.width(), image.height()];
-                if let Some(out) = distort::render(self, image, origin, all) {
+                if let Some(out) = distort::render(self, distort::Source::of(image), origin, all) {
                     *image = out;
                 }
             }
@@ -681,19 +696,15 @@ impl Target {
         }
         self.region_with(region, None, |window, changed| {
             let [x0, y0, x1, y1] = window;
-            let cropped;
-            let src = if window == [0, 0, self.image.width(), self.image.height()] {
-                &*self.image
-            } else {
-                cropped = image::imageops::crop_imm(&*self.image, x0, y0, x1 - x0, y1 - y0)
-                    .to_image();
-                &cropped
-            };
+            // Read where it is: the window is not copied for a small region.
+            let src = distort::Source::part(&self.image, window);
             let part = [changed[0] - x0, changed[1] - y0, changed[2] - x0, changed[3] - y0];
             match distort::render(filter, src, self.at(window), part) {
                 Some(out) => (out, [changed[0], changed[1]]),
                 None => {
-                    let mut all = src.clone();
+                    let mut all =
+                        image::imageops::crop_imm(&*self.image, x0, y0, x1 - x0, y1 - y0)
+                            .to_image();
                     filter.apply(&mut all, self.at(window));
                     (all, [x0, y0])
                 }

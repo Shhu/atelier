@@ -661,7 +661,6 @@ file-error-format-limit = { $format } images are limited to { $max } px per side
 
 ## Layer merging
 
-doc-merge-locked = Cannot merge: a layer is locked.
 doc-merge-too-large = Cannot merge: the layers are too far apart.
 
 ## Flatten Image
@@ -3206,7 +3205,7 @@ panels8-screen-notice = Press F or Esc to leave full screen. Tab shows the panel
 panels8-shortcut-screen-mode = Next screen mode
 
 ## Command palette keywords
-panels8-keywords-sampler = color sampler sampling point values measure info
+panels8-keywords-sampler = color sampler sampling point values measure info clear delete
 panels8-keywords-ruler = ruler measure distance angle straighten level protractor
 panels8-keywords-info = info values cursor rgb cmyk position size
 panels8-keywords-histogram = histogram levels statistics channels mean
@@ -3245,7 +3244,7 @@ view8-flip-horizontal = Flip Horizontal
 view8-hint-rotate = Rotate the view
 view8-hint-steps = By 15° steps
 view8-hint-reset = Reset the view
-view8-palette-keywords-rotate-view = turn tilt angle canvas view rotation
+view8-palette-keywords-rotate-view = turn tilt angle canvas view rotation reset all windows
 view8-palette-keywords-flip = mirror view reverse check composition
 
 ## Filter menu: Distort group and filter names
@@ -3292,7 +3291,7 @@ distort8-out-from-center = Out From Center
 distort8-pond-ripples = Pond Ripples
 distort8-shear-curve = Shear curve
 distort8-shear-default = Default
-distort8-shear-tip = Drag a point or the line to bend it. Drag a point out of the grid to remove it.
+distort8-shear-tip = Click the line to add a point, drag a point to bend it. Drag a point out of the grid to remove it.
 
 ## Distort filters: command palette keywords
 
@@ -3342,7 +3341,7 @@ pattern9-status-left-out = { $count ->
     [one] { $count } pattern of the library can't be read; its file stays on the disk.
    *[other] { $count } patterns of the library can't be read; their files stay on the disk.
 }
-pattern9-status-already = This tile is already in the library, as "{ $name }".
+pattern9-status-already = This pattern is already in the library, as "{ $name }".
 pattern9-tile-tip = { $name } (right-click to rename or delete)
 pattern9-delete-title = Delete Pattern
 pattern9-delete-ok = Delete
@@ -3365,3 +3364,23 @@ ui9-options-position-locked = Position locked
 
 ## Navigator: what screen readers say of the picture
 ui9-navigator-image = Image overview
+
+## Edit: Stroke, Image: Auto, an adjustment played, on a layer without pixels
+adjust11-no-pixels = This layer has no pixels to change: choose a pixel layer, or its mask.
+
+## Crop tool: Overlay menu, lines drawn over the box
+crop11-overlay-diagonal = Diagonal
+crop11-overlay-triangle = Triangle
+crop11-overlay-golden-ratio = Golden Ratio
+
+## Layer locks: Ctrl+/ when the lock it would put on is already on through a group ($lock: lock names; $group: group name)
+locks11-lock-held-by-group = { $lock }: already on through the group "{ $group }"
+
+## Free Transform of a Pattern Fill layer in perspective or warped
+pattern11-why-distort = The pattern of "{ $name }" can be moved, scaled, rotated or flipped, but not put in perspective or warped.
+## Steps of an action
+pattern11-step-new-solid-fill = New Solid Color Fill Layer
+pattern11-step-new-gradient-fill = New Gradient Fill Layer
+
+## Title bar: the menu holding the menus a narrow window has no room for
+ui11-menu-more = More menus

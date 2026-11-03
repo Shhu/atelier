@@ -102,31 +102,50 @@ impl Document {
     /// The image as shown at `pixel`, averaged over `radius` pixels around
     /// it (within the canvas, by coverage); `None` where nothing shows.
     pub fn sampled(&self, pixel: (i64, i64), radius: i64) -> Option<[u8; 3]> {
+        self.sampled_all(&[pixel], radius).pop().flatten()
+    }
+
+    /// [`Self::sampled`] at each of `pixels`, the layers composed once.
+    pub fn sampled_all(&self, pixels: &[(i64, i64)], radius: i64) -> Vec<Option<[u8; 3]>> {
         let canvas = self.full_rect();
         let side = (radius * 2 + 1) as u32;
-        let around = PixelRect {
-            x: pixel.0 - radius,
-            y: pixel.1 - radius,
-            w: side,
-            h: side,
-        };
-        let rect = intersect(around, canvas)?;
+        let rects: Vec<_> = pixels
+            .iter()
+            .map(|p| {
+                let around = PixelRect {
+                    x: p.0 - radius,
+                    y: p.1 - radius,
+                    w: side,
+                    h: side,
+                };
+                intersect(around, canvas)
+            })
+            .collect();
+        if rects.iter().all(Option::is_none) {
+            return vec![None; pixels.len()];
+        }
         let options = compose::Options {
             held: self.effects_held,
             later_styles: true,
             ..Default::default()
         };
         let layers = self.render_layers();
-        let image = compose::plan(&layers, canvas, &mut compose::FullSize, &options).render(rect);
-        let (mut sum, mut weight) = ([0u64; 3], 0u64);
-        for p in image.pixels() {
-            let a = u64::from(p[3]);
-            weight += a;
-            for (s, &c) in sum.iter_mut().zip(&p.0[..3]) {
-                *s += u64::from(c) * a;
-            }
-        }
-        (weight > 0).then(|| sum.map(|s| ((s + weight / 2) / weight) as u8))
+        let plan = compose::plan(&layers, canvas, &mut compose::FullSize, &options);
+        rects
+            .into_iter()
+            .map(|rect| {
+                let image = plan.render(rect?);
+                let (mut sum, mut weight) = ([0u64; 3], 0u64);
+                for p in image.pixels() {
+                    let a = u64::from(p[3]);
+                    weight += a;
+                    for (s, &c) in sum.iter_mut().zip(&p.0[..3]) {
+                        *s += u64::from(c) * a;
+                    }
+                }
+                (weight > 0).then(|| sum.map(|s| ((s + weight / 2) / weight) as u8))
+            })
+            .collect()
     }
 
     /// The canvas becomes `canvas`, a point (x, y) going to `map`(x, y): the

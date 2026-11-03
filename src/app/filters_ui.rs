@@ -259,6 +259,11 @@ struct FilterDialog {
     center: Pos2,
     square: Square,
     canvas: Option<Job<RgbaImage>>,
+    /// The canvas computation is a quick one (see [`crate::filters::drafted`]).
+    canvas_draft: bool,
+    /// Key of the canvas preview shown if it is a quick one: the result
+    /// itself is computed next.
+    drafted: Option<u64>,
     /// Key of a canvas preview whose computation failed (not tried again).
     failed: Option<u64>,
     /// Smart Sharpen: Shadows and Highlights settings shown.
@@ -281,17 +286,29 @@ struct DialogLayout {
 }
 
 impl DialogLayout {
-    /// Below each other when all fits, else side by side when the window is
-    /// wide enough, the settings scrolling on their own beside the square.
+    /// Below each other when all fits; else, settings no taller than the
+    /// square, a smaller square above them; else side by side when the
+    /// window is wide enough, the settings scrolling on their own beside the
+    /// square.
     fn of(ctx: &egui::Context, settings: Option<f32>) -> Self {
         let room = dialog_body_room(ctx);
-        let stacked = SQUARE + ZOOM_ROW + 16.0 + settings.unwrap_or(0.0);
+        let settings = settings.unwrap_or(0.0);
+        // The zoom row, the gap and the spacing between them.
+        let between = ZOOM_ROW + 18.0;
+        let stacked = SQUARE + between + settings;
         let side = (room - ZOOM_ROW).clamp(MIN_SQUARE, SQUARE);
         let wide = dialog_bounds(ctx).width() >= side + SQUARE + SCROLL_ROOM + 8.0 + 34.0;
         if stacked <= room || !wide {
             return Self {
                 columns: false,
                 side: SQUARE,
+                room,
+            };
+        }
+        if settings <= side {
+            return Self {
+                columns: false,
+                side: (room - between - settings).clamp(MIN_SQUARE_ABOVE, SQUARE),
                 room,
             };
         }
@@ -415,6 +432,8 @@ const SQUARE: f32 = 288.0;
 const SCROLL_ROOM: f32 = 12.0;
 /// Smallest side of the preview square, beside the settings on a short window.
 const MIN_SQUARE: f32 = 128.0;
+/// Smallest side of the preview square above short settings.
+const MIN_SQUARE_ABOVE: f32 = 96.0;
 /// Height of the zoom row below the square, with the gap.
 const ZOOM_ROW: f32 = 36.0;
 /// Zoom levels of the preview square.
@@ -587,7 +606,7 @@ impl AtelierApp {
         let smart = self.smart_filters_apply();
         let Some(doc) = &mut self.doc else { return };
         if !doc.can_paint() && !smart {
-            self.status = t!("filter-no-pixels");
+            self.status_cannot(t!("filter-no-pixels"));
             return;
         }
         // The result is previewed over the whole layer: a layer smaller
@@ -621,6 +640,8 @@ impl AtelierApp {
             center,
             square: Square::default(),
             canvas: None,
+            canvas_draft: false,
+            drafted: None,
             failed: None,
             tones: false,
             painted,
@@ -700,13 +721,13 @@ impl AtelierApp {
         // it, until the result is in (`poll_filter`).
         if !doc.begin_paint() {
             doc.discard_step();
-            self.status = t!("filter-no-pixels");
+            self.status_cannot(t!("filter-no-pixels"));
             return;
         }
         let Some(mut target) = active_target(doc, self.selection.as_ref()) else {
             doc.end_paint();
             doc.discard_step();
-            self.status = t!("status-selection-empty");
+            self.status_cannot(t!("status-selection-empty"));
             return;
         };
         fit_to_canvas(&mut target, doc, &filter);
@@ -874,8 +895,10 @@ impl AtelierApp {
     /// result; else the one being computed is waited for, or the result is
     /// computed on another thread (see [`Self::adjusting_window`]).
     pub(super) fn apply_adjustment(&mut self, adjustment: crate::pixel_ops::Adjustment) {
-        let Some(doc) = &self.doc else { return };
+        let Some(doc) = &mut self.doc else { return };
         if adjustment.is_neutral() {
+            // Nothing changed: a Fade after it has nothing to fade.
+            doc.mark_fade_nothing();
             return self.record(crate::actions::Recorded::Adjust { adjustment });
         }
         let (doc_id, id, rev) = (doc.uid(), doc.active_layer().id, doc.target_rev());
@@ -896,7 +919,7 @@ impl AtelierApp {
             }
             _ => {
                 let Some(target) = active_target(doc, self.selection.as_ref()) else {
-                    self.status = t!("status-selection-empty");
+                    self.status_cannot(t!("status-selection-empty"));
                     return;
                 };
                 let name = format!("Adjustment: {:?}", adjustment.kind());
@@ -926,6 +949,8 @@ impl AtelierApp {
         {
             doc.mark_fade();
             self.status = t!("dialog-adjust-applied", name = adjustment.title());
+        } else {
+            doc.mark_fade_nothing();
         }
         self.record(crate::actions::Recorded::Adjust { adjustment });
     }
@@ -1166,7 +1191,7 @@ impl AtelierApp {
         );
         // The first frame only measures: shown laid out for what it measured.
         let measured = DialogLayout::of(ctx, dialog.settings_height);
-        if measured.columns != layout.columns {
+        if measured.columns != layout.columns || measured.side != layout.side {
             ctx.request_discard("the filter dialog's layout");
         }
         if preview != dialog.preview {
@@ -1186,6 +1211,8 @@ impl AtelierApp {
             let shown = self.preview_shown.as_ref().filter(|p| {
                 matches!(p.preview, LayerPreview::Filter(k) if k == key) && p.mask.is_none()
             });
+            // A quick preview is not the result.
+            let shown = shown.filter(|_| dialog.drafted != Some(key));
             let ready = if self.smart_filters_apply() {
                 None
             } else if let Some(p) = shown {
@@ -1194,7 +1221,7 @@ impl AtelierApp {
                 dialog
                     .canvas
                     .take()
-                    .filter(|job| job.key == key && !job.stopped())
+                    .filter(|job| job.key == key && !job.stopped() && !dialog.canvas_draft)
                     .map(Ready::Job)
             };
             let placed = target.as_ref().map(|t| (t.image.dimensions(), t.offset));
@@ -1282,7 +1309,9 @@ impl AtelierApp {
                     region[3] - region[1],
                 )
                 .to_image();
-                let mut filtered = target.filter_region(region, &filter);
+                // Reduced below 100 %: one sample per pixel is enough.
+                let mut filtered =
+                    crate::filters::drafted(zoom < 1.0, || target.filter_region(region, &filter));
                 for image in [&mut filtered, &mut original] {
                     color_ui::show_through(lut.as_deref(), image.as_mut(), false);
                 }
@@ -1310,6 +1339,7 @@ impl AtelierApp {
                     && image.dimensions() == target.image.dimensions()
                 {
                     let preview = LayerPreview::Filter(job.key);
+                    dialog.drafted = dialog.canvas_draft.then_some(job.key);
                     self.show_preview_at(preview, image, target.offset);
                 }
             }
@@ -1336,12 +1366,23 @@ impl AtelierApp {
         {
             job.stop();
         }
-        if dialog.preview && !shown && dialog.canvas.is_none() && dialog.failed != Some(key) {
+        // Settings just changed: a quick preview first, then the result
+        // itself once it is shown and the settings stay.
+        let draft = !shown && dialog.filter.has_draft();
+        let refine = shown && dialog.drafted == Some(key);
+        if dialog.preview
+            && (!shown || refine)
+            && dialog.canvas.is_none()
+            && dialog.failed != Some(key)
+        {
             let (target, filter) = (target.clone(), dialog.filter);
             let reach = filter.reach().unwrap_or(0);
             let name = format!("Filter canvas preview: {:?}", filter.kind());
+            dialog.canvas_draft = draft;
             dialog.canvas = Some(Job::spawn(ctx, key, [0; 4], Some(name), move || {
-                target.process(reach, |image, origin| filter.apply(image, origin))
+                crate::filters::drafted(draft, || {
+                    target.process(reach, |image, origin| filter.apply(image, origin))
+                })
             }));
         }
     }
@@ -1373,7 +1414,10 @@ fn square_image(image: &RgbaImage, zoom: f32) -> ColorImage {
 /// around, the original shown while pressed; − and + zoom below it.
 fn preview_square(ui: &mut egui::Ui, dialog: &mut FilterDialog, side: f32) {
     let ppp = ui.ctx().pixels_per_point();
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::drag());
+    // Narrower than the settings below it: centered above them.
+    let (rect, response) = ui
+        .vertical_centered(|ui| ui.allocate_exact_size(Vec2::splat(side), Sense::drag()))
+        .inner;
     if response.dragged() {
         dialog.center -= response.drag_delta() * ppp / dialog.zoom;
     }

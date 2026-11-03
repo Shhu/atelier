@@ -3,19 +3,27 @@
 
 use std::sync::Arc;
 
-use image::RgbaImage;
+use image::{GrayImage, RgbaImage};
 
 use super::*;
-use crate::pixel_ops::{Fade, FadeArea};
+use crate::pixel_ops::{Clip, ClipShape, Fade, FadeArea};
 use crate::selection::Selection;
 
-/// What the step Fade would act on covered.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// What the step Fade would act on covered: Fade blends there, even the
+/// pixels the step left as they were.
+#[derive(Clone)]
 enum Covered {
     /// The selection, else the whole layer: a filter, an adjustment, a fill.
     Selection,
-    /// The pixels it changed: a stroke, a brush, a transform.
+    /// What it painted, with its coverage, at its canvas position: a brush,
+    /// the Paint Bucket, a stroke.
+    Painted(Arc<GrayImage>, (i64, i64)),
+    /// The pixels it changed: the brushes that work dab after dab (Blur,
+    /// Smudge…).
     Changed,
+    /// The pixels it changed, and the canvas box it put its result in: a
+    /// transform.
+    Moved(PixelRect),
     /// Nothing: the command changed no pixel, and an older step can't be
     /// faded in its place.
     Nothing,
@@ -24,7 +32,7 @@ enum Covered {
 /// The result Fade can act on: the history step, layer and target revision
 /// right after it. Anything done since (a new step, an undo, another layer
 /// or target) leaves it out of date.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub(super) struct FadeMark {
     step: u64,
     layer: u64,
@@ -35,67 +43,65 @@ pub(super) struct FadeMark {
 impl Document {
     /// The step just recorded, which worked on the selection, can be faded.
     pub fn mark_fade(&mut self) {
-        self.fade_mark = Some(self.current_fade_mark(Covered::Selection));
+        self.set_fade_mark(Covered::Selection);
+    }
+
+    /// The step just recorded painted `coverage` (its corner at the canvas
+    /// position `at`): it can be faded there.
+    pub fn mark_fade_painted(&mut self, coverage: GrayImage, at: (i64, i64)) {
+        self.set_fade_mark(Covered::Painted(Arc::new(coverage), at));
     }
 
     /// The step just recorded can be faded, over the pixels it changed.
     pub fn mark_fade_changed(&mut self) {
-        self.fade_mark = Some(self.current_fade_mark(Covered::Changed));
+        self.set_fade_mark(Covered::Changed);
     }
 
     /// The command just run changed nothing: there is nothing to fade, and
     /// a Fade an action plays next has nothing to do.
     pub fn mark_fade_nothing(&mut self) {
-        self.fade_mark = Some(self.current_fade_mark(Covered::Nothing));
+        self.set_fade_mark(Covered::Nothing);
     }
 
-    /// The transform just recorded can be faded, if what was there still
-    /// lies inside the layer's frame: the pixels it left outside couldn't
-    /// come back.
-    pub fn mark_fade_transformed(&mut self) {
-        self.mark_fade_changed();
-        let fits = self.before_step().is_some_and(|(before, from)| {
-            let after = self.target_layer();
-            after.is_some_and(|after| {
-                framed_at(before.dimensions(), from, after.image().dimensions(), after.offset)
-                    .is_some()
-            })
-        });
-        if !fits {
-            self.fade_mark = None;
-        }
+    /// The transform just recorded, which put its result in the canvas box
+    /// `to`, can be faded: over the pixels it changed and that box. The
+    /// layer's frame grows to hold what was there if it must.
+    pub fn mark_fade_transformed(&mut self, to: Option<PixelRect>) {
+        let to = to.unwrap_or(PixelRect { x: 0, y: 0, w: 0, h: 0 });
+        self.set_fade_mark(Covered::Moved(to));
     }
 
-    fn current_fade_mark(&self, covered: Covered) -> FadeMark {
-        FadeMark {
+    fn set_fade_mark(&mut self, covered: Covered) {
+        self.fade_mark = Some(FadeMark {
             step: self.history_step(),
             layer: self.active_layer().id,
             target: self.target_rev(),
             covered,
-        }
+        });
     }
 
-    /// The mark, if still valid.
-    fn fade_covered(&self) -> Option<Covered> {
-        let mark = self.fade_mark?;
-        (mark == self.current_fade_mark(mark.covered)).then_some(mark.covered)
+    /// What the mark covered, if it is still valid.
+    fn fade_covered(&self) -> Option<&Covered> {
+        let mark = self.fade_mark.as_ref()?;
+        let now = (self.history_step(), self.active_layer().id, self.target_rev());
+        (now == (mark.step, mark.layer, mark.target)).then_some(&mark.covered)
     }
 
     /// The name of what can be faded now, if something can.
     pub fn fade_name(&self) -> Option<&str> {
         self.fade_covered()
-            .filter(|c| *c != Covered::Nothing)
+            .filter(|c| !matches!(c, Covered::Nothing))
             .and_then(|_| self.undo.back().map(|s| s.name.as_str()))
     }
 
     /// The last command changed nothing, so a Fade after it has nothing to do.
     pub fn fade_of_nothing(&self) -> bool {
-        self.fade_covered() == Some(Covered::Nothing)
+        matches!(self.fade_covered(), Some(Covered::Nothing))
     }
 
     /// The target's pixels before the last step, and their canvas position.
     fn before_step(&mut self) -> Option<(Arc<RgbaImage>, (i64, i64))> {
-        let covered = self.fade_covered()?;
+        let covered = self.fade_covered()?.clone();
         let previous = self.undo.back()?.state.clone();
         let layer = self.active_layer().id;
         let current = self.restore(previous);
@@ -104,7 +110,7 @@ impl Document {
             .flatten();
         self.restore(current);
         // The quick mask's revision moved with the states.
-        self.fade_mark = Some(self.current_fade_mark(covered));
+        self.set_fade_mark(covered);
         before
     }
 
@@ -114,8 +120,9 @@ impl Document {
     /// a step, which ends the Fade.
     pub fn fade_source(&mut self, selection: Option<&Selection>) -> Option<Fade> {
         self.fade_name()?;
-        let covered = self.fade_covered()?;
+        let covered = self.fade_covered()?.clone();
         let (before, from) = self.before_step()?;
+        self.frame_for_fade(before.dimensions(), from)?;
         let canvas = self.full_rect();
         let after = self.target_layer()?;
         let origin = after.offset;
@@ -125,12 +132,23 @@ impl Document {
             (Covered::Selection, Some(s)) => {
                 s.clip(&after, canvas).map_or(FadeArea::Changed, FadeArea::Within)
             }
-            _ => FadeArea::Changed,
+            (Covered::Painted(mask, at), _) => FadeArea::Within(Clip {
+                rect: [0, 0, w, h],
+                shape: Some(ClipShape::Mask(mask, (at.0 - origin.0, at.1 - origin.1))),
+                inverted: false,
+            }),
+            (Covered::Changed, _) => FadeArea::Changed,
+            (Covered::Moved(to), _) => {
+                let x = |v: i64| (v - origin.0).clamp(0, i64::from(w)) as u32;
+                let y = |v: i64| (v - origin.1).clamp(0, i64::from(h)) as u32;
+                let r = [x(to.x), y(to.y), x(to.x + i64::from(to.w)), y(to.y + i64::from(to.h))];
+                FadeArea::ChangedOr(r.into())
+            }
+            (Covered::Nothing, _) => return None,
         };
         let before = if (before.dimensions(), from) == ((w, h), origin) {
             before
         } else {
-            // The step enlarged the layer: nothing else moves its pixels.
             let (dx, dy) = framed_at(before.dimensions(), from, (w, h), origin)?;
             let mut framed = RgbaImage::new(w, h);
             image::imageops::replace(&mut framed, &*before, dx, dy);
@@ -143,6 +161,43 @@ impl Document {
             opacity: 1.0,
             mode: BlendMode::Normal,
         })
+    }
+
+    /// The target's frame holds the pixels before the step (`size` at
+    /// `from`): a step that moved them out of it (a transform turning or
+    /// shrinking the layer) has the layer's frame grown to hold both, with
+    /// transparent margins, so that the faded result keeps them. `None` if
+    /// it can't (a mask's frame, a box too large).
+    fn frame_for_fade(&mut self, size: (u32, u32), from: (i64, i64)) -> Option<()> {
+        let after = self.target_layer()?;
+        let (frame, origin) = (after.image().dimensions(), after.offset);
+        if framed_at(size, from, frame, origin).is_some() {
+            return Some(());
+        }
+        let rect = after.rect();
+        drop(after);
+        if self.mask_targeted() {
+            return None;
+        }
+        let old = PixelRect {
+            x: from.0,
+            y: from.1,
+            w: size.0,
+            h: size.1,
+        };
+        let u = old.union(rect);
+        if !self.fits(u) {
+            return None;
+        }
+        let covered = self.fade_covered()?.clone();
+        let layer = &mut self.layers[self.active];
+        let mut image = RgbaImage::new(u.w, u.h);
+        image::imageops::replace(&mut image, layer.image(), rect.x - u.x, rect.y - u.y);
+        layer.replace_pixels(image);
+        layer.reframe((u.x, u.y));
+        // Not a change of its pixels: Fade still follows the step.
+        self.set_fade_mark(covered);
+        Some(())
     }
 
     /// `image` (what [`Fade::apply`] gave) replaces the target's pixels, in a
@@ -294,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn a_transform_that_shrinks_the_frame_cant_be_faded() {
+    fn a_transform_that_shrinks_the_frame_grows_it_back_for_fade() {
         let mut small = RgbaImage::new(2, 2);
         small.fill(255);
         let mut d = Document::new(RgbaImage::new(6, 6), None);
@@ -306,12 +361,18 @@ mod tests {
         let layer = d.active_layer_mut();
         layer.replace_pixels(RgbaImage::new(4, 4));
         layer.offset = (1, 1);
-        d.mark_fade_transformed();
-        assert!(d.fade_name().is_some(), "what was there is inside");
+        d.mark_fade_transformed(None);
+        assert!(d.fade_source(None).is_some(), "what was there is inside");
+        assert_eq!(d.active_layer().rect(), PixelRect { x: 1, y: 1, w: 4, h: 4 });
         d.checkpoint("Smaller".into());
         let layer = d.active_layer_mut();
         layer.replace_pixels(RgbaImage::new(1, 1));
-        d.mark_fade_transformed();
-        assert!(d.fade_name().is_none(), "its corners would be lost");
+        layer.offset = (3, 3);
+        d.mark_fade_transformed(Some(PixelRect { x: 3, y: 3, w: 1, h: 1 }));
+        let fade = d.fade_source(None).expect("its corners come back");
+        assert_eq!(d.active_layer().rect(), PixelRect { x: 1, y: 1, w: 4, h: 4 });
+        assert_eq!(fade.before.dimensions(), (4, 4));
+        assert!(d.fade_name().is_some(), "still the step to fade");
+        assert!(matches!(fade.area, FadeArea::ChangedOr(_)));
     }
 }

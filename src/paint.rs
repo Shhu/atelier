@@ -212,6 +212,24 @@ impl Stroke {
         self.painted
     }
 
+    /// What the stroke covered, 0..255 (its tip within the selection, not
+    /// its opacity), over the area its dabs reached, with that area's corner
+    /// (image coordinates). `None` for the modes that change the pixels dab
+    /// after dab.
+    pub fn covered(&self) -> Option<(image::GrayImage, (u32, u32))> {
+        if self.mask.is_empty() {
+            return None;
+        }
+        let r = self.touched?;
+        let w = self.base.width() as usize;
+        let full = (self.settings.opacity.clamp(0.0, 1.0) * 65535.0).max(1.0);
+        let mask = image::GrayImage::from_fn(r.w, r.h, |x, y| {
+            let m = self.mask[(r.y + y) as usize * w + (r.x + x) as usize] as f32;
+            image::Luma([(m / full * 255.0).round().min(255.0) as u8])
+        });
+        Some((mask, (r.x, r.y)))
+    }
+
     /// Whether `image`, the stroke's target, differs from the pixels before
     /// the stroke where the dabs reached, or `margin` pixels around (a
     /// stroke can cover pixels without changing them: a transparent clone

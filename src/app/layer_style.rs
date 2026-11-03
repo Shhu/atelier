@@ -132,6 +132,15 @@ impl AtelierApp {
         }
     }
 
+    /// A new fill layer of `fill` (an action's step), masked by the
+    /// selection as the menu's.
+    pub(super) fn new_fill_layer(&mut self, fill: Fill) {
+        let selection = self.selection.clone();
+        let Some(doc) = &mut self.doc else { return };
+        doc.add_fill_layer(fill, selection.as_ref());
+        self.reset_pending();
+    }
+
     /// Blend mode of the selected layers (the unlocked ones), as a series
     /// of edits (one undo step).
     fn set_blend(&mut self, mode: BlendMode) {
@@ -323,6 +332,7 @@ impl AtelierApp {
             return;
         }
         let group = layer.is_group();
+        let corner = self.doc.as_ref().map_or((0.0, 0.0), |d| d.tile_corner(d.active));
         let (mut fx, mut blend, mut opacity, mut fill) = (
             layer.effects.clone(),
             layer.blend,
@@ -344,8 +354,9 @@ impl AtelierApp {
             |ui| {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 16.0;
+                    let list = style_list_width(ui);
                     ui.vertical(|ui| {
-                        ui.set_width(190.0);
+                        ui.set_width(list);
                         ui.spacing_mut().item_spacing.y = 2.0;
                         style_list(ui, &mut dialog.page, &mut fx);
                     });
@@ -361,7 +372,7 @@ impl AtelierApp {
                                 hovered =
                                     blending_options(ui, &mut blend, &mut opacity, &mut fill, group);
                             }
-                            Some(style) => style_page(ui, style, &mut fx),
+                            Some(style) => style_page(ui, style, &mut fx, corner),
                         }
                     });
                 });
@@ -388,12 +399,34 @@ impl AtelierApp {
     }
 }
 
+/// Room of a row's label in the style list: after the checkbox.
+const STYLE_LABEL_LEFT: f32 = 36.0;
+
+/// Width of the style list: its widest label (in this language) and a
+/// margin, 190 px at least.
+fn style_list_width(ui: &egui::Ui) -> f32 {
+    let font = ui_kit::medium(ui_kit::TEXT_SIZE);
+    let widest = std::iter::once(t!("core-blending-options"))
+        .chain(Style::ALL.iter().map(|s| s.label()))
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap(label, font.clone(), Color32::PLACEHOLDER)
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    (STYLE_LABEL_LEFT + widest + 12.0).max(190.0).ceil()
+}
+
 /// Left column of the Layer Style window: Blending Options, then each style
 /// with its checkbox.
 fn style_list(ui: &mut egui::Ui, page: &mut Option<Style>, fx: &mut Effects) {
     let item = |ui: &mut egui::Ui, selected: bool, label: &str| {
         let (rect, response) =
             ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label)
+        });
         let fill = if selected {
             color::ACCENT_SOFT
         } else if response.hovered() {
@@ -403,7 +436,7 @@ fn style_list(ui: &mut egui::Ui, page: &mut Option<Style>, fx: &mut Effects) {
         };
         ui.painter().rect_filled(rect, 6.0, fill);
         ui.painter().text(
-            rect.left_center() + vec2(36.0, 0.0),
+            rect.left_center() + vec2(STYLE_LABEL_LEFT, 0.0),
             egui::Align2::LEFT_CENTER,
             label,
             ui_kit::medium(ui_kit::TEXT_SIZE),
@@ -440,6 +473,10 @@ fn style_list(ui: &mut egui::Ui, page: &mut Option<Style>, fx: &mut Effects) {
                 Color32::WHITE,
             );
         }
+        let name = style.label();
+        toggled.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, &name)
+        });
         if toggled.clicked() {
             on = !on;
             *fx.enabled_mut(style) = on;
@@ -532,7 +569,8 @@ fn mode_and_color(ui: &mut egui::Ui, id: &str, blend: &mut BlendMode, rgba: &mut
 }
 
 /// Settings of one style.
-fn style_page(ui: &mut egui::Ui, style: Style, fx: &mut Effects) {
+/// `corner`: see `Document::tile_corner`.
+fn style_page(ui: &mut egui::Ui, style: Style, fx: &mut Effects, corner: (f32, f32)) {
     let d = Effects::default();
     match style {
         Style::Bevel => {
@@ -634,7 +672,7 @@ fn style_page(ui: &mut egui::Ui, style: Style, fx: &mut Effects) {
             gap_between_blocks(ui);
             percent(ui, &t!("panel-opacity"), &mut p.opacity, 100.0);
             gap_between_blocks(ui);
-            super::patterns_ui::pattern_fill_fields(ui, &mut p.fill);
+            super::patterns_ui::pattern_fill_fields(ui, &mut p.fill, corner);
         }
         Style::GradientOverlay => {
             let g = &mut fx.gradient_overlay;

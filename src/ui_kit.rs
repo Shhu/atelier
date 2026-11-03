@@ -702,7 +702,27 @@ fn number_field_in<N: Numeric>(
         .layout_no_wrap(label.to_owned(), medium(11.0), color::LABEL)
         .size()
         .x;
-    let width = width.max(8.0 + label_w + 4.0 + 44.0);
+    // So does a long value ("1600 px"): the value never runs into the
+    // label. (A field without one keeps its width as its value changes.)
+    let empty = blank && value.to_f64() == 0.0;
+    let shown = if empty || label.is_empty() {
+        String::new()
+    } else if N::INTEGRAL {
+        format!("{:.0}{suffix}", value.to_f64())
+    } else {
+        format!("{}{suffix}", i18n::short_decimal(value.to_f64()))
+    };
+    let value_w = ui
+        .painter()
+        .layout_no_wrap(
+            shown,
+            egui::TextStyle::Button.resolve(ui.style()),
+            color::TEXT,
+        )
+        .size()
+        .x
+        + 2.0 * ui.spacing().button_padding.x;
+    let width = width.max(8.0 + label_w + 4.0 + value_w.max(44.0) + 4.0);
     let (rect, _) = ui.allocate_exact_size(vec2(width, 28.0), Sense::hover());
     let hovered = ui.rect_contains_pointer(rect);
     let painter = ui.painter().clone();
@@ -725,7 +745,6 @@ fn number_field_in<N: Numeric>(
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
     frameless(&mut child);
-    let empty = blank && value.to_f64() == 0.0;
     let mut drag = egui::DragValue::new(value)
         .range(range)
         .suffix(if empty { "" } else { suffix })
@@ -734,7 +753,8 @@ fn number_field_in<N: Numeric>(
             if blank && text.trim().is_empty() {
                 return Some(0.0);
             }
-            i18n::parse_decimal(text.trim_end_matches(suffix))
+            // "52%" as well as "52 %".
+            i18n::parse_decimal(text.trim().trim_end_matches(suffix.trim()))
         });
     if empty {
         drag = drag.custom_formatter(|_, _| String::new());
