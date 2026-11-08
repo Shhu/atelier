@@ -70,6 +70,11 @@
     <display_length compare="ge">768</display_length>
   </requires>
   <releases>
+    <release version="0.5.2" date="2026-11-08">
+      <description>
+        <p>A whole-app audit: crash recovery, damaged files that can no longer close the app, settings shared safely between windows, Batch that stops when asked, PSB files and better PSD compatibility, faster Layers panel, Levels and brush strokes, AZERTY shortcuts, safer Windows builds, and many fixes to selections, history and French wording.</p>
+      </description>
+    </release>
     <release version="0.5.1" date="2026-11-03">
       <description>
         <p>A review of 0.5.0: closing during background work asks to save, PSD keeps disabled layer styles, Cancel and Esc always stop background work, actions stop only on real refusals, Fade without seams, layer styles follow previews, faster Distort previews and resampling, a Golden Spiral crop overlay, an Adjustment Composite histogram, and better layouts on small windows.</p>
