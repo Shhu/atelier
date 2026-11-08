@@ -24,6 +24,17 @@ impl Document {
         self.quick_mask_rev
     }
 
+    /// Where the quick mask changed since its key was `since` (canvas),
+    /// when only there and known.
+    pub fn quick_mask_changes(&self, since: u64) -> Option<PixelRect> {
+        let d = &self.quick_mask_deltas;
+        if d.last()?.1 != self.quick_mask_rev {
+            return None;
+        }
+        let first = d.iter().position(|(from, _, _)| *from == since)?;
+        d[first..].iter().map(|(_, _, r)| *r).reduce(PixelRect::union)
+    }
+
     /// Enters Quick Mask Mode, as the step `name`: the selection becomes
     /// the mask (without one, everything is selected).
     pub fn enter_quick_mask(&mut self, name: String) {
@@ -182,6 +193,7 @@ impl Document {
             rev,
             bounds: std::cell::Cell::new(None),
             styles_cache: std::cell::RefCell::new(None),
+            look: std::cell::RefCell::new(None),
             offset: (canvas.x, canvas.y),
             effects: Default::default(),
             mask: None,
@@ -209,6 +221,8 @@ impl Document {
             return;
         };
         let src = proxy.image.as_raw();
+        // Where it changed, when only in an area (see `quick_mask_delta`).
+        let mut changed_area = None;
         if p != canvas || mask.dimensions() != (canvas.w, canvas.h) {
             // Resized or moved stand-in (whole-image operations): replaced.
             let mut image = GrayImage::new(canvas.w, canvas.h);
@@ -244,6 +258,7 @@ impl Document {
             if !changed {
                 return;
             }
+            changed_area = Some(r);
             let out = &mut Arc::make_mut(mask).as_mut()[y0 * w..y1 * w];
             par_rows(out, w, |first, band| {
                 for (j, row) in band.chunks_exact_mut(w).enumerate() {
@@ -255,7 +270,20 @@ impl Document {
                 }
             });
         }
-        self.quick_mask_rev = next_rev();
+        let (from, to) = (self.quick_mask_rev, next_rev());
+        self.quick_mask_rev = to;
+        // Kept while they follow each other (a few: the display catches up
+        // at the next frame).
+        let deltas = &mut self.quick_mask_deltas;
+        match changed_area {
+            Some(r) => {
+                if deltas.last().is_some_and(|d| d.1 != from) || deltas.len() >= 64 {
+                    deltas.clear();
+                }
+                deltas.push((from, to, r));
+            }
+            None => deltas.clear(),
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 //! Recently opened or saved files, most recent first, kept in the settings
-//! folder (one path per line, see [`encode`]), with what the start screen
-//! shows of them.
+//! folder (one path per line, see [`encode`]; shared with the other
+//! windows, see `store`), with what the start screen shows of them.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -10,6 +10,7 @@ use std::time::Duration;
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 
 use crate::config;
+use crate::store::{self, Format, Store};
 
 const MAX: usize = 8;
 /// Thumbnail size (pixels), twice the displayed size for sharp screens.
@@ -44,6 +45,8 @@ pub struct Recent {
     thumbs: Option<Receiver<Found>>,
     /// Number of dimensions asked for.
     expected: usize,
+    /// The list's file (none in tests).
+    store: Option<Store>,
 }
 
 /// What the background threads found.
@@ -60,14 +63,27 @@ const SIZES_WAIT: Duration = Duration::from_millis(100);
 
 impl Recent {
     pub fn load() -> Self {
-        let paths = std::fs::read(file())
-            .unwrap_or_default()
-            .split(|&b| b == b'\n')
-            .filter_map(decode)
-            .take(MAX)
-            .collect();
+        // Tests start with no recent files and never write the list.
+        if cfg!(test) {
+            return Self::default();
+        }
+        Self::load_from(file())
+    }
+
+    fn load_from(path: PathBuf) -> Self {
+        let mut store = Store::new(path, LINES).tidying(|v| {
+            if let Some(list) = v.as_array_mut() {
+                list.truncate(MAX);
+            }
+        });
+        let paths = match store.read() {
+            store::Found::Value(v) => paths_of(&v),
+            _ => Vec::new(),
+        };
+        store.adopt(&lines_of(&paths));
         Self {
             paths,
+            store: Some(store),
             ..Default::default()
         }
     }
@@ -104,18 +120,15 @@ impl Recent {
         self.save();
     }
 
-    fn save(&self) {
-        let text: Vec<u8> = self
-            .paths
-            .iter()
-            .filter_map(|p| encode(p))
-            .flat_map(|mut line| {
-                line.push(b'\n');
-                line
-            })
-            .collect();
-        let _ = std::fs::create_dir_all(config::dir());
-        let _ = std::fs::write(file(), text);
+    /// Saved, merged with the files another window added or removed
+    /// meanwhile, which then show here too.
+    fn save(&mut self) {
+        let Some(store) = &mut self.store else { return };
+        if let Ok(merged) = store.save(lines_of(&self.paths)) {
+            store.adopt(&merged);
+            self.paths = paths_of(&merged);
+            self.entries = None;
+        }
     }
 
     /// Forgets a file that could not be opened.
@@ -242,6 +255,47 @@ fn file() -> PathBuf {
     config::dir().join("recent")
 }
 
+/// The list's file: one line per path, as a list of lines to merge.
+const LINES: Format = Format {
+    decode: |bytes| {
+        let lines = bytes.split(|&b| b == b'\n').filter_map(decode);
+        Some(lines.filter_map(|p| line_of(&p)).map(serde_json::Value::String).collect())
+    },
+    encode: |value| {
+        let lines = value.as_array().into_iter().flatten();
+        lines
+            .filter_map(serde_json::Value::as_str)
+            .flat_map(|line| [line.as_bytes(), b"\n"].concat())
+            .collect()
+    },
+};
+
+/// A path as a line of text: [`encode`]d, with the bytes of a name that is
+/// not UTF-8 written %XX (which [`decode`] reads back as well).
+fn line_of(path: &Path) -> Option<String> {
+    let line = encode(path)?;
+    Some(String::from_utf8(line).unwrap_or_else(|e| {
+        let mut text = String::new();
+        for b in e.into_bytes() {
+            match b {
+                0..0x80 => text.push(b as char),
+                b => text.push_str(&format!("%{b:02X}")),
+            }
+        }
+        text
+    }))
+}
+
+fn lines_of(paths: &[PathBuf]) -> serde_json::Value {
+    paths.iter().filter_map(|p| line_of(p)).map(serde_json::Value::String).collect()
+}
+
+fn paths_of(list: &serde_json::Value) -> Vec<PathBuf> {
+    let lines = list.as_array().into_iter().flatten();
+    let lines = lines.filter_map(serde_json::Value::as_str);
+    lines.filter_map(|l| decode(l.as_bytes())).take(MAX).collect()
+}
+
 /// A path as a line of the list: "%", line feeds and carriage returns are
 /// written %XX, and on Unix a name that is not UTF-8 is kept byte for byte.
 /// `None` for a path that cannot be written (not Unicode, on Windows).
@@ -351,8 +405,7 @@ mod tests {
 
     #[test]
     fn entries_are_read_off_the_ui_thread_and_damaged_files_skipped() {
-        let dir = std::env::temp_dir().join("atelier-recent-entries");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("recent-entries");
         let good = dir.join("good.png");
         image::RgbaImage::new(3, 2).save(&good).unwrap();
         let damaged = dir.join("damaged.psd");
@@ -361,7 +414,7 @@ mod tests {
         let mut recent = Recent::with_paths(vec![damaged, gone, good.clone()]);
         let ctx = egui::Context::default();
         let mut entries = Vec::new();
-        for _ in 0..100 {
+        for _ in crate::testing::patience() {
             entries = recent
                 .entries(&ctx)
                 .iter()
@@ -380,9 +433,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_silent_file_holds_back_only_its_entry() {
-        let dir = std::env::temp_dir().join("atelier-recent-silent");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("recent-silent");
         let silent = dir.join("share.png");
         let made = std::process::Command::new("mkfifo").arg(&silent).status();
         assert!(made.is_ok_and(|s| s.success()));
@@ -392,7 +443,7 @@ mod tests {
         let mut recent = Recent::with_paths(vec![b.clone(), silent.clone(), a.clone()]);
         let ctx = egui::Context::default();
         let mut entries = Vec::new();
-        for _ in 0..200 {
+        for _ in crate::testing::patience() {
             entries = recent
                 .entries(&ctx)
                 .iter()
@@ -414,5 +465,33 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let path = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9.png"));
         assert_eq!(decode(&encode(path).unwrap()).as_deref(), Some(path));
+        // Through the shared list too.
+        let dir = crate::testing::test_dir("recent-non-utf8");
+        let mut recent = Recent::load_from(dir.join("recent"));
+        recent.add(path);
+        assert_eq!(Recent::load_from(dir.join("recent")).paths(), &[path.to_path_buf()]);
+    }
+
+    /// Two windows: the files each opens stay in the list, most recent
+    /// first; one removed in a window is removed.
+    #[test]
+    fn two_windows_share_the_list() {
+        let dir = crate::testing::test_dir("recent-two-windows");
+        let file = dir.join("recent");
+        let p = |name: &str| dir.join(name);
+        let mut a = Recent::load_from(file.clone());
+        a.add(&p("one.png"));
+        let mut b = Recent::load_from(file.clone());
+        a.add(&p("two.png"));
+        b.add(&p("three.png"));
+        assert_eq!(b.paths(), &[p("three.png"), p("two.png"), p("one.png")]);
+        a.forget(&p("one.png"));
+        for i in 0..MAX {
+            b.add(&p(&format!("more{i}.png")));
+        }
+        let read = Recent::load_from(file).paths().to_vec();
+        assert_eq!(read.len(), MAX);
+        assert!(!read.contains(&p("one.png")));
+        assert_eq!(read[0], p(&format!("more{}.png", MAX - 1)));
     }
 }

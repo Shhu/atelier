@@ -28,7 +28,7 @@ fn plain(rgb: [u8; 3]) -> H {
 }
 
 fn settle(h: &mut H) {
-    for _ in 0..1000 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if !h.state().filters.busy() && !h.state().actions.playing() {
             return;

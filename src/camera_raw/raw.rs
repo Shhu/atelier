@@ -15,7 +15,7 @@ use image::RgbaImage;
 use image::error::{ImageFormatHint, UnsupportedError, UnsupportedErrorKind};
 
 use super::source::Source;
-use crate::document::{FileError, check_size};
+use crate::document::{Budget, FileError, check_size};
 
 /// Extensions of camera RAW files.
 pub const EXTENSIONS: &[&str] = &[
@@ -38,11 +38,13 @@ pub struct RawFile {
     pub preview_only: bool,
 }
 
-/// Reads a RAW file: its raw data for a DNG, else its embedded preview.
-pub fn read(path: &Path) -> Result<RawFile, FileError> {
+/// Reads a RAW file: its raw data for a DNG, else its embedded preview;
+/// the file, its decoding and the pixels it gives taken from `budget`.
+pub fn read(path: &Path, budget: &mut Budget) -> Result<RawFile, FileError> {
     let data = std::fs::read(path)?;
+    budget.take_bytes(data.len() as u64)?;
     if dng::is_dng(&data) {
-        match dng::decode(&data) {
+        match dng::decode(&data, budget) {
             Ok(source) => {
                 return Ok(RawFile {
                     source,
@@ -50,16 +52,25 @@ pub fn read(path: &Path) -> Result<RawFile, FileError> {
                 });
             }
             Err(dng::DngError::Damaged) => return Err(FileError::Damaged),
+            Err(dng::DngError::Memory(e)) => return Err(e),
             Err(dng::DngError::Unsupported) => {}
         }
     }
-    let image = preview::largest(&data).ok_or_else(unsupported)?;
+    let image = preview::largest(&data, budget)?.ok_or_else(unsupported)?;
     check_size(image.width(), image.height())?;
+    budget.take(image.width(), image.height(), SOURCE_BYTES_PER_PIXEL)?;
     Ok(RawFile {
         source: Source::from_rgba(&image),
         preview_only: true,
     })
 }
+
+/// Bytes per pixel of a [`Source`]: its colors, and opacity.
+const SOURCE_BYTES_PER_PIXEL: u64 = 12 + 1;
+
+/// Bytes per pixel developing a source takes beside it: the image made,
+/// and what rendering holds while making it.
+const DEVELOP_BYTES_PER_PIXEL: u64 = 4 + 12;
 
 fn unsupported() -> FileError {
     FileError::Image(image::ImageError::Unsupported(
@@ -71,10 +82,12 @@ fn unsupported() -> FileError {
 }
 
 /// A RAW file developed with its default settings (placed as a layer,
-/// opened by a batch), and whether only its preview could be read.
-pub fn develop(path: &Path) -> Result<(RgbaImage, bool), FileError> {
-    let file = read(path)?;
+/// opened by a batch), and whether only its preview could be read; within
+/// `budget`.
+pub fn develop(path: &Path, budget: &mut Budget) -> Result<(RgbaImage, bool), FileError> {
+    let file = read(path, budget)?;
     let source = &file.source;
+    budget.take(source.width, source.height, DEVELOP_BYTES_PER_PIXEL)?;
     let settings = super::Settings::for_source(source);
     let analysis = super::Analysis::of(source);
     let frame = super::Frame::whole(source);
@@ -94,9 +107,12 @@ pub fn size(path: &Path) -> Option<(u32, u32)> {
     preview::size(&std::fs::read(path).ok()?)
 }
 
-/// The embedded preview (thumbnails of the recent files).
-pub fn thumbnail(path: &Path) -> Option<RgbaImage> {
-    preview::largest(&std::fs::read(path).ok()?)
+/// The embedded preview (thumbnails of the recent files), within
+/// `budget`.
+pub fn thumbnail(path: &Path, budget: &mut Budget) -> Option<RgbaImage> {
+    let data = std::fs::read(path).ok()?;
+    budget.take_bytes(data.len() as u64).ok()?;
+    preview::largest(&data, budget).ok().flatten()
 }
 
 #[cfg(test)]

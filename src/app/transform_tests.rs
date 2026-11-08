@@ -433,7 +433,7 @@ fn large_transforms_are_computed_aside() {
     h.state_mut()
         .run(Action::Transform(Command::FlipHorizontal));
     assert!(h.state().transform_busy(), "on another thread");
-    for _ in 0..200 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if !h.state().transform_busy() {
             break;

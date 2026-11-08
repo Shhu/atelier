@@ -661,8 +661,8 @@ impl Document {
             self.step += 1;
             // A full history: the oldest step the joined one let go comes
             // back (the two count as one).
-            if self.evicted.as_ref().is_some_and(|(seq, ..)| *seq == last.seq) {
-                let (_, oldest, forgotten) = self.evicted.take().expect("checked");
+            if self.evicted.last().is_some_and(|(seq, ..)| *seq == last.seq) {
+                let (_, oldest, forgotten) = self.evicted.pop().expect("checked");
                 self.undo.push_front(oldest);
                 self.forgotten = forgotten;
             }

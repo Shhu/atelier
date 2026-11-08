@@ -17,6 +17,7 @@ use super::dialogs::{
 };
 use super::filters_ui::active_target;
 use super::paint_tools::frame_samples;
+use super::file_dialog::Filter as _;
 use super::*;
 use crate::compose::levels::reduce_rgba;
 use crate::document::SmartFilterKind;
@@ -311,6 +312,16 @@ impl LiquifyState {
     /// the image.
     pub(super) fn busy(&self) -> bool {
         self.workspace.is_some() || self.applying.is_some()
+    }
+
+    /// The workspace is open (its strokes are nowhere else).
+    pub(super) fn open(&self) -> bool {
+        self.workspace.is_some()
+    }
+
+    /// Its result is being computed, not in the document yet.
+    pub(super) fn applying(&self) -> bool {
+        self.applying.is_some()
     }
 }
 
@@ -903,10 +914,10 @@ impl AtelierApp {
     /// Save Mesh…: the distortion in a file, to apply it again later.
     fn save_mesh(&mut self, mesh: &Mesh) {
         let filter = t!("liquify-mesh-files");
-        let mut dialog = rfd::FileDialog::new()
+        let mut dialog = file_dialog::new()
             .set_title(t!("liquify-save-mesh-title"))
             .set_file_name(format!("{}.{MESH_EXTENSION}", t!("liquify-mesh-file-name")))
-            .add_filter(filter, &[MESH_EXTENSION]);
+            .filter(filter, &[MESH_EXTENSION]);
         if let Some(dir) = self.current_dir() {
             dialog = dialog.set_directory(dir);
         }
@@ -918,18 +929,18 @@ impl AtelierApp {
         }
         let file = path.file_name().map(|n| n.to_string_lossy().into_owned());
         let file = file.unwrap_or_default();
-        self.status.set(match std::fs::write(&path, mesh.to_bytes()) {
+        self.status.set(match crate::store::write(&path, &mesh.to_bytes()) {
             Ok(()) => t!("liquify-status-mesh-saved", file = file.as_str()),
-            Err(e) => t!("liquify-status-mesh-error", error = e.to_string()),
+            Err(e) => t!("liquify-status-mesh-error", error = crate::i18n::io_error(&e)),
         });
     }
 
     /// Load Mesh…: a mesh saved earlier (stretched to the layer).
     fn load_mesh(&mut self) -> Option<Mesh> {
-        let mut dialog = rfd::FileDialog::new()
+        let mut dialog = file_dialog::new()
             .set_title(t!("liquify-load-mesh-title"))
-            .add_filter(t!("liquify-mesh-files"), &[MESH_EXTENSION])
-            .add_filter(t!("app-file-filter-all"), &["*"]);
+            .filter(t!("liquify-mesh-files"), &[MESH_EXTENSION])
+            .filter(t!("app-file-filter-all"), &["*"]);
         if let Some(dir) = self.current_dir() {
             dialog = dialog.set_directory(dir);
         }
@@ -943,7 +954,10 @@ impl AtelierApp {
                 mesh
             }
             Err(e) => {
-                self.status_cannot(t!("liquify-status-mesh-error", error = e.to_string()));
+                self.status_cannot(t!(
+                    "liquify-status-mesh-error",
+                    error = crate::i18n::io_error(&e)
+                ));
                 None
             }
         }
@@ -1338,7 +1352,7 @@ fn options(ui: &mut egui::Ui, s: &mut Settings, has_last: bool) -> Option<Reques
     let percent_row =
         |ui: &mut egui::Ui, label: String, value: &mut f32, min: f32, default: f32| {
             let mut shown = *value * 100.0;
-            slider_row(
+            if slider_row(
                 ui,
                 &label,
                 None,
@@ -1347,8 +1361,9 @@ fn options(ui: &mut egui::Ui, s: &mut Settings, has_last: bool) -> Option<Reques
                 &percent,
                 Track::Accent,
                 default,
-            );
-            *value = shown / 100.0;
+            ) {
+                *value = shown / 100.0;
+            }
         };
     ui.spacing_mut().item_spacing.y = 8.0;
     ui_kit::section(ui, &t!("liquify-brush-options"));
@@ -1663,7 +1678,7 @@ mod tests {
 
     /// Runs frames until the result is in.
     fn settle(h: &mut Harness<'static, AtelierApp>) {
-        for _ in 0..500 {
+        for _ in crate::testing::patience() {
             h.run_steps(1);
             if h.state().liquify.applying.is_none() {
                 return;

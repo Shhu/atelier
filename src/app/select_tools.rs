@@ -219,6 +219,16 @@ impl AtelierApp {
         SelectMode::from_modifiers(shift, alt, self.select_mode)
     }
 
+    /// Mode of a Ctrl+click that loads a thumbnail (layer, mask, channel,
+    /// path) as a selection: a new selection whatever the options bar
+    /// says; Shift adds, Alt subtracts, both intersect.
+    pub(super) fn load_mode(&self, shift: bool, alt: bool) -> SelectMode {
+        if self.selection.is_none() && !self.select_busy() {
+            return SelectMode::Replace;
+        }
+        SelectMode::from_modifiers(shift, alt, SelectMode::Replace)
+    }
+
     /// Combines `new` with the current selection.
     pub(super) fn apply_selection(&mut self, new: Option<Selection>, mode: SelectMode) {
         let Some(canvas) = self.doc.as_ref().map(Document::full_rect) else {
@@ -284,6 +294,7 @@ impl AtelierApp {
                     pixels: ctrl.then_some(alt),
                     floating: None,
                     moved: false,
+                    by: (0, 0),
                 });
                 return self.move_selection(view, pointer, down, shift);
             }
@@ -470,7 +481,18 @@ impl AtelierApp {
                     d = handles::constrain_axis(d);
                 }
                 let (dx, dy) = (d.x.round() as i64, d.y.round() as i64);
-                self.selection = Some(m.selection.clone().translate(dx, dy));
+                if (dx, dy) != m.by {
+                    m.by = (dx, dy);
+                    // An inverted one moves as a whole (made over the
+                    // canvas once per new offset); the others follow the
+                    // pointer off the canvas and back.
+                    self.selection = if m.selection.inverted {
+                        let canvas = self.doc.as_ref().map(Document::full_rect);
+                        canvas.and_then(|c| m.selection.moved(dx, dy, c))
+                    } else {
+                        Some(m.selection.clone().translate(dx, dy))
+                    };
+                }
                 if let (Some((id, (x, y))), Some(doc)) = (m.floating, &mut self.doc)
                     && let Some(layer) = doc.layers.iter_mut().find(|l| l.id == id)
                 {
@@ -503,7 +525,7 @@ impl AtelierApp {
         let Some(canvas) = self.doc.as_ref().map(Document::full_rect) else {
             return;
         };
-        let Some(moved) = selection.clone().translate(d.0, d.1).within(canvas) else {
+        let Some(moved) = selection.moved(d.0, d.1, canvas) else {
             return;
         };
         if pixels && self.in_quick_mask() {
@@ -545,30 +567,14 @@ impl AtelierApp {
         let (x, y) = (ip.x.floor() as i64, ip.y.floor() as i64);
         let tolerance = (self.wand_tolerance * 255.0).round() as u8;
         let canvas = doc.full_rect();
-        // Active layer, or the whole image as displayed: flattened, then
-        // filled, with the selection, in the background when large.
-        type Pixels = Box<dyn FnOnce() -> Arc<image::RgbaImage> + Send>;
-        let ((w, h), origin, pixels): (_, _, Pixels) = if self.wand_all_layers {
-            let flatten = doc.flatten_later();
-            (
-                (canvas.w, canvas.h),
-                (0, 0),
-                Box::new(move || Arc::new(flatten())),
-            )
-        } else {
-            let layer = doc.active_layer();
-            let image = layer.shared_image();
-            (
-                layer.image().dimensions(),
-                layer.offset,
-                Box::new(move || image),
-            )
-        };
-        let (lx, ly) = (x - origin.0, y - origin.1);
-        if lx < 0 || ly < 0 || lx >= w as i64 || ly >= h as i64 {
-            self.status_cannot(t!("select-wand-outside-layer"));
+        // Clicks off the canvas do nothing.
+        if x < 0 || y < 0 || x >= canvas.w as i64 || y >= canvas.h as i64 {
             return;
         }
+        // Filled, with the selection, in the background when large.
+        let Some(pixels) = self.wand_pixels_later() else {
+            return;
+        };
         let (shift, alt) = self.ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
         let mode = self.selection_mode(shift, alt);
         // Anti-alias: edges softened by about a pixel.
@@ -578,13 +584,13 @@ impl AtelierApp {
             0.0
         };
         let contiguous = self.wand_contiguous;
-        let area = w as u64 * h as u64;
+        let area = canvas.w as u64 * canvas.h as u64;
         self.name_tool_step();
         self.select_later(Then::Select(mode), area, move || {
             let image = pixels();
             let mask =
-                crate::pixel_ops::magic_wand(&image, lx as u32, ly as u32, tolerance, contiguous);
-            let found = Selection::from_mask(&mask, origin).and_then(|s| s.within(canvas));
+                crate::pixel_ops::magic_wand(&image, x as u32, y as u32, tolerance, contiguous);
+            let found = Selection::from_mask(&mask, (0, 0));
             feathered(found, feather, canvas)
         });
     }
@@ -1120,6 +1126,50 @@ impl AtelierApp {
         self.status.set(t!("select-subject-searching"));
     }
 
+    /// A subject search (Select Subject, Remove Background) runs for the
+    /// active document.
+    pub(super) fn subject_searching(&self) -> bool {
+        self.subject_job.as_ref().is_some_and(|j| {
+            j.found.is_none() && self.doc.as_ref().is_some_and(|d| d.uid() == j.doc)
+        })
+    }
+
+    /// Esc during the subject search: stopped, its result ignored (the
+    /// worker ends on its own; nothing waits for it).
+    pub(super) fn cancel_subject(&mut self) {
+        let Some(job) = self.subject_job.take() else {
+            return;
+        };
+        self.status.set(if job.remove_from.is_some() {
+            t!("selection14-remove-background-stopped")
+        } else {
+            t!("selection14-subject-stopped")
+        });
+    }
+
+    /// A subject search that only ends when the returned sender sends (or
+    /// is dropped): for tests that act while it runs.
+    #[cfg(test)]
+    pub(super) fn fake_subject_job(
+        &mut self,
+        remove_background: bool,
+    ) -> mpsc::Sender<(GrayImage, Option<String>)> {
+        let doc = self.doc.as_ref().expect("a document");
+        let (send, result) = mpsc::channel();
+        let layer = doc.active_layer();
+        self.subject_job = Some(SubjectJob {
+            result,
+            doc: doc.uid(),
+            remove_from: remove_background.then(|| (layer.id, layer.rev())),
+            generation: doc.history_generation(),
+            base: self.selection.clone(),
+            fingerprint: super::object_select::fingerprint(doc),
+            use_ai: false,
+            found: None,
+        });
+        send
+    }
+
     /// The subject search is done (its result may wait for a text).
     #[cfg(test)]
     pub(super) fn subject_found(&self) -> bool {
@@ -1129,6 +1179,12 @@ impl AtelierApp {
     /// Applies the subject search result when it is ready.
     pub(super) fn poll_subject(&mut self, ctx: &egui::Context) {
         let Some(job) = &mut self.subject_job else { return };
+        // Its document closed: dropped (the search ends on its own).
+        let active = self.doc.as_ref().is_some_and(|d| d.uid() == job.doc);
+        if !active && !self.parked.iter().any(|p| p.doc.uid() == job.doc) {
+            self.subject_job = None;
+            return;
+        }
         if job.found.is_none() {
             match job.result.try_recv() {
                 Ok(found) => job.found = Some(found),
@@ -1150,12 +1206,13 @@ impl AtelierApp {
         if self.type_tool.edit.is_some() {
             return;
         }
-        let job = self.subject_job.take().expect("checked");
-        let (mask, note) = job.found.expect("received");
-        // Never on another document.
-        if self.doc.as_ref().is_none_or(|d| d.uid() != job.doc) {
+        // Never on another document: its own one, in a background tab,
+        // gets it once active again.
+        if !active {
             return;
         }
+        let job = self.subject_job.take().expect("checked");
+        let (mask, note) = job.found.expect("received");
         // A selection made before it lands first, in order.
         self.wait_select_job();
         let Some(doc) = self.doc.as_mut() else { return };

@@ -85,7 +85,8 @@ impl ExportOptions {
         if (w, h) == flat.dimensions() {
             return flat;
         }
-        image::imageops::resize(&flat, w, h, self.resample.filter())
+        // Premultiplied: no dark fringe along transparent edges.
+        crate::pixel_ops::resize(&flat, w, h, self.resample.filter())
     }
 
     /// The file's bytes, the image already at its export size; `icc`: the
@@ -178,6 +179,28 @@ pub(crate) fn copyright_exif(text: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resized_exports_keep_the_color_of_transparent_edges() {
+        // Opaque red on the left, clear on the right.
+        let flat = RgbaImage::from_fn(8, 8, |x, _| {
+            image::Rgba(if x < 4 { [255, 0, 0, 255] } else { [0; 4] })
+        });
+        for resample in [Resample::Bilinear, Resample::Bicubic, Resample::Lanczos] {
+            for scale in [50.0, 300.0] {
+                let options = ExportOptions {
+                    scale,
+                    resample,
+                    ..ExportOptions::default()
+                };
+                let out = options.render(flat.clone());
+                for p in out.pixels().filter(|p| p.0[3] > 0) {
+                    assert_eq!(p.0[..3], [255, 0, 0], "{resample:?} {scale}%: {p:?}");
+                }
+                assert!(out.pixels().any(|p| p.0[3] > 0 && p.0[3] < 255), "a soft edge");
+            }
+        }
+    }
 
     #[test]
     fn exports_stay_within_what_atelier_opens() {

@@ -100,6 +100,12 @@ pub(super) struct ColorRange {
 }
 
 impl ColorRange {
+    /// Its selection is computed: OK can apply it.
+    #[cfg(test)]
+    pub(super) fn ready(&self) -> bool {
+        self.shown.is_some()
+    }
+
     fn key(&self) -> u64 {
         let samples: Vec<_> = self
             .samples
@@ -359,15 +365,46 @@ impl AtelierApp {
             return;
         };
         if apply && cr.shown.is_some() {
-            self.apply_color_range(&cr);
+            self.record(crate::actions::Recorded::ColorRange {
+                samples: cr
+                    .samples
+                    .iter()
+                    .map(|s| crate::actions::RangeColor { lab: s.lab, add: s.add })
+                    .collect(),
+                fuzziness: cr.fuzziness,
+                invert: cr.invert,
+            });
+            self.apply_color_range(cr.samples, cr.fuzziness, cr.invert);
         }
     }
 
-    fn apply_color_range(&mut self, cr: &ColorRange) {
+    /// Color Range played by an action: at once, or its window open with
+    /// these settings (`dialog`).
+    pub(super) fn play_color_range(
+        &mut self,
+        samples: &[crate::actions::RangeColor],
+        fuzziness: f32,
+        invert: bool,
+        dialog: bool,
+    ) {
+        let samples: Vec<RangeSample> = samples
+            .iter()
+            .map(|s| RangeSample { lab: s.lab, add: s.add })
+            .collect();
+        let fuzziness = fuzziness.clamp(0.0, 200.0);
+        if !dialog {
+            return self.apply_color_range(samples, fuzziness, invert);
+        }
+        self.open_color_range();
+        if let Some(cr) = &mut self.sel.color_range {
+            (cr.samples, cr.fuzziness, cr.invert) = (samples, fuzziness, invert);
+        }
+    }
+
+    fn apply_color_range(&mut self, samples: Vec<RangeSample>, fuzziness: f32, invert: bool) {
         self.wait_select_job();
         let Some(doc) = &self.doc else { return };
         let (canvas, flatten) = (doc.full_rect(), doc.flatten_later());
-        let (samples, fuzziness, invert) = (cr.samples.clone(), cr.fuzziness, cr.invert);
         let within = self.selection.clone();
         let pixels = canvas.w as u64 * canvas.h as u64;
         self.sel.step_name = Some(super::select_menu::step_label(t!("sel-menu-color-range")));

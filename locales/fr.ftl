@@ -77,7 +77,7 @@ menu-image-crop-to-element = Recadrer sur l'élément sélectionné
 menu-image-trim = Rogner (tout le contenu visible)
 menu-layer = Calque
 menu-layer-new = Nouveau calque
-menu-layer-via-copy = Calque par copier
+menu-layer-via-copy = Calque par Copier
 menu-layer-duplicate = Dupliquer le calque
 menu-layer-delete = Supprimer le calque
 menu-layer-arrange = Disposition
@@ -254,7 +254,7 @@ dialog-split-gap = Écart max. dans un élément
 dialog-split-gap-hint = Augmentez pour regrouper les lettres d'un mot, diminuez pour séparer des éléments proches.
 dialog-split-no-pixels = Aucun pixel visible.
 dialog-split-found = { $count ->
-    [one] { $count } seul élément trouvé.
+    [one] Seulement { $count } élément trouvé.
    *[other] { $count } éléments trouvés.
 }
 dialog-split-apply = Séparer
@@ -350,11 +350,10 @@ dialog-curves-output = Sortie
 
 ## Selection tools
 
-select-wand-outside-layer = Cliquez sur les pixels du calque actif.
 select-ai-unavailable = IA indisponible : { $error } ; méthode sans IA utilisée.
 select-subject-searching = Recherche du sujet…
 select-subject-failed = La recherche du sujet a échoué.
-select-subject-not-found = Aucun sujet net trouvé : essayez le lasso magnétique ou la baguette magique.
+select-subject-not-found = Aucun sujet net trouvé : essayez l'outil Lasso magnétique ou l'outil Baguette magique.
 select-layer-changed = Le calque a changé pendant la recherche.
 select-background-removed = Arrière-plan de « { $name } » supprimé
 select-subject-selected-note = Sujet sélectionné — { $note }
@@ -472,7 +471,7 @@ optbar-use-foreground = Utiliser le premier plan
 
 side-kind-image = Image
 side-kind-text = Texte
-side-kind-locked = { $kind } · non modifiable
+side-kind-locked = { $kind } · verrouillé
 side-locked-notice = Calque verrouillé — déverrouillez-le dans le panneau Calques.
 side-transform = Transformation
 side-rotate-left-tip = Rotation de 90° antihoraire
@@ -528,7 +527,7 @@ hint-add = ajouter
 hint-subtract = soustraire
 hint-deselect = désélectionner
 hint-inverse = intervertir
-hint-layer-via-copy = calque par copier
+hint-layer-via-copy = calque par Copier
 hint-anchor-point = point d'ancrage
 hint-remove-point = retirer le point
 hint-close-path = fermer
@@ -947,7 +946,7 @@ sel-contract-by = Contracter de
 sel-feather-title = Contour progressif
 sel-feather-radius = Rayon
 sel-modify-at-bounds = Appliquer l'effet aux limites de la zone de travail
-sel-modify-at-bounds-tip = Désactivé, la sélection se prolonge au-delà des bords de la zone de travail.
+sel-modify-at-bounds-tip = Décoché : la sélection se prolonge au-delà des bords de la zone de travail.
 
 ## Save Selection, Load Selection
 
@@ -1065,13 +1064,13 @@ paint-vibrance-tip = Limite l'écrêtage des couleurs entièrement saturées
 paint-strength = Intensité
 paint-sample-all-tip = Agit sur ce que montrent tous les calques visibles, et peint le résultat sur le calque actif
 paint-finger-painting = Peinture au doigt
-paint-finger-painting-tip = Commence chaque tracé avec la couleur de premier plan
+paint-finger-painting-tip = Commence chaque coup de pinceau avec la couleur de premier plan
 paint-dodge-hint = Éclaircit les zones peintes
 paint-burn-hint = Assombrit les zones peintes
 paint-sponge-hint = Modifie la saturation des couleurs des zones peintes
 paint-blur-hint = Adoucit les contours nets des zones peintes
 paint-sharpen-hint = Accentue le contraste des contours des zones peintes
-paint-smudge-hint = Étale la couleur le long du tracé, comme un doigt dans la peinture fraîche
+paint-smudge-hint = Étale la couleur le long du coup de pinceau, comme un doigt dans la peinture fraîche
 
 ## Gradient tool options
 
@@ -1197,7 +1196,7 @@ retouch-tool-red-eye = Œil rouge
 ## Retouching tools: options bar
 
 retouch-aligned = Aligné
-retouch-aligned-tip = Garder le même décalage avec la source d'un tracé à l'autre ; décoché, chaque tracé repart du point source
+retouch-aligned-tip = Garder le même décalage avec la source d'un coup de pinceau à l'autre ; décoché, chaque coup de pinceau repart du point source
 retouch-sample = Échantillon
 retouch-sample-current = Calque actif
 retouch-sample-below = Calque actif et inférieurs
@@ -1232,7 +1231,7 @@ retouch-status-nothing-to-sample = Rien autour à échantillonner.
 retouch-status-no-red-eye = Aucun œil rouge trouvé ici.
 retouch-status-select-first = Sélectionnez d'abord la zone à remplir.
 retouch-needs-selection = Sélection requise
-retouch-status-cancelled = { $name } annulé
+retouch-status-cancelled = { $name } : opération annulée
 retouch-status-ai-failed = Le modèle d'IA a échoué ({ $error }) : remplissage fait sans lui.
 
 ## Content-Aware Fill
@@ -1432,7 +1431,7 @@ vector-status-rasterized = « { $name } » pixellisé (n'est plus modifiable c
 
 vector-menu-paths = Tracés
 vector-paths-title = Tracés
-vector-paths-empty = Aucun tracé : dessinez-en un avec la plume.
+vector-paths-empty = Aucun tracé : dessinez-en un avec l'outil Plume.
 vector-work-path = Tracé de travail
 vector-path-name = Tracé { $number }
 vector-shape-path-name = Tracé de la forme { $name }
@@ -1608,7 +1607,7 @@ xchg-psd-mode-duotone = Bichromie
 xchg-psd-mode-lab = Lab
 xchg-psd-note-depth = la profondeur de { $bits } bits (8 bits par couche ici)
 xchg-psd-note-mode = le mode { $mode } (RVB ici)
-xchg-psd-note-text = le texte modifiable de { $names }
+xchg-psd-note-text = le texte modifiable de { $names } (ouvert en pixels)
 xchg-psd-note-smart = objets dynamiques en pixels : { $names }
 xchg-psd-note-vector = les masques vectoriels de { $names }
 xchg-psd-note-shapes = les contours de forme de { $names }
@@ -1916,7 +1915,7 @@ actions-default-web = Exporter pour le Web (JPEG)
 
 ## Steps of the actions
 
-actions-step-rotate = Faire pivoter la zone de travail
+actions-step-rotate = Rotation de la zone de travail
 actions-step-crop = Recadrer
 actions-step-select = Définir la sélection
 actions-step-select-all = Tout sélectionner
@@ -2393,7 +2392,7 @@ fx3-ai-error-write = le fichier n'a pas pu être écrit ({ $error })
 fx3-model-ready-run-again = { $name } est prêt : relancez la commande (la sélection ou le calque a changé entre-temps).
 
 ## Content-Aware Fill, Spot Healing Brush
-fx3-ai-skipped-transparency = La zone a des pixels transparents : remplie par des motifs, sans le modèle d'IA.
+fx3-ai-skipped-transparency = La zone a des pixels transparents : remplie avec des morceaux pris dans l'image, sans le modèle d'IA.
 
 ## Start screen
 ui3-status-welcome = Créez une image ({ $new }), ouvrez-en une ({ $open }) ou glissez-la dans la fenêtre.
@@ -2424,7 +2423,6 @@ ui3-shortcuts-title = Raccourcis clavier
 ui3-shortcuts-filter = Rechercher
 ui3-shortcuts-other = Autres touches
 ui3-shortcuts-palette = Rechercher une commande
-ui3-shortcuts-hide-side = Masquer le panneau latéral
 ui3-shortcuts-brush-size = Taille de la forme (plus petite / plus grande)
 ui3-shortcuts-pan = Déplacer la vue (maintenir)
 
@@ -2626,7 +2624,7 @@ files4-psd-note-comps = les compositions de calques
 tools4-status-last-layer = Suppression impossible : un document garde au moins un calque.
 
 ## Move tool
-tools4-show-transform-controls = Afficher les options de transformation
+tools4-show-transform-controls = Afficher les contrôles de transformation
 tools4-show-transform-controls-tip = Affiche le cadre et les poignées du calque sélectionné : faire glisser une poignée le met à l'échelle ou le fait pivoter. Sinon, un glissement ne fait que déplacer.
 
 ## Keys in Quick Mask mode
@@ -2663,8 +2661,8 @@ fx4-ai-model-damaged = fichier du modèle endommagé : il a été supprimé et 
 
 ## Linked smart objects: Edit Contents, files read again
 smart4-status-link-unreadable = { $count ->
-    [one] { $count } fichier lié illisible montre sa dernière copie : { $names }
-   *[other] { $count } fichiers liés illisibles montrent leurs dernières copies : { $names }
+    [one] { $count } fichier lié est illisible, sa dernière copie est affichée : { $names }
+   *[other] { $count } fichiers liés sont illisibles, leurs dernières copies sont affichées : { $names }
 }
 smart4-status-link-saved = Enregistré dans { $name } : les objets dynamiques liés à ce fichier suivent.
 smart4-status-link-saved-flat = Enregistré dans { $name }, calques fusionnés : les objets dynamiques liés à ce fichier suivent. Cet onglet garde les calques jusqu'à sa fermeture.
@@ -2737,7 +2735,7 @@ ui4-log-objsel-picked-again = Sélection d'objet : l'image a changé pendant un
 
 ## Diagnostics: what was measured, as named in the window
 ui4-op-ai = { $name } (IA)
-ui4-op-stroke = Fin d'un tracé : { $tool }
+ui4-op-stroke = Fin d'un coup de pinceau : { $tool }
 ui4-op-open = Ouverture ({ $format })
 ui4-op-save = Enregistrement ({ $format })
 ui4-op-export = Exportation ({ $format })
@@ -2763,7 +2761,7 @@ ui4-op-objsel-analysis = Sélection d'objet : analyse de l'image
 ## Diagnostics: what the window was doing during a freeze
 ui4-diag-doing-tool = Outil : { $tool }
 ui4-diag-doing-dialog = Fenêtre : { $name }
-ui4-diag-doing-stroke = tracé en cours
+ui4-diag-doing-stroke = coup de pinceau en cours
 ui4-diag-doing-pointer = bouton de la souris enfoncé
 ui4-diag-doing-ran = a exécuté { $operations }
 ui4-diag-doing-jobs = en arrière-plan : { $jobs }
@@ -2786,7 +2784,7 @@ ui4-diag-report = Signaler un problème…
 ui4-diag-report-tip = Copie le rapport, puis ouvre la page où signaler les problèmes
 ui4-diag-status-report = Rapport copié : collez-le dans votre message, sur la page qui s'est ouverte.
 ui4-diag-just-now = à l'instant
-ui4-diag-tip-frame = Temps pour dessiner la fenêtre une fois. Sous { $smooth }, c'est fluide ; au-delà de { $sluggish }, ça rame.
+ui4-diag-tip-frame = Temps pour dessiner la fenêtre une fois. Sous { $smooth }, l'affichage est fluide ; au-delà de { $sluggish }, il manque de fluidité.
 ui4-diag-tip-freezes = Moments où la fenêtre a cessé de répondre pendant plus de { $freeze }.
 ui4-diag-tip-memory = Mémoire qu'utilise le programme, y compris celle qu'il partage avec d'autres programmes.
 ui4-diag-tip-history = Mémoire gardée pour annuler, pour tous les documents ouverts ; au-delà du budget, les étapes les plus anciennes sont supprimées.
@@ -3008,8 +3006,8 @@ fx6-ai-inpaint-damaged = fichier du modèle endommagé et supprimé ; télécha
 
 ## Layer commands
 
-input6-menu-layer-via-cut = Calque par couper
-input6-hist-layer-via-cut = Calque par couper
+input6-menu-layer-via-cut = Calque par Couper
+input6-hist-layer-via-cut = Calque par Couper
 input6-menu-stamp-visible = Fusionner une copie des calques visibles
 input6-hist-stamp-visible = Copie fusionnée des calques visibles
 input6-status-nothing-visible = Rien de visible à fusionner.
@@ -3136,7 +3134,7 @@ panels8-clear = Effacer
 panels8-straighten-layer = Redresser le calque
 panels8-straighten-tip = Fait pivoter le calque pour mettre la ligne à niveau et recadre la zone de travail. Alt : sans recadrer.
 panels8-why-no-samplers = Aucun point d'échantillonnage à effacer.
-panels8-why-no-line = Tracez d'abord une ligne avec la Règle.
+panels8-why-no-line = Tracez d'abord une ligne avec l'outil Règle.
 panels8-sampler-hint = Clic : ajouter un point. { $alt_click } : en retirer un.
 panels8-status-samplers-full = Un document contient { $count } points d'échantillonnage au plus.
 panels8-status-straighten-quick-mask = Quittez d'abord le mode Masque.
@@ -3228,14 +3226,14 @@ crop8-clear-tip = Vide la largeur, la hauteur et la résolution
 crop8-resolution = Rés.
 crop8-resolution-tip = Résolution donnée à l'image recadrée ; vide, elle ne change pas
 crop8-straighten-tip = Redresser : tracez une ligne le long de ce qui doit être droit
-crop8-overlay = Superposition
+crop8-overlay = Incrustation
 crop8-overlay-thirds = Règle des tiers
 crop8-overlay-grid = Grille
 crop8-overlay-none = Aucune
 crop8-shield = Opacité
 crop8-shield-tip = Assombrissement de la zone recadrée
 crop8-delete-cropped = Supprimer les pixels recadrés
-crop8-delete-cropped-tip = Désactivé, les pixels hors du cadre restent dans les calques et peuvent être révélés plus tard
+crop8-delete-cropped-tip = Décoché : les pixels hors du cadre restent dans les calques et peuvent être révélés plus tard
 ## Crop tool: status bar hint
 crop8-hint-turn = hors du cadre : le faire pivoter
 
@@ -3310,7 +3308,7 @@ distort8-keywords-wave = déformer déformation sinusoïde vagues
 distort8-keywords-zigzag = déformer déformation étang anneaux
 
 ## Crop tool, whole-document changes: fixes after review
-crop9-preset-name = Préréglage de recadrage
+crop9-preset-name = Paramètre prédéfini de recadrage
 crop9-ratio-tip = Une proportion, pas des pixels. Vide : libre.
 ## Status bar: the image turned would be too large
 crop9-status-too-large = L'image tournée dépasserait la taille maximale.
@@ -3358,7 +3356,7 @@ pattern9-offset-tip = Où le motif commence, depuis le coin supérieur gauche du
 pattern9-step-define = Utiliser comme motif
 pattern9-step-new-fill = Nouveau calque de remplissage de motif
 ## Opening a file: Pattern Fill layers whose tile isn't in the file
-pattern9-psd-note-fills = le motif de remplissage de { $names }, absent du fichier (conservé en pixels)
+pattern9-psd-note-fills = le remplissage de motif de { $names }, dont le motif manque (conservé en pixels)
 
 ## Help > Shortcuts: rows missing until now
 ui9-shortcut-screen-mode-back = Mode d'affichage précédent
@@ -3379,7 +3377,7 @@ crop11-overlay-triangle = Triangle
 crop11-overlay-golden-ratio = Nombre d'or
 
 ## Layer locks: Ctrl+/ when the lock it would put on is already on through a group ($lock: lock names; $group: group name)
-locks11-lock-held-by-group = { $lock } : déjà en place par le groupe « { $group } »
+locks11-lock-held-by-group = { $lock } : déjà actif par l'intermédiaire du groupe « { $group } »
 
 ## Free Transform of a Pattern Fill layer in perspective or warped
 pattern11-why-distort = Le motif de « { $name } » peut être déplacé, mis à l'échelle, pivoté ou retourné, mais pas mis en perspective ni déformé.
@@ -3394,3 +3392,146 @@ ui11-menu-more = Autres menus
 histogram12-source-adjustment = Composite de réglage
 ## Crop tool: Overlay menu, golden rectangle squares and spiral (Shift+O turns it)
 histogram12-spiral-overlay = Spirale d'or
+
+## Actions panel menu › Load Actions: loaded, and some loaded actions lost a function key already used by another action
+batch14-status-loaded-keys = Scripts chargés depuis { $path }. { $count ->
+    [one] { $count } touche de fonction était déjà prise : ce script n'en a plus.
+   *[other] { $count } touches de fonction étaient déjà prises : ces scripts n'en ont plus.
+}
+## Playing an action: the step names a known command but its settings can't be read (hand-edited or damaged file)
+batch14-error-damaged = les réglages de cette étape sont illisibles.
+
+## Help › Keyboard Shortcuts, other keys: Shift+[ ]
+input14-shortcuts-hardness = Dureté de la forme (plus douce / plus dure)
+## Help › Keyboard Shortcuts, other keys: Alt + right-drag on the canvas
+input14-shortcuts-brush-drag = Taille de la forme (gauche / droite) et dureté (haut / bas)
+## Help › Keyboard Shortcuts: the gesture written after a modifier ("Alt+Right-drag")
+input14-key-right-drag = Glisser clic droit
+## Help › Keyboard Shortcuts, other keys: the digits
+input14-shortcuts-opacity = Opacité de l'outil ou du calque (deux chiffres à la suite : la valeur exacte)
+## Help › Keyboard Shortcuts, other keys: Shift + the digits
+input14-shortcuts-flow = Flux de l'outil
+## Help › Keyboard Shortcuts, other keys: Alt+[ ]
+input14-shortcuts-layer-step = Sélectionner le calque du dessous / du dessus
+## Help › Keyboard Shortcuts, other keys: Alt+, and Alt+.
+input14-shortcuts-layer-edge = Sélectionner le calque du bas / du haut
+## Help › Keyboard Shortcuts, other keys: Shift++ and Shift+−
+input14-shortcuts-blend-step = Mode de fusion suivant / précédent (de l'outil de peinture ou du calque)
+## Help › Keyboard Shortcuts, other keys: Alt+Shift+letter
+input14-shortcuts-blend-letter = Un mode de fusion par sa lettre (de l'outil de peinture ou du calque)
+## Help › Keyboard Shortcuts: the key written after modifiers ("Alt+Shift+letter")
+input14-key-letter = lettre
+## Help › Keyboard Shortcuts, other keys: Ctrl+2 to Ctrl+9
+input14-shortcuts-channels = Couches (composite, couleurs, couches alpha)
+## Help › Keyboard Shortcuts, other keys: Ctrl+Tab and Shift+Ctrl+Tab
+input14-shortcuts-documents = Document suivant / précédent
+## Help › Keyboard Shortcuts, other keys: the arrow keys, alone and with Shift
+input14-shortcuts-nudge = Déplacer de 1 px / 10 px
+## Help › Keyboard Shortcuts: the arrow keys, as a key name
+input14-key-arrows = Flèches
+## Help › Keyboard Shortcuts, other keys: Delete and Backspace
+input14-shortcuts-delete = Effacer la sélection (sans sélection : supprimer le calque)
+## Help › Keyboard Shortcuts, other keys: Alt+Shift+Backspace and Shift+Ctrl+Backspace
+input14-shortcuts-fill-keep = Remplir avec la couleur de premier plan / d'arrière-plan en préservant la transparence
+## Help › Keyboard Shortcuts, other keys: Ctrl+Space+Click and Alt+Space+Click
+input14-shortcuts-click-zoom = Zoom avant / arrière là où l'on clique
+## Help › Keyboard Shortcuts, other keys: Alt + mouse wheel
+input14-shortcuts-wheel-zoom = Zoom
+## Help › Keyboard Shortcuts, other keys: Enter and Esc
+input14-shortcuts-apply = Appliquer / annuler ce qui est en préparation
+## Help › Keyboard Shortcuts: section of the keys found elsewhere on a French keyboard
+input14-shortcuts-azerty = Clavier AZERTY
+## Status bar: Shift++ or Alt+Shift+letter changed the painting tool's blend mode
+input14-status-tool-blend = Mode : { $mode }
+
+## Saving: why it failed, after "could not save …:" (Windows: another program, a viewer or an antivirus, holds the file open)
+platforms14-file-error-in-use = le fichier est utilisé par un autre programme ; fermez-le et réessayez
+## Start: the window couldn't be made (most often the graphics card or its driver); written to the log and shown in a message box on Windows
+platforms14-startup-failed = Atelier n'a pas pu démarrer : { $error }. Mettre à jour le pilote graphique peut aider. Détails dans { $log }.
+## Start: title of that message box
+platforms14-startup-failed-title = Atelier n'a pas pu démarrer
+## macOS app menu (the menu named after the app, left of File)
+platforms14-mac-about = À propos d'Atelier
+## macOS app menu: hide Atelier's windows (Cmd+H)
+platforms14-mac-hide = Masquer Atelier
+## macOS app menu: hide the other apps' windows (Option+Cmd+H)
+platforms14-mac-hide-others = Masquer les autres
+## macOS app menu: show every app's windows again
+platforms14-mac-show-all = Tout afficher
+## macOS app menu: quit (Cmd+Q), asking for unsaved documents first
+platforms14-mac-quit = Quitter Atelier
+
+## PSD: what opening or saving leaves out
+psd14-psd-note-settings = des réglages que cette application n'a pas, de { $names }
+psd14-psd-note-legacy-brightness = l'ancien algorithme de Luminosité/Contraste de { $names } (ouvert avec l'actuel)
+psd14-psd-note-cropped = les parties de { $names } au-delà de { $max } px par côté (un fichier .psb les garde entières)
+## PSD: opening a file that lost something
+psd14-status-opened-psd-simplified = Ouvert : { $path } — non conservé : { $notes }. L'enregistrement demandera un nouveau fichier, pour que celui-ci ne soit pas remplacé par moins.
+## PSD: saving
+psd14-error-psd-over-4gb = les calques occupent plus de 4 Go, ce qu'un fichier PSD ne peut pas contenir : enregistrez un document .psb ou Atelier
+## Hue/Saturation: the colors edited
+psd14-hue-master = Global
+## Save As: the file types offered
+psd14-file-filter-psb = Document PSB (volumineux)
+
+## Opening or saving a document: smart objects inside smart objects, more levels than Atelier reads (a sentence fragment after "could not open/save …:")
+readers14-error-nested = les objets dynamiques sont imbriqués sur plus de { $max } niveaux
+
+## Crash recovery: at start, the documents a window that ended without closing them left (a crash, a kill, a logout)
+safety14-recovery-title = Récupérer des documents
+safety14-recovery-text = { $count ->
+    [one] Atelier s'est fermé sans enregistrer { $count } document. Le rouvrir avec ses modifications non enregistrées ?
+   *[other] Atelier s'est fermé sans enregistrer ces { $count } documents. Les rouvrir avec leurs modifications non enregistrées ?
+}
+safety14-recovery-hint = Ignorer les supprime définitivement. Annuler les propose de nouveau au prochain démarrage.
+safety14-recovery-open = Récupérer
+safety14-recovery-discard = Ignorer
+safety14-status-recovered = { $count ->
+    [one] { $count } document récupéré : enregistrez-le pour le garder.
+   *[other] { $count } documents récupérés : enregistrez-les pour les garder.
+}
+## Crash recovery: the copies of the modified documents can't be written (log)
+safety14-recovery-failed = Impossible d'écrire les fichiers de récupération : { $error }
+## Closing the window while a workspace is open, or while work is under way
+safety14-close-liquify-open = La fenêtre Fluidité est ouverte : cliquez sur OK ou Annuler avant de fermer la fenêtre.
+safety14-close-camera-raw-open = La fenêtre Camera Raw est ouverte : cliquez sur OK ou Annuler avant de fermer la fenêtre.
+safety14-status-close-waits = La fenêtre se fermera une fois le travail en cours terminé.
+## Camera Raw presets: their file can't be read
+safety14-raw-presets-damaged = Les paramètres prédéfinis Camera Raw n'ont pas pu être lus : le fichier a été conservé sous le nom { $backup }, et les paramètres enregistrés désormais vont dans un nouveau.
+safety14-raw-presets-unreadable = Les paramètres prédéfinis Camera Raw n'ont pas pu être lus ({ $error }) : ceux enregistrés pendant cette session ne sont pas conservés.
+## Swatches: their file can't be read
+safety14-swatches-damaged = Le nuancier enregistré n'a pas pu être lu : le nuancier par défaut est affiché, et le fichier a été conservé sous le nom { $backup }.
+## Save As a PSD file that can't hold everything: asked before writing
+safety14-psd-title = Enregistrer en PSD ?
+safety14-psd-text = Un fichier PSD ne peut pas contenir tout ce document : « { $name } » perdrait { $notes }.
+safety14-psd-hint = Un document Atelier garde tout. Enregistré quand même, le document reste marqué comme ayant des modifications non enregistrées.
+safety14-psd-save-anyway = Enregistrer quand même
+safety14-psd-save-atelier = Enregistrer en document Atelier
+safety14-status-psd-not-saved = Non enregistré : { $name }
+
+## Select Subject and Remove Background: Esc stops the search
+selection14-hint-stop-search = Arrêter la recherche
+selection14-subject-stopped = Recherche du sujet arrêtée
+selection14-remove-background-stopped = Suppression de l'arrière-plan arrêtée
+
+## Diagnostics: operation names for the preview jobs
+words14-op-adjust-preview = Aperçu du réglage : { $name }
+## Diagnostics: a filter dialog's result shown on the layer
+words14-op-layer-preview = Aperçu du filtre sur le calque
+## Diagnostics: the Fade dialog's preview
+words14-op-fade-preview = Estomper : aperçu
+## Diagnostics: the Make a Color Transparent dialog's preview
+words14-op-transparent-preview = Rendre une couleur transparente : aperçu
+## Diagnostics: checking whether a linked file is back
+words14-op-linked-look = Fichiers liés : recherche d'un fichier
+## Log: the pattern library's index could not be read and was renamed
+words14-log-pattern-index-damaged = Index de la bibliothèque de motifs endommagé, mis de côté sous le nom { $backup }
+## Log: patterns of the library that could not be read
+words14-log-patterns-left-out = { $count ->
+    [one] { $count } motif de la bibliothèque n'a pas pu être lu
+   *[other] { $count } motifs de la bibliothèque n'ont pas pu être lus
+}
+## Log: the pattern library could not be read at all
+words14-log-pattern-library-not-read = Bibliothèque de motifs non lue : { $error }
+## Log: changes to the pattern library could not be saved
+words14-log-pattern-library-not-saved = Bibliothèque de motifs non enregistrée : { $error }

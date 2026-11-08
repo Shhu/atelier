@@ -19,8 +19,8 @@ mod white;
 
 pub use render::{Analysis, Frame, Visual, apply, parametric_samples, render};
 pub use settings::{
-    BUILT_IN_PRESETS, BuiltIn, Preset, Profile, Settings, VignetteStyle, Wheel, WhiteBalance,
-    load_presets, save_presets,
+    BUILT_IN_PRESETS, BuiltIn, Preset, Presets, Profile, Settings, VignetteStyle, Wheel,
+    WhiteBalance,
 };
 pub use source::Source;
 pub use white::{TEMPERATURE_RANGE, TINT_RANGE};

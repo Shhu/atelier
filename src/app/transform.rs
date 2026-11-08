@@ -233,6 +233,22 @@ struct Commit {
     placed: Option<(u32, u32, f32)>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: while set, transforms applied aside on this thread wait
+    /// before computing (at most a minute), so "still applying" is a state
+    /// the test holds, not a race.
+    pub(super) static HOLD: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+}
+
+#[cfg(test)]
+fn hold_while(hold: &std::sync::atomic::AtomicBool) {
+    let started = std::time::Instant::now();
+    while hold.load(std::sync::atomic::Ordering::Relaxed) && started.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// A transform computed on another thread.
 struct Applying {
     rx: mpsc::Receiver<Vec<Transformed>>,
@@ -738,6 +754,7 @@ impl AtelierApp {
         let quick = self.in_quick_mask();
         if self.doc.is_none()
             || (!quick && self.refuse_transform_locked())
+            || (!quick && self.transform_targets().len() <= 1 && self.refuse_empty_layer())
         {
             return false;
         }
@@ -939,6 +956,7 @@ impl AtelierApp {
             pixels: Some(alt),
             floating: None,
             moved: false,
+            by: (0, 0),
         });
         Some(self.move_selection(view, pointer, down, shift))
     }
@@ -1420,6 +1438,12 @@ impl AtelierApp {
         }
     }
 
+    /// Width and height of the box of what is transformed.
+    pub(super) fn transform_box(&self) -> Option<(f64, f64)> {
+        let b = bounds(self.transform_source()?);
+        Some((b[2] - b[0], b[3] - b[1]))
+    }
+
     /// The frame about to be applied, in units of the source box (see
     /// `Recorded::Transform`); `None` for a warp, or if nothing moves.
     pub(super) fn recorded_frame(&self) -> Option<[Pt; 4]> {
@@ -1452,9 +1476,22 @@ impl AtelierApp {
     /// on what is selected now: applied at once, or with `dialog` left to
     /// be adjusted (Enter applies it). Returns `false` if there is nothing
     /// to transform.
-    pub(super) fn play_transform(&mut self, unit: [Pt; 4], dialog: bool) -> bool {
+    pub(super) fn play_transform(
+        &mut self,
+        unit: [Pt; 4],
+        frame: Option<crate::actions::Frame>,
+        dialog: bool,
+    ) -> bool {
         self.commit_pending();
-        if !self.enter_transform() || !self.set_transform_frame(unit) {
+        if !self.enter_transform() {
+            return false;
+        }
+        // Rebuilt on the box of what plays it.
+        let unit = match (frame, self.transform_box()) {
+            (Some(f), Some((w, h))) => f.corners(w, h),
+            _ => unit,
+        };
+        if !self.set_transform_frame(unit) {
             return false;
         }
         if !dialog {
@@ -1638,8 +1675,12 @@ impl AtelierApp {
         // Large: computed on another thread, the frame shown meanwhile.
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
+        #[cfg(test)]
+        let hold = HOLD.with(Arc::clone);
         std::thread::spawn(move || {
             let _job = crate::diag::job("Transform");
+            #[cfg(test)]
+            hold_while(&hold);
             let _ = tx.send(job.run());
             ctx.request_repaint();
         });

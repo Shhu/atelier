@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Atelier documents: a zip whose first entry, stored, is "mimetype"
+     holding "image/x-atelier" (as OpenDocument files do), so file managers
+     open them with Atelier rather than an archive manager. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="image/x-atelier">
+    <comment>Atelier document</comment>
+    <comment xml:lang="fr">Document Atelier</comment>
+    <sub-class-of type="application/zip"/>
+    <generic-icon name="image-x-generic"/>
+    <magic priority="70">
+      <match type="string" value="PK\003\004" offset="0">
+        <match type="string" value="mimetypeimage/x-atelier" offset="30"/>
+      </match>
+    </magic>
+    <glob pattern="*.atelier"/>
+  </mime-type>
+</mime-info>

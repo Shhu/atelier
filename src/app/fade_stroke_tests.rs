@@ -19,7 +19,7 @@ fn app(color: [u8; 4]) -> Harness<'static, AtelierApp> {
 }
 
 fn settle(h: &mut Harness<'static, AtelierApp>) {
-    for _ in 0..600 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if !h.state().filters.busy() {
             return;
@@ -137,7 +137,7 @@ fn fade_after_an_adjustment_is_its_own_step_with_a_live_preview() {
     press(&mut h, Modifiers::NONE, Key::Escape);
     h.state_mut().run(Action::Fade);
     h.state_mut().filters.fade.as_mut().unwrap().fade.opacity = 0.5;
-    for _ in 0..200 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if h.state().preview_shown.is_some() {
             break;
@@ -361,7 +361,7 @@ fn every_new_adjustment_works_as_a_dialog_and_as_a_layer() {
         h.state_mut().adjust.as_mut().unwrap().adjustment = set.clone();
         h.run_steps(2);
         press(&mut h, Modifiers::NONE, Key::Enter);
-        for _ in 0..200 {
+        for _ in crate::testing::patience() {
             h.run_steps(1);
             if !h.state().filters.busy() && h.state().adjust.is_none() {
                 break;
@@ -471,7 +471,7 @@ fn actions_record_and_replay_them() {
     other.state_mut().actions.library = h.state().actions.library.clone();
     other.state_mut().actions.library.sets[0].actions[0].expanded = false;
     assert!(other.state_mut().play_for_batch((0, 0)));
-    for _ in 0..600 {
+    for _ in crate::testing::patience() {
         other.run_steps(1);
         if !other.state().actions.playing() && !other.state().filters.busy() {
             break;
@@ -510,7 +510,7 @@ fn fade_on_a_targeted_mask_changes_the_mask_only_in_a_step_of_its_own() {
 
     h.state_mut().run(Action::Fade);
     h.state_mut().filters.fade.as_mut().expect("Fade opens").fade.opacity = 0.25;
-    for _ in 0..200 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if h.state().preview_shown.is_some() {
             break;
@@ -561,7 +561,7 @@ fn play(h: &mut Harness<'static, AtelierApp>, commands: Vec<Recorded>) {
         }],
     };
     assert!(h.state_mut().play_for_batch((0, 0)));
-    for _ in 0..600 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if !h.state().actions.playing() && !h.state().filters.busy() {
             return;

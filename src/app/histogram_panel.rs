@@ -260,6 +260,13 @@ pub(super) struct HistogramPanel {
     settle: Settle,
     /// The last result is for what is there now.
     fresh: bool,
+    /// The count that failed (a panic): not started again until what it
+    /// counts changes.
+    failed: Option<u64>,
+    /// Tests: while set, a count waits before starting (its cancel still
+    /// heard), so "a count is going on" is a state they hold, not a race.
+    #[cfg(test)]
+    pub(super) hold: Arc<AtomicBool>,
 }
 
 impl HistogramPanel {
@@ -347,14 +354,15 @@ impl AtelierApp {
         // (A count still right goes on through other presses.)
         let held = self.edit_held(ctx);
         let panel = &mut self.hist_panel;
-        if let Some(job) = panel.job.take_if(|j| j.thread.is_finished())
-            && let Ok(Some(counts)) = job.thread.join()
-            && job.key == key
-        {
-            panel.shown = Some((key, Arc::new(counts)));
+        if let Some(job) = panel.job.take_if(|j| j.thread.is_finished()) {
+            match job.thread.join() {
+                Ok(Some(counts)) if job.key == key => panel.shown = Some((key, Arc::new(counts))),
+                Ok(_) => {}
+                Err(_) => panel.failed = Some(job.key),
+            }
         }
         panel.fresh = panel.shown.as_ref().is_some_and(|s| s.0 == key);
-        if panel.fresh {
+        if panel.fresh || panel.failed == Some(key) {
             return;
         }
         ctx.request_repaint_after(POLL);
@@ -379,9 +387,15 @@ impl AtelierApp {
         if source == Source::AdjustmentComposite {
             up_to(&mut layers, active);
         }
+        #[cfg(test)]
+        let hold = Arc::clone(&self.hist_panel.hold);
         let thread = std::thread::Builder::new()
             .name("histogram".into())
             .spawn(move || {
+                #[cfg(test)]
+                while hold.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 crate::document::watch_styles_only();
                 let selected = selection.map(|s| Selected {
                     mask: s.to_mask(canvas),

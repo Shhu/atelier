@@ -350,10 +350,17 @@ impl AtelierApp {
             if shift {
                 d = handles::constrain_axis(d);
             }
-            m.by = (d.x.round() as i64, d.y.round() as i64);
-            if let Some(s) = &m.selection {
-                self.selection = Some(s.clone().translate(m.by.0, m.by.1));
+            let by = (d.x.round() as i64, d.y.round() as i64);
+            if let Some(s) = m.selection.as_ref().filter(|_| by != m.by) {
+                // An inverted one moves as a whole, over the canvas.
+                self.selection = if s.inverted {
+                    let canvas = self.doc.as_ref().map(Document::full_rect);
+                    canvas.and_then(|c| s.moved(by.0, by.1, c))
+                } else {
+                    Some(s.clone().translate(by.0, by.1))
+                };
             }
+            m.by = by;
         }
         if down {
             return CursorIcon::Grabbing;
@@ -382,7 +389,7 @@ impl AtelierApp {
         doc.sync_selection(m.selection.clone());
         doc.apply_transformed(TransformTarget::QuickMask, &t, done, t!("xchg-hist-move"));
         let (dx, dy) = m.by;
-        self.selection = m.selection.and_then(|s| s.translate(dx, dy).within(canvas));
+        self.selection = m.selection.and_then(|s| s.moved(dx, dy, canvas));
         self.sync_selection();
         self.status.set(moved_status((dx, dy)));
     }
@@ -440,7 +447,7 @@ impl AtelierApp {
         // this one moved: its box, without scanning the mask again.
         let hard = selection.as_ref().is_none_or(|s| s.mask.is_none());
         if let Some(s) = selection {
-            self.selection = s.translate(d.0, d.1).within(canvas);
+            self.selection = s.moved(d.0, d.1, canvas);
             self.sync_selection();
         }
         if let Some(b) = bounds.filter(|_| hard) {
@@ -480,7 +487,7 @@ impl AtelierApp {
         let Some(doc) = &mut self.doc else { return };
         doc.move_quick_mask(d, selection.as_ref());
         if let Some(s) = selection {
-            self.selection = s.translate(d.0, d.1).within(r);
+            self.selection = s.moved(d.0, d.1, r);
             self.sync_selection();
         }
     }
@@ -532,7 +539,7 @@ impl AtelierApp {
         doc.mark_modified();
         doc.copy_quick_mask(&copy.base, by, Some(&copy.selection));
         let canvas = doc.full_rect();
-        self.selection = copy.selection.clone().translate(by.0, by.1).within(canvas);
+        self.selection = copy.selection.moved(by.0, by.1, canvas);
         self.sync_selection();
         let Some(doc) = &self.doc else { return true };
         self.xform.quick.copy = Some(QuickCopy {

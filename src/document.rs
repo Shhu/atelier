@@ -34,6 +34,7 @@ mod measures;
 mod native;
 mod psd;
 mod quick_mask;
+pub mod recovery;
 mod shared_composite;
 mod smart;
 mod styles_jobs;
@@ -47,6 +48,7 @@ pub use artboards::{
 pub use color::{ProofSetup, to_cmyk};
 pub use measures::{ColorSampler, MAX_SAMPLERS, Measure, inner_size};
 pub use file_io::MemoryUse;
+pub(crate) use file_io::Budget;
 #[cfg(test)]
 pub use file_io::set_test_free_memory;
 pub use file_io::{
@@ -61,7 +63,9 @@ pub(crate) use masks::TEST_BIG_FEATHERS;
 pub use native::is_native;
 pub use native::{adjustment_from_json, adjustment_to_json};
 pub use psd::is_psd;
-pub use shared_composite::note_painted;
+pub use shared_composite::{forget_shared_composite, note_painted};
+#[cfg(test)]
+pub use shared_composite::{shared_composite_kept, shared_painted};
 pub use smart::{
     Contents, ContentsUpdate, EmbeddedIn, Link, LinkFresh, LinkRead, LinkReport, SmartFilter,
     SmartFilterKind,
@@ -75,6 +79,11 @@ pub use vectors::{PathRef, SavedPath};
 
 const MAX_UNDO: usize = 50;
 
+/// Oldest steps a full history let go kept at hand (see
+/// `Document::evicted`): as many recent steps can be discarded in a row
+/// (a cancelled transform, a rollback) and give them all back.
+const MAX_EVICTED: usize = 16;
+
 /// Memory the undo history of a document may keep beyond its current state:
 /// 1 GiB still holds about ten steps on a 24 MP layer. The last step is
 /// always kept. The documents set aside in other tabs share
@@ -83,6 +92,23 @@ pub const HISTORY_BUDGET: usize = 1 << 30;
 
 /// Memory the histories of all open documents may keep together.
 pub const TOTAL_HISTORY_BUDGET: usize = 2 << 30;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`HISTORY_BUDGET`] for the documents edited on this thread,
+    /// to go past it without gigabytes.
+    pub(crate) static TEST_HISTORY_BUDGET: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`HISTORY_BUDGET`] (in tests, as lowered on this thread).
+fn history_budget() -> usize {
+    #[cfg(test)]
+    if let Some(budget) = TEST_HISTORY_BUDGET.get() {
+        return budget;
+    }
+    HISTORY_BUDGET
+}
 
 /// Largest layer (in pixels, 1 GiB of RGBA) that merging or painting may
 /// create beyond the size of the canvas.
@@ -231,6 +257,9 @@ pub struct Layer {
     /// Box of the visible pixels (layer coordinates) for a revision.
     bounds: Cell<Option<(u64, Option<[u32; 4]>)>>,
     styles_cache: RefCell<Option<StylesCache>>,
+    /// Fingerprint of `kind` and `effects` (see [`Layer::look_hash`]), with
+    /// the values it was computed for.
+    look: RefCell<Option<(LayerKind, Effects, u64)>>,
     /// The last styles drawn from a preview of its shape (see
     /// `styles_jobs::styles_with`), apart: its own stay for when the
     /// preview ends. Shared by its copies.
@@ -411,6 +440,22 @@ impl Layer {
         self.rev
     }
 
+    /// Fingerprint of the kind and styles (settings holding floats: their
+    /// debug text). Kept until they change: comparing them costs far less
+    /// than formatting them, which the display would do for every layer on
+    /// every frame.
+    pub fn look_hash(&self) -> u64 {
+        if let Some((kind, effects, hash)) = &*self.look.borrow()
+            && *kind == self.kind
+            && *effects == self.effects
+        {
+            return *hash;
+        }
+        let hash = crate::compose::debug_hash(&(&self.kind, &self.effects));
+        *self.look.borrow_mut() = Some((self.kind.clone(), self.effects.clone(), hash));
+        hash
+    }
+
     /// Mutable pixels. They are copied only if shared with the history; the
     /// revision changes, and a text becomes pixels.
     pub fn pixels_mut(&mut self) -> &mut RgbaImage {
@@ -431,6 +476,15 @@ impl Layer {
             self.rev = rev;
         }
         out
+    }
+
+    /// Takes `copy`, a copy of its pixels `of` made elsewhere, as its own
+    /// (no longer shared: painting them copies nothing), when it still has
+    /// those. The same pixels: nothing else changes.
+    pub fn adopt_copy(&mut self, of: &Arc<RgbaImage>, copy: RgbaImage) {
+        if Arc::ptr_eq(&self.image, of) && copy.dimensions() == of.dimensions() {
+            self.image = Arc::new(copy);
+        }
     }
 
     /// Replaces the pixels (a text becomes pixels).
@@ -675,13 +729,13 @@ impl Layer {
     fn buffers(&self, out: &mut Vec<(usize, usize)>) {
         let mut raw = |r: &[u8]| out.push((r.as_ptr() as usize, r.len()));
         raw(self.image.as_raw());
-        if let Some(m) = &self.mask {
-            raw(m.image().as_raw());
-        }
         if let Some(c) = self.styles_cache.borrow().as_ref() {
             for f in c.styles.exterior.iter().chain(&c.styles.interior) {
                 raw(f.coverage.as_raw());
             }
+        }
+        if let Some(m) = &self.mask {
+            m.buffers(out);
         }
         if let Some(smart) = &self.smart {
             smart.buffers(out);
@@ -911,10 +965,11 @@ pub struct Document {
     /// number, kept increasing in both (a later discard of an older step
     /// is all that matters for the generations before it).
     discards: Vec<(u64, u64)>,
-    /// The oldest step a full history let go to record the step numbered
-    /// here, and whether steps were forgotten before: given back if that
-    /// step is discarded (it changed nothing).
-    evicted: Option<(u64, Step, bool)>,
+    /// The oldest steps a full history let go, each with the number of
+    /// the step recorded then and whether steps were forgotten before,
+    /// latest last: given back if that step is discarded (it changed
+    /// nothing). At most [`MAX_EVICTED`].
+    evicted: Vec<(u64, Step, bool)>,
     /// Steps were forgotten (a full history): the oldest state kept is no
     /// longer the one opened.
     forgotten: bool,
@@ -934,6 +989,10 @@ pub struct Document {
     quick_mask: Option<Arc<GrayImage>>,
     /// Changes whenever the quick mask does (display key).
     quick_mask_rev: u64,
+    /// The quick mask's last changes made only in an area (a brush), one
+    /// after the other: from which revision to which, and that area
+    /// (canvas).
+    quick_mask_deltas: Vec<(u64, u64, PixelRect)>,
     /// Brush stroke in progress: the effects are not recomputed.
     effects_held: bool,
     /// Unique across the program (layer ids are only unique within a document).
@@ -988,7 +1047,7 @@ impl Document {
             generation: 0,
             hard_generation: 0,
             discards: Vec::new(),
-            evicted: None,
+            evicted: Vec::new(),
             forgotten: false,
             dropped_redo: None,
             fade_mark: None,
@@ -997,6 +1056,7 @@ impl Document {
             selection: None,
             quick_mask: None,
             quick_mask_rev: next_rev(),
+            quick_mask_deltas: Vec::new(),
             effects_held: false,
             uid: next_rev(),
             mask_target: None,
@@ -1020,8 +1080,15 @@ impl Document {
     }
 
     /// [`Self::open`], taking at most `memory` ([`FileError::LowMemory`]
-    /// past what is free: the user may open it anyway).
+    /// past what is free: the user may open it anyway). A decoder that
+    /// panics on a damaged file says it is damaged: Open, Place, drag and
+    /// drop and Batch all come here, and none takes the application down.
     pub fn open_within(path: &Path, memory: MemoryUse) -> Result<Opened, FileError> {
+        std::panic::catch_unwind(|| Self::open_unguarded(path, memory))
+            .unwrap_or(Err(FileError::Damaged))
+    }
+
+    fn open_unguarded(path: &Path, memory: MemoryUse) -> Result<Opened, FileError> {
         if is_native(path) {
             return Ok(Opened {
                 doc: native::read(path, memory)?,
@@ -1039,7 +1106,8 @@ impl Document {
             });
         }
         if crate::camera_raw::raw::is_raw(path) {
-            let (image, preview_only) = crate::camera_raw::raw::develop(path)?;
+            let (image, preview_only) =
+                crate::camera_raw::raw::develop(path, &mut memory.budget())?;
             return Ok(Opened {
                 doc: Self::new(image, Some(path.to_path_buf())),
                 animated: false,
@@ -1049,7 +1117,7 @@ impl Document {
                     .collect(),
             });
         }
-        let decoded = file_io::read_image(path)?;
+        let decoded = file_io::read_image(path, &mut memory.budget())?;
         let mut doc = Self::new(decoded.image, Some(path.to_path_buf()));
         doc.icc_profile = decoded.icc_profile.map(Arc::new);
         doc.file_metadata.exif = decoded.exif.map(Arc::new);
@@ -1068,8 +1136,9 @@ impl Document {
     /// What saving over its Photoshop file would lose: what opening it
     /// left out, and what such a file can't hold (translated notes).
     pub fn psd_losses(&self) -> Vec<String> {
+        let big = self.path.as_deref().is_some_and(psd::is_psb);
         let mut notes = self.file_notes.clone();
-        notes.extend(psd::losses(self));
+        notes.extend(psd::losses(self, big));
         notes
     }
 
@@ -1081,7 +1150,7 @@ impl Document {
         let mut notes = Vec::new();
         if is_psd(path) {
             file_io::write_atomic(path, |out| {
-                notes = psd::write(self, out)?;
+                notes = psd::write(self, out, psd::is_psb(path))?;
                 Ok(())
             })?;
         } else {
@@ -1113,7 +1182,7 @@ impl Document {
         if format == ExportFormat::Psd {
             let mut notes = Vec::new();
             file_io::write_atomic(path, |out| {
-                notes = psd::write(self, out)?;
+                notes = psd::write(self, out, psd::is_psb(path))?;
                 Ok(())
             })?;
             return Ok(notes);
@@ -1168,7 +1237,7 @@ impl Document {
             generation: 0,
             hard_generation: 0,
             discards: Vec::new(),
-            evicted: None,
+            evicted: Vec::new(),
             forgotten: false,
             dropped_redo: None,
             fade_mark: None,
@@ -1177,6 +1246,7 @@ impl Document {
             selection: self.selection.clone(),
             quick_mask: self.quick_mask.clone(),
             quick_mask_rev: next_rev(),
+            quick_mask_deltas: Vec::new(),
             effects_held: false,
             uid: next_rev(),
             mask_target: self.mask_target,
@@ -1385,13 +1455,16 @@ impl Document {
             name,
             seq: self.seq,
         });
-        // The oldest step goes, but stays at hand until another step comes:
-        // this one may change nothing (a cancelled dialog).
-        self.evicted = None;
+        // The oldest step goes, but stays at hand for a while: this one
+        // may change nothing (a cancelled dialog), nor the ones before it
+        // (a rollback over several steps).
         if self.undo.len() > MAX_UNDO
             && let Some(oldest) = self.undo.pop_front()
         {
-            self.evicted = Some((self.seq, oldest, self.forgotten));
+            if self.evicted.len() == MAX_EVICTED {
+                self.evicted.remove(0);
+            }
+            self.evicted.push((self.seq, oldest, self.forgotten));
             self.forgotten = true;
         }
         // Kept until another step comes: this one may change nothing.
@@ -1408,7 +1481,7 @@ impl Document {
         {
             self.dropped_redo = None;
         }
-        self.trim_history(HISTORY_BUDGET);
+        self.trim_history(history_budget());
         self.step += 1;
         self.state_id = next_rev();
         self.modified = true;
@@ -1469,11 +1542,11 @@ impl Document {
     /// [`Self::history_bytes`]). The last step is always kept. A dropped
     /// redo list goes first: it only comes back if a step changes nothing.
     pub fn trim_history(&mut self, budget: usize) {
-        if (self.dropped_redo.is_some() || self.evicted.is_some())
+        if (self.dropped_redo.is_some() || !self.evicted.is_empty())
             && self.history_bytes() > budget
         {
             self.dropped_redo = None;
-            self.evicted = None;
+            self.evicted.clear();
         }
         let mut seen = std::collections::HashSet::new();
         self.state_buffers(&mut seen, None);
@@ -1587,8 +1660,8 @@ impl Document {
                 self.hard_generation = generation;
             }
             // The oldest step it made the history let go comes back.
-            if self.evicted.as_ref().is_some_and(|(seq, ..)| *seq == prev.seq) {
-                let (_, oldest, forgotten) = self.evicted.take().expect("checked");
+            if self.evicted.last().is_some_and(|(seq, ..)| *seq == prev.seq) {
+                let (_, oldest, forgotten) = self.evicted.pop().expect("checked");
                 self.undo.push_front(oldest);
                 self.forgotten = forgotten;
             }
@@ -1646,7 +1719,7 @@ impl Document {
         let state = self.restore(prev.state);
         self.redo.push(Step { state, ..prev });
         self.dropped_redo = None;
-        self.evicted = None;
+        self.evicted.clear();
         self.step += 1;
         self.history_moved();
         true
@@ -1659,7 +1732,7 @@ impl Document {
         let state = self.restore(next.state);
         self.undo.push_back(Step { state, ..next });
         self.dropped_redo = None;
-        self.evicted = None;
+        self.evicted.clear();
         self.step += 1;
         self.history_moved();
         true
@@ -1742,6 +1815,7 @@ impl Document {
             rev: next_rev(),
             bounds: Cell::new(None),
             styles_cache: RefCell::new(None),
+            look: RefCell::new(None),
             preview_styles: Default::default(),
             styles_job: Default::default(),
             offset,
@@ -1960,11 +2034,30 @@ impl Document {
         }
         let canvas = self.full_rect();
         let image = self.flatten();
-        self.checkpoint(t!("menu-layer-flatten"));
         let name = t!("doc-background-layer-name");
+        // Already a single plain layer as Flatten would make it: nothing
+        // to do, no step.
+        if let [only] = &self.layers[..]
+            && only.name == name
+            && matches!(only.kind, LayerKind::Pixels)
+            && only.offset == (canvas.x, canvas.y)
+            && (only.visible, only.opacity, only.fill, only.blend) == (true, 1.0, 1.0, BlendMode::Normal)
+            && (only.locked, only.locks, only.clipped, only.link) == (false, Locks::default(), false, None)
+            && !only.effects.any()
+            && only.mask.is_none()
+            && only.text.is_none()
+            && only.shape.is_none()
+            && only.artboard.is_none()
+            && only.smart.is_none()
+            && *only.image == image
+        {
+            return false;
+        }
+        self.checkpoint(t!("menu-layer-flatten"));
         let layer = self.make_layer(name, image, (canvas.x, canvas.y));
         self.layers = vec![layer];
         self.active = 0;
+        self.drop_stale_mask_target();
         true
     }
 
@@ -2776,9 +2869,8 @@ impl Document {
             }
             layer.effects.turn(turn);
             layer.map_patterns(old, &map, |f| f.turned(degrees));
-            // Degrees counterclockwise: it keeps its direction on the image.
             if let LayerKind::Fill(Fill::Gradient(g)) = &mut layer.kind {
-                g.angle = (g.angle - degrees).rem_euclid(360.0);
+                g.turned(degrees);
             }
             layer.edit_mask(old, |m| {
                 m.rotate(degrees, (old_center, new_center), turn, false, (0, 0));
@@ -2848,6 +2940,9 @@ impl Document {
                 .effects
                 .turn(|x, y| if horizontal { (-x, y) } else { (x, -y) });
             layer.map_patterns(old, &map, |f| f.mirrored(horizontal));
+            if let LayerKind::Fill(Fill::Gradient(g)) = &mut layer.kind {
+                g.mirrored(horizontal);
+            }
             layer.edit_mask(old, |m| m.flip(horizontal, (w, h), (0, 0)));
         }
     }
@@ -4243,9 +4338,14 @@ mod tests {
         doc.checkpoint("typing".into());
         assert!(doc.rollback_to(mark));
         assert_eq!(doc.layers.len(), 1);
-        // Further back than the history reaches (the oldest step the last
-        // one let go comes back, not those before): not at the mark.
+        // The oldest steps the last ones let go come back (up to
+        // MAX_EVICTED of them): still at the mark.
         for _ in 0..MAX_UNDO + 2 {
+            doc.checkpoint("step".into());
+        }
+        assert!(doc.rollback_to(mark));
+        // Further back than that: not at the mark.
+        for _ in 0..MAX_UNDO + MAX_EVICTED + 2 {
             doc.checkpoint("step".into());
         }
         assert!(!doc.rollback_to(mark));

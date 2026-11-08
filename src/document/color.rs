@@ -59,10 +59,17 @@ impl Document {
     }
 
     /// Edit › Assign Profile: the same numbers, read as `profile`'s
-    /// (`None`: the working RGB's). One step of the history.
-    pub fn assign_profile(&mut self, profile: Option<&Profile>) {
+    /// (`None`: the working RGB's). One step of the history, none when
+    /// it is the profile assigned already.
+    pub fn assign_profile(&mut self, profile: Option<&Profile>) -> bool {
+        let icc = profile.map(|p| Arc::clone(p.icc()));
+        // The profile it has already: nothing to record.
+        if icc.as_deref() == self.icc_profile.as_deref() {
+            return false;
+        }
         self.checkpoint(t!("color-hist-assign-profile"));
-        self.icc_profile = profile.map(|p| Arc::clone(p.icc()));
+        self.icc_profile = icc;
+        true
     }
 
     /// Edit › Convert to Profile: every layer's colors (pixels, fills,
@@ -110,7 +117,7 @@ impl Document {
         if format == ExportFormat::Psd {
             let mut notes = Vec::new();
             file_io::write_atomic(path, |out| {
-                notes = psd::write_cmyk(self, out, cmyk)?;
+                notes = psd::write_cmyk(self, out, cmyk, psd::is_psb(path))?;
                 Ok(())
             })?;
             return Ok(notes);
@@ -491,8 +498,7 @@ mod tests {
 
     #[test]
     fn profiles_and_proof_setup_are_saved() {
-        let dir = std::env::temp_dir().join(format!("atelier-color-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("color");
         let path = dir.join("proof.atelier");
         let mut doc = Document::new(RgbaImage::from_pixel(3, 2, Rgba([1, 2, 3, 255])), None);
         doc.assign_profile(Some(WorkingRgb::ProPhoto.profile()));
@@ -527,8 +533,7 @@ mod tests {
 
     #[test]
     fn cmyk_jpeg_and_tiff_read_back() {
-        let dir = std::env::temp_dir().join(format!("atelier-cmyk-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("cmyk");
         let mut image = RgbaImage::from_pixel(16, 8, Rgba([255, 255, 255, 255]));
         for x in 0..8 {
             for y in 0..8 {
@@ -594,8 +599,7 @@ mod tests {
 
     #[test]
     fn cmyk_files_open_converted_with_their_profile() {
-        let dir = std::env::temp_dir().join(format!("atelier-cmyk-open-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("cmyk-open");
         let steel = [70, 130, 180];
         let doc = Document::new(
             RgbaImage::from_pixel(8, 8, Rgba([steel[0], steel[1], steel[2], 255])),
@@ -637,6 +641,7 @@ mod tests {
             saturation: 0.5,
             lightness: 0.0,
             colorize: true,
+            ranges: Default::default(),
         };
         for adjustment in [
             Adjustment::PhotoFilter(Default::default()),
@@ -665,8 +670,7 @@ mod tests {
     #[test]
     fn ycck_jpegs_open_with_their_profile() {
         // Photoshop's CMYK JPEGs are usually YCCK (Adobe's transform 2).
-        let dir = std::env::temp_dir().join(format!("atelier-ycck-open-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("ycck-open");
         let c = Conversion {
             from: cms::srgb(),
             to: cms::default_cmyk(),
@@ -695,8 +699,7 @@ mod tests {
     }
     #[test]
     fn cmyk_jpegs_keep_one_pixel_detail_at_low_quality() {
-        let dir = std::env::temp_dir().join(format!("atelier-cmyk-q-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("cmyk-q");
         // 1-px red / white columns, and 1-px black / white columns.
         let photo = RgbaImage::from_fn(96, 64, |x, y| match (x % 2 == 0, y < 32) {
             (true, true) => Rgba([230, 20, 30, 255]),

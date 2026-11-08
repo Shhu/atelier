@@ -46,7 +46,7 @@ pub(super) struct CameraRaw {
     loading: Option<Loading>,
     developing: Option<Developing>,
     /// Read when first shown.
-    presets: Option<Vec<Preset>>,
+    presets: Option<camera_raw::Presets>,
 }
 
 impl CameraRaw {
@@ -54,6 +54,16 @@ impl CameraRaw {
     /// and the image.
     pub(super) fn busy(&self) -> bool {
         self.window.is_some() || self.loading.is_some() || self.developing.is_some()
+    }
+
+    /// The window is open (its settings are nowhere else).
+    pub(super) fn open(&self) -> bool {
+        self.window.is_some()
+    }
+
+    /// A RAW file being read, or a development not in a document yet.
+    pub(super) fn working(&self) -> bool {
+        self.loading.is_some() || self.developing.is_some()
     }
 }
 
@@ -467,15 +477,18 @@ impl AtelierApp {
         });
     }
 
-    /// Opens a RAW file: read on another thread, then Camera Raw's window.
-    pub(super) fn open_raw(&mut self, path: &Path) {
+    /// Opens a RAW file: read on another thread within `memory` (past
+    /// what is free, asked first), then Camera Raw's window.
+    pub(super) fn open_raw(&mut self, path: &Path, memory: crate::document::MemoryUse) {
         let purpose = Purpose::Open {
             path: path.to_path_buf(),
             preview_only: false,
         };
         let file = path.to_path_buf();
+        // What is free now, told here (the reading thread takes it).
+        let mut budget = memory.budget();
         self.load(purpose, None, move || {
-            camera_raw::raw::read(&file).map(|raw| (raw.source, raw.preview_only))
+            camera_raw::raw::read(&file, &mut budget).map(|raw| (raw.source, raw.preview_only))
         });
     }
 
@@ -583,7 +596,11 @@ impl AtelierApp {
             return;
         };
         if self.camera_raw.presets.is_none() {
-            self.camera_raw.presets = Some(camera_raw::load_presets());
+            let mut presets = camera_raw::Presets::load();
+            if let Some(notice) = presets.notice.take() {
+                self.report_warning(notice);
+            }
+            self.camera_raw.presets = Some(presets);
         }
         window.keys(ctx);
         window.update_preview(ctx);
@@ -603,7 +620,7 @@ impl AtelierApp {
         let screen = ctx.content_rect();
         let width = (screen.width() - 16.0).min(1680.0);
         let mut status = None;
-        let presets = self.camera_raw.presets.get_or_insert_with(Vec::new);
+        let presets = self.camera_raw.presets.get_or_insert_with(Default::default);
         let out = floating_dialog(
             ctx,
             DialogSpec {
@@ -660,6 +677,12 @@ impl AtelierApp {
             }
             (Ok(loaded), purpose) => {
                 self.open_camera_raw(purpose, loaded.source, loaded.analysis, settings)
+            }
+            // An honest file larger than what is free: asked.
+            (Err(FileError::LowMemory(free)), Purpose::Open { path, .. })
+                if !self.automate.running() =>
+            {
+                self.open_anyway = Some(files::OpenAnyway { path, free });
             }
             (Err(e), Purpose::Open { path, .. }) => {
                 let path = files::file_name(&path);
@@ -932,38 +955,42 @@ impl RawWindow {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
+        // Exactly these modifiers, like the main window (Shift+Y is not Y).
         let v = &mut self.view;
         ctx.input_mut(|i| {
             let none = Modifiers::NONE;
-            if i.consume_key(none, Key::Backslash) {
+            if consume_exact(i, KeyboardShortcut::new(none, Key::Backslash)) {
                 v.before = !v.before;
                 v.side_by_side = false;
             }
-            if i.consume_key(none, Key::Y) {
+            if consume_exact(i, KeyboardShortcut::new(none, Key::Y)) {
                 v.side_by_side = !v.side_by_side;
             }
-            if i.consume_key(none, Key::U) {
+            if consume_exact(i, KeyboardShortcut::new(none, Key::U)) {
                 v.clip_shadows = !v.clip_shadows;
             }
-            if i.consume_key(none, Key::O) {
+            if consume_exact(i, KeyboardShortcut::new(none, Key::O)) {
                 v.clip_highlights = !v.clip_highlights;
             }
-            if i.consume_key(none, Key::I) {
+            if consume_exact(i, KeyboardShortcut::new(none, Key::I)) {
                 v.sampling = !v.sampling;
             }
             let ctrl_alt = Modifiers::COMMAND.plus(Modifiers::ALT);
-            if i.consume_key(ctrl_alt, Key::Num0) {
+            if consume_exact(i, KeyboardShortcut::new(ctrl_alt, Key::Num0)) {
                 v.zoom = Some(1.0);
             }
-            if i.consume_key(Modifiers::COMMAND, Key::Num0) {
+            if consume_exact(i, KeyboardShortcut::new(Modifiers::COMMAND, Key::Num0)) {
                 v.zoom = None;
             }
-            if i.consume_key(Modifiers::COMMAND, Key::Plus)
-                || i.consume_key(Modifiers::COMMAND, Key::Equals)
+            // "+" is typed with Shift on many keyboards.
+            let shift_ctrl = Modifiers::COMMAND.plus(Modifiers::SHIFT);
+            if consume_exact(i, KeyboardShortcut::new(Modifiers::COMMAND, Key::Plus))
+                || consume_exact(i, KeyboardShortcut::new(shift_ctrl, Key::Plus))
+                || consume_exact(i, KeyboardShortcut::new(Modifiers::COMMAND, Key::Equals))
             {
                 v.step_zoom(1);
             }
-            if i.consume_key(Modifiers::COMMAND, Key::Minus) {
+            if consume_exact(i, KeyboardShortcut::new(Modifiers::COMMAND, Key::Minus)) {
                 v.step_zoom(-1);
             }
         });
@@ -1092,7 +1119,12 @@ impl RawWindow {
         pane.job = Some((key, rx));
     }
 
-    fn body(&mut self, ui: &mut egui::Ui, presets: &mut Vec<Preset>, status: &mut Option<String>) {
+    fn body(
+        &mut self,
+        ui: &mut egui::Ui,
+        presets: &mut camera_raw::Presets,
+        status: &mut Option<String>,
+    ) {
         let height = dialog_body_height(ui.ctx());
         ui.horizontal_top(|ui| {
             let preview_w = (ui.available_width() - SIDE - 16.0).max(200.0);
@@ -1457,7 +1489,7 @@ impl RawWindow {
     fn panels(
         &mut self,
         ui: &mut egui::Ui,
-        presets: &mut Vec<Preset>,
+        presets: &mut camera_raw::Presets,
         status: &mut Option<String>,
     ) {
         // Profile: Color or Monochrome (above the panels, like Camera Raw).
@@ -2017,7 +2049,7 @@ impl RawWindow {
     fn presets(
         &mut self,
         ui: &mut egui::Ui,
-        presets: &mut Vec<Preset>,
+        presets: &mut camera_raw::Presets,
         status: &mut Option<String>,
     ) {
         let mut apply = None;
@@ -2027,7 +2059,7 @@ impl RawWindow {
             }
         }
         let mut delete = None;
-        for (i, preset) in presets.iter().enumerate() {
+        for (i, preset) in presets.list.iter().enumerate() {
             let (clicked, deleted) = preset_row(ui, &preset.name, true);
             if clicked {
                 apply = Some(self.settings.with_look(&preset.settings));
@@ -2042,7 +2074,7 @@ impl RawWindow {
         }
         let mut save = false;
         if let Some(i) = delete {
-            presets.remove(i);
+            presets.list.remove(i);
             save = true;
         }
         ui.add_space(6.0);
@@ -2082,8 +2114,8 @@ impl RawWindow {
                     )
                     .clicked();
                     if (ok || enter) && !typed.is_empty() {
-                        presets.retain(|p| p.name != typed);
-                        presets.push(Preset {
+                        presets.list.retain(|p| p.name != typed);
+                        presets.list.push(Preset {
                             name: typed.clone(),
                             settings: self.settings.clone(),
                         });
@@ -2100,8 +2132,8 @@ impl RawWindow {
                 }
             }
         }
-        if save && let Err(e) = camera_raw::save_presets(presets) {
-            *status = Some(t!("raw-preset-save-failed", error = e.to_string()));
+        if save && let Err(e) = presets.save() {
+            *status = Some(t!("raw-preset-save-failed", error = crate::i18n::io_error(&e)));
         }
     }
 }

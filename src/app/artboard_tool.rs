@@ -265,6 +265,11 @@ impl Artboards {
     pub(super) fn dragging(&self) -> bool {
         self.drag.is_some()
     }
+
+    /// Artboards to Files writing its files.
+    pub(super) fn exporting(&self) -> bool {
+        self.job.is_some()
+    }
 }
 
 /// The side whose "+" button of artboard `r` (screen) is at `p`.
@@ -835,7 +840,7 @@ impl AtelierApp {
                     ui.label(egui::RichText::new(shown).color(ui_kit::color::MUTED));
                     let browse = t!("artboard-files-browse");
                     if ui_kit::button(ui, &browse, Kind::Normal, None, true).clicked() {
-                        let mut dialog = rfd::FileDialog::new().set_title(browse);
+                        let mut dialog = file_dialog::new().set_title(browse);
                         if let Some(dir) = &s.folder {
                             dialog = dialog.set_directory(dir);
                         }
@@ -973,7 +978,7 @@ impl AtelierApp {
     }
 
     /// Writes artboard files on another thread (see `artboard_windows`).
-    fn run_artboards_job(
+    pub(super) fn run_artboards_job(
         &mut self,
         count: usize,
         job: impl FnOnce() -> Result<Vec<PathBuf>, String> + Send + 'static,
@@ -1032,7 +1037,7 @@ impl AtelierApp {
         if which.is_empty() || options.format == ExportFormat::Psd {
             return false;
         }
-        let mut dialog = rfd::FileDialog::new().set_title(t!("file-export-title"));
+        let mut dialog = file_dialog::new().set_title(t!("file-export-title"));
         if let Some(dir) = self.current_dir() {
             dialog = dialog.set_directory(dir);
         }

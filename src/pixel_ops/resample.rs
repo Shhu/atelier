@@ -252,7 +252,7 @@ mod tests {
     /// Release timing of one 6000×4000 layer to 9000×6000 (run by hand:
     /// `cargo test --release -- --ignored resample_timing --nocapture`).
     #[test]
-    #[ignore]
+    #[ignore = "timing, in release"]
     fn resample_timing() {
         let src = noise(6000, 4000, 3);
         for filter in [FilterType::Triangle, FilterType::CatmullRom, FilterType::Lanczos3] {

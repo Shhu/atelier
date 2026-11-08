@@ -140,6 +140,10 @@ impl Writer {
         self.data.extend_from_slice(&v.to_be_bytes());
     }
 
+    pub fn u64(&mut self, v: u64) {
+        self.data.extend_from_slice(&v.to_be_bytes());
+    }
+
     pub fn f64(&mut self, v: f64) {
         self.data.extend_from_slice(&v.to_be_bytes());
     }
@@ -173,20 +177,36 @@ impl Writer {
     /// A 4-byte length, then what `f` writes, padded with zeros to a
     /// multiple of `pad` (the padding counted in the length).
     pub fn block(&mut self, pad: usize, f: impl FnOnce(&mut Writer)) {
+        self.sized(false, pad, f);
+    }
+
+    /// [`Self::block`], its length taking 8 bytes if `big` (a PSB's).
+    pub fn sized(&mut self, big: bool, pad: usize, f: impl FnOnce(&mut Writer)) {
         let at = self.data.len();
-        self.u32(0);
+        let n = if big { 8 } else { 4 };
+        self.zeros(n);
         f(self);
-        let len = self.data.len() - at - 4;
+        let len = self.data.len() - at - n;
         self.zeros((pad - len % pad) % pad);
-        let len = (self.data.len() - at - 4) as u32;
-        self.data[at..at + 4].copy_from_slice(&len.to_be_bytes());
+        let len = self.data.len() - at - n;
+        if big {
+            self.data[at..at + n].copy_from_slice(&(len as u64).to_be_bytes());
+        } else {
+            self.data[at..at + n].copy_from_slice(&(len as u32).to_be_bytes());
+        }
     }
 
     /// Tagged block `key` ("8BIM" signature), its data padded to 4 bytes.
     pub fn tagged(&mut self, key: &[u8; 4], f: impl FnOnce(&mut Writer)) {
+        self.tagged_sized(key, false, f);
+    }
+
+    /// [`Self::tagged`] for a key whose length takes 8 bytes in a PSB
+    /// (`big`).
+    pub fn tagged_sized(&mut self, key: &[u8; 4], big: bool, f: impl FnOnce(&mut Writer)) {
         self.bytes(b"8BIM");
         self.bytes(key);
-        self.block(4, f);
+        self.sized(big, 4, f);
     }
 }
 

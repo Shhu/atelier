@@ -359,7 +359,7 @@ fn sel(x: i64, y: i64, w: u32, h: u32) -> Selection {
 }
 
 fn settle(h: &mut Harness<'static, AtelierApp>) {
-    for _ in 0..1000 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if !h.state().filters.busy() && !h.state().retouch.busy() {
             return;
@@ -772,8 +772,7 @@ fn refusals_name_the_group_that_has_the_lock() {
 
 #[test]
 fn place_doesnt_land_in_a_group_that_wont_let_it_move() {
-    let dir = std::env::temp_dir().join("atelier-locks-place");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("locks-place");
     let path = dir.join("place.png");
     RgbaImage::from_pixel(30, 30, Rgba([0, 255, 0, 255])).save(&path).unwrap();
     let mut h = app();
@@ -1027,7 +1026,7 @@ fn unlocking_from_the_row_is_recorded_for_the_active_layer() {
 
 /// Waits for the filters, the retouch and the transforms in the background.
 fn settle_all(h: &mut Harness<'static, AtelierApp>) {
-    for _ in 0..1000 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         let app = h.state();
         if !app.filters.busy() && !app.retouch.busy() && !app.transform_busy() {
@@ -1069,7 +1068,7 @@ fn reset_transform_follows_lock_position() {
     h.state_mut().run(Action::Smart(smart_ui::Command::Convert));
     settle_all(&mut h);
     let half = [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.0, 0.5]];
-    assert!(h.state_mut().play_step(&crate::actions::Recorded::Transform { corners: half }, false).is_ok());
+    assert!(h.state_mut().play_step(&crate::actions::Recorded::Transform { corners: half, frame: None }, false).is_ok());
     settle_all(&mut h);
     let a = doc(&h).active;
     let b = doc(&h).layers[a].content_bounds();

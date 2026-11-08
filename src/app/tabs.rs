@@ -4,6 +4,9 @@
 use super::*;
 use crate::document::{HISTORY_BUDGET, TOTAL_HISTORY_BUDGET};
 
+/// How often the active document's history is trimmed again.
+const RETRIM_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A document in a background tab, with what belongs to it.
 pub(super) struct ParkedDoc {
     pub(super) doc: Document,
@@ -218,6 +221,20 @@ impl AtelierApp {
     /// [`TOTAL_HISTORY_BUDGET`]: the active one keeps its own budget, the
     /// documents set aside share what is left and lose their oldest steps.
     pub(super) fn trim_histories(&mut self) {
+        // The step being recorded cost nothing when it was (it shared every
+        // buffer): once its change is in, the history may be past its
+        // budget. Trimmed again now and then.
+        let now = std::time::Instant::now();
+        if self
+            .history
+            .trimmed_at
+            .is_none_or(|t| now.duration_since(t) >= RETRIM_EVERY)
+        {
+            self.history.trimmed_at = Some(now);
+            if let Some(doc) = &mut self.doc {
+                doc.trim_history(HISTORY_BUDGET);
+            }
+        }
         let key = self
             .doc
             .as_ref()

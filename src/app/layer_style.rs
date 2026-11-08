@@ -96,6 +96,11 @@ impl AtelierApp {
                     );
                     let layer = layer.id;
                     doc.checkpoint(t!("core-menu-layer-style"));
+                    // Opened on a style (menu, Properties): that style is on,
+                    // as when chosen in the window's list.
+                    if let Some(style) = page {
+                        *doc.active_layer_mut().effects.enabled_mut(style) = true;
+                    }
                     self.layer_style = Some(StyleDialog {
                         page,
                         layer,
@@ -167,9 +172,12 @@ impl AtelierApp {
     }
 
     /// Shift++ / Shift+-: next / previous blend mode; Alt+Shift+letter: a
-    /// mode, like Photoshop (with the painting tools, these keys are the
-    /// tool's).
-    pub(super) fn blend_shortcut(&self, input: &egui::InputState) -> Option<Action> {
+    /// mode, like Photoshop. With a painting tool, these keys are the tool's
+    /// (the Mode of the Brush, the Gradient, the Paint Bucket).
+    pub(super) fn blend_shortcut(&mut self, ctx: &egui::Context) {
+        let Some(action) = ctx.input(blend_key) else {
+            return;
+        };
         let painting = matches!(
             self.tool,
             Tool::Brush
@@ -186,36 +194,27 @@ impl AtelierApp {
                 | Tool::HealingBrush
                 | Tool::SpotHealing
         );
-        if painting {
-            return None;
-        }
-        input.events.iter().find_map(|e| match e {
-            egui::Event::Key {
-                key,
-                pressed: true,
-                modifiers,
-                ..
-            } => {
-                let shift_only = modifiers.matches_exact(Modifiers::SHIFT);
-                match key {
-                    Key::Plus | Key::Equals if shift_only => Some(Action::BlendStep(true)),
-                    Key::Minus if shift_only => Some(Action::BlendStep(false)),
-                    _ if modifiers.matches_exact(Modifiers::ALT.plus(Modifiers::SHIFT)) => {
-                        let letter = key
-                            .name()
-                            .chars()
-                            .next()
-                            .filter(|_| key.name().len() == 1)?;
-                        BlendMode::cycle(true)
-                            .into_iter()
-                            .find(|m| m.letter() == Some(letter))
-                            .map(Action::SetBlend)
-                    }
-                    _ => None,
-                }
+        let p = &mut self.paint;
+        let mode = match self.tool {
+            Tool::Brush => &mut p.mode,
+            Tool::Gradient => &mut p.gradient.mode,
+            Tool::Bucket => &mut p.bucket.mode,
+            _ if painting => return,
+            _ => return self.run(action),
+        };
+        let modes = BlendMode::cycle(false);
+        *mode = match action {
+            Action::BlendStep(next) => {
+                let i = modes.iter().position(|m| *m == *mode).unwrap_or(0);
+                let n = modes.len();
+                modes[if next { (i + 1) % n } else { (i + n - 1) % n }]
             }
-            _ => None,
-        })
+            // Pass Through is a group's only.
+            Action::SetBlend(m) if modes.contains(&m) => m,
+            _ => return,
+        };
+        let label = mode.label();
+        self.status.set(t!("input14-status-tool-blend", mode = label));
     }
 
     /// Layer › Layer Style, and the styles button of the Layers panel.
@@ -528,7 +527,7 @@ fn labeled<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui, f3
 fn percent(ui: &mut egui::Ui, label: &str, value: &mut f32, default: f32) {
     let mut v = (*value * 100.0).round();
     let unit = i18n::percent("");
-    slider_row(
+    if slider_row(
         ui,
         label,
         None,
@@ -537,8 +536,9 @@ fn percent(ui: &mut egui::Ui, label: &str, value: &mut f32, default: f32) {
         &unit,
         Track::Accent,
         default,
-    );
-    *value = v / 100.0;
+    ) {
+        *value = v / 100.0;
+    }
 }
 
 /// Pixel size slider.
@@ -582,7 +582,7 @@ fn style_page(ui: &mut egui::Ui, style: Style, fx: &mut Effects, corner: (f32, f
             gap_between_blocks(ui);
             let mut depth = (b.depth * 100.0).round();
             let unit = i18n::percent("");
-            slider_row(
+            if slider_row(
                 ui,
                 &t!("core-bevel-depth"),
                 None,
@@ -591,8 +591,9 @@ fn style_page(ui: &mut egui::Ui, style: Style, fx: &mut Effects, corner: (f32, f
                 &unit,
                 Track::Accent,
                 100.0,
-            );
-            b.depth = depth / 100.0;
+            ) {
+                b.depth = depth / 100.0;
+            }
             gap_between_blocks(ui);
             pixels(ui, &t!("core-style-size"), &mut b.size, 250.0, d.bevel.size);
             gap_between_blocks(ui);
@@ -715,6 +716,38 @@ fn glow_page(ui: &mut egui::Ui, id: &str, g: &mut GlowFx, spread: &str) {
 /// The capture's document with every kind of layer (see the capture test):
 /// `mask` targets a mask, `pixels` a layer's pixels, `adjustment` shows an
 /// adjustment layer, `style` opens the Layer Style window.
+/// Shift++ / Shift+- (next / previous blend mode), Alt+Shift+letter (a
+/// mode), pressed this frame.
+fn blend_key(input: &egui::InputState) -> Option<Action> {
+    input.events.iter().find_map(|e| match e {
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } => {
+            let shift_only = modifiers.matches_exact(Modifiers::SHIFT);
+            match key {
+                Key::Plus | Key::Equals if shift_only => Some(Action::BlendStep(true)),
+                Key::Minus if shift_only => Some(Action::BlendStep(false)),
+                _ if modifiers.matches_exact(Modifiers::ALT.plus(Modifiers::SHIFT)) => {
+                    let letter = key
+                        .name()
+                        .chars()
+                        .next()
+                        .filter(|_| key.name().len() == 1)?;
+                    BlendMode::cycle(true)
+                        .into_iter()
+                        .find(|m| m.letter() == Some(letter))
+                        .map(Action::SetBlend)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 pub(super) fn capture_layers(app: &mut AtelierApp, what: &str) {
     use crate::pixel_ops::HueSaturation;

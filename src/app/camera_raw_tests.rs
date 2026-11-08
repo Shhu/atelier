@@ -37,7 +37,7 @@ fn pixels(h: &Harness<'static, AtelierApp>) -> image::RgbaImage {
 
 /// Runs frames until `done`.
 fn settle(h: &mut Harness<'static, AtelierApp>, done: impl Fn(&AtelierApp) -> bool) {
-    for _ in 0..600 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if done(h.state()) {
             return;
@@ -77,6 +77,8 @@ fn the_filter_menu_and_shortcut_open_the_window() {
     // \ shows the image before, U and O the clipping warnings.
     h.key_press(Key::Backslash);
     h.key_press(Key::O);
+    // Exactly the key: Shift+U is not U.
+    h.key_press_modifiers(Modifiers::SHIFT, Key::U);
     h.run_steps(2);
     let view = &window(&h).view;
     assert!(view.before && view.clip_highlights && !view.clip_shadows);
@@ -202,8 +204,7 @@ fn a_raw_file_opens_through_the_window_as_a_new_document() {
         as_shot,
         orientation: 1,
     };
-    let dir = std::env::temp_dir().join("atelier-raw-open");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("raw-open");
     let path = dir.join("card.DNG");
     std::fs::write(&path, dng.bytes()).unwrap();
     let tabs = h.state().parked.len();
@@ -267,8 +268,7 @@ fn on_a_smart_object_it_is_a_smart_filter_edited_again_from_the_layer() {
     assert_eq!(exposure_of(h.state()), Some(0.5));
 
     // Saved and opened again: the same smart filter.
-    let dir = std::env::temp_dir().join("atelier-raw-smart");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("raw-smart");
     let path = dir.join("smart.atelier");
     let doc = h.state_mut().doc.as_mut().unwrap();
     doc.save(&path).unwrap();

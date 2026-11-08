@@ -1101,7 +1101,7 @@ mod tests {
         let canvas = doc.full_rect();
         assert!(super::styles_of(&doc.layers, 2, canvas, false, true).is_none());
         let mut styles = None;
-        for _ in 0..2000 {
+        for _ in crate::testing::patience() {
             styles = super::styles_of(&doc.layers, 2, canvas, false, true);
             if styles.is_some() {
                 break;

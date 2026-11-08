@@ -219,8 +219,9 @@ impl AtelierApp {
 
     /// Histograms of what an adjustment changes: the active layer's pixels
     /// (its mask's when targeted, the quick mask), inside the selection
-    /// (computed once per revision of that target and selection).
-    pub(super) fn active_histogram(&mut self) -> Option<Histograms> {
+    /// (counted once per revision of that target and selection, on a worker
+    /// thread: the former ones of the same layer, or none, meanwhile).
+    pub(super) fn active_histogram(&mut self, ctx: &egui::Context) -> Option<Histograms> {
         let doc = self.doc.as_ref()?;
         let layer = doc.active_layer();
         let selection = self.selection.as_ref().map(|s| {
@@ -239,12 +240,31 @@ impl AtelierApp {
                 selection,
             )),
         );
-        if self.histogram.as_ref().is_none_or(|(k, _)| *k != key) {
-            let target = super::filters_ui::active_target(doc, self.selection.as_ref())?;
-            let h = crate::pixel_ops::histogram_within(&target.image, target.clip.as_ref());
-            self.histogram = Some((key, h));
+        if let Some((of, job)) = self.histogram_job.take_if(|(_, j)| j.is_finished())
+            && let Ok(h) = job.join()
+        {
+            self.histogram = Some((of, h));
         }
-        self.histogram.as_ref().map(|(_, h)| *h)
+        let current = self.histogram.as_ref().is_some_and(|(k, _)| *k == key);
+        if !current && self.histogram_job.as_ref().is_none_or(|(k, _)| *k != key) {
+            // (One that no longer counts is left to end on its own.)
+            let target = super::filters_ui::active_target(doc, self.selection.as_ref())?;
+            let job = std::thread::Builder::new()
+                .name("histogram".into())
+                .spawn(move || {
+                    crate::pixel_ops::histogram_within(&target.image, target.clip.as_ref())
+                });
+            if let Ok(job) = job {
+                self.histogram_job = Some((key, job));
+            }
+        }
+        if self.histogram_job.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(15));
+        }
+        self.histogram
+            .as_ref()
+            .filter(|(k, _)| k.0 == key.0)
+            .map(|(_, h)| *h)
     }
 
     /// Image adjustment (see [`AdjustKind`]): blocks the rest of the window
@@ -260,7 +280,7 @@ impl AtelierApp {
             dialog.adjustment,
             Adjustment::Levels(_) | Adjustment::Curves(_)
         )
-        .then(|| self.active_histogram())
+        .then(|| self.active_histogram(ctx))
         .flatten();
         let primary = self.primary.to_srgba_unmultiplied();
         // Alt+2..5 (like Photoshop): RGB, red, green, blue channel.
@@ -657,7 +677,7 @@ impl AtelierApp {
             extension: d.extension.map(actions_panel::contents),
         });
         let (w, h) = if d.relative {
-            (cw + d.width, ch + d.height)
+            (cw.saturating_add(d.width), ch.saturating_add(d.height))
         } else {
             (d.width, d.height)
         };
@@ -785,6 +805,11 @@ impl AtelierApp {
             self.save();
             // A linked file asking first: the close waits for its answer.
             if let Some(ask) = &mut self.smart.link_save {
+                ask.then = Some(pending);
+                return;
+            }
+            // A Photoshop file that loses something: likewise.
+            if let Some(ask) = &mut self.psd_ask {
                 ask.then = Some(pending);
                 return;
             }
@@ -1858,8 +1883,9 @@ pub(super) enum Track<'a> {
 /// Slider from −100 to +100 for `value` from −1 to 1.
 fn percent_row(ui: &mut egui::Ui, left: &str, right: Option<&str>, value: &mut f32, track: Track) {
     let mut shown = *value * 100.0;
-    slider_row(ui, left, right, &mut shown, -100.0..=100.0, "", track, 0.0);
-    *value = shown / 100.0;
+    if slider_row(ui, left, right, &mut shown, -100.0..=100.0, "", track, 0.0) {
+        *value = shown / 100.0;
+    }
 }
 
 /// Slider showing `value × scale`, from `range`; reset to 0.
@@ -1874,8 +1900,9 @@ fn scaled_row(
 ) {
     let mut shown = *value * scale;
     let default = 0.0f32.clamp(*range.start(), *range.end());
-    slider_row(ui, label, None, &mut shown, range, unit, track, default);
-    *value = shown / scale;
+    if slider_row(ui, label, None, &mut shown, range, unit, track, default) {
+        *value = shown / scale;
+    }
 }
 
 /// Slider row: label (and the opposite label at the right end, for color
@@ -2102,8 +2129,12 @@ fn slider_row_mapped(
         );
         painter.circle_filled(center, radius, Color32::WHITE);
     });
-    let scale = 10f32.powi(steps.decimals as i32);
-    *value = ((*value * scale).round() / scale).clamp(min, max);
+    // Only what the user changed is rounded and bounded: a value set
+    // elsewhere is shown as it is, never written back.
+    if *value != before {
+        let scale = 10f32.powi(steps.decimals as i32);
+        *value = ((*value * scale).round() / scale).clamp(min, max);
+    }
     *value != before
 }
 
@@ -2156,8 +2187,7 @@ fn value_field(
         state.bg_stroke = UiStroke::NONE;
     }
     let response = child.add(
-        egui::DragValue::new(value)
-            .range(range)
+        ui_kit::bounded_drag(value, range)
             .speed(if decimals > 0 { 0.1 } else { 0.5 })
             .custom_formatter(move |v, _| {
                 let text = i18n::decimal(v, decimals);
@@ -2264,8 +2294,10 @@ fn levels_editor(ui: &mut egui::Ui, ch: &mut LevelsChannel, hist: &[u32; 256], t
         named(ui, &field, &t!("ui6-levels-input-black"));
         let field = ui.add_sized(
             [w, 26.0],
-            egui::DragValue::new(&mut ch.gamma)
-                .range(crate::pixel_ops::MIN_GAMMA..=crate::pixel_ops::MAX_GAMMA)
+            ui_kit::bounded_drag(
+                &mut ch.gamma,
+                crate::pixel_ops::MIN_GAMMA..=crate::pixel_ops::MAX_GAMMA,
+            )
                 .speed(0.01)
                 .custom_formatter(|v, _| i18n::decimal(v, 2))
                 .custom_parser(i18n::parse_decimal),
@@ -2294,12 +2326,12 @@ fn levels_editor(ui: &mut egui::Ui, ch: &mut LevelsChannel, hist: &[u32; 256], t
         let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
         let field = ui.add_sized(
             [w, 26.0],
-            egui::DragValue::new(&mut ch.out_black).range(0..=255),
+            ui_kit::bounded_drag(&mut ch.out_black, 0..=255),
         );
         named(ui, &field, &t!("ui6-levels-output-black"));
         let field = ui.add_sized(
             [w, 26.0],
-            egui::DragValue::new(&mut ch.out_white).range(0..=255),
+            ui_kit::bounded_drag(&mut ch.out_white, 0..=255),
         );
         named(ui, &field, &t!("ui6-levels-output-white"));
     });
@@ -2495,7 +2527,8 @@ pub(super) fn curves_editor(
     if !ui.ctx().egui_wants_keyboard_input() {
         let (step, next, nudge, delete) = ui.input(|i| {
             let step = if i.modifiers.shift { 10.0 } else { 1.0 };
-            let next = (i.modifiers.command && i.key_pressed(Key::Tab))
+            // The Control key on macOS too (Cmd+Tab is the system's).
+            let next = (i.modifiers.ctrl && i.key_pressed(Key::Tab))
                 .then_some(if i.modifiers.shift { -1 } else { 1 });
             let mut d = [0.0f32; 2];
             if !i.modifiers.command && !i.modifiers.alt {
@@ -2880,7 +2913,7 @@ pub(super) fn adjustment_editor(
             curves_editor(ui, curve, hist, CHANNEL_TINTS[c], point);
             gap_between_blocks(ui);
             let ctx = ui.ctx().clone();
-            let next = KeyboardShortcut::new(Modifiers::COMMAND, Key::Tab);
+            let next = KeyboardShortcut::new(Modifiers::CTRL, Key::Tab);
             let hint = t!(
                 "input3-curves-hint",
                 ctrl_click = keys::click(&ctx, Modifiers::COMMAND),
@@ -2963,15 +2996,50 @@ pub(super) fn adjustment_editor(
                 let track = Track::Gradient(SATURATION);
                 scaled_row(ui, &saturation, sat, 100.0, 0.0..=100.0, "", track);
             } else {
+                // All the colors, or one hue range of them.
+                let names = [
+                    t!("psd14-hue-master"),
+                    t!("core-bw-reds"),
+                    t!("core-bw-yellows"),
+                    t!("core-bw-greens"),
+                    t!("core-bw-cyans"),
+                    t!("core-bw-blues"),
+                    t!("core-bw-magentas"),
+                ];
+                let current = (*range).min(names.len() - 1);
+                block(ui, |ui| {
+                    ui_kit::field_label(ui, &t!("adjust8-colors"));
+                    let width = ui.available_width();
+                    let mut shown = current;
+                    ui_kit::combo(ui, "hue_range", None, &names[current], width, |ui| {
+                        for (i, name) in names.iter().enumerate() {
+                            ui.selectable_value(&mut shown, i, name);
+                        }
+                    });
+                    *range = shown;
+                });
+                gap_between_blocks(ui);
+                let (h, s, l) = match current {
+                    0 => (&mut hs.hue, &mut hs.saturation, &mut hs.lightness),
+                    k => {
+                        let r = &mut hs.ranges.0[k - 1];
+                        (&mut r.hue, &mut r.saturation, &mut r.lightness)
+                    }
+                };
                 let track = Track::Gradient(&HUES_CENTERED);
-                scaled_row(ui, &hue, &mut hs.hue, 1.0, -180.0..=180.0, "°", track);
+                scaled_row(ui, &hue, h, 1.0, -180.0..=180.0, "°", track);
                 gap_between_blocks(ui);
                 let track = Track::Gradient(SATURATION);
-                percent_row(ui, &saturation, None, &mut hs.saturation, track);
+                percent_row(ui, &saturation, None, s, track);
+                gap_between_blocks(ui);
+                let track = Track::Gradient(LIGHTNESS);
+                percent_row(ui, &lightness, None, l, track);
             }
-            gap_between_blocks(ui);
-            let track = Track::Gradient(LIGHTNESS);
-            percent_row(ui, &lightness, None, &mut hs.lightness, track);
+            if hs.colorize {
+                gap_between_blocks(ui);
+                let track = Track::Gradient(LIGHTNESS);
+                percent_row(ui, &lightness, None, &mut hs.lightness, track);
+            }
             gap_between_blocks(ui);
             hue_bars(ui, hs);
             gap_between_blocks(ui);
@@ -2990,6 +3058,7 @@ pub(super) fn adjustment_editor(
                         saturation: crate::pixel_ops::COLORIZE_SATURATION,
                         lightness: 0.0,
                         colorize: true,
+                        ranges: Default::default(),
                     }
                 } else {
                     HueSaturation::default()

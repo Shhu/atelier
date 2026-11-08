@@ -484,12 +484,11 @@ fn a_dng_opens_neutral_and_with_its_highlight_data() {
         as_shot,
         orientation: 1,
     };
-    let dir = std::env::temp_dir().join("atelier-raw-dng");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("raw-dng");
     let path = dir.join("card.dng");
     std::fs::write(&path, dng.bytes()).unwrap();
     assert!(raw::is_raw(&path));
-    let file = raw::read(&path).expect("read");
+    let file = raw::read(&path, &mut crate::document::MemoryUse::Free.budget()).expect("read");
     assert!(!file.preview_only);
     let source = file.source;
     let analysis = Analysis::of(&source);

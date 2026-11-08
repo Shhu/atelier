@@ -28,6 +28,9 @@ impl Ifd {
     }
 }
 
+/// Directories read from a file at most: a DNG has a handful.
+const MAX_IFDS: usize = 64;
+
 /// Size of a value of each TIFF type.
 fn type_size(kind: u16) -> usize {
     match kind {
@@ -58,7 +61,7 @@ impl<'a> Tiff<'a> {
     }
 
     pub fn u16(&self, at: usize) -> Option<u16> {
-        let b: [u8; 2] = self.data.get(at..at + 2)?.try_into().ok()?;
+        let b: [u8; 2] = self.data.get(at..at.checked_add(2)?)?.try_into().ok()?;
         Some(if self.little {
             u16::from_le_bytes(b)
         } else {
@@ -67,7 +70,7 @@ impl<'a> Tiff<'a> {
     }
 
     pub fn u32(&self, at: usize) -> Option<u32> {
-        let b: [u8; 4] = self.data.get(at..at + 4)?.try_into().ok()?;
+        let b: [u8; 4] = self.data.get(at..at.checked_add(4)?)?.try_into().ok()?;
         Some(if self.little {
             u32::from_le_bytes(b)
         } else {
@@ -78,6 +81,10 @@ impl<'a> Tiff<'a> {
     /// The directory at `at` and the offset of the next one (0: none).
     pub fn ifd(&self, at: usize) -> Option<(Ifd, usize)> {
         let n = self.u16(at)? as usize;
+        // Entries past the end of the file are not there.
+        if at.checked_add(2 + 12 * n)? > self.data.len() {
+            return None;
+        }
         let mut entries = Vec::with_capacity(n);
         for i in 0..n {
             let e = at + 2 + 12 * i;
@@ -105,10 +112,10 @@ impl<'a> Tiff<'a> {
         Some((Ifd { entries }, next))
     }
 
-    /// The directories chained from `first`.
-    pub fn chain(&self, first: usize) -> Vec<Ifd> {
+    /// The directories chained from `first`, their offsets added to
+    /// `seen`.
+    fn chain(&self, first: usize, seen: &mut Vec<usize>) -> Vec<Ifd> {
         let mut out = Vec::new();
-        let mut seen = Vec::new();
         let mut at = first;
         while at != 0 && !seen.contains(&at) && out.len() < 16 {
             seen.push(at);
@@ -122,16 +129,26 @@ impl<'a> Tiff<'a> {
     }
 
     /// The directories of the file: the chain, and their sub-IFDs (two
-    /// levels deep).
+    /// levels deep), each read once and [`MAX_IFDS`] at most (a directory
+    /// listing itself many times would multiply them).
     pub fn all_ifds(&self, first: usize) -> Vec<Ifd> {
-        let mut out = self.chain(first);
+        let mut seen = Vec::new();
+        let mut out = self.chain(first, &mut seen);
         let mut i = 0;
         let mut depth_end = out.len();
         let mut depth = 0;
         while i < out.len() && depth < 2 {
             if let Some(e) = out[i].get(330) {
                 for offset in self.values(e) {
-                    if let Some((sub, _)) = self.ifd(offset as usize) {
+                    if !(0.0..=f64::from(u32::MAX)).contains(&offset) {
+                        continue;
+                    }
+                    let at = offset as usize;
+                    if out.len() >= MAX_IFDS || seen.contains(&at) {
+                        continue;
+                    }
+                    seen.push(at);
+                    if let Some((sub, _)) = self.ifd(at) {
                         out.push(sub);
                     }
                 }
@@ -186,5 +203,40 @@ impl<'a> Tiff<'a> {
 
     pub fn numbers(&self, ifd: &Ifd, tag: u16) -> Option<Vec<f64>> {
         ifd.get(tag).map(|e| self.values(e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory listing itself as its sub-IFD many times (fuzzing: a
+    /// 12 KB file made 9 million directories): each read once; offsets
+    /// past any file are skipped.
+    #[test]
+    fn sub_ifds_are_read_once() {
+        let n = 3000u32;
+        let mut file = b"II*\0\x08\0\0\0".to_vec();
+        file.extend(2u16.to_le_bytes());
+        // SubIFDs: n offsets, all to this directory.
+        file.extend(330u16.to_le_bytes());
+        file.extend(4u16.to_le_bytes());
+        file.extend(n.to_le_bytes());
+        file.extend(38u32.to_le_bytes());
+        // SubIFDs again, as a huge double.
+        file.extend(330u16.to_le_bytes());
+        file.extend(12u16.to_le_bytes());
+        file.extend(1u32.to_le_bytes());
+        file.extend((38 + 4 * n).to_le_bytes());
+        file.extend(0u32.to_le_bytes());
+        for _ in 0..n {
+            file.extend(8u32.to_le_bytes());
+        }
+        file.extend(1e300f64.to_le_bytes());
+        let (tiff, first) = Tiff::new(&file).unwrap();
+        let ifds = tiff.all_ifds(first);
+        assert_eq!(ifds.len(), 1);
+        assert_eq!(tiff.u16(usize::MAX), None);
+        assert_eq!(tiff.u32(usize::MAX - 1), None);
     }
 }

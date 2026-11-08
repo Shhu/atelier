@@ -783,6 +783,7 @@ impl Document {
         merged.mask = None;
         merged.fill = 1.0;
         self.active = lower;
+        self.drop_stale_mask_target();
         Ok(())
     }
 
@@ -814,6 +815,7 @@ impl Document {
         let start = r.start;
         self.layers.splice(r, [merged]);
         self.active = start;
+        self.drop_stale_mask_target();
         Ok(())
     }
 
@@ -838,6 +840,7 @@ impl Document {
         self.layers[first].depth = 0;
         self.active = first;
         self.fix_depths();
+        self.drop_stale_mask_target();
         Ok(())
     }
 }

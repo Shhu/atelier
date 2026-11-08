@@ -267,6 +267,32 @@ impl LevelCache {
         self.hints.clear();
     }
 
+    /// `reduced`, the pixels of version `version` of source `key` (of
+    /// `size`, at `at` in the canvas) reduced to this level elsewhere (on
+    /// the worker that made them): what they will be asked for finds them.
+    pub fn seed_rgba(
+        &mut self,
+        key: SourceKey,
+        version: u64,
+        at: (i64, i64),
+        size: (u32, u32),
+        reduced: Arc<RgbaImage>,
+    ) {
+        let b = self.block();
+        if self.level == 0 || reduced.dimensions() != (size.0.div_ceil(b), size.1.div_ceil(b)) {
+            return;
+        }
+        self.used.insert(key);
+        let image = Reduced::Rgba(reduced);
+        let entry = Entry {
+            version,
+            at,
+            size,
+            image,
+        };
+        self.entries.insert(key, entry);
+    }
+
     /// Memory its reduced images take.
     pub fn bytes(&self) -> usize {
         self.entries

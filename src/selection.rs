@@ -97,11 +97,54 @@ impl Selection {
         self.coverage(x.floor() as i64, y.floor() as i64) >= 128
     }
 
+    /// The same shape at another place (a change of coordinates). To move
+    /// the selection over the canvas, see [`Self::moved`].
     pub fn translate(self, dx: i64, dy: i64) -> Selection {
         Selection {
             rect: self.rect.translate(dx, dy),
             ..self
         }
+    }
+
+    /// The selection moved by (dx, dy) over `canvas`, as one canvas-sized
+    /// coverage: what leaves the canvas is no longer selected, and the part
+    /// it uncovers is not selected (an inverted selection moves as a whole,
+    /// not just its hole). `None` if nothing stays selected.
+    pub fn moved(&self, dx: i64, dy: i64, canvas: PixelRect) -> Option<Selection> {
+        if !self.inverted || (dx, dy) == (0, 0) {
+            return self.clone().translate(dx, dy).within(canvas);
+        }
+        let keep = intersect(canvas.translate(dx, dy), canvas)?;
+        let row = canvas.w as usize;
+        let mut out = GrayImage::new(canvas.w, canvas.h);
+        let (kx0, kx1) = ((keep.x - canvas.x) as usize, (keep.right() - canvas.x) as usize);
+        let (ky0, ky1) = (keep.y - canvas.y, keep.bottom() - canvas.y);
+        // The hole, moved, where it lands on the canvas.
+        let hole = self.rect.translate(dx, dy);
+        par_rows(out.as_mut(), row, |first, band| {
+            for (i, line) in band.chunks_exact_mut(row).enumerate() {
+                let y = (first + i) as i64;
+                if y < ky0 || y >= ky1 {
+                    continue;
+                }
+                line[kx0..kx1].fill(255);
+                let cy = canvas.y + y;
+                if cy < hole.y || cy >= hole.bottom() {
+                    continue;
+                }
+                let hx0 = (hole.x - canvas.x).max(kx0 as i64) as usize;
+                let hx1 = (hole.right() - canvas.x).min(kx1 as i64).max(hx0 as i64) as usize;
+                let sy = (cy - hole.y) as u32;
+                for (x, v) in line.iter_mut().enumerate().take(hx1).skip(hx0) {
+                    let inner = match &self.mask {
+                        Some(m) => m.get_pixel((canvas.x + x as i64 - hole.x) as u32, sy).0[0],
+                        None => 255,
+                    };
+                    *v = 255 - inner;
+                }
+            }
+        });
+        Self::from_mask(&out, (canvas.x, canvas.y))
     }
 
     /// The selection limited to the canvas; `None` if it selects nothing
@@ -225,6 +268,12 @@ impl Selection {
     /// Transform Selection: the selection moved by `map` (canvas point →
     /// canvas point). A rectangle scaled or moved stays a rectangle.
     pub fn transformed(&self, map: Affine, canvas: PixelRect) -> Option<Selection> {
+        // Inverted: its coverage over the canvas moves as a whole (what
+        // leaves the frame or the canvas is no longer selected).
+        if self.inverted {
+            return Self::from_mask(&self.to_mask(canvas), (canvas.x, canvas.y))?
+                .transformed(map, canvas);
+        }
         let r = self.rect;
         let [a, b, c, d, e, f] = map.0;
         if self.mask.is_none() && b == 0.0 && d == 0.0 && a > 0.0 && e > 0.0 {
@@ -238,11 +287,7 @@ impl Selection {
                 w: (x1 - x0).max(1) as u32,
                 h: (y1 - y0).max(1) as u32,
             };
-            return Selection {
-                inverted: self.inverted,
-                ..moved.into()
-            }
-            .within(canvas);
+            return Selection::from(moved).within(canvas);
         }
         let inverse = map.inverse()?;
         let corners = [
@@ -263,7 +308,7 @@ impl Selection {
             w: (x1.ceil() as i64 - x0).max(1) as u32,
             h: (y1.ceil() as i64 - y0).max(1) as u32,
         };
-        let moved = intersect(bbox, canvas).and_then(|area| {
+        intersect(bbox, canvas).and_then(|area| {
             let full;
             let src = match &self.mask {
                 Some(m) => m.as_ref(),
@@ -274,16 +319,7 @@ impl Selection {
             };
             let mask = mask_ops::resample(src, (r.x, r.y), area, inverse);
             Self::from_mask(&mask, (area.x, area.y))
-        });
-        match (moved, self.inverted) {
-            (moved, false) => moved,
-            (Some(s), true) => Selection {
-                inverted: true,
-                ..s
-            }
-            .within(canvas),
-            (None, true) => Some(canvas.into()),
-        }
+        })
     }
 
     /// Selection from a coverage placed at `origin`, reduced to the bounding
@@ -533,51 +569,108 @@ impl Channel {
 }
 
 /// Fills a polygon (even-odd rule) on a `w` × `h` image whose corner is at
-/// `origin`; 4 sub-scanlines per pixel and exact horizontal coverage to
-/// anti-alias the edges.
+/// `origin`, anti-aliased with the exact area of each pixel it covers (the
+/// signed areas of its edges accumulated along each row, as font
+/// rasterizers do): the same precision on every side.
 pub fn fill_polygon(points: &[(f32, f32)], w: u32, h: u32, origin: (i64, i64)) -> GrayImage {
-    const SUB: usize = 4;
-    let mut mask = GrayImage::new(w, h);
-    let mut row = vec![0.0f32; w as usize + 1];
-    let mut crossings = Vec::new();
+    let (wu, hu) = (w as usize, h as usize);
+    // Two more columns per row: an edge's right neighbour, and x = w.
+    let stride = wu + 2;
+    let mut area = vec![0.0f32; stride * hu];
     let n = points.len();
-    for y in 0..h {
-        row.iter_mut().for_each(|v| *v = 0.0);
-        for s in 0..SUB {
-            let sy = origin.1 as f32 + y as f32 + (s as f32 + 0.5) / SUB as f32;
-            crossings.clear();
-            for i in 0..n {
-                let (ax, ay) = points[i];
-                let (bx, by) = points[(i + 1) % n];
-                if (ay <= sy) != (by <= sy) {
-                    crossings.push(ax + (sy - ay) / (by - ay) * (bx - ax) - origin.0 as f32);
-                }
-            }
-            crossings.sort_by(f32::total_cmp);
-            for pair in crossings.chunks_exact(2) {
-                let (a, b) = (pair[0].clamp(0.0, w as f32), pair[1].clamp(0.0, w as f32));
-                if b <= a {
-                    continue;
-                }
-                // Exact coverage of segment [a, b] on each pixel.
-                let (ia, ib) = (a.floor() as usize, b.floor() as usize);
-                if ia == ib {
-                    row[ia] += b - a;
-                } else {
-                    row[ia] += ia as f32 + 1.0 - a;
-                    for v in &mut row[ia + 1..ib] {
-                        *v += 1.0;
-                    }
-                    row[ib] += b - ib as f32;
-                }
+    let (ox, oy) = (origin.0 as f32, origin.1 as f32);
+    for i in 0..n {
+        let (ax, ay) = points[i];
+        let (bx, by) = points[(i + 1) % n];
+        let (a, b) = ((ax - ox, ay - oy), (bx - ox, by - oy));
+        // Split where the edge crosses x = 0 and x = w: beyond them, it
+        // counts as running along that side.
+        let mut cuts = [0.0f32, 1.0, 1.0, 1.0];
+        let mut k = 1;
+        for edge in [0.0, w as f32] {
+            let t = (edge - a.0) / (b.0 - a.0);
+            if t > 0.0 && t < 1.0 {
+                cuts[k] = t;
+                k += 1;
             }
         }
-        for x in 0..w {
-            let cov = (row[x as usize] / SUB as f32).clamp(0.0, 1.0);
-            mask.put_pixel(x, y, Luma([(cov * 255.0).round() as u8]));
+        cuts[1..=k].sort_by(f32::total_cmp);
+        let at = |t: f32| ((a.0 + (b.0 - a.0) * t).clamp(0.0, w as f32), a.1 + (b.1 - a.1) * t);
+        for pair in cuts[..=k].windows(2) {
+            accumulate_edge(&mut area, stride, hu, at(pair[0]), at(pair[1]));
         }
     }
+    let mut mask = GrayImage::new(w, h);
+    par_rows(mask.as_mut(), wu, |first, band| {
+        for (j, line) in band.chunks_exact_mut(wu).enumerate() {
+            let mut sum = 0.0f32;
+            for (v, a) in line.iter_mut().zip(&area[(first + j) * stride..]) {
+                sum += a;
+                // Even-odd: one, three... windings inside, two outside.
+                let m = sum.abs() % 2.0;
+                let cov = if m > 1.0 { 2.0 - m } else { m };
+                *v = (cov.clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+        }
+    });
     mask
+}
+
+/// Adds the signed area that edge `p0` → `p1` (pixel coordinates, x within
+/// 0..=w) covers to the right of it, cell by cell, to `area` (rows of
+/// `stride`, `h` of them): summed along a row, it gives the coverage.
+fn accumulate_edge(area: &mut [f32], stride: usize, h: usize, p0: (f32, f32), p1: (f32, f32)) {
+    if (p0.1 - p1.1).abs() <= f32::EPSILON || h == 0 {
+        return;
+    }
+    let (dir, p0, p1) = if p0.1 < p1.1 {
+        (1.0, p0, p1)
+    } else {
+        (-1.0, p1, p0)
+    };
+    if p1.1 <= 0.0 || p0.1 >= h as f32 {
+        return;
+    }
+    let dxdy = (p1.0 - p0.0) / (p1.1 - p0.1);
+    let y0 = p0.1.max(0.0);
+    let mut x = p0.0 + (y0 - p0.1) * dxdy;
+    let last = stride - 1;
+    for y in y0 as usize..(p1.1.ceil() as usize).min(h) {
+        let line = &mut area[y * stride..(y + 1) * stride];
+        let dy = ((y + 1) as f32).min(p1.1) - (y as f32).max(p0.1);
+        let next = x + dxdy * dy;
+        let d = dy * dir;
+        let (x0, x1) = if x < next { (x, next) } else { (next, x) };
+        let (x0f, x1c) = (x0.floor(), x1.ceil());
+        let (i0, i1) = (x0f as usize, x1c as usize);
+        if i1 <= i0 + 1 {
+            // Within one cell: split by the mean position.
+            let mid = 0.5 * (x + next) - x0f;
+            line[i0.min(last)] += d * (1.0 - mid);
+            line[(i0 + 1).min(last)] += d * mid;
+        } else {
+            // Across cells: a ramp, the triangles at both ends.
+            let s = (x1 - x0).recip();
+            let f0 = x0 - x0f;
+            let a0 = 0.5 * s * (1.0 - f0) * (1.0 - f0);
+            let f1 = x1 - x1c + 1.0;
+            let am = 0.5 * s * f1 * f1;
+            line[i0] += d * a0;
+            if i1 == i0 + 2 {
+                line[i0 + 1] += d * (1.0 - a0 - am);
+            } else {
+                let a1 = s * (1.5 - f0);
+                line[i0 + 1] += d * (a1 - a0);
+                for v in &mut line[i0 + 2..i1 - 1] {
+                    *v += d * s;
+                }
+                let a2 = a1 + (i1 - i0 - 3) as f32 * s;
+                line[i1 - 1] += d * (1.0 - a2 - am);
+            }
+            line[i1.min(last)] += d * am;
+        }
+        x = next;
+    }
 }
 
 #[cfg(test)]
@@ -701,13 +794,107 @@ mod tests {
         let turned = sel.transformed(turn, canvas).unwrap();
         assert_eq!(turned.rect, rect(15, 5, 10, 20));
         assert!(turned.contains(20.0, 10.0) && !turned.contains(12.0, 15.0));
-        // Inverted: what is selected outside follows.
+        // Inverted: the whole coverage turns, not just the hole. The canvas
+        // turned around (20, 15) only covers x < 35 of the canvas.
         let inverted = Selection {
             inverted: true,
             ..sel
         };
         let turned = inverted.transformed(turn, canvas).unwrap();
-        assert!(turned.inverted && turned.contains(12.0, 15.0) && !turned.contains(20.0, 10.0));
+        assert!(!turned.inverted && turned.contains(12.0, 15.0) && !turned.contains(20.0, 10.0));
+        assert!(turned.contains(5.0, 150.0) && !turned.contains(100.0, 100.0));
+    }
+
+    /// An inverted selection scaled or moved behaves like the same pixels
+    /// selected without inversion: the canvas corners leave the selection.
+    #[test]
+    fn inverted_selections_transform_and_move_as_a_whole() {
+        let canvas = rect(0, 0, 100, 100);
+        let hole = rect(40, 40, 20, 20);
+        let inverted = Selection {
+            inverted: true,
+            ..hole.into()
+        };
+        let all: Selection = canvas.into();
+        // Half size around the center.
+        let half = Affine([0.5, 0.0, 25.0, 0.0, 0.5, 25.0]);
+        for sel in [&inverted, &all] {
+            let small = sel.transformed(half, canvas).unwrap();
+            assert_eq!((small.coverage(2, 2), small.coverage(30, 30)), (0, 255));
+        }
+        let small = inverted.transformed(half, canvas).unwrap();
+        assert_eq!(small.coverage(50, 50), 0);
+        // A 45° turn around the center leaves the corners out.
+        let (c, s) = (std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2);
+        let turn = Affine([c, -s, 50.0 - c * 50.0 + s * 50.0, s, c, 50.0 - s * 50.0 - c * 50.0]);
+        let turned = inverted.transformed(turn, canvas).unwrap();
+        assert_eq!((turned.coverage(1, 1), turned.coverage(50, 50)), (0, 0));
+        assert_eq!(turned.coverage(50, 10), 255);
+        // Moved 30 px to the right: the left 30 px are no longer selected,
+        // the hole moved with the rest, and the right edge left the canvas.
+        let moved = inverted.moved(30, 0, canvas).unwrap();
+        assert!(!moved.inverted);
+        assert_eq!((moved.coverage(10, 10), moved.coverage(30, 10)), (0, 255));
+        assert_eq!((moved.coverage(75, 50), moved.coverage(65, 50)), (0, 255));
+        assert_eq!(moved.coverage(99, 99), 255);
+        // With a soft hole, its coverage moves with it.
+        let soft = Selection::from_mask(
+            &GrayImage::from_fn(4, 1, |x, _| Luma([[0, 100, 200, 255][x as usize]])),
+            (10, 10),
+        )
+        .unwrap();
+        let soft = Selection {
+            inverted: true,
+            ..soft
+        };
+        let moved = soft.moved(-5, 3, canvas).unwrap();
+        for x in 0..4 {
+            assert_eq!(moved.coverage(5 + x, 13), soft.coverage(10 + x, 10));
+        }
+        assert_eq!(moved.coverage(99, 50), 0);
+        assert!(inverted.moved(100, 0, canvas).is_none());
+        assert_eq!(inverted.moved(0, 0, canvas), Some(inverted.clone()));
+        // Not inverted: as before.
+        let plain: Selection = hole.into();
+        assert_eq!(plain.moved(5, 5, canvas), Some(rect(45, 45, 20, 20).into()));
+    }
+
+    /// Lasso edges are anti-aliased with their exact area, horizontal as
+    /// well as vertical ones, on each side, even beyond the image.
+    #[test]
+    fn polygon_coverage_is_exact_on_every_side() {
+        let px = |m: &GrayImage, x, y| m.get_pixel(x, y).0[0];
+        let near = |got: u8, want: f32| {
+            assert!((got as f32 - want * 255.0).abs() <= 1.0, "{got} for {want}");
+        };
+        let square = [(5.3, 10.1), (20.7, 10.1), (20.7, 25.9), (5.3, 25.9)];
+        let m = fill_polygon(&square, 30, 30, (0, 0));
+        // Top and bottom (they snapped to quarters before), left and right.
+        near(px(&m, 10, 10), 0.9);
+        near(px(&m, 10, 25), 0.9);
+        near(px(&m, 5, 15), 0.7);
+        near(px(&m, 20, 15), 0.7);
+        assert_eq!((px(&m, 10, 15), px(&m, 4, 15), px(&m, 10, 9)), (255, 0, 0));
+        near(px(&m, 5, 10), 0.7 * 0.9);
+        let thin = fill_polygon(&[(0.0, 3.1), (9.0, 3.1), (9.0, 3.3), (0.0, 3.3)], 10, 6, (0, 0));
+        near(px(&thin, 4, 3), 0.2);
+        // A diagonal edge: half of each pixel it splits.
+        let triangle = [(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)];
+        let t = fill_polygon(&triangle, 10, 10, (0, 0));
+        near(px(&t, 4, 5), 0.5);
+        assert_eq!(px(&t, 3, 3), 255);
+        // Beyond the image on the left and above: counted up to its side.
+        let wide = [(-50.0, -5.0), (10.5, -5.0), (10.5, 8.0), (-50.0, 8.0)];
+        let c = fill_polygon(&wide, 20, 20, (0, 0));
+        assert_eq!((px(&c, 0, 0), px(&c, 11, 3), px(&c, 3, 8)), (255, 0, 0));
+        near(px(&c, 10, 3), 0.5);
+        // Same result shifted by the origin (to the float rounding).
+        let moved = square.map(|(x, y)| (x + 100.0, y - 7.0));
+        let shifted = fill_polygon(&moved, 30, 30, (100, -7));
+        assert!(shifted.pixels().zip(m.pixels()).all(|(a, b)| a.0[0].abs_diff(b.0[0]) <= 1));
+        // Even-odd: a path that goes round twice selects nothing.
+        let twice = [(1.0, 1.0), (8.0, 1.0), (8.0, 8.0), (1.0, 8.0)].repeat(2);
+        assert_eq!(px(&fill_polygon(&twice, 10, 10, (0, 0)), 4, 4), 0);
     }
 
     #[test]

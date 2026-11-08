@@ -79,7 +79,7 @@ fn drag(h: &mut Harness<'static, AtelierApp>, from: Pos2, to: Pos2) {
 
 /// Until `done`, the workers having time to finish.
 fn wait(h: &mut Harness<'static, AtelierApp>, done: impl Fn(&AtelierApp) -> bool) {
-    for _ in 0..400 {
+    for _ in crate::testing::patience() {
         if done(h.state()) {
             return;
         }
@@ -669,11 +669,15 @@ fn a_large_image_keeps_the_interface_going_while_counted_and_closing_stops_it() 
     h.state_mut().doc = Some(Document::new(big, None));
     h.state_mut()
         .run(Action::Workspace(workspace::Command::Histogram));
-    let t = std::time::Instant::now();
+    // Held (see `HistogramPanel::hold`): a frame that waited for the
+    // count would never end.
+    let hold = std::sync::Arc::clone(&h.state().hist_panel.hold);
+    hold.store(true, std::sync::atomic::Ordering::Relaxed);
     h.step();
     // Not waited for: the thread is started, the frame goes on.
-    assert!(h.state().hist_panel.counting() || h.state().hist_panel.counts().is_some());
-    assert!(t.elapsed().as_millis() < 1500, "{:?}", t.elapsed());
+    assert!(h.state().hist_panel.counting());
+    assert!(h.state().hist_panel.counts().is_none());
+    // Closing stops it, held or not.
     h.state_mut()
         .run(Action::Workspace(workspace::Command::Histogram));
     h.step();

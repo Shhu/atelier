@@ -139,10 +139,13 @@ fn preview_of(
     };
     // At most twice the preview's side (sharp on high-density screens).
     let side = PREVIEW as u32 * 2;
-    let mut small = if shown.width().max(shown.height()) > side {
-        image::DynamicImage::ImageRgba8(shown)
-            .thumbnail(side, side)
-            .into_rgba8()
+    let (sw, sh) = shown.dimensions();
+    let mut small = if sw.max(sh) > side {
+        // Premultiplied, as the file.
+        let k = f64::from(side) / f64::from(sw.max(sh));
+        let fit = |v: u32| ((f64::from(v) * k).round() as u32).clamp(1, side);
+        let filter = image::imageops::FilterType::Triangle;
+        crate::pixel_ops::resize(&shown, fit(sw), fit(sh), filter)
     } else {
         shown
     };
@@ -694,9 +697,7 @@ mod tests {
 
     /// A 300 × 200 PNG opened from a folder of its own.
     fn app(name: &str) -> (Harness<'static, AtelierApp>, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("atelier-export-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir(&format!("export-{name}"));
         let path = dir.join("photo.png");
         RgbaImage::from_fn(300, 200, |x, y| Rgba([x as u8, y as u8, 90, 255]))
             .save(&path)
@@ -746,7 +747,7 @@ mod tests {
         let d = h.state_mut().export.as_mut().unwrap();
         d.options.format = ExportFormat::Jpeg;
         d.options.scale = 50.0;
-        for _ in 0..200 {
+        for _ in crate::testing::patience() {
             h.run_steps(1);
             let shown = h.state().export.as_ref().and_then(|d| d.shown.as_ref());
             if shown.is_some_and(|(o, ..)| o.scale == 50.0) {

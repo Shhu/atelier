@@ -24,6 +24,10 @@ trap 'rm -rf "$out"' EXIT
 . packaging/windows/paths.sh
 cp "$WIN_TARGET_WSL/release/atelier.exe" "$out/"
 cp packaging/flatpak/atelier.flatpak "$out/"
+# Nothing naming this computer's folders is uploaded (the Flatpak bundle is
+# compressed: its tree is looked at).
+packaging/check-private.sh "$out/atelier.exe" "$out/atelier.flatpak" \
+    packaging/flatpak/build/files
 
 git tag "$tag"
 git push origin main "$tag"

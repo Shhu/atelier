@@ -138,7 +138,7 @@ fn key(h: &mut Harness<'_, AtelierApp>, key: Key, modifiers: Modifiers) {
 }
 
 fn wait_for_fill(h: &mut Harness<'static, AtelierApp>) {
-    for _ in 0..3000 {
+    for _ in crate::testing::patience() {
         if !h.state().retouch.busy() {
             return;
         }
@@ -776,7 +776,7 @@ fn a_large_scale_is_applied_on_a_worker() {
     key(&mut h, Key::Enter, Modifiers::NONE);
     // Under load the worker can finish within the frames `key` runs, so
     // only the result is checked, not that it is still busy.
-    for _ in 0..1000 {
+    for _ in crate::testing::patience() {
         if !h.state().transform_busy() {
             break;
         }
@@ -794,9 +794,7 @@ fn a_large_scale_is_applied_on_a_worker() {
 #[test]
 fn redo_while_typing_with_nothing_typed_to_redo_goes_on_typing() {
     let mut h = logo_app();
-    if !has_fonts(&mut h) {
-        return;
-    }
+    assert!(has_fonts(&mut h), "the bundled font at least");
     h.state_mut().rulers.settings.snap = false;
     drag(
         &mut h,

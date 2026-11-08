@@ -86,6 +86,8 @@ struct Resources {
     alpha_ids: Vec<u32>,
     /// Index of the active layer's record.
     target_layer: Option<usize>,
+    /// The link group of each record (0: none).
+    link_groups: Vec<u16>,
     guides: Vec<Guide>,
     /// The Color Sampler blocks (read once the canvas is known).
     sampler_blocks: Vec<(u16, Vec<u8>)>,
@@ -229,16 +231,34 @@ fn has_spot(id: u16, data: &[u8]) -> bool {
         .is_some_and(|d| d.chunks_exact(stride).any(|c| c[12] == 2))
 }
 
+/// Signatures of image resources (Photoshop's and other applications'),
+/// as ag-psd and psd-tools accept them.
+const RESOURCE_SIGNATURES: [&[u8]; 5] = [b"8BIM", b"MeSa", b"AgHg", b"PHUT", b"DCSR"];
+
 fn resources(r: &mut Reader) -> Result<Resources> {
     let mut out = Resources::default();
     let mut ascii_names = Vec::new();
-    while r.remaining() >= 12 && r.bytes(4)? == b"8BIM" {
+    while r.remaining() >= 12 {
+        let sig = r.bytes(4)?;
+        if !RESOURCE_SIGNATURES.contains(&sig) {
+            break;
+        }
         let id = r.u16()?;
         let name = r.pascal(2)?;
         let len = r.u32()? as usize;
         let raw = r.bytes(len)?;
         let mut d = Reader::new(raw);
         r.skip(len % 2)?;
+        // Another application's (ImageReady's variables are "MeSa"): said,
+        // never written back as Photoshop's.
+        if sig != b"8BIM" {
+            match id {
+                7000 | 7001 | 7003 => out.variables = true,
+                _ if out.other.contains(&id) => {}
+                _ => out.other.push(id),
+            }
+            continue;
+        }
         let kept = || PsdResource {
             id,
             name: name.to_vec(),
@@ -262,6 +282,11 @@ fn resources(r: &mut Reader) -> Result<Resources> {
                 }
             }
             1024 => out.target_layer = Some(d.u16()? as usize),
+            1026 => {
+                while d.remaining() >= 2 {
+                    out.link_groups.push(d.u16()?);
+                }
+            }
             1032 => {
                 d.skip(12)?;
                 let n = d.u32()? as usize;
@@ -429,11 +454,38 @@ impl MaskData {
     }
 }
 
-/// Keys of the tagged blocks whose length takes 8 bytes in a PSB.
-const BIG_KEYS: [&[u8; 4]; 13] = [
+/// Keys of the tagged blocks whose length takes 8 bytes in a PSB: the
+/// specification's, and those ag-psd and psd-tools also read so.
+const BIG_KEYS: [&[u8; 4]; 21] = [
     b"LMsk", b"Lr16", b"Lr32", b"Layr", b"Mt16", b"Mt32", b"Mtrn", b"Alph", b"FMsk", b"lnk2",
-    b"FEid", b"FXid", b"PxSD",
+    b"FEid", b"FXid", b"PxSD", b"cinf", b"lnk3", b"lnkE", b"pths", b"extd", b"extn", b"FELS",
+    b"artd",
 ];
+
+/// Of [`BIG_KEYS`], those found in files, which some writers give a 4-byte
+/// length anyway (ag-psd): the length tells.
+const OBSERVED_BIG_KEYS: [&[u8; 4]; 7] = [b"lnk3", b"lnkE", b"pths", b"extd", b"extn", b"FELS", b"artd"];
+
+/// Whether the length of block `key` (after signature `sig`), at the start
+/// of `r`, takes 8 bytes: in a PSB (`big`) for [`BIG_KEYS`], always after
+/// "8B64". A 4-byte length of a key in [`OBSERVED_BIG_KEYS`] is told by
+/// what follows: its high word is 0 (no block takes 4 GB) and the next
+/// word isn't the signature of the next block.
+fn long_length(r: &Reader, sig: &[u8], key: &[u8; 4], big: bool) -> bool {
+    if sig == b"8B64" {
+        return true;
+    }
+    if !big || !BIG_KEYS.contains(&key) {
+        return false;
+    }
+    if !OBSERVED_BIG_KEYS.contains(&key) {
+        return true;
+    }
+    let mut peek = r.clone();
+    let high = peek.u32().ok();
+    let next = peek.bytes(4).ok();
+    high == Some(0) && !matches!(next, Some(b"8BIM" | b"8B64"))
+}
 
 fn tagged_blocks<'a>(r: &mut Reader<'a>, big: bool) -> Result<Vec<([u8; 4], &'a [u8])>> {
     let mut blocks = Vec::new();
@@ -445,7 +497,7 @@ fn tagged_blocks<'a>(r: &mut Reader<'a>, big: bool) -> Result<Vec<([u8; 4], &'a 
         }
         r.skip(4)?;
         let key = r.tag()?;
-        let len = r.len(big && BIG_KEYS.contains(&&key))?;
+        let len = r.len(long_length(r, sig, &key, big))?;
         blocks.push((key, r.bytes(len)?));
     }
     Ok(blocks)
@@ -834,6 +886,10 @@ struct Notes {
     dropped: Vec<String>,
     styles: Vec<String>,
     pattern_fills: Vec<String>,
+    /// Layers with blocks Atelier doesn't read.
+    settings: Vec<String>,
+    /// Brightness/Contrast layers in the legacy algorithm.
+    legacy: Vec<String>,
 }
 
 impl Notes {
@@ -882,6 +938,14 @@ impl Notes {
                 &self.pattern_fills,
                 t!("pattern9-psd-note-fills", names = list(&self.pattern_fills)),
             ),
+            (
+                &self.legacy,
+                t!("psd14-psd-note-legacy-brightness", names = list(&self.legacy)),
+            ),
+            (
+                &self.settings,
+                t!("psd14-psd-note-settings", names = list(&self.settings)),
+            ),
         ];
         for (names, line) in groups {
             if !names.is_empty() {
@@ -905,6 +969,24 @@ struct File<'a> {
     pattern_blocks: Vec<&'a [u8]>,
     /// The merged image's data (compression first).
     image_data: &'a [u8],
+    /// The saved paths' names in full ("pths"), in their order.
+    path_names: Vec<String>,
+}
+
+/// The saved paths' names of a "pths" block: a version, then a descriptor
+/// listing each path's information.
+fn path_names(block: &[u8]) -> Option<Vec<String>> {
+    let mut r = Reader::new(block);
+    r.u32().ok()?;
+    let d = Descriptor::read(&mut r).ok()?;
+    let names = d.list(b"pathList")?.iter().map(|v| match v {
+        super::descriptor::Value::Object(info) => match info.get(b"pathUnicodeName") {
+            Some(super::descriptor::Value::Text(name)) => Some(name.clone()),
+            _ => None,
+        },
+        _ => None,
+    });
+    names.collect()
 }
 
 fn parse(data: &[u8]) -> Result<File<'_>> {
@@ -958,6 +1040,11 @@ fn parse(data: &[u8]) -> Result<File<'_>> {
         .filter(|(k, _)| matches!(k, b"Patt" | b"Pat2" | b"Pat3"))
         .map(|(_, block)| *block)
         .collect();
+    let path_names = global
+        .iter()
+        .find(|(k, _)| k == b"pths")
+        .and_then(|(_, block)| path_names(block))
+        .unwrap_or_default();
     Ok(File {
         header,
         resources,
@@ -966,7 +1053,48 @@ fn parse(data: &[u8]) -> Result<File<'_>> {
         merged_alpha,
         pattern_blocks,
         image_data,
+        path_names,
     })
+}
+
+/// Blending Options Atelier lacks, away from their defaults: Blend Clipped
+/// Layers as Group off, Blend Interior Effects as Group, channels left out
+/// of the blending, Transparency Shapes Layer off, Layer and Vector Mask
+/// Hides Effects.
+fn advanced_blending(rec: &Record) -> bool {
+    let flag = |key: &[u8; 4], default: u8| {
+        rec.block(key)
+            .and_then(|d| d.first())
+            .is_some_and(|&v| v != default)
+    };
+    flag(b"clbl", 1)
+        || flag(b"infx", 0)
+        || flag(b"tsly", 1)
+        || flag(b"lmgm", 0)
+        || flag(b"vmgm", 0)
+        || rec.block(b"brst").is_some_and(|d| !d.is_empty())
+}
+
+/// Layer blocks Atelier reads, or that only describe the file as it was
+/// (its ids and versions, the name's source, effects' reference point,
+/// metadata, older copies of what it reads): leaving them out loses
+/// nothing. A color label counts once it is set.
+fn known_block(key: &[u8; 4], data: &[u8], rec: &Record) -> bool {
+    const KNOWN: [&[u8; 4]; 52] = [
+        b"luni", b"lyid", b"lsct", b"lsdk", b"iOpa", b"lspf", b"lfx2", b"lfxs", b"lmfx", b"knko",
+        b"clbl", b"infx", b"tsly", b"lmgm", b"vmgm", b"brst", b"vmsk", b"vsms", b"vstk", b"vscg",
+        b"vogk", b"TySh", b"SoLd", b"PlLd", b"SoLE", b"artb", b"artd", b"abdd", b"PtFl", b"GdFl",
+        b"SoCo", b"levl", b"curv", b"hue2", b"hue ", b"blnc", b"brit", b"CgEd", b"vibA", b"expA",
+        b"mixr", b"selc", b"blwh", b"nvrt", b"post", b"thrs", b"grdm", b"phfl", b"clrL", b"lnsr",
+        b"lyvr", b"fxrp",
+    ];
+    const DESCRIPTIVE: [&[u8; 4]; 4] = [b"shmd", b"cust", b"ffxi", b"sn2P"];
+    match key {
+        // Older styles, beside the current ones.
+        b"lrFX" => effects_of(rec).is_some(),
+        b"lclr" => data.iter().all(|&b| b == 0),
+        _ => KNOWN.contains(&key) || DESCRIPTIVE.contains(&key),
+    }
 }
 
 /// The styles of a layer, as written.
@@ -1160,6 +1288,9 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
         } else {
             match adjust::read(&rec.blocks, &patterns) {
                 Some(Ok(kind)) => {
+                    if adjust::legacy_brightness(&rec.blocks) {
+                        notes.legacy.push(rec.name.clone());
+                    }
                     layer.kind = kind;
                     layer.replace_pixels(RgbaImage::new(0, 0));
                     layer.offset = (0, 0);
@@ -1199,8 +1330,11 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
         let knockout = rec
             .block(b"knko")
             .is_some_and(|d| d.first().is_some_and(|&k| k != 0));
-        if knockout || rec.blend_if {
+        if knockout || rec.blend_if || advanced_blending(rec) {
             notes.styles.push(rec.name.clone());
+        }
+        if rec.blocks.iter().any(|(k, d)| !known_block(k, d, rec)) {
+            notes.settings.push(rec.name.clone());
         }
         if layer.has_pixels() {
             if rec.block(b"TySh").is_some() {
@@ -1286,8 +1420,11 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
         if f.resources.target_layer == Some(i) {
             target = Some(doc.layers.len());
         }
+        // Its link group for now: made an id of the document's below.
+        layer.link = f.resources.link_groups.get(i).filter(|&&g| g != 0).map(|&g| g.into());
         doc.layers.push(layer);
     }
+    link_groups(&mut doc);
     doc.fix_depths();
     // Files give a group no frame: it starts at what it holds.
     doc.frame_groups();
@@ -1356,11 +1493,13 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
         .find(|points| !points.is_empty())
         .unwrap_or_default();
     let path = |data: &[u8]| super::vector::path_of(data, canvas).ok();
+    // Their names in full when the file has them.
     doc.paths = (f.resources.paths.iter())
-        .filter_map(|(name, data)| {
+        .enumerate()
+        .filter_map(|(i, (name, data))| {
             let path = path(data)?;
             Some(crate::document::SavedPath {
-                name: name.clone(),
+                name: f.path_names.get(i).unwrap_or(name).clone(),
                 path,
             })
         })
@@ -1412,6 +1551,28 @@ pub(super) fn document_within(data: &[u8], mut budget: Budget) -> Result<Importe
     })
 }
 
+/// The layers' link groups (as `link`) made links of the document: a group
+/// of a single layer links nothing.
+fn link_groups(doc: &mut Document) {
+    let groups: Vec<Option<u64>> = doc.layers.iter_mut().map(|l| l.link.take()).collect();
+    let mut ids: Vec<(u64, u64)> = Vec::new();
+    for (i, g) in groups.iter().enumerate() {
+        let Some(g) = *g else { continue };
+        if groups.iter().filter(|&&h| h == Some(g)).count() < 2 {
+            continue;
+        }
+        let id = match ids.iter().find(|(k, _)| *k == g) {
+            Some(&(_, id)) => id,
+            None => {
+                doc.next_id += 1;
+                ids.push((g, doc.next_id));
+                doc.next_id
+            }
+        };
+        doc.layers[i].link = Some(id);
+    }
+}
+
 /// A flat file's extra channel is its transparency unless the alpha
 /// channels are named as such.
 fn has_transparency(f: &File) -> bool {
@@ -1457,15 +1618,20 @@ pub fn canvas_size(path: &Path) -> Option<(u32, u32)> {
 
 /// Preview of a Photoshop document: its thumbnail resource, else its
 /// merged image.
-pub fn thumbnail_of(path: &Path) -> Option<RgbaImage> {
+pub fn thumbnail_of(path: &Path, budget: &mut Budget) -> Option<RgbaImage> {
     let data = std::fs::read(path).ok()?;
+    budget.take_bytes(data.len() as u64).ok()?;
     let f = parse(&data).ok()?;
     if let Some(jpeg) = &f.resources.thumbnail
-        && let Ok(image) = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
+        && let Some(image) =
+            crate::document::file_io::decode_within(jpeg, image::ImageFormat::Jpeg, budget)
     {
-        return Some(image.into_rgba8());
+        return Some(image);
     }
     let color = color_channels(f.header.mode);
+    // The color planes merged, then made RGBA.
+    let depth = u64::from(f.header.depth).div_ceil(8);
+    (budget.take(f.header.width, f.header.height, color as u64 * depth + 4)).ok()?;
     let wanted: Vec<usize> = (0..color).collect();
     let planes = merged_planes(&f, &wanted).ok()?;
     let refs: Vec<&[u8]> = planes.iter().map(Vec::as_slice).collect();
@@ -1492,4 +1658,135 @@ pub(super) fn merged_image(data: &[u8]) -> Option<RgbaImage> {
         unmatte(&mut image);
     }
     Some(image)
+}
+
+/// The name and clipping flag of each record of a file (tests).
+#[cfg(test)]
+pub(super) fn records_of(data: &[u8]) -> Vec<(String, bool)> {
+    let f = parse(data).expect("a file");
+    f.records.iter().map(|r| (r.name.clone(), r.clipped)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tagged block: signature, key, a length of 4 or 8 bytes, data.
+    fn block(sig: &[u8; 4], key: &[u8; 4], long: bool, data: &[u8]) -> Vec<u8> {
+        let mut out = [&sig[..], key].concat();
+        if long {
+            out.extend((data.len() as u64).to_be_bytes());
+        } else {
+            out.extend((data.len() as u32).to_be_bytes());
+        }
+        out.extend(data);
+        out
+    }
+
+    fn keys(data: &[u8], big: bool) -> Vec<[u8; 4]> {
+        let blocks = tagged_blocks(&mut Reader::new(data), big).unwrap();
+        blocks.into_iter().map(|(k, _)| k).collect()
+    }
+
+    /// In a PSB, the keys ag-psd and psd-tools give 8-byte lengths are read
+    /// so, and so is any block signed "8B64": the blocks after them stay.
+    #[test]
+    fn psb_blocks_have_the_lengths_other_readers_give_them() {
+        let lsct = block(b"8BIM", b"lsct", false, &[0, 0, 0, 1]);
+        for key in [b"cinf", b"artd", b"lnk3", b"pths", b"extn", b"lnkE", b"FELS"] {
+            let data = [block(b"8BIM", key, true, &[]), lsct.clone()].concat();
+            assert_eq!(keys(&data, true), [*key, *b"lsct"], "{key:?}");
+            let data = [block(b"8BIM", key, true, &[1, 2, 3, 4]), lsct.clone()].concat();
+            assert_eq!(keys(&data, true), [*key, *b"lsct"], "{key:?}");
+        }
+        let data = [block(b"8B64", b"cust", true, &[]), lsct.clone()].concat();
+        assert_eq!(keys(&data, true), [*b"cust", *b"lsct"]);
+        // Some writers give the keys found in files 4 bytes anyway.
+        for len in [0, 8] {
+            let data = [block(b"8BIM", b"lnk3", false, &vec![7; len]), lsct.clone()].concat();
+            assert_eq!(keys(&data, true), [*b"lnk3", *b"lsct"], "{len}");
+        }
+        // A PSD's are all 4 bytes.
+        let data = [block(b"8BIM", b"cinf", false, &[]), lsct.clone()].concat();
+        assert_eq!(keys(&data, false), [*b"cinf", *b"lsct"]);
+    }
+
+    fn resource(sig: &[u8; 4], id: u16, data: &[u8]) -> Vec<u8> {
+        let mut out = sig.to_vec();
+        out.extend(id.to_be_bytes());
+        out.extend([0, 0]);
+        out.extend((data.len() as u32).to_be_bytes());
+        out.extend(data);
+        out.resize(out.len() + data.len() % 2, 0);
+        out
+    }
+
+    /// Resources of other applications don't end the list: those after
+    /// them are read, and theirs are said.
+    #[test]
+    fn resources_after_another_signature_are_read() {
+        let guides = [&[0, 0, 0, 1][..], &[0; 8], &[0, 0, 0, 1], &[0, 0, 1, 64, 0]].concat();
+        let data = [
+            resource(b"MeSa", 7000, b"vars"),
+            resource(b"8BIM", 1032, &guides),
+            resource(b"AgHg", 1234, &[1]),
+        ]
+        .concat();
+        let r = resources(&mut Reader::new(&data)).unwrap();
+        assert!(r.variables);
+        assert_eq!(r.guides.len(), 1);
+        assert_eq!(r.other, [1234]);
+        assert!(r.kept.is_empty());
+    }
+
+    fn record_with<'a>(blocks: Vec<([u8; 4], &'a [u8])>) -> Record<'a> {
+        Record {
+            rect: [0; 4],
+            blend: *b"norm",
+            opacity: 255,
+            clipped: false,
+            hidden: false,
+            blend_if: false,
+            mask: None,
+            name: "x".into(),
+            blocks,
+            channels: Vec::new(),
+        }
+    }
+
+    /// Blending Options Atelier lacks count once away from their default,
+    /// and blocks it doesn't know are never dropped silently.
+    #[test]
+    fn advanced_blending_and_unknown_blocks_are_said() {
+        let defaults: Vec<([u8; 4], &[u8])> = vec![
+            (*b"clbl", &[1, 0, 0, 0]),
+            (*b"infx", &[0, 0, 0, 0]),
+            (*b"tsly", &[1, 0, 0, 0]),
+            (*b"lmgm", &[0, 0, 0, 0]),
+            (*b"vmgm", &[0, 0, 0, 0]),
+            (*b"brst", &[]),
+            (*b"lclr", &[0; 8]),
+            (*b"shmd", &[1, 2]),
+        ];
+        let rec = record_with(defaults.clone());
+        assert!(!advanced_blending(&rec));
+        assert!(rec.blocks.iter().all(|(k, d)| known_block(k, d, &rec)));
+        for (key, value) in [
+            (*b"clbl", &[0u8, 0, 0, 0][..]),
+            (*b"infx", &[1, 0, 0, 0]),
+            (*b"tsly", &[0, 0, 0, 0]),
+            (*b"lmgm", &[1, 0, 0, 0]),
+            (*b"vmgm", &[1, 0, 0, 0]),
+            (*b"brst", &[0, 0, 0, 1]),
+        ] {
+            let mut blocks = defaults.clone();
+            blocks.retain(|(k, _)| *k != key);
+            blocks.push((key, value));
+            assert!(advanced_blending(&record_with(blocks)), "{key:?}");
+        }
+        let rec = record_with(vec![(*b"lclr", &[0, 2, 0, 0, 0, 0, 0, 0])]);
+        assert!(!known_block(&rec.blocks[0].0, rec.blocks[0].1, &rec));
+        let rec = record_with(vec![(*b"zzzz", &[])]);
+        assert!(!known_block(&rec.blocks[0].0, rec.blocks[0].1, &rec));
+    }
 }

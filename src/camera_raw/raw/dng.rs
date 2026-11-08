@@ -11,14 +11,25 @@ use super::demosaic::malvar;
 use super::ljpeg;
 use super::tiff::{Ifd, Tiff};
 use crate::camera_raw::source::{Calibration, Camera, Source};
+use crate::document::{Budget, FileError};
 use crate::camera_raw::white::{self, Mat3};
 
 /// Why a DNG could not be decoded.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum DngError {
     /// A variant this decoder does not handle (its preview may do).
     Unsupported,
     Damaged,
+    /// Decoding it would take more memory than allowed (the budget's
+    /// [`FileError::LowMemory`] or [`FileError::OutOfMemory`]).
+    Memory(FileError),
+}
+
+/// Bytes per pixel decoding takes at once, for `spp` samples per pixel:
+/// the samples, their levels, the mosaic and its colors, or the colors and
+/// their cropped or turned copy.
+fn decode_bytes_per_pixel(spp: usize) -> u64 {
+    6 * spp as u64 + 28
 }
 
 use DngError::{Damaged, Unsupported};
@@ -77,8 +88,9 @@ pub fn is_dng(data: &[u8]) -> bool {
     })
 }
 
-/// The developed-to-be pixels of a DNG, the right way up.
-pub fn decode(data: &[u8]) -> Result<Source, DngError> {
+/// The developed-to-be pixels of a DNG, the right way up, taken from
+/// `budget`.
+pub fn decode(data: &[u8], budget: &mut Budget) -> Result<Source, DngError> {
     let (tiff, first) = Tiff::new(data).ok_or(Damaged)?;
     let ifds = tiff.all_ifds(first);
     let ifd0 = ifds.first().ok_or(Damaged)?;
@@ -117,6 +129,7 @@ pub fn decode(data: &[u8]) -> Result<Source, DngError> {
     {
         return Err(Unsupported);
     }
+    (budget.take(w as u32, h as u32, decode_bytes_per_pixel(spp))).map_err(DngError::Memory)?;
     let mut samples = read_samples(&tiff, raw, w, h, spp, bits)?;
 
     // Linearization, black and white levels.
@@ -144,7 +157,7 @@ pub fn decode(data: &[u8]) -> Result<Source, DngError> {
     let (aw, ah) = (right - left, bottom - top);
     let repeat = tiff
         .numbers(raw, BLACK_REPEAT)
-        .filter(|r| r.len() == 2 && r[0] >= 1.0 && r[1] >= 1.0)
+        .filter(|r| r.len() == 2 && r.iter().all(|v| (1.0..=64.0).contains(v)))
         .map_or((1, 1), |r| (r[0] as usize, r[1] as usize));
     let blacks = tiff.numbers(raw, BLACK_LEVEL).unwrap_or_default();
     let delta_h = tiff.numbers(raw, BLACK_DELTA_H).unwrap_or_default();
@@ -173,6 +186,7 @@ pub fn decode(data: &[u8]) -> Result<Source, DngError> {
             (((v - b) / (white_of(s) - b).max(1.0)) as f32).clamp(0.0, 1.0)
         })
         .collect();
+    drop(samples);
     if let Some(e) = raw.get(OPCODE_LIST_2) {
         let list: Vec<u8> = tiff.values(e).iter().map(|&v| v as u8).collect();
         apply_opcodes(&list, &mut levels, aw, ah, spp)?;
@@ -189,6 +203,7 @@ pub fn decode(data: &[u8]) -> Result<Source, DngError> {
                 levels[i] * gains[pattern[(y % 2) * 2 + x % 2] as usize]
             })
             .collect();
+        drop(levels);
         malvar(&mosaic, aw, ah, pattern)
     } else {
         (0..aw * ah)
@@ -212,7 +227,10 @@ pub fn decode(data: &[u8]) -> Result<Source, DngError> {
     let crop = match (tiff.numbers(raw, CROP_ORIGIN), tiff.numbers(raw, CROP_SIZE)) {
         (Some(o), Some(s)) if o.len() == 2 && s.len() == 2 => {
             let (x0, y0) = ((o[0] as usize).min(aw - 1), (o[1] as usize).min(ah - 1));
-            let (x1, y1) = ((x0 + s[0] as usize).min(aw), (y0 + s[1] as usize).min(ah));
+            let (x1, y1) = (
+                x0.saturating_add(s[0] as usize).min(aw),
+                y0.saturating_add(s[1] as usize).min(ah),
+            );
             [
                 x0 as u32,
                 y0 as u32,
@@ -338,8 +356,15 @@ fn apply_opcodes(
                 let (spacing_v, spacing_h) = (f64_at(params, 40)?, f64_at(params, 48)?);
                 let (origin_v, origin_h) = (f64_at(params, 56)?, f64_at(params, 64)?);
                 let map_planes = u32_at(params, 72)? as usize;
-                let n = points_v * points_h * map_planes;
-                if n == 0 || spacing_v <= 0.0 || spacing_h <= 0.0 {
+                // As many gains as the parameters hold, no more.
+                let n = (points_v.checked_mul(points_h))
+                    .and_then(|n| n.checked_mul(map_planes))
+                    .ok_or(Damaged)?;
+                if n == 0
+                    || n > params.len().saturating_sub(76) / 4
+                    || spacing_v <= 0.0
+                    || spacing_h <= 0.0
+                {
                     return Err(Damaged);
                 }
                 let gains: Vec<f32> = (0..n)
@@ -506,9 +531,17 @@ fn read_samples(
         let (at, len) = (offsets[i] as usize, counts[i] as usize);
         tiff.data.get(at..at.saturating_add(len)).ok_or(Damaged)
     };
+    // The samples of tile `i` inside the image: its data must hold them
+    // (a few bytes declaring a large image are damaged, not padded).
+    let inside = |i: usize| {
+        let (x0, y0) = ((i % across) * tw, (i / across) * th);
+        (tw.min(w - x0), th.min(h - y0))
+    };
     let decode_tile = |i: usize| -> Result<Vec<u16>, DngError> {
         let data = chunk(i)?;
         let n = tw * th * spp;
+        let (cols, rows) = inside(i);
+        let needed = ((rows - 1) * tw + cols) * spp;
         let mut out = match compression {
             1 => unpack(data, tw * spp, th, bits, tiff.little),
             8 => {
@@ -526,6 +559,9 @@ fn read_samples(
                     .map_err(|_| Damaged)?;
                 let image = image.to_rgb8();
                 let (jw, jh) = (image.width() as usize, image.height() as usize);
+                if jw < cols || jh < rows {
+                    return Err(Damaged);
+                }
                 // Rows of the tile, from the JPEG's (smaller at the edges).
                 let mut out = vec![0u16; n];
                 for y in 0..jh.min(th) {
@@ -540,6 +576,10 @@ fn read_samples(
             }
             _ => return Err(Unsupported),
         };
+        if out.len() < needed {
+            return Err(Damaged);
+        }
+        // The padding of a tile past the image's edge may be left out.
         out.resize(n, 0);
         if predictor == 2 {
             for row in out.chunks_exact_mut(tw * spp) {
@@ -552,34 +592,44 @@ fn read_samples(
         }
         Ok(out)
     };
-    let decoded: Vec<Result<Vec<u16>, DngError>> = {
-        let threads = crate::pixel_ops::threads().clamp(1, tiles.max(1));
-        let per = tiles.div_ceil(threads);
-        std::thread::scope(|s| {
+    // A few tiles per thread at a time, each copied into place: never all
+    // of them decoded beside the samples.
+    let threads = crate::pixel_ops::threads().clamp(1, tiles.max(1));
+    let batch = threads * 4;
+    let mut samples = vec![0u16; w * h * spp];
+    for start in (0..tiles).step_by(batch) {
+        let end = (start + batch).min(tiles);
+        let decoded: Vec<Result<Vec<u16>, DngError>> = std::thread::scope(|s| {
+            let per = (end - start).div_ceil(threads);
             let handles: Vec<_> = (0..threads)
                 .map(|t| {
                     let decode_tile = &decode_tile;
+                    let first = (start + t * per).min(end);
                     s.spawn(move || {
-                        (t * per..((t + 1) * per).min(tiles))
+                        (first..(first + per).min(end))
                             .map(decode_tile)
                             .collect::<Vec<_>>()
                     })
                 })
                 .collect();
+            // A thread that panicked: its tiles are damaged.
             handles
                 .into_iter()
-                .flat_map(|h| h.join().unwrap_or_default())
+                .flat_map(|h| h.join().unwrap_or_else(|_| vec![Err(Damaged)]))
                 .collect()
-        })
-    };
-    let mut samples = vec![0u16; w * h * spp];
-    for (i, tile) in decoded.into_iter().enumerate() {
-        let tile = tile?;
-        let (x0, y0) = ((i % across) * tw, (i / across) * th);
-        for y in 0..th.min(h - y0) {
-            let n = tw.min(w - x0) * spp;
-            let from = &tile[y * tw * spp..][..n];
-            samples[((y0 + y) * w + x0) * spp..][..n].copy_from_slice(from);
+        });
+        if decoded.len() != end - start {
+            return Err(Damaged);
+        }
+        for (i, tile) in (start..end).zip(decoded) {
+            let tile = tile?;
+            let (x0, y0) = ((i % across) * tw, (i / across) * th);
+            let (cols, rows) = inside(i);
+            for y in 0..rows {
+                let n = cols * spp;
+                let from = &tile[y * tw * spp..][..n];
+                samples[((y0 + y) * w + x0) * spp..][..n].copy_from_slice(from);
+            }
         }
     }
     Ok(samples)
@@ -808,7 +858,7 @@ pub mod tests {
     fn a_tiny_dng_decodes_in_every_variant() {
         for (lossless, linear) in [(false, false), (true, false), (false, true)] {
             let (dng, neutral) = gray_card(lossless, linear);
-            let source = decode(&dng.bytes()).expect("decoded");
+            let source = decode(&dng.bytes(), &mut Budget::of(1 << 30)).expect("decoded");
             assert_eq!((source.width, source.height), (16, 12));
             // Levels between black and white, multiplied by the white
             // balance as shot (1 / neutral, the largest at 1).
@@ -865,21 +915,71 @@ pub mod tests {
         assert!(left < right && right > 0.7, "{left} {right}");
         // A required opcode this decoder does not know: unsupported.
         let unknown = [&1u32.to_be_bytes()[..], &op(42, area(0))].concat();
-        assert_eq!(
+        assert!(matches!(
             apply_opcodes(&unknown, &mut data, 4, 4, 2),
             Err(Unsupported)
-        );
+        ));
     }
 
     #[test]
     fn orientation_and_damage() {
         let (mut dng, _) = gray_card(false, false);
         dng.orientation = 6;
-        let source = decode(&dng.bytes()).unwrap();
+        let source = decode(&dng.bytes(), &mut Budget::of(1 << 30)).unwrap();
         assert_eq!((source.width, source.height), (12, 16));
         let bytes = dng.bytes();
-        assert_eq!(decode(&bytes[..bytes.len() - 10]).unwrap_err(), Damaged);
+        assert!(matches!(
+            decode(&bytes[..bytes.len() - 10], &mut Budget::of(1 << 30)),
+            Err(Damaged)
+        ));
         assert!(is_dng(&bytes));
         assert!(!is_dng(b"II*\0\x08\0\0\0\0\0"));
+    }
+
+    /// A few bytes declaring a large image (fuzzing): its strip can't hold
+    /// its samples, so it is damaged, not padded with zeros into gigabytes;
+    /// an honest file past the memory free is asked about.
+    #[test]
+    fn what_a_dng_declares_is_not_believed() {
+        let (mut dng, _) = gray_card(false, true);
+        (dng.width, dng.height, dng.samples) = (4000, 4000, Vec::new());
+        let budget = || Budget::of(1 << 30);
+        assert!(matches!(decode(&dng.bytes(), &mut budget()), Err(Damaged)));
+        let (dng, _) = gray_card(false, false);
+        assert!(matches!(
+            decode(&dng.bytes(), &mut Budget::of(1000)),
+            Err(DngError::Memory(FileError::OutOfMemory(1000)))
+        ));
+        // A shorter strip than its rows: damaged too.
+        let (mut short, _) = gray_card(false, false);
+        short.samples.truncate(100);
+        assert!(matches!(decode(&short.bytes(), &mut budget()), Err(Damaged)));
+    }
+
+    /// A gain map whose three point counts multiply past the largest
+    /// number (to 4 once wrapped): damaged, not read out of bounds.
+    #[test]
+    fn gain_map_counts_are_checked() {
+        let mut params: Vec<u8> = [0u32, 0, 4, 4, 0, 1, 1, 1]
+            .map(u32::to_be_bytes)
+            .concat();
+        params.extend(4_294_967_291u32.to_be_bytes());
+        params.extend(3_937_083_985u32.to_be_bytes());
+        for v in [1.0f64, 1.0, 0.0, 0.0] {
+            params.extend(v.to_be_bytes());
+        }
+        params.extend(3_560_890_636u32.to_be_bytes());
+        params.extend([0u8; 16]);
+        let list = [
+            &1u32.to_be_bytes()[..],
+            &9u32.to_be_bytes(),
+            &[0, 1, 3, 0],
+            &0u32.to_be_bytes(),
+            &(params.len() as u32).to_be_bytes(),
+            &params,
+        ]
+        .concat();
+        let mut data = vec![0.4f32; 4 * 4];
+        assert!(matches!(apply_opcodes(&list, &mut data, 4, 4, 1), Err(Damaged)));
     }
 }

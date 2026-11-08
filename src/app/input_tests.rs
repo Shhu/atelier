@@ -453,7 +453,7 @@ fn azerty_ctrl_digits_show_the_channels() {
     let app = h.state();
     assert_eq!(app.channels.color_shown(doc(&h)), Some(1), "green");
     assert_eq!(app.rulers.settings.grid, grid);
-    // The 6 key: the first alpha channel; without one, Zoom Out (a French
+    // The 6 key types "-": Zoom Out, with an alpha channel too (a French
     // laptop has no other key for it).
     let zoom = h.state().zoom;
     type_key(&mut h, Key::Minus, Key::Num6, Modifiers::COMMAND);
@@ -461,12 +461,8 @@ fn azerty_ctrl_digits_show_the_channels() {
     h.state_mut().doc.as_mut().unwrap().new_channel();
     let zoom = h.state().zoom;
     type_key(&mut h, Key::Minus, Key::Num6, Modifiers::COMMAND);
-    assert_eq!(h.state().zoom, zoom);
-    assert_eq!(
-        h.state().channels.color_shown(doc(&h)),
-        None,
-        "the alpha channel"
-    );
+    assert!(h.state().zoom < zoom, "zoomed out again");
+    assert_eq!(h.state().channels.color_shown(doc(&h)), Some(1), "still green");
     // Ctrl+3: red; Ctrl+Alt+3 is not a channel shortcut.
     type_key(&mut h, Key::Num3, Key::Num3, Modifiers::COMMAND);
     assert_eq!(h.state().channels.color_shown(doc(&h)), Some(0));
@@ -1957,4 +1953,143 @@ fn layer_shortcuts_lock_cut_stamp_and_desaturate() {
     let [r, g, b, _] = doc(&h).active_layer().pixel_at(10, 10).expect("a pixel");
     assert!(r == g && g == b, "gray: {r} {g} {b}");
     assert!(h.state().adjust.is_none(), "no dialog");
+}
+
+/// AZERTY: Ctrl+ù is Ctrl+' (Grid), Alt+Shift+Ctrl+ù Quick Export (the key
+/// arrives as its place, Quote), and Shift+Ctrl+: (typing "/") Lock.
+#[test]
+fn azerty_grid_and_lock_have_their_keys() {
+    let mut h = app();
+    let grid = h.state().rulers.settings.grid;
+    type_key(&mut h, Key::Quote, Key::Quote, Modifiers::COMMAND);
+    assert_ne!(h.state().rulers.settings.grid, grid);
+    let locked = |h: &Harness<'static, AtelierApp>| {
+        let d = doc(h);
+        d.is_locked(d.active)
+    };
+    type_key(&mut h, Key::Slash, Key::Slash, Modifiers::COMMAND);
+    let qwerty = locked(&h);
+    type_key(
+        &mut h,
+        Key::Slash,
+        Key::Period,
+        Modifiers::COMMAND.plus(Modifiers::SHIFT),
+    );
+    assert_ne!(locked(&h), qwerty, "unlocked again");
+    // Help › Shortcuts says where they are.
+    let rows = h.state().shortcut_rows(&h.ctx);
+    let azerty = t!("input14-shortcuts-azerty");
+    let grid_key = keys::combo(&h.ctx, Modifiers::COMMAND, "ù");
+    assert!(rows.iter().any(|(section, _, key)| *section == azerty && *key == grid_key));
+}
+
+/// The brackets: ^ and $ on AZERTY arrive as their places; Ctrl+Alt (AltGr
+/// on Windows, typing "[" or "{") is not a shortcut.
+#[test]
+fn azerty_brackets_and_altgr() {
+    let mut h = app();
+    let size = h.state().brush_size;
+    // "^" is a dead key: egui-winit gives its place.
+    type_key(&mut h, Key::OpenBracket, Key::OpenBracket, Modifiers::NONE);
+    assert!(h.state().brush_size < size);
+    let size = h.state().brush_size;
+    type_key(&mut h, Key::CloseBracket, Key::CloseBracket, Modifiers::NONE);
+    assert!(h.state().brush_size > size);
+    let (size, step) = (h.state().brush_size, doc(&h).history_step());
+    let altgr = Modifiers::COMMAND.plus(Modifiers::ALT);
+    type_key(&mut h, Key::OpenCurlyBracket, Key::Num4, altgr);
+    type_key(&mut h, Key::OpenBracket, Key::Num5, altgr);
+    assert_eq!(h.state().brush_size, size);
+    assert_eq!(doc(&h).history_step(), step, "no layer moved");
+}
+
+/// Ctrl+Tab is the Control key on every system (on macOS, Cmd+Tab is the
+/// system's): Control alone switches documents.
+#[test]
+fn control_tab_switches_documents() {
+    let mut h = app();
+    let img = image::RgbaImage::from_pixel(50, 50, image::Rgba([0, 0, 0, 255]));
+    h.state_mut().add_tab(Document::new(img, None));
+    h.run_steps(2);
+    assert_eq!(h.state().active_tab, 1);
+    // macOS: Control without Command.
+    type_key(&mut h, Key::Tab, Key::Tab, Modifiers::CTRL);
+    assert_eq!(h.state().active_tab, 0);
+    type_key(
+        &mut h,
+        Key::Tab,
+        Key::Tab,
+        Modifiers::CTRL.plus(Modifiers::SHIFT),
+    );
+    assert_eq!(h.state().active_tab, 1);
+    // Windows and Linux: Ctrl sets both.
+    type_key(
+        &mut h,
+        Key::Tab,
+        Key::Tab,
+        Modifiers::CTRL.plus(Modifiers::COMMAND),
+    );
+    assert_eq!(h.state().active_tab, 0);
+}
+
+/// Alt+. / Alt+, select the top / bottom layer, F7 shows or hides the
+/// Layers panel (an action on F7 keeps the key), Alt+Shift+Ctrl+N adds a
+/// layer.
+#[test]
+fn photoshop_layer_and_panel_keys() {
+    let mut h = with_logo();
+    type_key(&mut h, Key::Comma, Key::Comma, Modifiers::ALT);
+    assert_eq!(doc(&h).active, 0);
+    type_key(&mut h, Key::Period, Key::Period, Modifiers::ALT);
+    assert_eq!(doc(&h).active, 1);
+    let shown = h.state().side_shown();
+    type_key(&mut h, Key::F7, Key::F7, Modifiers::NONE);
+    assert_ne!(h.state().side_shown(), shown);
+    type_key(&mut h, Key::F7, Key::F7, Modifiers::NONE);
+    assert_eq!(h.state().side_shown(), shown);
+    let layers = doc(&h).layers.len();
+    let all = Modifiers::COMMAND
+        .plus(Modifiers::SHIFT)
+        .plus(Modifiers::ALT);
+    type_key(&mut h, Key::N, Key::N, all);
+    assert_eq!(doc(&h).layers.len(), layers + 1);
+    // An action on F7 takes the key.
+    h.state_mut().actions.library.sets[0].actions[0].key = Some(crate::actions::FnKey {
+        number: 7,
+        shift: false,
+        ctrl: false,
+    });
+    let rows = h.state().shortcut_rows(&h.ctx);
+    assert!(!rows.iter().any(|(_, _, key)| key.contains("F7")));
+    type_key(&mut h, Key::F7, Key::F7, Modifiers::NONE);
+    assert_eq!(h.state().side_shown(), shown, "the action played instead");
+}
+
+/// Help › Shortcuts lists every key the document's shortcuts answer to,
+/// once.
+#[test]
+fn help_lists_every_working_shortcut_once() {
+    let h = app();
+    let rows = h.state().shortcut_rows(&h.ctx);
+    let listed: Vec<&str> = rows
+        .iter()
+        .flat_map(|(_, _, key)| key.split(", "))
+        .collect();
+    let shifted_lock = SHORTCUT_TOGGLE_LOCK_SHIFTED;
+    for (s, _) in document_shortcuts()
+        .into_iter()
+        .chain(FILE_SHORTCUTS)
+        .chain(FILL_SHORTCUTS)
+        .filter(|(s, _)| *s != shifted_lock)
+    {
+        let label = keys::shortcut(&h.ctx, &s);
+        assert!(listed.contains(&label.as_str()), "{label} is not listed");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (section, what, key) in &rows {
+        assert!(seen.insert((section, what, key)), "twice: {section} {what} {key}");
+    }
+    // The Window menu's keys are listed there only.
+    let tab = keys::shortcut(&h.ctx, &workspace::SHORTCUT_PANELS);
+    assert_eq!(rows.iter().filter(|(_, _, key)| *key == tab).count(), 1);
 }

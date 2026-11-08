@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 mod monitor;
 
-pub use monitor::monitor_profile;
+pub use monitor::{monitor_profile, profile_of as monitor_profile_of, watch as watch_monitor};
 
 /// What a profile's numbers are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,7 +1,7 @@
 //! Settings of Camera Raw, in its units (sliders from −100 to +100 unless
 //! said otherwise), serializable (presets, Smart Filters), and the presets.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -389,34 +389,109 @@ fn presets_file() -> PathBuf {
     crate::config::dir().join("camera-raw-presets.json")
 }
 
-/// The user's presets (none in tests).
-pub fn load_presets() -> Vec<Preset> {
-    if cfg!(test) {
-        return Vec::new();
-    }
-    load_presets_from(&presets_file())
+/// The user's presets, as kept in their file (shared with the other
+/// windows, see `store`).
+#[derive(Default)]
+pub struct Presets {
+    pub list: Vec<Preset>,
+    /// Entries this version can't read (made by a newer one): written back
+    /// as they are, after the others.
+    unknown: Vec<serde_json::Value>,
+    store: Option<crate::store::Store>,
+    /// What the user must know about the file, once.
+    pub notice: Option<String>,
 }
 
-pub fn save_presets(presets: &[Preset]) -> std::io::Result<()> {
-    if cfg!(test) {
-        return Ok(());
-    }
-    save_presets_to(&presets_file(), presets)
-}
+/// JSON, each preset this version reads written as it writes it: what
+/// another window saved compares with what this one read.
+const PRESETS_FILE: crate::store::Format = crate::store::Format {
+    decode: |bytes| {
+        let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        for entry in value.as_array_mut().into_iter().flatten() {
+            if let Ok(preset) = serde_json::from_value::<Preset>(entry.clone())
+                && let Ok(same) = serde_json::to_value(preset)
+            {
+                *entry = same;
+            }
+        }
+        Some(value)
+    },
+    encode: crate::store::JSON.encode,
+};
 
-fn load_presets_from(path: &Path) -> Vec<Preset> {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
-}
-
-fn save_presets_to(path: &Path, presets: &[Preset]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+impl Presets {
+    /// The user's presets (none in tests, and never saved).
+    pub fn load() -> Self {
+        if cfg!(test) {
+            return Self::default();
+        }
+        Self::load_from(presets_file())
     }
-    let json = serde_json::to_vec_pretty(presets).map_err(std::io::Error::other)?;
-    std::fs::write(path, json)
+
+    fn load_from(path: PathBuf) -> Self {
+        use crate::store::{Found, Store};
+        let mut store = Store::new(path, PRESETS_FILE);
+        let mut presets = Self::default();
+        match store.read() {
+            Found::Value(serde_json::Value::Array(entries)) => presets.take(entries),
+            Found::Missing => store.adopt(&serde_json::Value::Array(Vec::new())),
+            found => {
+                let found = match found {
+                    // Not a list of presets: set aside too.
+                    Found::Value(_) => store.set_aside(),
+                    found => found,
+                };
+                presets.notice = Some(match found {
+                    Found::SetAside(backup) => crate::i18n::t!(
+                        "safety14-raw-presets-damaged",
+                        backup = backup
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    ),
+                    Found::Unreadable(e) => crate::i18n::t!(
+                        "safety14-raw-presets-unreadable",
+                        error = crate::i18n::io_error(&e)
+                    ),
+                    _ => unreachable!(),
+                });
+            }
+        }
+        presets.store = Some(store);
+        presets
+    }
+
+    /// `entries` read one by one: one this version can't read is kept
+    /// aside, not lost.
+    fn take(&mut self, entries: Vec<serde_json::Value>) {
+        (self.list, self.unknown) = (Vec::new(), Vec::new());
+        for entry in entries {
+            match serde_json::from_value::<Preset>(entry.clone()) {
+                Ok(preset) => self.list.push(preset),
+                Err(_) => self.unknown.push(entry),
+            }
+        }
+    }
+
+    /// Saved, merged with what another window saved meanwhile (which then
+    /// shows here too).
+    pub fn save(&mut self) -> std::io::Result<()> {
+        let Some(store) = &mut self.store else {
+            return Ok(());
+        };
+        let mut entries = Vec::new();
+        for preset in &self.list {
+            entries.push(serde_json::to_value(preset).map_err(std::io::Error::other)?);
+        }
+        entries.extend(self.unknown.iter().cloned());
+        let merged = store.save(serde_json::Value::Array(entries))?;
+        if let serde_json::Value::Array(entries) = &merged {
+            store.adopt(&merged);
+            self.take(entries.clone());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -425,7 +500,7 @@ mod tests {
 
     #[test]
     fn presets_are_saved_and_loaded_back() {
-        let dir = std::env::temp_dir().join("atelier-raw-presets");
+        let dir = crate::testing::test_dir("raw-presets");
         let path = dir.join("presets.json");
         let mut settings = Settings {
             exposure: 0.7,
@@ -437,13 +512,56 @@ mod tests {
             name: "Mine".into(),
             settings,
         }];
-        save_presets_to(&path, &presets).unwrap();
-        assert_eq!(load_presets_from(&path), presets);
+        let mut saved = Presets::load_from(path.clone());
+        saved.list = presets.clone();
+        saved.save().unwrap();
+        assert_eq!(Presets::load_from(path.clone()).list, presets);
         // Older files miss the newer fields: they get their defaults.
         std::fs::write(&path, r#"[{"name":"Old","settings":{"exposure":1.0}}]"#).unwrap();
-        let old = load_presets_from(&path);
+        let old = Presets::load_from(path).list;
         assert_eq!(old[0].settings.exposure, 1.0);
         assert_eq!(old[0].settings.effects, Effects::default());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A full disk, a value from a newer version or another window never
+    /// cost the user's presets.
+    #[test]
+    fn presets_are_never_lost() {
+        let dir = crate::testing::test_dir("raw-presets-kept");
+        let path = dir.join("presets.json");
+        let newer = r#"[{"name":"Portrait","settings":{"profile":"Hologram"}},
+            {"name":"Night","settings":{"exposure":1.0}}]"#;
+        std::fs::write(&path, newer).unwrap();
+        let mut a = Presets::load_from(path.clone());
+        assert_eq!(a.list.len(), 1, "the readable one");
+        let mut b = Presets::load_from(path.clone());
+        a.list.push(Preset {
+            name: "LED".into(),
+            settings: Settings::default(),
+        });
+        a.save().unwrap();
+        b.list.clear();
+        b.save().unwrap();
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let names: Vec<&str> = on_disk
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["LED", "Portrait"], "Night removed by B, the rest kept");
+        assert_eq!(on_disk[1]["settings"]["profile"], "Hologram");
+        // Damaged: set aside, never overwritten.
+        std::fs::write(&path, b"[{\"name\": \"Por").unwrap();
+        let mut c = Presets::load_from(path.clone());
+        assert!(c.list.is_empty() && c.notice.is_some());
+        c.save().unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("presets.json.bak")).unwrap(),
+            b"[{\"name\": \"Por"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -368,6 +368,13 @@ impl AtelierApp {
         let canvas = doc.full_rect();
         let ppp = ctx.pixels_per_point();
         let (tw, th) = ((30.0 * ppp).round() as u32, (20.0 * ppp).round() as u32);
+        // Only those of this document's filter masks are kept.
+        let masked = |l: &&Layer| l.smart.as_ref().is_some_and(|s| s.filter_mask.is_some());
+        if self.smart.thumbs.len() > layers.iter().filter(masked).count() {
+            let ids: std::collections::HashSet<u64> =
+                layers.iter().filter(masked).map(|l| l.id).collect();
+            self.smart.thumbs.retain(|id, _| ids.contains(id));
+        }
         for &i in shown {
             let layer = &layers[i];
             let Some(m) = layer.smart.as_ref().and_then(|s| s.filter_mask.as_ref()) else {

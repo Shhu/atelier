@@ -43,8 +43,10 @@ fn yes() -> bool {
 #[derive(Serialize, Deserialize)]
 struct LinkEntry {
     path: PathBuf,
+    /// With `/` between folders whatever the system (read back with `/`
+    /// or `\`), so the folder also moves between systems.
     #[serde(default)]
-    relative: Option<PathBuf>,
+    relative: Option<String>,
     /// Modification time of the file when last read: seconds since 1970,
     /// nanoseconds.
     #[serde(default)]
@@ -172,7 +174,7 @@ pub(super) fn write_all(
             name: s.contents.name.clone(),
             link: s.link.as_ref().map(|l| LinkEntry {
                 path: l.path.clone(),
-                relative: folder.and_then(|f| relative(&l.path, f)),
+                relative: folder.and_then(|f| relative(&l.path, f)).map(|r| portable(&r)),
                 modified: l
                     .modified
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -225,24 +227,57 @@ fn relative(path: &Path, folder: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-/// A path on another machine: UNC (`\\host\share`, also `//host/share`
-/// on Windows), as written on any system.
+/// A relative path with `/` between its parts, as every system reads it.
+fn portable(relative: &Path) -> String {
+    let parts: Vec<_> = relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect();
+    parts.join("/")
+}
+
+/// [`portable`] read back, also with the `\` Windows builds wrote. Names
+/// and `..` only: never a root or a drive, so the path stays relative.
+fn from_portable(relative: &str) -> PathBuf {
+    relative
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != "." && !part.contains(':'))
+        .collect()
+}
+
+/// A path that may name another machine, so is not visited until the user
+/// asks: UNC in any spelling (two separators first, `\??\` NT paths), as
+/// written on any system. On Windows only drive-letter and relative paths
+/// are local: a rooted path without a drive, a device or any other prefix
+/// may reach a network host.
 pub(in crate::document) fn remote(path: &Path) -> bool {
     let text = path.to_string_lossy();
-    let local = ["\\\\?\\", "\\\\.\\"];
-    if text.starts_with("\\\\") && !local.iter().any(|l| text.starts_with(l)) {
+    // `\\?\C:\` and `\\.\C:\`: a local drive, written the long way.
+    let drive = |rest: &str| {
+        let b = rest.as_bytes();
+        b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+    };
+    if [r"\\?\", r"\\.\"].iter().any(|l| text.strip_prefix(l).is_some_and(drive)) {
+        return false;
+    }
+    let sep = |c: char| c == '/' || c == '\\';
+    let mut chars = text.chars();
+    if chars.next().is_some_and(sep) && chars.next().is_some_and(sep) || text.starts_with(r"\??\")
+    {
         return true;
     }
     #[cfg(windows)]
     {
         use std::path::{Component, Prefix};
-        if let Some(Component::Prefix(p)) = path.components().next() {
-            return matches!(
-                p.kind(),
-                Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..)
-            );
+        match path.components().next() {
+            Some(Component::Prefix(p)) => {
+                !matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+            }
+            Some(Component::RootDir) => true,
+            _ => false,
         }
     }
+    #[cfg(not(windows))]
     false
 }
 
@@ -306,8 +341,8 @@ pub(super) fn smart_of(
         // (Windows would connect to that host): not looked at until
         // updated, or edited.
         let exists = |p: &Path| !remote(p) && p.exists();
-        let path = match (&l.relative, folder) {
-            (Some(r), Some(f)) if !exists(&l.path) && exists(&f.join(r)) => f.join(r),
+        let path = match (l.relative.as_deref().map(from_portable), folder) {
+            (Some(r), Some(f)) if !exists(&l.path) && exists(&f.join(&r)) => f.join(r),
             _ => l.path,
         };
         Link {
@@ -380,9 +415,7 @@ mod tests {
 
     #[test]
     fn smart_objects_round_trip() {
-        let dir = std::env::temp_dir().join("atelier-native-smart");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("native-smart");
         let mut doc = Document::new(RgbaImage::from_pixel(120, 90, Rgba([255; 4])), None);
         let pattern =
             RgbaImage::from_fn(40, 30, |x, y| Rgba([(x * 6) as u8, (y * 8) as u8, 90, 255]));
@@ -466,8 +499,7 @@ mod tests {
 
     #[test]
     fn the_first_save_records_links_relative_to_its_folder() {
-        let base = std::env::temp_dir().join("atelier-link-first-save");
-        let _ = std::fs::remove_dir_all(&base);
+        let base = crate::testing::test_dir("link-first-save");
         let project = base.join("project");
         std::fs::create_dir_all(&project).unwrap();
         let linked = project.join("photo.png");
@@ -491,9 +523,88 @@ mod tests {
     }
 
     #[test]
+    fn links_in_a_subfolder_move_between_systems() {
+        let r = from_portable;
+        let assets = Path::new("assets").join("photo.png");
+        // As Windows builds wrote it, and as every build writes it now.
+        assert_eq!(r(r"assets\photo.png"), assets);
+        assert_eq!(r("assets/photo.png"), assets);
+        assert_eq!(r(r"..\shared/logo.png"), Path::new("..").join("shared").join("logo.png"));
+        // Never a root or a drive.
+        assert_eq!(r("/etc/x.png"), Path::new("etc").join("x.png"));
+        assert_eq!(r(r"C:\x.png"), Path::new("x.png"));
+        assert_eq!(portable(&Path::new("..").join(&assets)), "../assets/photo.png");
+
+        // A document linking a file in its subfolder, saved, its manifest
+        // then spelled as on Windows, opened after the folder moved.
+        let base = crate::testing::test_dir("link-separators");
+        let project = base.join("project");
+        std::fs::create_dir_all(project.join("assets")).unwrap();
+        let linked = project.join(&assets);
+        RgbaImage::from_pixel(8, 8, Rgba([0, 255, 0, 255]))
+            .save(&linked)
+            .unwrap();
+        let mut doc = Document::new(RgbaImage::from_pixel(20, 20, Rgba([255; 4])), None);
+        doc.place_file(&linked, true).unwrap();
+        let saved = project.join("doc.atelier");
+        doc.save(&saved).unwrap();
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&saved).unwrap()).unwrap();
+        let mut manifest = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name(super::super::MANIFEST).unwrap(), &mut manifest)
+            .unwrap();
+        assert!(manifest.contains(r#""assets/photo.png""#), "{manifest}");
+        let windows = manifest.replace(r#""assets/photo.png""#, r#""assets\\photo.png""#);
+        let out_path = project.join("windows.atelier");
+        let mut out = zip::ZipWriter::new(std::fs::File::create(&out_path).unwrap());
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).unwrap();
+            let name = entry.name().to_owned();
+            out.start_file(name.as_str(), zip::write::SimpleFileOptions::default())
+                .unwrap();
+            if name == super::super::MANIFEST {
+                std::io::Write::write_all(&mut out, windows.as_bytes()).unwrap();
+            } else {
+                std::io::copy(&mut entry, &mut out).unwrap();
+            }
+        }
+        out.finish().unwrap();
+        // Windows doesn't move a folder holding an open file.
+        drop(zip);
+        let moved = base.join("moved");
+        std::fs::rename(&project, &moved).unwrap();
+        let back = Document::open(&moved.join("windows.atelier")).unwrap().doc;
+        let link = back
+            .layers
+            .iter()
+            .find_map(|l| l.smart.as_ref().and_then(|s| s.link.as_ref()))
+            .unwrap();
+        assert!(!link.missing);
+        assert_eq!(link.path, moved.join(&assets));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn network_paths_are_not_visited_on_opening() {
-        assert!(remote(Path::new(r"\\host\share\x.png")));
+        for p in [
+            r"\\host\share\x.png",
+            "//host/share/x.png",
+            "//host//share//x.png",
+            r"/\host\share\x.png",
+            r"\/host\share\x.png",
+            r"\??\UNC\host\share\x.png",
+            r"\??\C:\img\x.png",
+            r"\\?\UNC\host\share\x.png",
+            r"\\.\UNC\host\share\x.png",
+            r"\\.\pipe\x",
+        ] {
+            assert!(remote(Path::new(p)), "{p}");
+        }
         assert!(!remote(Path::new(r"\\?\C:\img\x.png")));
-        assert!(!remote(Path::new("/home/me/x.png")));
+        assert!(!remote(Path::new(r"\\.\C:\img\x.png")));
+        assert!(!remote(Path::new(r"C:\img\x.png")));
+        assert!(!remote(Path::new("img/x.png")));
+        assert!(!remote(Path::new(r"..\img\x.png")));
+        // A rooted path without a drive is local on Unix only.
+        assert_eq!(remote(Path::new("/home/me/x.png")), cfg!(windows));
     }
 }

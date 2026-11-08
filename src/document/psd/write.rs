@@ -23,15 +23,48 @@ const MAX_CHANNELS: usize = 56;
 struct Pixels {
     rect: PixelRect,
     image: Option<(Arc<RgbaImage>, (i64, i64))>,
-    mask: Option<GrayImage>,
+    /// The mask's image and its origin in the canvas.
+    mask: Option<(GrayImage, (i64, i64))>,
+}
+
+/// Largest side of a layer or mask box in a PSD (version 1), past which
+/// readers refuse the file (ag-psd) or the layer (psd-tools); a PSB holds
+/// 300,000, more than Atelier's layers reach.
+const PSD_SIDE: u32 = 30_000;
+
+/// What a PSD keeps of box `r` (canvas coordinates): `r`, but along a side
+/// longer than [`PSD_SIDE`], the 30,000 px that hold the canvas (never
+/// larger) and as much of `r` as they can.
+fn psd_box(r: PixelRect, (cw, ch): (u32, u32)) -> PixelRect {
+    let axis = |at: i64, len: u32, canvas: u32| -> (i64, u32) {
+        if len <= PSD_SIDE {
+            return (at, len);
+        }
+        let side = i64::from(PSD_SIDE);
+        let lo = at.clamp((i64::from(canvas) - side).min(0), 0);
+        let (a, b) = (at.max(lo), (at + i64::from(len)).min(lo + side));
+        (a, (b - a).max(0) as u32)
+    };
+    let (x, w) = axis(r.x, r.w, cw);
+    let (y, h) = axis(r.y, r.h, ch);
+    PixelRect { x, y, w, h }
+}
+
+/// The box of a layer's mask (canvas coordinates).
+fn mask_box(l: &Layer) -> Option<PixelRect> {
+    let m = l.mask.as_ref()?;
+    let (x, y) = m.origin(l.offset);
+    let (w, h) = m.image().dimensions();
+    Some(PixelRect { x, y, w, h })
 }
 
 /// Writes `doc`, in CMYK through `cmyk` if given (the layers' pixels and
-/// the merged image converted); returns the file and what could not be
-/// kept.
+/// the merged image converted), as a PSB if `big`; returns the file and
+/// what could not be kept.
 pub(super) fn document(
     doc: &Document,
     cmyk: Option<&Conversion>,
+    big: bool,
 ) -> Result<(Vec<u8>, Vec<String>), FileError> {
     let layers = crate::document::group_overlays_for_files(doc.render_layers());
     let flat = doc.flatten();
@@ -40,7 +73,9 @@ pub(super) fn document(
     let colors = if cmyk.is_some() { 4 } else { 3 };
     let extra = MAX_CHANNELS - colors - usize::from(transparent);
     let channels = &doc.channels[..doc.channels.len().min(extra)];
-    let notes = notes(doc, &layers, channels.len(), cmyk.is_some());
+    let notes = notes(doc, &layers, channels.len(), cmyk.is_some(), big);
+    let canvas = (w, h);
+    let fit = |r: PixelRect| if big { r } else { psd_box(r, canvas) };
 
     // Records from the bottom up: a group's divider before its layers.
     let mut contents = Vec::with_capacity(layers.len());
@@ -55,7 +90,10 @@ pub(super) fn document(
         if i == doc.active {
             target = contents.len();
         }
-        contents.push(Some(layer));
+        // Clipped to the layer below in its group, as readers keep it (at
+        // the bottom of a group, clipping holds nothing).
+        let clipped = layer.clipped && i > 0 && layers[i - 1].depth >= layer.depth;
+        contents.push(Some((layer, clipped)));
     }
     let pixels: Vec<Pixels> = contents
         .iter()
@@ -66,34 +104,45 @@ pub(super) fn document(
                 w: 0,
                 h: 0,
             };
-            let layer = c.filter(|l| l.has_pixels());
+            let layer = c.map(|(l, _)| l).filter(|l| l.has_pixels());
             let rect = layer.and_then(Layer::content_bounds).unwrap_or(empty);
+            let mask = c.and_then(|(l, _)| {
+                let (m, whole) = (l.mask.as_ref()?, mask_box(l)?);
+                let kept = fit(whole);
+                let image = if kept == whole {
+                    m.image().clone()
+                } else {
+                    let (x, y) = ((kept.x - whole.x) as u32, (kept.y - whole.y) as u32);
+                    image::imageops::crop_imm(m.image(), x, y, kept.w, kept.h).to_image()
+                };
+                Some((image, (kept.x, kept.y)))
+            });
             Pixels {
-                rect,
+                rect: fit(rect),
                 image: layer.map(|l| (l.shared_image(), l.offset)),
-                mask: c.and_then(|l| l.mask.as_ref()).map(|m| m.image().clone()),
+                mask,
             }
         })
         .collect();
     for (c, p) in contents.iter().zip(&pixels) {
-        if let Some(layer) = c {
+        if let Some((layer, _)) = c {
             check_layer(layer, p.rect.w, p.rect.h)?;
-            if let Some(m) = &p.mask {
+            if let Some((m, _)) = &p.mask {
                 check_layer(layer, m.width(), m.height())?;
             }
         }
     }
-    let (channels_data, ()) = par_map(&pixels, |p| channels_of(p, cmyk), || ());
+    let (channels_data, ()) = par_map(&pixels, |p| channels_of(p, cmyk, big), || ());
     let records: Vec<Record> = contents
         .iter()
         .zip(&pixels)
         .zip(channels_data)
-        .map(|((c, p), channels)| record(*c, p.rect, channels))
+        .map(|((c, p), channels)| record(*c, p, channels, big))
         .collect();
 
     let mut out = Writer::default();
     out.bytes(b"8BPS");
-    out.u16(1);
+    out.u16(if big { 2 } else { 1 });
     out.zeros(6);
     out.u16((colors + usize::from(transparent) + channels.len()) as u16);
     out.u32(h);
@@ -105,10 +154,25 @@ pub(super) fn document(
         Some(c) => Some(c.to.icc().as_slice()),
         None => doc.icc_profile.as_deref().map(Vec::as_slice),
     };
-    out.block(1, |r| resources(r, doc, target, channels, icc));
-    let mut overflow = false;
-    out.block(1, |s| {
-        s.block(4, |info| {
+    // Linked layers: a group id per record (dividers and unlinked layers 0).
+    let mut groups: Vec<u64> = Vec::new();
+    let links: Vec<u16> = contents
+        .iter()
+        .map(|c| match c.and_then(|(l, _)| l.link) {
+            Some(link) => {
+                let at = groups.iter().position(|&g| g == link).unwrap_or_else(|| {
+                    groups.push(link);
+                    groups.len() - 1
+                });
+                (at + 1).min(u16::MAX as usize) as u16
+            }
+            None => 0,
+        })
+        .collect();
+    out.block(1, |r| resources(r, doc, target, &links, channels, icc));
+    let at = out.data.len();
+    out.sized(big, 1, |s| {
+        s.sized(big, 4, |info| {
             let count = records.len() as i16;
             info.i16(if transparent { -count } else { count });
             for rec in &records {
@@ -119,23 +183,45 @@ pub(super) fn document(
                     info.bytes(data);
                 }
             }
-            overflow = info.data.len() > u32::MAX as usize;
         });
         // Global layer mask info: none.
         s.u32(0);
         pattern::write_block(s, &pattern::used(&layers));
+        unicode_path_names(s, doc, big);
     });
-    merged(&mut out, &flat, transparent, channels, cmyk);
-    if overflow || out.data.len() > u32::MAX as usize {
-        return Err(FileError::TooLarge(w, h));
+    // A PSD's lengths take 4 bytes: past 4 GB, only a PSB holds the layers.
+    if !big && out.data.len() - at - 4 > u32::MAX as usize {
+        return Err(FileError::PsdOver4Gb);
     }
+    merged(&mut out, &flat, transparent, channels, cmyk, big);
     Ok((out.data, notes))
 }
 
 /// What a Photoshop document of `doc` can't keep, `kept` of its alpha
 /// channels written.
-fn notes(doc: &Document, layers: &[Layer], kept: usize, cmyk: bool) -> Vec<String> {
+fn notes(doc: &Document, layers: &[Layer], kept: usize, cmyk: bool, big: bool) -> Vec<String> {
     let mut notes = Vec::new();
+    // Layers and masks past a PSD's sides, cropped.
+    let canvas = (doc.width(), doc.height());
+    let cropped: Vec<&str> = layers
+        .iter()
+        .filter(|_| !big)
+        .filter(|l| {
+            let pixels = l.has_pixels().then(|| l.content_bounds()).flatten();
+            pixels
+                .into_iter()
+                .chain(mask_box(l))
+                .any(|r| psd_box(r, canvas) != r)
+        })
+        .map(|l| l.name.as_str())
+        .collect();
+    if !cropped.is_empty() {
+        notes.push(t!(
+            "psd14-psd-note-cropped",
+            names = cropped.join(", "),
+            max = PSD_SIDE
+        ));
+    }
     if kept < doc.channels.len() {
         notes.push(t!(
             "xchg-psd-note-channels",
@@ -180,7 +266,7 @@ fn notes(doc: &Document, layers: &[Layer], kept: usize, cmyk: bool) -> Vec<Strin
 
 /// What saving `doc` as a Photoshop document would lose (as [`document`]
 /// says it, without writing).
-pub(super) fn losses(doc: &Document) -> Vec<String> {
+pub(super) fn losses(doc: &Document, big: bool) -> Vec<String> {
     // The channels [`document`] keeps; only that many need the merged
     // image's transparency to tell.
     let mut kept = doc.channels.len();
@@ -188,7 +274,7 @@ pub(super) fn losses(doc: &Document) -> Vec<String> {
         let transparent = doc.flatten().pixels().any(|p| p.0[3] < 255);
         kept = kept.min(MAX_CHANNELS - 3 - usize::from(transparent));
     }
-    notes(doc, &doc.render_layers(), kept, false)
+    notes(doc, &doc.render_layers(), kept, false, big)
 }
 
 /// First index of the block of group `g` (itself and the layers below it
@@ -281,6 +367,7 @@ fn resources(
     r: &mut Writer,
     doc: &Document,
     target: usize,
+    links: &[u16],
     channels: &[crate::document::Channel],
     icc: Option<&[u8]>,
 ) {
@@ -311,6 +398,8 @@ fn resources(
             },
             // Placed for another canvas: left out (said by `notes`).
             id if PLACED.contains(&id) && !placed_fit(doc) => return,
+            // The clipping path names a saved path: gone with it.
+            2999 if !clipping_path_kept(&res.data, doc) => return,
             _ => Cow::Borrowed(&res.data[..]),
         };
         r.bytes(b"8BIM");
@@ -322,7 +411,8 @@ fn resources(
     };
     // Crop's Resolution: the document's value over what the file said.
     let density = doc.file_metadata.image.as_ref().and_then(|m| m.density);
-    let fixed = |ppi: f64| (ppi.clamp(1.0, 65000.0) * 65536.0).round() as u32;
+    // Signed 16.16 (Fixed).
+    let fixed = |ppi: f64| (ppi.clamp(1.0, 32767.0) * 65536.0).round() as u32;
     match (kept.iter().find(|k| k.id == 1005), density) {
         (Some(res), None) => raw(r, res),
         // Its units stay, the values in pixels per inch.
@@ -347,6 +437,11 @@ fn resources(
         raw(r, res);
     }
     resource(r, 1024, &|r| r.u16(target as u16));
+    if links.iter().any(|&l| l != 0) {
+        resource(r, 1026, &|r| links.iter().for_each(|&l| r.u16(l)));
+        // Each link group on (none is turned off for a while).
+        resource(r, 1072, &|r| links.iter().for_each(|_| r.u8(1)));
+    }
     if !doc.guides.is_empty() {
         resource(r, 1032, &|r| {
             r.u32(1);
@@ -409,6 +504,42 @@ fn resources(
     }
 }
 
+/// Whether the clipping path (resource 2999: a path's name first) names
+/// one of the saved paths written.
+fn clipping_path_kept(data: &[u8], doc: &Document) -> bool {
+    let Some(name) = data.first().and_then(|&n| data.get(1..=n as usize)) else {
+        return false;
+    };
+    doc.paths
+        .iter()
+        .take(SAVED_PATHS)
+        .any(|p| mac_roman(&p.name) == name)
+}
+
+/// The saved paths' names in full ("pths", global: resources only hold
+/// them in Mac OS Roman), when one needs it.
+fn unicode_path_names(w: &mut Writer, doc: &Document, big: bool) {
+    use super::descriptor::{Descriptor, Value};
+    let paths = &doc.paths[..doc.paths.len().min(SAVED_PATHS)];
+    let roman = |n: &str| super::read::mac_roman(&mac_roman(n)) == n;
+    if paths.iter().all(|p| roman(&p.name)) {
+        return;
+    }
+    let list = paths
+        .iter()
+        .map(|p| {
+            let info = Descriptor::new(b"pathInfoClass")
+                .with(b"pathUnicodeName", Value::Text(p.name.clone()));
+            Value::Object(info)
+        })
+        .collect();
+    let d = Descriptor::new(b"pathsDataClass").with(b"pathList", Value::List(list));
+    w.tagged_sized(b"pths", big, |w| {
+        w.u32(16);
+        d.write(w);
+    });
+}
+
 /// Saved paths a file holds (resources 2000 to 2997).
 pub(super) const SAVED_PATHS: usize = 998;
 
@@ -442,22 +573,30 @@ fn empty_channel() -> Vec<u8> {
     vec![0, 0]
 }
 
-/// A plane of `w` × `h` bytes, RLE compressed (row lengths, then rows).
-fn rle(plane: &[u8], w: usize, h: usize) -> Vec<u8> {
+/// A plane of `w` × `h` bytes, RLE compressed (row lengths, then rows):
+/// lengths of 2 bytes, 4 in a PSB (`big`). A PSD's rows are at most
+/// [`PSD_SIDE`] bytes, which pack within 2 bytes.
+fn rle(plane: &[u8], w: usize, h: usize, big: bool) -> Vec<u8> {
     if w == 0 || h == 0 {
         return empty_channel();
     }
+    debug_assert!(big || w <= PSD_SIDE as usize);
     let mut rows = Vec::with_capacity(plane.len() / 2);
     let mut lengths = Vec::with_capacity(h);
     for row in plane.chunks_exact(w) {
         let at = rows.len();
         pack_row(row, &mut rows);
-        lengths.push((rows.len() - at) as u16);
+        lengths.push(rows.len() - at);
     }
-    let mut out = Vec::with_capacity(2 + 2 * h + rows.len());
+    let count = if big { 4 } else { 2 };
+    let mut out = Vec::with_capacity(2 + count * h + rows.len());
     out.extend_from_slice(&1u16.to_be_bytes());
     for n in lengths {
-        out.extend_from_slice(&n.to_be_bytes());
+        if big {
+            out.extend_from_slice(&(n as u32).to_be_bytes());
+        } else {
+            out.extend_from_slice(&(n as u16).to_be_bytes());
+        }
     }
     out.extend_from_slice(&rows);
     out
@@ -491,7 +630,8 @@ fn cmyk_planes(rgb: &[u8], cmyk: &Conversion) -> [Vec<u8>; 4] {
 
 /// The compressed channels of a record: transparency, red, green, blue
 /// (or cyan, magenta, yellow, black), then the mask.
-fn channels_of(p: &Pixels, cmyk: Option<&Conversion>) -> Vec<(i16, Vec<u8>)> {
+fn channels_of(p: &Pixels, cmyk: Option<&Conversion>, big: bool) -> Vec<(i16, Vec<u8>)> {
+    let rle = |plane: &[u8], w, h| rle(plane, w, h, big);
     let r = p.rect;
     let (w, h) = (r.w as usize, r.h as usize);
     let mut channels: Vec<(i16, Vec<u8>)> = match (&p.image, cmyk) {
@@ -526,15 +666,23 @@ fn channels_of(p: &Pixels, cmyk: Option<&Conversion>) -> Vec<(i16, Vec<u8>)> {
                 .collect()
         }
     };
-    if let Some(m) = &p.mask {
+    if let Some((m, _)) = &p.mask {
         let (mw, mh) = m.dimensions();
         channels.push((-2, rle(m.as_raw(), mw as usize, mh as usize)));
     }
     channels
 }
 
-fn record(layer: Option<&Layer>, rect: PixelRect, channels: Vec<(i16, Vec<u8>)>) -> Record {
-    let mask = layer.and_then(|l| l.mask.as_ref().map(|m| (m, m.origin(l.offset))));
+fn record(
+    content: Option<(&Layer, bool)>,
+    p: &Pixels,
+    channels: Vec<(i16, Vec<u8>)>,
+    big: bool,
+) -> Record {
+    let (layer, rect) = (content.map(|(l, _)| l), p.rect);
+    let mask = layer
+        .and_then(|l| l.mask.as_ref())
+        .zip(p.mask.as_ref().map(|(image, at)| (image.dimensions(), *at)));
 
     let mut w = Writer::default();
     w.i32(rect.y as i32);
@@ -544,20 +692,24 @@ fn record(layer: Option<&Layer>, rect: PixelRect, channels: Vec<(i16, Vec<u8>)>)
     w.u16(channels.len() as u16);
     for (id, data) in &channels {
         w.i16(*id);
-        w.u32(data.len() as u32);
+        if big {
+            w.u64(data.len() as u64);
+        } else {
+            w.u32(data.len() as u32);
+        }
     }
     w.bytes(b"8BIM");
     let blend = layer.map_or(BlendMode::Normal, |l| l.blend);
     w.bytes(blend_key(blend));
     w.u8(layer.map_or(255, |l| (l.opacity.clamp(0.0, 1.0) * 255.0).round() as u8));
-    w.u8(u8::from(layer.is_some_and(|l| l.clipped)));
+    w.u8(u8::from(content.is_some_and(|(_, clipped)| clipped)));
     let pixels = layer.is_some_and(Layer::has_pixels);
     let hidden = layer.is_some_and(|l| !l.visible);
     w.u8(8 | if pixels { 0 } else { 16 } | if hidden { 2 } else { 0 });
     w.u8(0);
     w.block(1, |x| {
         match mask {
-            Some((m, (ox, oy))) => x.block(1, |x| mask_data(x, m, (ox, oy))),
+            Some((m, (size, at))) => x.block(1, |x| mask_data(x, m, size, at)),
             None => x.u32(0),
         }
         // Blending ranges: none.
@@ -597,8 +749,10 @@ fn record(layer: Option<&Layer>, rect: PixelRect, channels: Vec<(i16, Vec<u8>)>)
             ),
             kind => adjust::write(kind, x),
         }
+        // The overlay's phase counts from the record's box once it is kept:
+        // the default one, unused, stays out of the file.
         let mut styles = l.effects.clone();
-        if !l.is_group() {
+        if !l.is_group() && styles.pattern_overlay.in_use() {
             let overlay = &mut styles.pattern_overlay.fill;
             *overlay = pattern::rebased(overlay, l.offset, rect);
         }
@@ -620,8 +774,7 @@ fn record(layer: Option<&Layer>, rect: PixelRect, channels: Vec<(i16, Vec<u8>)>)
 
 /// A mask's data: its box, default color, flags and, if not neutral, its
 /// density and feather.
-fn mask_data(x: &mut Writer, m: &crate::document::Mask, (ox, oy): (i64, i64)) {
-    let (mw, mh) = m.image().dimensions();
+fn mask_data(x: &mut Writer, m: &crate::document::Mask, (mw, mh): (u32, u32), (ox, oy): (i64, i64)) {
     x.i32(oy as i32);
     x.i32(ox as i32);
     x.i32((oy + mh as i64) as i32);
@@ -647,6 +800,7 @@ fn merged(
     transparent: bool,
     channels: &[crate::document::Channel],
     cmyk: Option<&Conversion>,
+    big: bool,
 ) {
     let (w, h) = (flat.width() as usize, flat.height() as usize);
     let matted = |c: usize| -> Vec<u8> {
@@ -668,13 +822,14 @@ fn merged(
         planes.push(flat.pixels().map(|p| p.0[3]).collect());
     }
     planes.extend(channels.iter().map(|c| fit(&c.mask, w, h)));
-    let (packed, ()) = par_map(&planes, |p| rle(p, w, h), || ());
+    let (packed, ()) = par_map(&planes, |p| rle(p, w, h, big), || ());
+    let counts = 2 + if big { 4 } else { 2 } * h;
     out.u16(1);
     for p in &packed {
-        out.bytes(&p[2..2 + 2 * h]);
+        out.bytes(&p[2..counts]);
     }
     for p in &packed {
-        out.bytes(&p[2 + 2 * h..]);
+        out.bytes(&p[counts..]);
     }
 }
 

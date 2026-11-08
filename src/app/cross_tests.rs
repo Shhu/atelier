@@ -62,7 +62,7 @@ fn drag(h: &mut Harness<'static, AtelierApp>, from: Pos2, to: Pos2) {
 
 /// Runs frames until `done`, the workers having their time.
 fn settle(h: &mut Harness<'static, AtelierApp>, done: impl Fn(&AtelierApp) -> bool) {
-    for _ in 0..800 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if done(h.state()) {
             return;
@@ -73,9 +73,7 @@ fn settle(h: &mut Harness<'static, AtelierApp>, done: impl Fn(&AtelierApp) -> bo
 }
 
 fn temp(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("atelier-cross-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("a folder");
-    dir
+    crate::testing::test_dir(&format!("cross-{name}"))
 }
 
 fn tile() -> Arc<Pattern> {
@@ -184,7 +182,7 @@ fn the_navigator_follows_a_crop() {
     );
 
     // And the thumbnail is made again, of what the crop left.
-    for _ in 0..800 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if h.state_mut().navigator_current() {
             return;

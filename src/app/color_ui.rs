@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::dialogs::{DialogSpec, block, floating_dialog, gap_between_blocks, help};
+use super::file_dialog::Filter as _;
 use super::*;
 use crate::cms::{self, Conversion, Grayscale, Intent, Lut, Profile, Proof, Space, WorkingRgb};
 use crate::document::ProofSetup;
@@ -89,8 +90,7 @@ impl ColorSettings {
             return;
         }
         if let Ok(json) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::create_dir_all(crate::config::dir());
-            let _ = std::fs::write(settings_file(), json);
+            let _ = crate::store::write(&settings_file(), &json);
         }
     }
 
@@ -146,6 +146,8 @@ pub(super) struct ColorUi {
     monitor: Profile,
     /// The system gave the monitor's profile.
     monitor_known: bool,
+    /// Its next profiles, from [`cms::watch_monitor`].
+    monitor_changes: Option<std::sync::mpsc::Receiver<Option<Vec<u8>>>>,
     pub(super) dialog: Option<Dialog>,
     /// The canvas's table for what it shows (fingerprint): `None`, the
     /// colors as they are.
@@ -161,6 +163,7 @@ impl ColorUi {
             settings,
             monitor_known: monitor.is_some(),
             monitor: monitor.unwrap_or_else(|| cms::srgb().clone()),
+            monitor_changes: None,
             dialog: None,
             canvas: None,
         }
@@ -172,6 +175,27 @@ impl ColorUi {
 
     pub(super) fn working_cmyk(&self) -> &Profile {
         &self.cmyk
+    }
+
+    /// Follows the profile of the monitor showing `window` (its HWND on
+    /// Windows): the canvas is shown again through each new one.
+    pub(super) fn watch_monitor(&mut self, window: Option<isize>, ctx: &egui::Context) {
+        let (send, receive) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        cms::watch_monitor(window, move |icc| {
+            ctx.request_repaint();
+            send.send(icc).is_ok()
+        });
+        self.monitor_changes = Some(receive);
+    }
+
+    /// The monitor's new profile, once the watch saw one.
+    pub(super) fn poll_monitor(&mut self) {
+        let Some(changes) = &self.monitor_changes else { return };
+        let Some(icc) = changes.try_iter().last() else { return };
+        let monitor = icc.and_then(cms::monitor_profile_of);
+        self.monitor_known = monitor.is_some();
+        self.monitor = monitor.unwrap_or_else(|| cms::srgb().clone());
     }
 
     /// The monitor's profile, and whether the system gave it (otherwise
@@ -408,9 +432,9 @@ fn intent_combo(ui: &mut egui::Ui, id: &str, intent: &mut Intent) {
 /// A profile file the user picks; `None` if cancelled, or not of `space`
 /// (said in the status).
 fn load_profile(space: Space, status: &mut super::status_bar::Status) -> Option<(PathBuf, Profile)> {
-    let path = rfd::FileDialog::new()
+    let path = file_dialog::new()
         .set_title(t!("color-load-title"))
-        .add_filter(t!("color-filter-profiles"), &["icc", "icm"])
+        .filter(t!("color-filter-profiles"), &["icc", "icm"])
         .pick_file()?;
     match Profile::load(&path).filter(|p| p.space() == space) {
         Some(p) => Some((path, p)),

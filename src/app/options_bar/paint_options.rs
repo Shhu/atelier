@@ -183,6 +183,9 @@ impl AtelierApp {
                 pressure_size(ui, &mut p.pressure_size);
             }
             _ => {
+                if self.tool == Tool::Brush {
+                    blend_mode(ui, "brush_mode", &mut p.mode);
+                }
                 let text = percent(self.opacity);
                 ui_kit::scrub(
                     ui,
@@ -444,24 +447,7 @@ impl AtelierApp {
         }
         sep(ui);
 
-        let mode = g.mode.label();
-        ui_kit::combo(
-            ui,
-            "gradient_mode",
-            Some(&t!("paint-mode")),
-            &mode,
-            150.0,
-            |ui| {
-                for (i, group) in BlendMode::GROUPS.iter().enumerate() {
-                    if i > 0 {
-                        ui.separator();
-                    }
-                    for &m in *group {
-                        ui.selectable_value(&mut g.mode, m, m.label());
-                    }
-                }
-            },
-        );
+        blend_mode(ui, "gradient_mode", &mut g.mode);
         let text = i18n::percent(format!("{:.0}", g.opacity * 100.0));
         ui_kit::scrub(
             ui,
@@ -478,4 +464,19 @@ impl AtelierApp {
             .on_hover_text(t!("paint-gradient-transparency-tip"));
         trailing_hint(ui, &t!("paint-gradient-hint"));
     }
+}
+
+/// The Mode drop-down of a painting tool: the layers' blend modes.
+fn blend_mode(ui: &mut egui::Ui, id: &str, mode: &mut BlendMode) {
+    let label = mode.label();
+    ui_kit::combo(ui, id, Some(&t!("paint-mode")), &label, 150.0, |ui| {
+        for (i, group) in BlendMode::GROUPS.iter().enumerate() {
+            if i > 0 {
+                ui.separator();
+            }
+            for &m in *group {
+                ui.selectable_value(mode, m, m.label());
+            }
+        }
+    });
 }

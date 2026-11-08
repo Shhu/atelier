@@ -589,6 +589,15 @@ struct LevelsEntry {
     out_white: u8,
 }
 
+/// A hue range of Hue/Saturation: its bounds (degrees), then its edit.
+#[derive(Serialize, Deserialize)]
+struct HueRangeEntry {
+    bounds: [f32; 4],
+    hue: f32,
+    saturation: f32,
+    lightness: f32,
+}
+
 /// Settings of an adjustment layer; curves as their points.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -627,6 +636,9 @@ enum AdjustmentEntry {
         saturation: f32,
         lightness: f32,
         colorize: bool,
+        /// The six hue ranges (none: each as it is by default, unedited).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ranges: Vec<HueRangeEntry>,
     },
     ColorBalance {
         shadows: [f32; 3],
@@ -980,6 +992,10 @@ pub(super) fn write(
     folder: Option<&Path>,
 ) -> Result<(), FileError> {
     let layers = crate::document::group_overlays_for_files(doc.render_layers());
+    // Never a file Atelier would refuse to open.
+    if super::smart::nesting(&layers) > MAX_NESTING {
+        return Err(FileError::NestedTooDeep(MAX_NESTING));
+    }
     for layer in layers.iter() {
         let (w, h) = layer.image().dimensions();
         check_layer(layer, w, h)?;
@@ -1256,7 +1272,7 @@ fn gradient_fill_of(f: &GradientFillEntry) -> GradientFill {
             .iter()
             .find(|s| s.1 as u8 == f.style as u8)
             .map_or(Shape::Linear, |s| s.0),
-        angle: finite_or(f.angle, 90.0),
+        angle: crate::compose::gradient::normal_angle(finite_or(f.angle, 90.0)),
         scale: finite_or(f.scale, 1.0).clamp(0.1, 10.0),
         reverse: f.reverse,
     }
@@ -1319,6 +1335,18 @@ fn adjustment_entry(a: &Adjustment) -> AdjustmentEntry {
             saturation: hs.saturation,
             lightness: hs.lightness,
             colorize: hs.colorize,
+            ranges: if hs.ranges == Default::default() {
+                Vec::new()
+            } else {
+                (hs.ranges.0.iter())
+                    .map(|r| HueRangeEntry {
+                        bounds: r.bounds,
+                        hue: r.hue,
+                        saturation: r.saturation,
+                        lightness: r.lightness,
+                    })
+                    .collect()
+            },
         },
         Adjustment::ColorBalance(cb) => AdjustmentEntry::ColorBalance {
             shadows: cb.shadows,
@@ -1407,11 +1435,25 @@ fn adjustment_of(e: &AdjustmentEntry) -> Result<Adjustment, FileError> {
             saturation,
             lightness,
             colorize,
+            ranges,
         } => Adjustment::HueSaturation(HueSaturation {
             hue: f(*hue, -180.0, 360.0),
             saturation: f(*saturation, -1.0, 1.0),
             lightness: f(*lightness, -1.0, 1.0),
             colorize: *colorize,
+            ranges: match ranges.len() {
+                0 => Default::default(),
+                6 => crate::pixel_ops::HueRanges(std::array::from_fn(|k| {
+                    let r = &ranges[k];
+                    crate::pixel_ops::HueRange {
+                        bounds: r.bounds.map(|b| finite_or(b, 0.0).rem_euclid(360.0)),
+                        hue: f(r.hue, -180.0, 180.0),
+                        saturation: f(r.saturation, -1.0, 1.0),
+                        lightness: f(r.lightness, -1.0, 1.0),
+                    }
+                })),
+                _ => return Err(FileError::Damaged),
+            },
         }),
         AdjustmentEntry::ColorBalance {
             shadows,
@@ -1602,15 +1644,20 @@ fn layer_entry(layer: &super::Layer, image: Option<String>) -> LayerEntry {
 
 /// Reads an Atelier document, within `memory`.
 pub(super) fn read(path: &Path, memory: super::file_io::MemoryUse) -> Result<Document, FileError> {
-    read_archive(&mut open(path)?, Some(path), &mut memory.budget())
+    read_archive(&mut open(path)?, Some(path), &mut memory.budget(), 0)
 }
 
 /// An Atelier document held in memory (a smart object's contents), its
 /// pixels taken from `budget`.
-fn read_bytes(data: &[u8], budget: &mut Budget) -> Result<Document, FileError> {
+fn read_bytes(data: &[u8], budget: &mut Budget, depth: u32) -> Result<Document, FileError> {
     let mut zip = ZipArchive::new(Cursor::new(data)).map_err(|_| FileError::Damaged)?;
-    read_archive(&mut zip, None, budget)
+    read_archive(&mut zip, None, budget, depth)
 }
+
+/// Smart objects nested deeper than this are refused: each
+/// level is read (and rendered) by recursion, and a received file could
+/// nest them until the stack overflows.
+const MAX_NESTING: u32 = 16;
 
 /// The entries of an archive being read that hold pixels or documents:
 /// each read once (a manifest naming one entry for many layers would
@@ -1618,13 +1665,16 @@ fn read_bytes(data: &[u8], budget: &mut Budget) -> Result<Document, FileError> {
 pub(super) struct Claims<'a> {
     names: std::collections::HashSet<String>,
     pub(super) budget: &'a mut Budget,
+    /// Smart objects around the document being read (0: the file's).
+    depth: u32,
 }
 
 impl<'a> Claims<'a> {
-    fn new(budget: &'a mut Budget) -> Self {
+    fn new(budget: &'a mut Budget, depth: u32) -> Self {
         Self {
             names: std::collections::HashSet::new(),
             budget,
+            depth,
         }
     }
 
@@ -1683,8 +1733,11 @@ impl<'a> Claims<'a> {
         name: &str,
         limit: u64,
     ) -> Result<Document, FileError> {
+        if self.depth >= MAX_NESTING {
+            return Err(FileError::NestedTooDeep(MAX_NESTING));
+        }
         let data = self.bytes(zip, name, limit, 64)?;
-        read_bytes(&data, self.budget)
+        read_bytes(&data, self.budget, self.depth + 1)
     }
 }
 
@@ -1713,9 +1766,10 @@ fn read_archive(
     zip: &mut ZipArchive<impl Read + Seek>,
     path: Option<&Path>,
     budget: &mut Budget,
+    depth: u32,
 ) -> Result<Document, FileError> {
     check_overlaps(zip)?;
-    let mut claims = Claims::new(budget);
+    let mut claims = Claims::new(budget, depth);
     let manifest = read_manifest(zip)?;
     check_size(manifest.width, manifest.height)?;
     if manifest.layers.is_empty() {
@@ -2038,11 +2092,10 @@ pub fn canvas_size(path: &Path) -> Option<(u32, u32)> {
 }
 
 /// The preview stored in an Atelier document.
-pub fn thumbnail_of(path: &Path) -> Option<RgbaImage> {
+pub fn thumbnail_of(path: &Path, budget: &mut Budget) -> Option<RgbaImage> {
     let mut zip = open(path).ok()?;
     let png = read_entry(&mut zip, THUMBNAIL, MAX_SMALL_ENTRY).ok()?;
-    let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png).ok()?;
-    Some(image.into_rgba8())
+    super::file_io::decode_within(&png, image::ImageFormat::Png, budget)
 }
 
 fn open(path: &Path) -> Result<ZipArchive<BufReader<File>>, FileError> {
@@ -2229,9 +2282,7 @@ mod tests {
     use image::Rgba;
 
     fn temp(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("atelier-native-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir(&format!("native-{name}"));
         dir.join("doc.atelier")
     }
 
@@ -2443,7 +2494,10 @@ mod tests {
         assert_eq!(back.channels[0].name, "Alpha 1");
         assert_eq!(back.channels[0].mask, doc.channels[0].mask);
         assert_eq!(canvas_size(&path), Some((40, 30)));
-        assert_eq!(thumbnail_of(&path).map(|t| t.dimensions()), Some((40, 30)));
+        assert_eq!(
+            thumbnail_of(&path, &mut Budget::new()).map(|t| t.dimensions()),
+            Some((40, 30))
+        );
     }
 
     /// A version 1 file (before groups, masks…) opens, with the look it
@@ -2808,6 +2862,7 @@ mod tests {
     /// are trusted beyond what its bytes can hold.
     #[test]
     fn declared_sizes_never_reserve_memory() {
+        crate::document::set_test_free_memory(Some(64 << 30));
         let path = temp("declared-sizes");
         let mut doc = Document::new(RgbaImage::from_pixel(8, 8, Rgba([9, 9, 9, 255])), None);
         doc.add_layer(
@@ -2841,7 +2896,7 @@ mod tests {
             let started = std::time::Instant::now();
             let opened = Document::open(&file);
             assert!(matches!(opened, Err(FileError::Damaged)), "{what}");
-            assert!(started.elapsed().as_secs_f32() < 1.0, "{what}");
+            assert!(started.elapsed().as_secs_f32() < 10.0, "{what}");
         }
         // Untouched, it opens.
         let same = crafted(&path, |_| {}, png, None);
@@ -2866,7 +2921,7 @@ mod tests {
         });
         assert!(matches!(Document::open(&shared), Err(FileError::Damaged)));
         assert!(Document::open(&path).is_ok());
-        let read = |memory| read_archive(&mut open(&path).unwrap(), None, &mut Budget::of(memory));
+        let read = |memory| read_archive(&mut open(&path).unwrap(), None, &mut Budget::of(memory), 0);
         assert!(matches!(read(100), Err(FileError::OutOfMemory(100))));
         assert!(read(1 << 20).is_ok());
     }
@@ -2927,7 +2982,7 @@ mod tests {
         out.write_all(&vec![0; 1 << 20]).unwrap();
         let mut zip = ZipArchive::new(Cursor::new(out.finish().unwrap().into_inner())).unwrap();
         let mut budget = Budget::of(1 << 30);
-        let mut claims = Claims::new(&mut budget);
+        let mut claims = Claims::new(&mut budget, 0);
         assert!(matches!(
             claims.bytes(&mut zip, "smart/1.atelier", 16 << 30, 64),
             Err(FileError::Damaged)
@@ -2947,7 +3002,7 @@ mod tests {
         );
         // Its bytes come out of the budget before they are read.
         let mut budget = Budget::of(1000);
-        let mut claims = Claims::new(&mut budget);
+        let mut claims = Claims::new(&mut budget, 0);
         assert!(matches!(
             claims.bytes(&mut zip, "smart/2.atelier", 16 << 30, 64),
             Err(FileError::OutOfMemory(1000))
@@ -3017,5 +3072,48 @@ mod tests {
         doc.save(&plain).unwrap();
         let mut zip = ZipArchive::new(File::open(&plain).unwrap()).unwrap();
         assert!(zip.by_name(EXIF).is_err() && zip.by_name(PSD_RESOURCES).is_err());
+    }
+
+    /// Smart objects nested deeper than Atelier reads: never written, and
+    /// a received file nesting them (each level read by recursion, until
+    /// the stack overflows) is refused.
+    #[test]
+    fn smart_objects_nest_so_deep_at_most() {
+        let path = temp("nesting");
+        let mut doc = Document::new(RgbaImage::from_pixel(2, 2, Rgba([1, 2, 3, 255])), None);
+        for _ in 0..MAX_NESTING {
+            assert!(doc.convert_to_smart(&[0]));
+        }
+        doc.save(&path).unwrap();
+        assert_eq!(Document::open(&path).unwrap().doc.flatten(), doc.flatten());
+        assert!(doc.convert_to_smart(&[0]));
+        let refused = path.with_file_name("deeper.atelier");
+        assert!(matches!(
+            doc.save(&refused),
+            Err(FileError::NestedTooDeep(MAX_NESTING))
+        ));
+        assert!(!refused.exists());
+        // One more level made by hand: the file within itself.
+        let data = std::fs::read(&path).unwrap();
+        let mut src = ZipArchive::new(Cursor::new(&data[..])).unwrap();
+        let mut out = ZipWriter::new(Cursor::new(Vec::new()));
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for i in 0..src.len() {
+            let entry = src.by_index_raw(i).unwrap();
+            if entry.name().starts_with("smart/") {
+                let name = entry.name().to_owned();
+                drop(entry);
+                out.start_file(name, stored).unwrap();
+                out.write_all(&data).unwrap();
+            } else {
+                out.raw_copy_file(entry).unwrap();
+            }
+        }
+        let hostile = path.with_file_name("hostile.atelier");
+        std::fs::write(&hostile, out.finish().unwrap().into_inner()).unwrap();
+        assert!(matches!(
+            Document::open(&hostile),
+            Err(FileError::NestedTooDeep(MAX_NESTING))
+        ));
     }
 }

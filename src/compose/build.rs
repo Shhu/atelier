@@ -136,8 +136,21 @@ fn hash_of(value: impl Hash) -> u64 {
     h.finish()
 }
 
-fn debug_hash(value: &impl std::fmt::Debug) -> u64 {
-    hash_of(format!("{value:?}"))
+/// Fingerprint of a value through its debug text (settings holding
+/// floats), written straight into the hasher.
+pub fn debug_hash(value: &impl std::fmt::Debug) -> u64 {
+    struct Feed(std::collections::hash_map::DefaultHasher);
+    impl std::fmt::Write for Feed {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0.write(s.as_bytes());
+            Ok(())
+        }
+    }
+    use std::fmt::Write as _;
+    use std::hash::Hasher as _;
+    let mut feed = Feed(std::collections::hash_map::DefaultHasher::new());
+    let _ = write!(feed, "{value:?}");
+    feed.0.finish()
 }
 
 /// `r` (canvas pixels) in pixels of `level`: the blocks it touches.
@@ -553,7 +566,7 @@ impl Builder<'_, '_> {
 }
 
 /// What the display compares from one frame to the next, for one layer.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Sig {
     pub id: u64,
     /// Where it is in the structure (a change: everything again).
@@ -663,8 +676,7 @@ pub fn signatures(layers: &[Layer], opts: &Options) -> Vec<Sig> {
             l.offset,
             (l.image().width(), l.image().height()),
             mask,
-            debug_hash(&l.kind),
-            debug_hash(&l.effects),
+            l.look_hash(),
             (
                 styles.as_ref().map(|s| s.version),
                 pixels,

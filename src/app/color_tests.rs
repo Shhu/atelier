@@ -239,8 +239,7 @@ fn picker_shows_cmyk_and_offers_the_closest_printable_color() {
 #[test]
 fn export_with_use_proof_setup_writes_cmyk() {
     let h = app();
-    let dir = std::env::temp_dir().join(format!("atelier-cmyk-export-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("cmyk-export");
     let path = dir.join("print.jpg");
     let options = crate::export::ExportOptions {
         format: crate::document::ExportFormat::Jpeg,

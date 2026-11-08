@@ -168,7 +168,15 @@ pub fn decode(data: &[u8], limit: usize) -> Option<Vec<u16>> {
                 }
                 let predictor = *segment.get(1 + 2 * ns)? as u32;
                 let transform = (*segment.get(3 + 2 * ns)? & 0x0F) as u32;
-                if ns != components || components == 0 || width == 0 || height == 0 {
+                // Lossless JPEG samples have 2 to 16 bits, less the
+                // point transform.
+                if ns != components
+                    || components == 0
+                    || width == 0
+                    || height == 0
+                    || !(2..=16).contains(&precision)
+                    || transform >= precision
+                {
                     return None;
                 }
                 if width * height * components > limit {
@@ -391,5 +399,13 @@ pub mod tests {
         );
         // A frame larger than the tile it is for: refused, not decoded.
         assert!(super::decode(&jpeg, samples.len() - 1).is_none());
+        // A precision no lossless JPEG has (fuzzing: the first prediction
+        // shifted past 32 bits): refused.
+        let sof = jpeg.windows(2).position(|m| m == [0xFF, 0xC3]).unwrap();
+        for precision in [0, 1, 40, 255] {
+            let mut wrong = jpeg.clone();
+            wrong[sof + 4] = precision;
+            assert!(super::decode(&wrong, samples.len()).is_none(), "{precision}");
+        }
     }
 }

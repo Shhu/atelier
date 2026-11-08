@@ -1500,19 +1500,31 @@ fn gauss_plane(v: &mut [f32], w: usize, h: usize, sigma: f32) {
     }
 }
 
-fn premultiply8(p: [u8; 4]) -> [u8; 4] {
-    let a = p[3] as u32;
-    let c = |v: u8| ((v as u32 * a + 127) / 255) as u8;
-    [c(p[0]), c(p[1]), c(p[2]), p[3]]
+/// A premultiplied pixel without rounding: color × alpha, alpha × 255
+/// (every straight color at every alpha stays distinct, see [`straight16`]).
+fn premultiply16(p: [u8; 4]) -> [u16; 4] {
+    let a = u16::from(p[3]);
+    [
+        u16::from(p[0]) * a,
+        u16::from(p[1]) * a,
+        u16::from(p[2]) * a,
+        a * 255,
+    ]
 }
 
-fn unpremultiply8(p: [u8; 4]) -> [u8; 4] {
-    let a = p[3] as u32;
+/// Back from [`premultiply16`] (exact for its values).
+fn straight16(p: [u16; 4]) -> [u8; 4] {
+    let a = (u32::from(p[3]) + 127) / 255;
     if a == 0 {
         return [0; 4];
     }
-    let c = |v: u8| ((v as u32 * 255 + a / 2) / a).min(255) as u8;
-    [c(p[0]), c(p[1]), c(p[2]), p[3]]
+    let c = |v: u16| ((u32::from(v) + a / 2) / a).min(255) as u8;
+    [c(p[0]), c(p[1]), c(p[2]), a as u8]
+}
+
+/// The 8-bit level of a [`premultiply16`] value.
+fn level8(v: u16) -> u8 {
+    ((u32::from(v) + 127) / 255) as u8
 }
 
 /// Surface Blur of a tile: each channel averaged over the square of radius
@@ -1590,41 +1602,55 @@ fn surface_blur_tile(t: &Tile, r: usize, threshold: f32) -> Vec<[u8; 4]> {
 
 /// Median of each channel (premultiplied) over the square of radius `r`
 /// (the tile's halo); with a threshold (Dust & Scratches), only where the
-/// pixel differs from it by more than that.
+/// pixel differs from it by more than that. Ranked by 8-bit level; the
+/// result is the mean of the window's exact values at the median level, so
+/// a flat area keeps its colors at any opacity.
 fn median_tile(t: &Tile, r: usize, threshold: Option<u8>) -> Vec<[u8; 4]> {
-    let px: Vec<[u8; 4]> = t.px.iter().map(|&p| premultiply8(p)).collect();
+    let exact: Vec<[u16; 4]> = t.px.iter().map(|&p| premultiply16(p)).collect();
+    let px: Vec<[u8; 4]> = exact.iter().map(|p| p.map(level8)).collect();
     let (iw, ih) = t.inner();
     let k = 2 * r + 1;
     let rank = (k * k / 2) as u32;
-    let mut out = vec![[0u8; 4]; iw * ih];
+    let mut out = vec![[0u16; 4]; iw * ih];
     let mut hist = [0u32; 256];
+    // Sum of the exact values at each level.
+    let mut sums = [0u64; 256];
     let cancel = cancel_flag();
     for c in 0..4 {
         // The window snakes through the tile (right along even rows, left
         // along odd ones): each step swaps one row or column of it.
         hist.fill(0);
+        sums.fill(0);
         for wy in 0..k {
-            for p in &px[wy * t.w..wy * t.w + k] {
-                hist[p[c] as usize] += 1;
+            for i in wy * t.w..wy * t.w + k {
+                hist[px[i][c] as usize] += 1;
+                sums[px[i][c] as usize] += u64::from(exact[i][c]);
             }
         }
         // Median: the value with `rank` values below it; `below` counts them.
         let (mut median, mut below) = (0usize, 0u32);
-        let swap = |hist: &mut [u32; 256], gone: u8, new: u8, below: &mut u32, median: usize| {
-            hist[gone as usize] -= 1;
-            hist[new as usize] += 1;
-            *below =
-                *below - u32::from((gone as usize) < median) + u32::from((new as usize) < median);
+        // Swaps the pixel at `gone` for the one at `new` in the window.
+        let swap = |(hist, sums): (&mut [u32; 256], &mut [u64; 256]),
+                    gone: usize,
+                    new: usize,
+                    below: &mut u32,
+                    median: usize| {
+            let (g, n) = (px[gone][c] as usize, px[new][c] as usize);
+            hist[g] -= 1;
+            hist[n] += 1;
+            sums[g] -= u64::from(exact[gone][c]);
+            sums[n] += u64::from(exact[new][c]);
+            *below = *below - u32::from(g < median) + u32::from(n < median);
         };
         let mut x = 0;
         for y in 0..ih {
             if cancelled(&cancel) {
-                return out;
+                return out.into_iter().map(straight16).collect();
             }
             if y > 0 {
                 for wx in x..x + k {
-                    let (gone, new) = (px[(y - 1) * t.w + wx][c], px[(y + k - 1) * t.w + wx][c]);
-                    swap(&mut hist, gone, new, &mut below, median);
+                    let (gone, new) = ((y - 1) * t.w + wx, (y + k - 1) * t.w + wx);
+                    swap((&mut hist, &mut sums), gone, new, &mut below, median);
                 }
             }
             for step in 0..iw {
@@ -1637,8 +1663,8 @@ fn median_tile(t: &Tile, r: usize, threshold: Option<u8>) -> Vec<[u8; 4]> {
                         (x + k, x)
                     };
                     for wy in y..y + k {
-                        let (gone, new) = (px[wy * t.w + gone_x][c], px[wy * t.w + new_x][c]);
-                        swap(&mut hist, gone, new, &mut below, median);
+                        let (gone, new) = (wy * t.w + gone_x, wy * t.w + new_x);
+                        swap((&mut hist, &mut sums), gone, new, &mut below, median);
                     }
                 }
                 while below > rank {
@@ -1649,25 +1675,25 @@ fn median_tile(t: &Tile, r: usize, threshold: Option<u8>) -> Vec<[u8; 4]> {
                     below += hist[median];
                     median += 1;
                 }
-                let own = px[(y + r) * t.w + x + r][c];
-                let m = median as u8;
+                let own = (y + r) * t.w + x + r;
+                let n = u64::from(hist[median]);
+                let m = ((sums[median] + n / 2) / n) as u16;
                 out[y * iw + x][c] = match threshold {
-                    Some(t) if own.abs_diff(m) <= t => own,
+                    Some(t) if px[own][c].abs_diff(median as u8) <= t => exact[own][c],
                     _ => m,
                 };
             }
         }
     }
-    out.iter_mut().for_each(|p| *p = unpremultiply8(*p));
-    out
+    out.into_iter().map(straight16).collect()
 }
 
 /// Minimum or Maximum of each channel (premultiplied: transparency spreads
 /// or shrinks with the colors) over the square of radius `r`.
 fn extreme_tile(t: &Tile, r: usize, max: bool) -> Vec<[u8; 4]> {
-    let px: Vec<[u8; 4]> = t.px.iter().map(|&p| premultiply8(p)).collect();
+    let px: Vec<[u16; 4]> = t.px.iter().map(|&p| premultiply16(p)).collect();
     let (iw, ih) = t.inner();
-    let mut out = vec![if max { [0; 4] } else { [255; 4] }; iw * ih];
+    let mut out = vec![if max { [0; 4] } else { [u16::MAX; 4] }; iw * ih];
     // Rows, then columns.
     let mut rows = Vec::with_capacity(iw * t.h);
     for y in 0..t.h {
@@ -1681,8 +1707,7 @@ fn extreme_tile(t: &Tile, r: usize, max: bool) -> Vec<[u8; 4]> {
             out[y * iw + x] = e;
         }
     }
-    out.iter_mut().for_each(|p| *p = unpremultiply8(*p));
-    out
+    out.into_iter().map(straight16).collect()
 }
 
 /// Below this radius, [`disc_rects`] gives the exact disc.
@@ -1745,19 +1770,11 @@ fn round_extreme(image: &mut RgbaImage, r: usize, max: bool) {
     if w == 0 || h == 0 {
         return;
     }
-    let neutral = if max { [0; 4] } else { [255; 4] };
-    let mut px = vec![[0u8; 4]; w * h];
-    let raw = image.as_raw();
-    par_rows(&mut px, w, |y0, band| {
-        for (i, p) in band.iter_mut().enumerate() {
-            let at = (y0 * w + i) * 4;
-            *p = premultiply8([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
-        }
-    });
+    let neutral = if max { [0; 4] } else { [u16::MAX; 4] };
     let mut out = vec![neutral; w * h];
     let mut rows = vec![neutral; w * h];
     let cancel = cancel_flag();
-    let pick = move |a: [u8; 4], b: [u8; 4]| -> [u8; 4] {
+    let pick = move |a: [u16; 4], b: [u16; 4]| -> [u16; 4] {
         std::array::from_fn(|c| if max { a[c].max(b[c]) } else { a[c].min(b[c]) })
     };
     for (rw, rh) in disc_rects(r) {
@@ -1765,15 +1782,16 @@ fn round_extreme(image: &mut RgbaImage, r: usize, max: bool) {
             return;
         }
         // Each row over ±rw.
-        let px = &px;
+        let raw = image.as_raw();
         par_rows(&mut rows, w, |y0, band| {
             let (mut line, mut buffers) = (Vec::new(), (Vec::new(), Vec::new()));
             for (j, row) in band.chunks_exact_mut(w).enumerate() {
-                let src = &px[(y0 + j) * w..(y0 + j + 1) * w];
+                let src = &raw[(y0 + j) * w * 4..(y0 + j + 1) * w * 4];
+                let at = |i: usize| premultiply16([src[i * 4], src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3]]);
                 line.clear();
-                line.extend(std::iter::repeat_n(src[0], rw));
-                line.extend_from_slice(src);
-                line.extend(std::iter::repeat_n(src[w - 1], rw));
+                line.extend(std::iter::repeat_n(at(0), rw));
+                line.extend((0..w).map(at));
+                line.extend(std::iter::repeat_n(at(w - 1), rw));
                 row.fill(neutral);
                 extreme_into(&line, rw, max, &mut buffers, row);
             }
@@ -1825,7 +1843,7 @@ fn round_extreme(image: &mut RgbaImage, r: usize, max: bool) {
     let raw = image.as_mut();
     par_rows(raw, w * 4, |y0, band| {
         for (i, p) in band.chunks_exact_mut(4).enumerate() {
-            p.copy_from_slice(&unpremultiply8(out[y0 * w + i]));
+            p.copy_from_slice(&straight16(out[y0 * w + i]));
         }
     });
 }
@@ -1833,15 +1851,15 @@ fn round_extreme(image: &mut RgbaImage, r: usize, max: bool) {
 /// [`running_extreme`] combined into `out` (its extreme with each
 /// window's), with `buffers` reused from a call to the next.
 fn extreme_into(
-    line: &[[u8; 4]],
+    line: &[[u16; 4]],
     r: usize,
     max: bool,
-    (from_start, to_end): &mut (Vec<[u8; 4]>, Vec<[u8; 4]>),
-    out: &mut [[u8; 4]],
+    (from_start, to_end): &mut (Vec<[u16; 4]>, Vec<[u16; 4]>),
+    out: &mut [[u16; 4]],
 ) {
     let k = 2 * r + 1;
     let n = line.len();
-    let pick = |a: [u8; 4], b: [u8; 4]| -> [u8; 4] {
+    let pick = |a: [u16; 4], b: [u16; 4]| -> [u16; 4] {
         std::array::from_fn(|c| if max { a[c].max(b[c]) } else { a[c].min(b[c]) })
     };
     from_start.clear();
@@ -1865,10 +1883,10 @@ fn extreme_into(
 
 /// Extreme of each window of 2r + 1 values of `line` (van Herk / Gil-Werman:
 /// three comparisons per value whatever `r`).
-fn running_extreme(line: &[[u8; 4]], r: usize, max: bool) -> Vec<[u8; 4]> {
+fn running_extreme(line: &[[u16; 4]], r: usize, max: bool) -> Vec<[u16; 4]> {
     let k = 2 * r + 1;
     let n = line.len();
-    let pick = |a: [u8; 4], b: [u8; 4]| -> [u8; 4] {
+    let pick = |a: [u16; 4], b: [u16; 4]| -> [u16; 4] {
         std::array::from_fn(|c| if max { a[c].max(b[c]) } else { a[c].min(b[c]) })
     };
     // From the start of each block of k, and to its end.
@@ -2686,6 +2704,39 @@ mod tests {
             [110, 110, 110, 255],
             "within the threshold"
         );
+    }
+
+    #[test]
+    fn median_and_extremes_keep_the_colors_of_soft_pixels() {
+        // A flat area: every filter that picks a neighbor's value leaves it.
+        for alpha in [1, 3, 10, 20, 40, 80, 254] {
+            let px = Rgba([200, 101, 47, alpha]);
+            let image = RgbaImage::from_pixel(24, 24, px);
+            let morph = |roundness| Morphology {
+                radius: 2.0,
+                roundness,
+            };
+            for filter in [
+                Filter::Median { radius: 2.0 },
+                Filter::DustAndScratches {
+                    radius: 2.0,
+                    threshold: 0.0,
+                },
+                Filter::Minimum(morph(false)),
+                Filter::Maximum(morph(false)),
+                Filter::Minimum(morph(true)),
+                Filter::Maximum(morph(true)),
+            ] {
+                let mut out = image.clone();
+                filter.apply(&mut out, (0, 0));
+                assert_eq!(out.get_pixel(12, 12), &px, "{filter:?} at alpha {alpha}");
+            }
+        }
+        // A speck in it is replaced by the area's exact color.
+        let mut image = RgbaImage::from_pixel(9, 9, Rgba([200, 101, 47, 10]));
+        image.put_pixel(4, 4, Rgba([0, 255, 0, 10]));
+        Filter::Median { radius: 1.0 }.apply(&mut image, (0, 0));
+        assert_eq!(image.get_pixel(4, 4).0, [200, 101, 47, 10]);
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! "Select Subject" without AI: GrabCut (Rother et al., 2004).
 //!
-//! The image border and transparent pixels are background; the rest is
-//! first assumed to be the subject. Then we alternate: color models
+//! Transparent pixels and the image border are background: certain where
+//! the border has its usual colors, probable elsewhere (a subject running
+//! off the frame keeps its part there); the rest is first assumed to be the
+//! subject. Then we alternate: color models
 //! (Gaussian mixtures) of the subject and the background, then a graph cut
 //! that picks the most likely side for each pixel while keeping a boundary
 //! that follows the image's edges.
@@ -41,16 +43,21 @@ pub fn select_subject(image: &RgbaImage) -> GrayImage {
         .map(|p| [p.0[0] as f32, p.0[1] as f32, p.0[2] as f32])
         .collect();
 
-    // Certain background: the border and transparency.
+    // Background: transparency, and the border. Where the border has its
+    // dominant colors it is certain; elsewhere (a subject touching the
+    // frame) only probable, left to the cut.
     let border = ((w.min(h) as f32 * 0.04).round() as usize).max(1);
-    let fixed_bg: Vec<bool> = (0..w * h)
+    let edge: Vec<bool> = (0..w * h)
         .map(|i| {
             let (x, y) = (i % w, i / w);
-            let edge = x < border || y < border || x >= w - border || y >= h - border;
-            edge || small.as_raw()[i * 4 + 3] < 128
+            x < border || y < border || x >= w - border || y >= h - border
         })
         .collect();
-    let mut fg: Vec<bool> = fixed_bg.iter().map(|&b| !b).collect();
+    let usual = border_colors(&colors, &edge);
+    let fixed_bg: Vec<bool> = (0..w * h)
+        .map(|i| small.as_raw()[i * 4 + 3] < 128 || (edge[i] && usual(colors[i])))
+        .collect();
+    let mut fg: Vec<bool> = (0..w * h).map(|i| !fixed_bg[i] && !edge[i]).collect();
     if fg.iter().all(|&f| !f) {
         return GrayImage::new(w0, h0);
     }
@@ -118,6 +125,33 @@ pub fn select_subject(image: &RgbaImage) -> GrayImage {
     } else {
         image::imageops::resize(&refined, w0, h0, FilterType::Triangle)
     }
+}
+
+/// Bins of color (8 levels per channel) holding three quarters of the
+/// border's pixels, the most frequent first: whether a color is one of them.
+fn border_colors(colors: &[[f32; 3]], edge: &[bool]) -> impl Fn([f32; 3]) -> bool + use<> {
+    let bin = |c: [f32; 3]| {
+        let q = |v: f32| (v.clamp(0.0, 255.0) as usize) >> 5;
+        q(c[0]) << 6 | q(c[1]) << 3 | q(c[2])
+    };
+    let mut counts = [0usize; 512];
+    let mut total = 0;
+    for (c, _) in colors.iter().zip(edge).filter(|&(_, &e)| e) {
+        counts[bin(*c)] += 1;
+        total += 1;
+    }
+    let mut order: Vec<usize> = (0..512).collect();
+    order.sort_by_key(|&b| std::cmp::Reverse(counts[b]));
+    let mut usual = [false; 512];
+    let mut taken = 0;
+    for b in order {
+        if taken * 4 >= total * 3 || counts[b] == 0 {
+            break;
+        }
+        usual[b] = true;
+        taken += counts[b];
+    }
+    move |c| usual[bin(c)]
 }
 
 /// Guided filter (He et al.): the mask locally takes the form of an affine
@@ -747,10 +781,39 @@ mod tests {
         let mask = select_subject(&img);
         assert_eq!(mask.dimensions(), (120, 90));
         assert_eq!(mask.get_pixel(60, 45).0[0], 255);
+        assert_eq!(mask.get_pixel(119, 89).0[0], 0);
         assert_eq!(mask.get_pixel(5, 5).0[0], 0);
         assert_eq!(mask.get_pixel(60, 45 + 32).0[0], 0);
         let selected = mask.pixels().filter(|p| p.0[0] >= 128).count() as f32;
         let disc = std::f32::consts::PI * 25.0 * 25.0;
         assert!((selected / disc - 1.0).abs() < 0.1, "{selected} vs {disc}");
+    }
+
+    /// A subject cut by the frame (a portrait cropped at the shoulders)
+    /// keeps its part along the border; the background there stays out.
+    #[test]
+    fn keeps_a_subject_running_off_the_frame() {
+        let inside = |x: u32, y: u32| {
+            let (dx, dy) = (x as f32 - 80.0, y as f32 - 120.0);
+            dx * dx + dy * dy < 50.0 * 50.0
+        };
+        let img = RgbaImage::from_fn(160, 120, |x, y| {
+            if inside(x, y) {
+                let v = if (x / 3 + y / 3) % 2 == 0 { 40 } else { 70 };
+                image::Rgba([200, v, v, 255])
+            } else {
+                image::Rgba([230, 235, 240, 255])
+            }
+        });
+        let mask = select_subject(&img);
+        // In the bottom band (4 % of the short side, about 5 px).
+        assert!(mask.get_pixel(80, 118).0[0] >= 128, "{}", mask.get_pixel(80, 118).0[0]);
+        assert!(mask.get_pixel(80, 90).0[0] >= 128);
+        assert!(mask.get_pixel(10, 118).0[0] < 128 && mask.get_pixel(150, 5).0[0] < 128);
+        let wrong = mask
+            .enumerate_pixels()
+            .filter(|(x, y, m)| (m.0[0] >= 128) != inside(*x, *y))
+            .count();
+        assert!(wrong < 300, "{wrong} pixels wrong");
     }
 }

@@ -311,7 +311,7 @@ fn histogram_statistics_use_the_decimal_comma() {
     let mean = t!("panels8-histogram-mean");
     let computing = t!("panels8-histogram-computing");
     let mut text = String::new();
-    for _ in 0..400 {
+    for _ in crate::testing::patience() {
         h.run_steps(2);
         std::thread::sleep(std::time::Duration::from_millis(5));
         text = h

@@ -182,7 +182,7 @@ pub(super) struct Filters {
     enlarged: Option<Enlarged>,
     /// Preview of an adjustment (or Make Transparent) being computed: what
     /// for (the layer's id and revision), and the computation.
-    adjust: Option<(LayerPreview, u64, u64, Job<RgbaImage>)>,
+    adjust: Option<(LayerPreview, u64, u64, Job<Previewed>)>,
     /// The preview whose computation failed (for that layer and revision):
     /// not started again.
     adjust_failed: Option<(LayerPreview, u64, u64)>,
@@ -205,8 +205,12 @@ struct AdjustApplying {
     layer: u64,
     rev: u64,
     started: f64,
-    job: Job<RgbaImage>,
+    job: Job<Previewed>,
 }
+
+/// An adjustment's result, and it reduced for the display (see
+/// [`super::render::Reduction`]).
+type Previewed = (RgbaImage, super::render::Reduction);
 
 /// A layer enlarged to the canvas for a dialog's preview: its document and
 /// id, its revision once enlarged, and its pixels, offset and revision
@@ -227,6 +231,11 @@ impl Filters {
             || self.fade.is_some()
             || self.stroke_open
             || self.processing.is_some()
+    }
+
+    /// A filter or adjustment being computed, not in the document yet.
+    pub(super) fn working(&self) -> bool {
+        self.applying.is_some() || self.adjusting.is_some() || self.processing.is_some()
     }
 
     /// The settings a filter's dialog opens with (an action's step).
@@ -346,7 +355,15 @@ struct Applying {
     /// The layer was an editable text.
     rasterized: bool,
     started: f64,
-    job: Job<RgbaImage>,
+    job: Work,
+}
+
+/// How a filter's result comes.
+enum Work {
+    Job(Job<RgbaImage>),
+    /// The dialog's preview, shown until it replaces the layer's pixels
+    /// (moved then, not copied).
+    Shown(Arc<RgbaImage>),
 }
 
 /// Size and canvas position of an image.
@@ -598,7 +615,7 @@ impl AtelierApp {
 
     /// The dialog of `filter`, opening with its settings.
     pub(super) fn open_filter_dialog(&mut self, filter: Filter) {
-        if self.refuse_hidden_target() {
+        if self.refuse_hidden_target() || self.refuse_empty_layer() {
             return;
         }
         let selection = self.selection.clone();
@@ -701,7 +718,7 @@ impl AtelierApp {
         filter: Filter,
         ready: Option<(Ready, ImageBox)>,
     ) {
-        if self.refuse_hidden_target() {
+        if self.refuse_hidden_target() || self.refuse_empty_layer() {
             return;
         }
         if self.smart_filters_apply() {
@@ -744,17 +761,14 @@ impl AtelierApp {
         let placed = (target.image.dimensions(), target.offset);
         let ready = ready.filter(|(_, fits)| *fits == placed).map(|(r, _)| r);
         let job = match ready {
-            Some(Ready::Job(job)) => job,
-            Some(Ready::Image(image)) => {
-                // A job that gives at once what the preview holds.
-                Job::spawn(&self.ctx, 0, [0; 4], None, move || (*image).clone())
-            }
+            Some(Ready::Job(job)) => Work::Job(job),
+            Some(Ready::Image(image)) => Work::Shown(image),
             None => {
                 let reach = filter.reach().unwrap_or(0);
                 let name = format!("Filter: {:?}", filter.kind());
-                Job::spawn(&self.ctx, 0, [0; 4], Some(name), move || {
+                Work::Job(Job::spawn(&self.ctx, 0, [0; 4], Some(name), move || {
                     target.process(reach, |image, origin| filter.apply(image, origin))
-                })
+                }))
             }
         };
         self.filters.applying = Some(Applying {
@@ -772,13 +786,24 @@ impl AtelierApp {
         let Some(applying) = &self.filters.applying else {
             return;
         };
-        let result = match applying.job.poll() {
-            Ok(Some(image)) => Some(image),
-            Ok(None) => return,
-            Err(()) => None,
+        let result = match &applying.job {
+            Work::Job(job) => match job.poll() {
+                Ok(Some(image)) => Some(image),
+                Ok(None) => return,
+                Err(()) => None,
+            },
+            Work::Shown(_) => None,
         };
         let Some(a) = self.filters.applying.take() else {
             return;
+        };
+        let result = match a.job {
+            Work::Job(_) => result,
+            Work::Shown(image) => {
+                // The preview leaves the canvas as the result replaces it.
+                self.end_layer_preview();
+                Some(Arc::try_unwrap(image).unwrap_or_else(|a| (*a).clone()))
+            }
         };
         let name = title(a.filter.kind());
         if let Some(doc) = &mut self.doc
@@ -829,12 +854,12 @@ impl AtelierApp {
         if let Some((done, layer, rev_then, job)) = &self.filters.adjust {
             match job.poll() {
                 Ok(None) => return,
-                Ok(Some(image)) => {
+                Ok(Some((image, reduced))) => {
                     let done = done.clone();
                     let current = (*layer, *rev_then) == (id, rev);
                     self.filters.adjust = None;
                     if current {
-                        self.show_preview(done, image);
+                        self.show_preview(done, image, reduced);
                     }
                 }
                 Err(()) => {
@@ -884,8 +909,12 @@ impl AtelierApp {
             LayerPreview::Fade(_) => "Fade preview".to_owned(),
             LayerPreview::Filter(_) => "Layer preview".to_owned(),
         };
+        // Reduced there for the canvas too.
+        let level = self.reduction_level();
         let job = Job::spawn(&self.ctx, 0, [0; 4], Some(name), move || {
-            target.process(0, |image, _| wanted.apply(image))
+            let image = target.process(0, |image, _| wanted.apply(image));
+            let reduced = super::render::reduction(level, &image);
+            (image, reduced)
         });
         self.filters.adjust = Some((preview, id, rev, job));
     }
@@ -907,7 +936,8 @@ impl AtelierApp {
             .preview_shown
             .take_if(|p| (&p.preview, p.layer, p.rev) == (&wanted, id, rev))
         {
-            return self.put_adjustment(adjustment, Arc::unwrap_or_clone(p.image));
+            let reduced = p.reduced;
+            return self.put_adjustment(adjustment, Arc::unwrap_or_clone(p.image), reduced);
         }
         self.preview_shown = None;
         let Some(doc) = &self.doc else { return };
@@ -924,8 +954,11 @@ impl AtelierApp {
                 };
                 let name = format!("Adjustment: {:?}", adjustment.kind());
                 let a = adjustment.clone();
+                let level = self.reduction_level();
                 Job::spawn(&self.ctx, 0, [0; 4], Some(name), move || {
-                    target.process(0, |image, _| a.apply(image))
+                    let image = target.process(0, |image, _| a.apply(image));
+                    let reduced = super::render::reduction(level, &image);
+                    (image, reduced)
                 })
             }
         };
@@ -941,12 +974,27 @@ impl AtelierApp {
 
     /// The adjustment's result `image` replaces the target's pixels (one
     /// step; computed again here if it no longer fits them), and is
-    /// recorded.
-    fn put_adjustment(&mut self, adjustment: crate::pixel_ops::Adjustment, image: RgbaImage) {
+    /// recorded. `reduced`: it for the display.
+    fn put_adjustment(
+        &mut self,
+        adjustment: crate::pixel_ops::Adjustment,
+        image: RgbaImage,
+        reduced: super::render::Reduction,
+    ) {
         let Some(doc) = &mut self.doc else { return };
-        if doc.put_processed_active(adjustment.title(), image)
-            || doc.adjust_active(&adjustment, self.selection.as_ref())
-        {
+        // What the display shows is these pixels as they are (not a mask,
+        // nor transparency kept from the layer's).
+        let as_is = !doc.mask_targeted() && doc.quick_mask().is_none() && !doc.alpha_locked();
+        if doc.put_processed_active(adjustment.title(), image) {
+            let layer = doc.active_layer();
+            let (id, rev) = (layer.id, layer.rev());
+            let (at, size) = (layer.offset, layer.image().dimensions());
+            doc.mark_fade();
+            if as_is {
+                self.seed_reduction(id, rev, at, size, &reduced);
+            }
+            self.status.set(t!("dialog-adjust-applied", name = adjustment.title()));
+        } else if doc.adjust_active(&adjustment, self.selection.as_ref()) {
             doc.mark_fade();
             self.status.set(t!("dialog-adjust-applied", name = adjustment.title()));
         } else {
@@ -973,7 +1021,7 @@ impl AtelierApp {
                 }
                 return true;
             }
-            Ok(Some(image)) => Some(image),
+            Ok(Some(done)) => Some(done),
             Err(()) => None,
         };
         let a = self.filters.adjusting.take().expect("checked above");
@@ -981,7 +1029,7 @@ impl AtelierApp {
             (d.uid(), d.active_layer().id, d.target_rev()) == (a.doc, a.layer, a.rev)
         });
         match result {
-            Some(image) if current => self.put_adjustment(a.adjustment, image),
+            Some((image, reduced)) if current => self.put_adjustment(a.adjustment, image, reduced),
             Some(_) => {}
             None => {
                 let adjustment = a.adjustment;
@@ -1013,6 +1061,17 @@ impl AtelierApp {
     /// pixels (Fill, adjustments, Make Transparent, Content-Aware Fill).
     pub(super) fn refuse_hidden_layer(&mut self) -> bool {
         self.refuse_hidden(false)
+    }
+
+    /// An empty layer (see [`Document::target_empty`]): the pixel
+    /// commands say so, rather than record a step that changes nothing.
+    /// Returns `true` then.
+    pub(super) fn refuse_empty_layer(&mut self) -> bool {
+        if self.doc.as_ref().is_some_and(Document::target_empty) {
+            self.status_cannot(t!("xform-status-empty"));
+            return true;
+        }
+        false
     }
 
     fn refuse_hidden(&mut self, filter: bool) -> bool {
@@ -1340,7 +1399,7 @@ impl AtelierApp {
                 {
                     let preview = LayerPreview::Filter(job.key);
                     dialog.drafted = dialog.canvas_draft.then_some(job.key);
-                    self.show_preview_at(preview, image, target.offset);
+                    self.show_preview_at(preview, image, target.offset, None);
                 }
             }
             Some(Err(())) => {
@@ -2306,7 +2365,7 @@ mod tests {
 
     /// Runs frames until the background work is done.
     fn settle(h: &mut Harness<'static, AtelierApp>, done: impl Fn(&AtelierApp) -> bool) {
-        for _ in 0..500 {
+        for _ in crate::testing::patience() {
             h.run_steps(1);
             if done(h.state()) {
                 return;
@@ -2930,23 +2989,37 @@ mod tests {
         harness
     }
 
+    /// [`AtelierApp::active_histogram`] once counted (on its worker).
+    fn counted(app: &mut AtelierApp, ctx: &egui::Context) -> crate::pixel_ops::Histograms {
+        let start = std::time::Instant::now();
+        loop {
+            let h = app.active_histogram(ctx);
+            if app.histogram_job.is_none() {
+                return h.expect("histograms");
+            }
+            assert!(start.elapsed().as_secs() < 30, "histograms never counted");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// Levels and Curves show the histogram of the targeted mask, and of
     /// the quick mask, as they are now: not the one of before an edit.
     #[test]
     fn histogram_follows_mask_and_quick_mask_edits() {
         use crate::pixel_ops::Adjustment;
         let mut h = sized(300, 200);
+        let ctx = h.ctx.clone();
         let app = h.state_mut();
         let doc = app.doc.as_mut().unwrap();
         assert!(doc.add_mask(crate::document::NewMask::RevealAll, None));
         doc.target_mask(true);
-        let white = app.active_histogram().unwrap();
+        let white = counted(app, &ctx);
         assert_eq!(white[0][0], 0);
         let doc = app.doc.as_mut().unwrap();
         assert!(doc.adjust_active(&Adjustment::Invert, None));
-        let cached = app.active_histogram().unwrap();
+        let cached = counted(app, &ctx);
         app.histogram = None;
-        assert_eq!(cached, app.active_histogram().unwrap(), "layer mask");
+        assert_eq!(cached, counted(app, &ctx), "layer mask");
         assert_eq!(cached[0][255], 0, "the mask is black now");
 
         let doc = app.doc.as_mut().unwrap();
@@ -2967,12 +3040,12 @@ mod tests {
         let app = h.state_mut();
         assert!(app.doc.as_ref().unwrap().quick_mask().is_some());
         app.selection = None;
-        let before = app.active_histogram().unwrap();
+        let before = counted(app, &ctx);
         let doc = app.doc.as_mut().unwrap();
         assert!(doc.adjust_active(&Adjustment::Invert, None));
-        let cached = app.active_histogram().unwrap();
+        let cached = counted(app, &ctx);
         app.histogram = None;
-        assert_eq!(cached, app.active_histogram().unwrap(), "quick mask");
+        assert_eq!(cached, counted(app, &ctx), "quick mask");
         assert_ne!(cached, before);
     }
 

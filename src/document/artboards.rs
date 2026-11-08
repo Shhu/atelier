@@ -784,9 +784,7 @@ mod tests {
     #[test]
     fn artboards_to_files_writes_one_file_each() {
         let doc = boards();
-        let folder = std::env::temp_dir().join("atelier-artboards-to-files");
-        let _ = std::fs::remove_dir_all(&folder);
-        std::fs::create_dir_all(&folder).unwrap();
+        let folder = crate::testing::test_dir("artboards-to-files");
         let files = ArtboardFiles {
             folder: folder.clone(),
             prefix: "doc_".into(),

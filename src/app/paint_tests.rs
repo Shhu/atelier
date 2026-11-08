@@ -424,3 +424,142 @@ fn gradient_on_a_targeted_mask() {
     assert!(mask.value_at(195, 50, layer.offset) > 0.95);
     assert_eq!(layer.pixel_at(5, 50), Some(WHITE));
 }
+
+/// A press at `from` with `modifiers` held, moves through `path`, release
+/// (canvas coordinates), `before_move` before each event (pen).
+fn drag_with(
+    h: &mut Harness<'static, AtelierApp>,
+    modifiers: Modifiers,
+    from: (f32, f32),
+    path: &[(f32, f32)],
+    before_move: impl Fn(&mut Harness<'static, AtelierApp>, Pos2),
+) {
+    let button = |h: &mut Harness<'static, AtelierApp>, pos, pressed| {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers,
+        })
+    };
+    h.event(egui::Event::ModifiersChanged(modifiers));
+    let start = screen(h, from.0, from.1);
+    h.hover_at(start);
+    h.run_steps(1);
+    before_move(&mut *h, start);
+    button(&mut *h, start, true);
+    h.run_steps(1);
+    let mut end = start;
+    for &(x, y) in path {
+        end = screen(h, x, y);
+        before_move(&mut *h, end);
+        h.hover_at(end);
+        h.run_steps(1);
+    }
+    button(&mut *h, end, false);
+    h.run_steps(1);
+    h.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+    h.run_steps(2);
+}
+
+/// Shift + click after a pen stroke: the line is at the pen's pressure
+/// from its start (no full-size dab where it joins the stroke).
+#[test]
+fn shift_click_line_keeps_the_pen_pressure() {
+    let mut h = app(Tool::Brush);
+    let app = h.state_mut();
+    (app.brush_size, app.hardness, app.paint.smoothing) = (30.0, 1.0, 0.0);
+    app.paint.pressure_size = true;
+    drag(&mut h, (20.0, 50.0), &[(40.0, 50.0), (60.0, 50.0)], pen(0.2));
+    assert!(band(&h, 50) <= 7, "pen stroke: {}", band(&h, 50));
+    drag_with(&mut h, Modifiers::SHIFT, (160.0, 50.0), &[], pen(0.2));
+    for x in [66, 72, 110, 150] {
+        let b = band(&h, x);
+        assert!((1..=7).contains(&b), "line at x = {x}: {b}");
+    }
+}
+
+/// Smoothing is the Brush's and the Eraser's: a Dodge stroke follows the
+/// pointer into the corner.
+#[test]
+fn smoothing_applies_to_the_brush_and_eraser_only() {
+    let gray = RgbaImage::from_fn(200, 100, |x, _| Rgba([(x / 2) as u8 + 60, 100, 100, 255]));
+    let corner = |tool: Tool| {
+        let mut h = app(tool);
+        let app = h.state_mut();
+        app.doc = Some(Document::new(gray.clone(), None));
+        (app.brush_size, app.hardness, app.paint.smoothing) = (8.0, 1.0, 1.0);
+        let mut path: Vec<(f32, f32)> = (1..=13).map(|i| (20.0 + i as f32 * 10.0, 20.0)).collect();
+        path.extend((1..=7).map(|i| (150.0, 20.0 + i as f32 * 10.0)));
+        drag(&mut h, (20.0, 20.0), &path, no_pen);
+        pixel(&h, 150, 20) != gray.get_pixel(150, 20).0
+    };
+    assert!(corner(Tool::Dodge), "Dodge reaches the corner");
+    assert!(!corner(Tool::Brush), "the Brush cuts it");
+}
+
+/// Shift + drag: the stroke stays on the axis it starts along.
+#[test]
+fn shift_drag_paints_a_straight_line() {
+    let mut h = app(Tool::Brush);
+    let a = h.state_mut();
+    (a.brush_size, a.hardness, a.paint.smoothing) = (4.0, 1.0, 0.0);
+    let path = [(40.0, 52.0), (80.0, 57.0), (120.0, 62.0), (160.0, 66.0)];
+    drag_with(&mut h, Modifiers::SHIFT, (20.0, 50.0), &path, no_pen);
+    assert_ne!(pixel(&h, 160, 50), WHITE, "on the horizontal");
+    assert_eq!(pixel(&h, 160, 66), WHITE);
+    assert_eq!(pixel(&h, 120, 62), WHITE);
+    // Vertical (a new document: no last stroke for Shift to join).
+    let mut h = app(Tool::Brush);
+    let a = h.state_mut();
+    (a.brush_size, a.hardness, a.paint.smoothing) = (4.0, 1.0, 0.0);
+    let path = [(102.0, 30.0), (106.0, 50.0), (111.0, 80.0)];
+    drag_with(&mut h, Modifiers::SHIFT, (100.0, 10.0), &path, no_pen);
+    assert_ne!(pixel(&h, 100, 80), WHITE, "on the vertical");
+    assert_eq!(pixel(&h, 111, 80), WHITE);
+}
+
+/// The Brush's Mode: Multiply darkens by the color, Normal covers; Alt+Shift+
+/// letter sets the Brush's mode, not the layer's.
+#[test]
+fn brush_blend_mode() {
+    let paint = |mode: BlendMode| {
+        let mut h = app(Tool::Brush);
+        let app = h.state_mut();
+        app.doc = Some(Document::new(
+            RgbaImage::from_pixel(200, 100, Rgba([128, 128, 128, 255])),
+            None,
+        ));
+        (app.brush_size, app.hardness, app.paint.smoothing) = (10.0, 1.0, 0.0);
+        app.primary = Color32::from_rgb(255, 0, 0);
+        app.paint.mode = mode;
+        drag(&mut h, (20.0, 50.0), &[(100.0, 50.0)], no_pen);
+        pixel(&h, 60, 50)
+    };
+    assert_eq!(paint(BlendMode::Normal), [255, 0, 0, 255]);
+    assert_eq!(paint(BlendMode::Multiply), [128, 0, 0, 255]);
+    let mut h = app(Tool::Brush);
+    h.key_press_modifiers(Modifiers::ALT.plus(Modifiers::SHIFT), Key::M);
+    h.run_steps(2);
+    assert_eq!(h.state().paint.mode, BlendMode::Multiply);
+    assert_eq!(doc(&h).active_layer().blend, BlendMode::Normal);
+    h.key_press_modifiers(Modifiers::SHIFT, Key::Plus);
+    h.run_steps(2);
+    assert_eq!(h.state().paint.mode, BlendMode::ColorBurn);
+}
+
+/// Alt + click with the Gradient tool picks the foreground color, like the
+/// Brush's, and draws nothing.
+#[test]
+fn alt_click_with_the_gradient_picks_a_color() {
+    let mut h = app(Tool::Gradient);
+    let green = [20, 160, 40, 255];
+    h.state_mut().doc = Some(Document::new(
+        RgbaImage::from_pixel(200, 100, Rgba(green)),
+        None,
+    ));
+    h.run_steps(2);
+    drag_with(&mut h, Modifiers::ALT, (50.0, 50.0), &[], no_pen);
+    assert_eq!(h.state().primary.to_srgba_unmultiplied(), green);
+    assert_eq!(pixel(&h, 120, 50), green);
+}

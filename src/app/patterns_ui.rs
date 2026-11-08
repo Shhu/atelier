@@ -88,8 +88,19 @@ fn loading_id() -> egui::Id {
     egui::Id::new("pattern_loading")
 }
 
-/// Thumbnails, by pattern and size.
-type Thumbs = Arc<Mutex<std::collections::HashMap<(u64, u32), egui::TextureHandle>>>;
+/// Thumbnails, by pattern and size, with when each was last drawn.
+#[derive(Default)]
+struct ThumbCache {
+    map: std::collections::HashMap<(u64, u32), (egui::TextureHandle, std::time::Instant)>,
+    /// When those not drawn for [`THUMB_UNUSED`] were last let go.
+    pruned: Option<std::time::Instant>,
+}
+
+type Thumbs = Arc<Mutex<ThumbCache>>;
+
+/// A pattern thumbnail not drawn for this long leaves (a pattern deleted,
+/// replaced, or a size no longer shown).
+const THUMB_UNUSED: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Texture of a pattern's tile for drawing it `side` physical pixels wide
 /// at most: the smallest of its reduced versions at least that size (drawn
@@ -103,26 +114,36 @@ pub(super) fn thumbnail(ctx: &egui::Context, p: &Pattern, side: f32) -> egui::Te
     let tile = p.image.width().max(p.image.height());
     let ratio = (tile as f32 / side.max(1.0)).max(1.0);
     let k = ratio.log2().floor() as usize;
-    let mut cache = cache.lock().expect("thumbnails");
-    cache
-        .entry((p.id, k as u32))
-        .or_insert_with(|| {
-            let image = p.mip(k);
-            let color = egui::ColorImage::from_rgba_unmultiplied(
-                [image.width() as usize, image.height() as usize],
-                image.as_raw(),
-            );
-            ctx.load_texture(
-                format!("pattern-{:x}-{k}", p.id),
-                color,
-                egui::TextureOptions {
-                    magnification: egui::TextureFilter::Nearest,
-                    minification: egui::TextureFilter::Linear,
-                    ..egui::TextureOptions::NEAREST
-                },
-            )
-        })
-        .id()
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    if cache
+        .pruned
+        .is_none_or(|t| now.duration_since(t) >= THUMB_UNUSED)
+    {
+        cache.pruned = Some(now);
+        cache
+            .map
+            .retain(|_, (_, used)| now.duration_since(*used) < THUMB_UNUSED);
+    }
+    let entry = cache.map.entry((p.id, k as u32)).or_insert_with(|| {
+        let image = p.mip(k);
+        let color = egui::ColorImage::from_rgba_unmultiplied(
+            [image.width() as usize, image.height() as usize],
+            image.as_raw(),
+        );
+        let tex = ctx.load_texture(
+            format!("pattern-{:x}-{k}", p.id),
+            color,
+            egui::TextureOptions {
+                magnification: egui::TextureFilter::Nearest,
+                minification: egui::TextureFilter::Linear,
+                ..egui::TextureOptions::NEAREST
+            },
+        );
+        (tex, now)
+    });
+    entry.1 = now;
+    entry.0.id()
 }
 
 /// Paints the tile fitted in `rect`, over a neutral background.
@@ -404,10 +425,16 @@ impl AtelierApp {
                             "pattern9-status-index-damaged",
                             backup = backup.as_str()
                         ));
-                        crate::diag::warn(format!("pattern index damaged, set aside: {backup}"));
+                        crate::diag::warn(tm!(
+                            "words14-log-pattern-index-damaged",
+                            backup = backup.as_str()
+                        ));
                     } else if read.left_out > 0 {
                         self.status.set(t!("pattern9-status-left-out", count = read.left_out));
-                        crate::diag::warn(format!("{} patterns not read", read.left_out));
+                        crate::diag::warn(tm!(
+                            "words14-log-patterns-left-out",
+                            count = read.left_out
+                        ));
                     }
                     self.patterns.library.merge(read);
                     self.patterns.loading = None;

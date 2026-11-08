@@ -44,8 +44,29 @@ fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Does the file at `path` hold exactly `bytes`? Its size is compared
+/// first, so a stale file is usually found without reading it.
+#[cfg(any(windows, test))]
+fn same_contents(path: &Path, bytes: &[u8]) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.len() == bytes.len() as u64)
+        && std::fs::read(path).is_ok_and(|b| b == bytes)
+}
+
 #[cfg(test)]
 mod tests {
+    /// An extracted runtime file is checked by its contents, not its size.
+    #[test]
+    fn same_contents_compares_bytes() {
+        let dir = crate::testing::test_dir("same-contents");
+        let path = dir.join("x.dll");
+        assert!(!super::same_contents(&path, b"abcd"), "missing");
+        std::fs::write(&path, b"abcd").unwrap();
+        assert!(super::same_contents(&path, b"abcd"));
+        assert!(!super::same_contents(&path, b"abce"), "same size, damaged");
+        assert!(!super::same_contents(&path, b"abc"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A panic in a background job becomes an error with its message.
     #[test]
     fn panics_become_errors() {

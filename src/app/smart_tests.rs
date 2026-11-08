@@ -47,7 +47,7 @@ fn smart<'a>(h: &'a Harness<'static, AtelierApp>) -> &'a crate::document::SmartO
 
 /// Runs frames until `done`.
 fn settle(h: &mut Harness<'static, AtelierApp>, done: impl Fn(&AtelierApp) -> bool) {
-    for _ in 0..500 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if done(h.state()) {
             return;
@@ -58,10 +58,7 @@ fn settle(h: &mut Harness<'static, AtelierApp>, done: impl Fn(&AtelierApp) -> bo
 }
 
 fn folder(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("atelier-smart-app-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    crate::testing::test_dir(&format!("smart-app-{name}"))
 }
 
 #[test]

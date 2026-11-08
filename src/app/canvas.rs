@@ -74,7 +74,12 @@ impl AtelierApp {
     /// Shows `image` (the result of a dialog's processing, see
     /// [`Document::processed_active`]) instead of what the active layer's
     /// target holds: its pixels, or its mask.
-    pub(super) fn show_preview(&mut self, preview: LayerPreview, image: image::RgbaImage) {
+    pub(super) fn show_preview(
+        &mut self,
+        preview: LayerPreview,
+        image: image::RgbaImage,
+        reduced: render::Reduction,
+    ) {
         let Some(doc) = &self.doc else { return };
         let Some(target) = doc.target_layer() else {
             return;
@@ -84,7 +89,7 @@ impl AtelierApp {
         }
         let offset = target.offset;
         drop(target);
-        self.show_preview_at(preview, image, offset);
+        self.show_preview_at(preview, image, offset, reduced);
     }
 
     /// [`Self::show_preview`] of what fills another box than the target's,
@@ -94,6 +99,7 @@ impl AtelierApp {
         preview: LayerPreview,
         image: image::RgbaImage,
         offset: (i64, i64),
+        reduced: render::Reduction,
     ) {
         let Some(doc) = &self.doc else { return };
         let shown = ShownPreview {
@@ -101,16 +107,22 @@ impl AtelierApp {
             rev: doc.target_rev(),
             ..ShownPreview::new(preview, doc.active_layer(), image)
         };
-        self.preview_shown = Some(if doc.quick_mask().is_some() {
+        let shown = if doc.quick_mask().is_some() {
             shown.on_quick_mask(offset)
         } else if doc.mask_targeted() {
             shown.on_mask(offset)
         } else {
             ShownPreview {
                 origin: Some(offset),
+                reduced,
                 ..shown
             }
-        });
+        };
+        let (layer, version, size) = (shown.layer, shown.fingerprint, shown.image.dimensions());
+        if shown.mask.is_none() {
+            self.seed_reduction(layer, version, offset, size, &shown.reduced);
+        }
+        self.preview_shown = Some(shown);
     }
 
     /// End of preview: the layer shows its real pixels again.
@@ -296,7 +308,8 @@ impl AtelierApp {
             start = false;
         }
 
-        // Alt + click (brush, bucket, eyedropper): pick a color, like Photoshop.
+        // Alt + click (brush, bucket, gradient, eyedropper): pick a color,
+        // like Photoshop.
         // A selection still being computed applies before anything else;
         // a Magic Wand click is chained after it instead (see
         // `select_later`), without holding up the interface.
@@ -307,7 +320,7 @@ impl AtelierApp {
         // (Ctrl with the Eyedropper: the Move tool for a moment, below.)
         // (Ctrl+Alt: the Move tool for a moment, dragging a copy.)
         let picks = (self.tool == Tool::Eyedropper && !self.snap_off)
-            || (alt && !ctrl && matches!(self.tool, Tool::Brush | Tool::Bucket));
+            || (alt && !ctrl && matches!(self.tool, Tool::Brush | Tool::Bucket | Tool::Gradient));
         // Shift + click with the Eyedropper: a Color Sampler point.
         if start
             && self.tool == Tool::Eyedropper
@@ -2175,6 +2188,9 @@ impl AtelierApp {
         self.leave_select_modes();
         self.forget_document_jobs();
         self.retouch.forget_composites();
+        if let Some(doc) = &self.doc {
+            crate::document::forget_shared_composite(doc.uid());
+        }
         self.doc = None;
         self.stroke = None;
         self.selection = None;
@@ -2194,6 +2210,7 @@ impl AtelierApp {
         self.thumbs.clear();
         self.fit_pending = Some(1.0);
         self.activate_neighbor_tab();
+        crate::memory::release_later();
     }
 }
 

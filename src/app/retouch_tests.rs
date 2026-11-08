@@ -85,7 +85,7 @@ fn drag(h: &mut Harness<'static, AtelierApp>, path: &[(f32, f32)]) {
 
 /// Waits for a fill computed on another thread.
 fn wait_for_fill(h: &mut Harness<'static, AtelierApp>) {
-    for _ in 0..3000 {
+    for _ in crate::testing::patience() {
         if !h.state().retouch.busy() {
             return;
         }

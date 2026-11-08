@@ -359,19 +359,22 @@ impl AtelierApp {
         };
         let sigs = crate::compose::signatures(below, &opts);
         let (uid, layer) = (doc.uid(), doc.active_layer().id);
-        let key = hash_of((uid, layer, format!("{sigs:?}")));
+        let key = hash_of((uid, layer, &sigs));
         let h = &mut self.below_histogram;
-        if let Some(job) = h.job.take_if(|j| j.1.is_finished())
-            && let Ok((cache, histograms)) = job.1.join()
-        {
-            if job.0 == (uid, layer) {
-                h.shown = Some((job.2, (uid, layer), histograms));
+        if let Some(job) = h.job.take_if(|j| j.1.is_finished()) {
+            match job.1.join() {
+                Ok((cache, histograms)) => {
+                    if job.0 == (uid, layer) {
+                        h.shown = Some((job.2, (uid, layer), histograms));
+                    }
+                    h.cache = Some((uid, cache));
+                }
+                Err(_) => h.failed = Some(job.2),
             }
-            h.cache = Some((uid, cache));
         }
         if h.job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
-        } else if h.shown.as_ref().is_none_or(|(k, _, _)| *k != key) {
+        } else if h.shown.as_ref().is_none_or(|(k, _, _)| *k != key) && h.failed != Some(key) {
             // The layers below it, reduced to about 1000 px.
             let canvas = doc.full_rect();
             let side = canvas.w.max(canvas.h) as f32;
@@ -752,356 +755,397 @@ impl AtelierApp {
         let list_drag = self.list_drag;
         let height = ui.available_height();
         let ctx = ui.ctx().clone();
+        // Those of layers deleted leave (two per layer at most: the image
+        // and the mask).
+        if self.thumbs.len() > 2 * doc.layers.len() {
+            let ids: std::collections::HashSet<u64> = doc.layers.iter().map(|l| l.id).collect();
+            self.thumbs.retain(|(id, _), _| ids.contains(id));
+        }
+        // Where each row starts in the list (a smart object's filters
+        // below it), and the list's height: only the rows in view are laid
+        // out (a long list costs no more than a short one).
+        let mut tops = Vec::with_capacity(shown.len() + 1);
+        let mut y = 0.0;
+        for &i in &shown {
+            tops.push(y);
+            y += ROW_HEIGHT + ROW_GAP + smart_rows::height(doc, &[i]);
+        }
+        tops.push(y);
+        let total = (y - ROW_GAP).max(0.0);
+        // Thumbnails of the rows in view at the last frame, and around.
+        let (seen_top, seen_bottom) = self.layer_list_view;
+        let near = |k: usize| tops[k + 1] >= seen_top - height && tops[k] <= seen_bottom + height;
         let thumbs: Vec<(Option<egui::TextureId>, Option<egui::TextureId>)> = shown
             .iter()
-            .map(|&i| {
-                (
+            .enumerate()
+            .map(|(k, &i)| match near(k) {
+                true => (
                     self.thumbnail(&ctx, i, false),
                     self.thumbnail(&ctx, i, true),
-                )
+                ),
+                false => (None, None),
             })
             .collect();
         let filter_masks = self.filter_mask_thumbs(&ctx, &shown);
         let mut filter_rows = smart_rows::FilterRows::default();
+        let mut in_view = self.layer_list_view;
         let Some(doc) = &self.doc else { return };
         egui::ScrollArea::vertical()
             .max_height(height)
             .auto_shrink([false, true])
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = ROW_GAP;
-                for (&i, (thumb_tex, mask_tex)) in shown.iter().zip(&thumbs) {
+            .show_viewport(ui, |ui, viewport| {
+                in_view = (viewport.top(), viewport.bottom());
+                let origin = ui.min_rect().min;
+                let width = ui.available_width();
+                ui.set_height(total);
+                for (k, (&i, (thumb_tex, mask_tex))) in shown.iter().zip(&thumbs).enumerate() {
                     let layer = &doc.layers[i];
-                    let (rect, row) = ui.allocate_exact_size(
-                        vec2(ui.available_width(), ROW_HEIGHT),
-                        Sense::click_and_drag(),
-                    );
-                    let painter = ui.painter().clone();
-                    let hovered = ui.rect_contains_pointer(rect);
-                    let fill = if i == active {
-                        color::ACCENT_SOFT
-                    } else if picked.contains(&i) {
-                        color::ACCENT_SOFT.gamma_multiply(0.5)
-                    } else if hovered {
-                        color::BG3
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-                    painter.rect_filled(rect, 8.0, fill);
-
-                    // Visibility (Alt + click: this one only).
-                    let eye = Rect::from_min_size(
-                        pos2(rect.left() + 4.0, rect.center().y - 14.0),
-                        Vec2::splat(28.0),
-                    );
-                    // Shown, but in a hidden group: its eye dimmed.
-                    let (glyph, fg) = match layer.visible {
-                        true if hidden_above(doc, i) => (icon::EYE, color::DISABLED),
-                        true => (icon::EYE, color::MUTED),
-                        false => (icon::EYE_SLASH, color::DISABLED),
-                    };
-                    let tip = t!(
-                        "input3-visibility-tip",
-                        alt_click = keys::click(ui.ctx(), Modifiers::ALT)
-                    );
-                    if row_icon(ui, eye, Id::new(("side_eye", layer.id)), glyph, fg, &tip).clicked()
-                    {
-                        let solo = ui.input(|inp| inp.modifiers.alt);
-                        visibility = Some((i, !layer.visible, solo));
-                    }
-
-                    // Nesting: indentation, groups' disclosure, clipping arrow.
-                    let mut x = eye.right() + layer.depth as f32 * INDENT;
-                    let caret =
-                        Rect::from_min_size(pos2(x, rect.center().y - 9.0), Vec2::splat(18.0));
-                    if let LayerKind::Group { expanded } = layer.kind {
-                        let glyph = if expanded {
-                            icon::CARET_DOWN
-                        } else {
-                            icon::CARET_RIGHT
-                        };
-                        let tip = t!("core-group-fold-tip");
-                        if row_icon(
-                            ui,
-                            caret,
-                            Id::new(("side_fold", layer.id)),
-                            glyph,
-                            color::MUTED,
-                            &tip,
-                        )
-                        .clicked()
-                        {
-                            fold = Some(i);
-                        }
-                    }
-                    x = caret.right();
-                    if layer.clipped && !layer.is_group() {
-                        painter.text(
-                            pos2(x + 6.0, rect.center().y),
-                            Align2::CENTER_CENTER,
-                            icon::ARROW_ELBOW_LEFT_DOWN,
-                            FontId::proportional(13.0),
-                            color::MUTED,
-                        );
-                        x += 14.0;
-                    }
-
-                    // Thumbnail, and the mask's with the chain between them.
-                    let thumb = Rect::from_min_size(
-                        pos2(x + 2.0, rect.center().y - 13.0),
-                        vec2(38.0, 26.0),
-                    );
-                    let clipped = painter.with_clip_rect(thumb.intersect(painter.clip_rect()));
-                    draw_thumb(&clipped, thumb, layer, *thumb_tex);
-                    smart_rows::badge(&clipped, thumb, layer);
-                    let targeted = i == active && !target_mask && !layer.is_group();
-                    thumb_frame(&painter, thumb, targeted);
-                    let mut right_of_thumbs = thumb.right();
-                    let mut mask_rect = None;
-                    let mut chain_rect = None;
-                    if let Some(m) = &layer.mask {
-                        let chain = Rect::from_min_size(
-                            pos2(thumb.right(), rect.center().y - 8.0),
-                            vec2(14.0, 16.0),
-                        );
-                        let mr =
-                            Rect::from_min_size(pos2(chain.right(), thumb.top()), thumb.size());
-                        if m.linked() {
-                            painter.text(
-                                chain.center(),
-                                Align2::CENTER_CENTER,
-                                icon::LINK_SIMPLE,
-                                FontId::proportional(11.0),
-                                color::LABEL,
-                            );
-                        }
-                        let clipped = painter.with_clip_rect(mr.intersect(painter.clip_rect()));
-                        clipped.rect_filled(mr, 4.0, Color32::from_gray(m.default));
-                        if let Some(tex) = mask_tex {
-                            let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
-                            clipped.image(
-                                *tex,
-                                fit_rect(mr, doc.width(), doc.height()),
-                                uv,
-                                Color32::WHITE,
-                            );
-                        }
-                        if !m.enabled {
-                            let stroke = UiStroke::new(2.0, Color32::from_rgb(0xe5, 0x48, 0x4d));
-                            clipped.line_segment([mr.left_top(), mr.right_bottom()], stroke);
-                            clipped.line_segment([mr.left_bottom(), mr.right_top()], stroke);
-                        }
-                        thumb_frame(
-                            &painter,
-                            mr,
-                            i == active && ((target_mask && !filter_mask) || layer.is_group()),
-                        );
-                        right_of_thumbs = mr.right();
-                        (mask_rect, chain_rect) = (Some(mr), Some(chain));
-                    }
-
-                    // Lock (shown when locked: a click unlocks), styles.
-                    let mut right = rect.right() - 6.0;
-                    if layer.locked || layer.locks.any() {
-                        let lock = Rect::from_min_size(
-                            pos2(right - 24.0, rect.center().y - 12.0),
-                            Vec2::splat(24.0),
-                        );
-                        // Lock All shows solid, a partial lock hollow.
-                        let (tip, tint) = if layer.locked {
-                            (t!("panel-unlock-tip"), color::MUTED)
-                        } else {
-                            (t!("layers8-partial-unlock-tip"), color::LABEL)
-                        };
-                        let glyph = icon::LOCK_SIMPLE;
-                        let response = row_icon(
-                            ui,
-                            lock,
-                            Id::new(("side_lock", layer.id)),
-                            glyph,
-                            tint,
-                            &tip,
-                        );
-                        response.widget_info(|| {
-                            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &tip)
-                        });
-                        if response.clicked() {
-                            unlock = Some(i);
-                        }
-                        if layer.locked {
-                            // The glyph's body filled (the icon font has no
-                            // filled weight).
-                            painter.rect_filled(
-                                Rect::from_center_size(
-                                    lock.center() + vec2(0.0, 1.6),
-                                    vec2(8.0, 6.0),
-                                ),
-                                1.0,
-                                tint,
-                            );
-                        }
-                        right = lock.left() - 4.0;
-                    } else if let Some(g) = doc.lock_group(i) {
-                        // Locked with its group: dimmed, the group unlocks.
-                        let lock = Rect::from_min_size(
-                            pos2(right - 24.0, rect.center().y - 12.0),
-                            Vec2::splat(24.0),
-                        );
-                        painter.text(
-                            lock.center(),
-                            Align2::CENTER_CENTER,
-                            icon::LOCK_SIMPLE,
-                            FontId::proportional(13.0),
-                            color::DISABLED,
-                        );
-                        let tip = t!("tools6-panel-group-lock-tip", group = doc.layers[g].name.as_str());
-                        ui.interact(lock, Id::new(("side_group_lock", layer.id)), Sense::hover())
-                            .on_hover_text(tip);
-                        right = lock.left() - 4.0;
-                    }
-                    if layer.effects.any() {
-                        let fx = painter.text(
-                            pos2(right - 2.0, rect.center().y),
-                            Align2::RIGHT_CENTER,
-                            "fx",
-                            ui_kit::bold(11.0),
-                            color::MUTED,
-                        );
-                        right = fx.left() - 6.0;
-                    }
-
-                    // Name and kind.
-                    let text = Rect::from_min_max(
-                        pos2(right_of_thumbs + 10.0, rect.top()),
-                        pos2(right, rect.bottom()),
-                    );
-                    let name_color = if !layer.visible || list_drag == Some(i) {
-                        color::LABEL
-                    } else {
-                        color::TEXT
-                    };
-                    let kind = kind_label(layer);
-                    let kind = if layer.locked {
-                        t!("side-kind-locked", kind = kind)
-                    } else {
-                        kind
-                    };
-                    // Too long, the name and kind end with "…" (the tooltip
-                    // shows the name whole).
-                    let line = |s: String, font: FontId, color: Color32| {
-                        let mut job = egui::text::LayoutJob::single_section(
-                            s,
-                            egui::TextFormat::simple(font, color),
-                        );
-                        job.wrap =
-                            egui::text::TextWrapping::truncate_at_width(text.width().max(0.0));
-                        painter.layout_job(job)
-                    };
-                    let name_galley = line(
-                        layer.name.clone(),
-                        ui_kit::medium(ui_kit::TEXT_SIZE),
-                        name_color,
-                    );
-                    let name_elided = name_galley.elided;
-                    let kind_galley = line(kind, FontId::proportional(11.0), color::LABEL);
-                    let text_painter = painter.with_clip_rect(text.intersect(painter.clip_rect()));
-                    let name_y = rect.center().y - 7.0 - name_galley.size().y / 2.0;
-                    let name_rect =
-                        Rect::from_min_size(pos2(text.left(), name_y), name_galley.size());
-                    text_painter.galley(pos2(text.left(), name_y), name_galley, name_color);
-                    let kind_y = rect.center().y + 9.0 - kind_galley.size().y / 2.0;
-                    text_painter.galley(pos2(text.left(), kind_y), kind_galley, color::LABEL);
-
-                    let tip = layer_row_tip(ui.ctx());
-                    let row = if name_elided {
-                        row.on_hover_ui(|ui| {
-                            ui.label(egui::RichText::new(&layer.name).strong());
-                            ui.label(tip);
-                        })
-                    } else {
-                        row.on_hover_text(tip)
-                    };
-                    let modifiers = ui.input(|inp| inp.modifiers);
-                    let at = row.interact_pointer_pos();
-                    let on = |r: Option<Rect>| {
-                        at.is_some_and(|p| r.is_some_and(|r| r.expand(2.0).contains(p)))
-                    };
-                    // Alt over the line between two rows: clipping the one
-                    // above to the one below, like Photoshop (its cursor
-                    // says so before the click).
-                    let clip_line = |p: Pos2| {
-                        if (p.y - rect.bottom()).abs() <= CLIP_LINE {
-                            Some(i)
-                        } else if (p.y - rect.top()).abs() <= CLIP_LINE && i + 1 < doc.layers.len()
-                        {
-                            Some(i + 1)
-                        } else {
-                            None
-                        }
-                    };
-                    if modifiers.alt
-                        && !modifiers.command
-                        && row.hover_pos().is_some_and(|p| clip_line(p).is_some())
-                    {
-                        ui.ctx().set_cursor_icon(CursorIcon::Alias);
-                    }
-                    let clip = at.filter(|_| modifiers.alt).and_then(clip_line);
-                    let part = if let Some(above) = clip {
-                        RowPart::ClipLine(above)
-                    } else if on(mask_rect) {
-                        RowPart::Mask
-                    } else if on(chain_rect) {
-                        RowPart::Chain
-                    } else if on(Some(thumb)) {
-                        RowPart::Thumbnail
-                    } else {
-                        RowPart::Name
-                    };
-                    // Double-click: on the name, renames it; beside it, the
-                    // layer's style, like Photoshop.
-                    let on_name = on(Some(name_rect)) || !layer.has_pixels();
-                    if row.double_clicked() {
-                        if part == RowPart::Name && on_name {
-                            rename = true;
-                        } else if layer.artboard.is_some() {
-                            // Zoom to fit the artboard.
-                            let fit = artboard_tool::Command::Fit(i);
-                            menu_action = Some(Action::Artboard(fit));
-                        } else if part == RowPart::Thumbnail && layer.is_smart() {
-                            let edit = smart_ui::Command::EditContents;
-                            menu_action = Some(Action::Smart(edit));
-                        } else if part == RowPart::Mask {
-                            // The mask, in Properties (its density and
-                            // feather), not the layer's style.
-                            click = Some((i, RowPart::Mask, Modifiers::NONE));
-                        } else if layer.styleable() {
-                            menu_action = Some(Action::LayerStyle(None));
-                        }
-                    } else if row.clicked() {
-                        click = Some((i, part, modifiers));
-                    }
-                    if row.drag_started() {
-                        drag_started = Some(i);
-                    }
-                    // Right click: the layer's menu, for that layer.
-                    if row.secondary_clicked() && !picked.contains(&i) {
-                        click = Some((i, RowPart::Name, Modifiers::NONE));
-                    }
-                    row.context_menu(|ui| {
-                        super::menus::menu_entries(ui, &layer_menu, &mut menu_action);
-                    });
+                    let rect = Rect::from_min_size(origin + vec2(0.0, tops[k]), vec2(width, ROW_HEIGHT));
+                    // Every row's place (dragging finds the gaps).
                     rows.push((rect, i));
-                    smart_rows::filter_rows(
-                        ui,
-                        doc,
-                        i,
-                        (rect.left() + 4.0, thumb.left()),
-                        filter_masks.get(&i).copied(),
-                        &mut filter_rows,
-                        &mut click,
-                        &mut menu_action,
-                    );
+                    if tops[k + 1] < viewport.top() || tops[k] > viewport.bottom() {
+                        continue;
+                    }
+                    let room = Rect::from_min_max(rect.min, pos2(rect.right(), origin.y + tops[k + 1]));
+                    let builder = UiBuilder::new().max_rect(room).id_salt(("layer_row", layer.id));
+                    ui.scope_builder(builder, |ui| {
+                        ui.spacing_mut().item_spacing.y = ROW_GAP;
+                        let (rect, row) = ui.allocate_exact_size(
+                            vec2(ui.available_width(), ROW_HEIGHT),
+                            Sense::click_and_drag(),
+                        );
+                        let painter = ui.painter().clone();
+                        let hovered = ui.rect_contains_pointer(rect);
+                        let fill = if i == active {
+                            color::ACCENT_SOFT
+                        } else if picked.contains(&i) {
+                            color::ACCENT_SOFT.gamma_multiply(0.5)
+                        } else if hovered {
+                            color::BG3
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        painter.rect_filled(rect, 8.0, fill);
+
+                        // Visibility (Alt + click: this one only).
+                        let eye = Rect::from_min_size(
+                            pos2(rect.left() + 4.0, rect.center().y - 14.0),
+                            Vec2::splat(28.0),
+                        );
+                        // Shown, but in a hidden group: its eye dimmed.
+                        let (glyph, fg) = match layer.visible {
+                            true if hidden_above(doc, i) => (icon::EYE, color::DISABLED),
+                            true => (icon::EYE, color::MUTED),
+                            false => (icon::EYE_SLASH, color::DISABLED),
+                        };
+                        let tip = t!(
+                            "input3-visibility-tip",
+                            alt_click = keys::click(ui.ctx(), Modifiers::ALT)
+                        );
+                        if row_icon(ui, eye, Id::new(("side_eye", layer.id)), glyph, fg, &tip).clicked()
+                        {
+                            let solo = ui.input(|inp| inp.modifiers.alt);
+                            visibility = Some((i, !layer.visible, solo));
+                        }
+
+                        // Nesting: indentation, groups' disclosure, clipping arrow.
+                        let mut x = eye.right() + layer.depth as f32 * INDENT;
+                        let caret =
+                            Rect::from_min_size(pos2(x, rect.center().y - 9.0), Vec2::splat(18.0));
+                        if let LayerKind::Group { expanded } = layer.kind {
+                            let glyph = if expanded {
+                                icon::CARET_DOWN
+                            } else {
+                                icon::CARET_RIGHT
+                            };
+                            let tip = t!("core-group-fold-tip");
+                            if row_icon(
+                                ui,
+                                caret,
+                                Id::new(("side_fold", layer.id)),
+                                glyph,
+                                color::MUTED,
+                                &tip,
+                            )
+                            .clicked()
+                            {
+                                fold = Some(i);
+                            }
+                        }
+                        x = caret.right();
+                        if layer.clipped && !layer.is_group() {
+                            painter.text(
+                                pos2(x + 6.0, rect.center().y),
+                                Align2::CENTER_CENTER,
+                                icon::ARROW_ELBOW_LEFT_DOWN,
+                                FontId::proportional(13.0),
+                                color::MUTED,
+                            );
+                            x += 14.0;
+                        }
+
+                        // Thumbnail, and the mask's with the chain between them.
+                        let thumb = Rect::from_min_size(
+                            pos2(x + 2.0, rect.center().y - 13.0),
+                            vec2(38.0, 26.0),
+                        );
+                        let clipped = painter.with_clip_rect(thumb.intersect(painter.clip_rect()));
+                        draw_thumb(&clipped, thumb, layer, *thumb_tex);
+                        smart_rows::badge(&clipped, thumb, layer);
+                        let targeted = i == active && !target_mask && !layer.is_group();
+                        thumb_frame(&painter, thumb, targeted);
+                        let mut right_of_thumbs = thumb.right();
+                        let mut mask_rect = None;
+                        let mut chain_rect = None;
+                        if let Some(m) = &layer.mask {
+                            let chain = Rect::from_min_size(
+                                pos2(thumb.right(), rect.center().y - 8.0),
+                                vec2(14.0, 16.0),
+                            );
+                            let mr =
+                                Rect::from_min_size(pos2(chain.right(), thumb.top()), thumb.size());
+                            if m.linked() {
+                                painter.text(
+                                    chain.center(),
+                                    Align2::CENTER_CENTER,
+                                    icon::LINK_SIMPLE,
+                                    FontId::proportional(11.0),
+                                    color::LABEL,
+                                );
+                            }
+                            let clipped = painter.with_clip_rect(mr.intersect(painter.clip_rect()));
+                            clipped.rect_filled(mr, 4.0, Color32::from_gray(m.default));
+                            if let Some(tex) = mask_tex {
+                                let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
+                                clipped.image(
+                                    *tex,
+                                    fit_rect(mr, doc.width(), doc.height()),
+                                    uv,
+                                    Color32::WHITE,
+                                );
+                            }
+                            if !m.enabled {
+                                let stroke = UiStroke::new(2.0, Color32::from_rgb(0xe5, 0x48, 0x4d));
+                                clipped.line_segment([mr.left_top(), mr.right_bottom()], stroke);
+                                clipped.line_segment([mr.left_bottom(), mr.right_top()], stroke);
+                            }
+                            thumb_frame(
+                                &painter,
+                                mr,
+                                i == active && ((target_mask && !filter_mask) || layer.is_group()),
+                            );
+                            right_of_thumbs = mr.right();
+                            (mask_rect, chain_rect) = (Some(mr), Some(chain));
+                        }
+
+                        // Lock (shown when locked: a click unlocks), styles.
+                        let mut right = rect.right() - 6.0;
+                        if layer.locked || layer.locks.any() {
+                            let lock = Rect::from_min_size(
+                                pos2(right - 24.0, rect.center().y - 12.0),
+                                Vec2::splat(24.0),
+                            );
+                            // Lock All shows solid, a partial lock hollow.
+                            let (tip, tint) = if layer.locked {
+                                (t!("panel-unlock-tip"), color::MUTED)
+                            } else {
+                                (t!("layers8-partial-unlock-tip"), color::LABEL)
+                            };
+                            let glyph = icon::LOCK_SIMPLE;
+                            let response = row_icon(
+                                ui,
+                                lock,
+                                Id::new(("side_lock", layer.id)),
+                                glyph,
+                                tint,
+                                &tip,
+                            );
+                            response.widget_info(|| {
+                                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &tip)
+                            });
+                            if response.clicked() {
+                                unlock = Some(i);
+                            }
+                            if layer.locked {
+                                // The glyph's body filled (the icon font has no
+                                // filled weight).
+                                painter.rect_filled(
+                                    Rect::from_center_size(
+                                        lock.center() + vec2(0.0, 1.6),
+                                        vec2(8.0, 6.0),
+                                    ),
+                                    1.0,
+                                    tint,
+                                );
+                            }
+                            right = lock.left() - 4.0;
+                        } else if let Some(g) = doc.lock_group(i) {
+                            // Locked with its group: dimmed, the group unlocks.
+                            let lock = Rect::from_min_size(
+                                pos2(right - 24.0, rect.center().y - 12.0),
+                                Vec2::splat(24.0),
+                            );
+                            painter.text(
+                                lock.center(),
+                                Align2::CENTER_CENTER,
+                                icon::LOCK_SIMPLE,
+                                FontId::proportional(13.0),
+                                color::DISABLED,
+                            );
+                            let tip = t!("tools6-panel-group-lock-tip", group = doc.layers[g].name.as_str());
+                            ui.interact(lock, Id::new(("side_group_lock", layer.id)), Sense::hover())
+                                .on_hover_text(tip);
+                            right = lock.left() - 4.0;
+                        }
+                        if layer.effects.any() {
+                            let fx = painter.text(
+                                pos2(right - 2.0, rect.center().y),
+                                Align2::RIGHT_CENTER,
+                                "fx",
+                                ui_kit::bold(11.0),
+                                color::MUTED,
+                            );
+                            right = fx.left() - 6.0;
+                        }
+
+                        // Name and kind.
+                        let text = Rect::from_min_max(
+                            pos2(right_of_thumbs + 10.0, rect.top()),
+                            pos2(right, rect.bottom()),
+                        );
+                        let name_color = if !layer.visible || list_drag == Some(i) {
+                            color::LABEL
+                        } else {
+                            color::TEXT
+                        };
+                        let kind = kind_label(layer);
+                        let kind = if layer.locked {
+                            t!("side-kind-locked", kind = kind)
+                        } else {
+                            kind
+                        };
+                        // Too long, the name and kind end with "…" (the tooltip
+                        // shows the name whole).
+                        let line = |s: String, font: FontId, color: Color32| {
+                            let mut job = egui::text::LayoutJob::single_section(
+                                s,
+                                egui::TextFormat::simple(font, color),
+                            );
+                            job.wrap =
+                                egui::text::TextWrapping::truncate_at_width(text.width().max(0.0));
+                            painter.layout_job(job)
+                        };
+                        let name_galley = line(
+                            layer.name.clone(),
+                            ui_kit::medium(ui_kit::TEXT_SIZE),
+                            name_color,
+                        );
+                        let name_elided = name_galley.elided;
+                        let kind_galley = line(kind, FontId::proportional(11.0), color::LABEL);
+                        let text_painter = painter.with_clip_rect(text.intersect(painter.clip_rect()));
+                        let name_y = rect.center().y - 7.0 - name_galley.size().y / 2.0;
+                        let name_rect =
+                            Rect::from_min_size(pos2(text.left(), name_y), name_galley.size());
+                        text_painter.galley(pos2(text.left(), name_y), name_galley, name_color);
+                        let kind_y = rect.center().y + 9.0 - kind_galley.size().y / 2.0;
+                        text_painter.galley(pos2(text.left(), kind_y), kind_galley, color::LABEL);
+
+                        let tip = layer_row_tip(ui.ctx());
+                        let row = if name_elided {
+                            row.on_hover_ui(|ui| {
+                                ui.label(egui::RichText::new(&layer.name).strong());
+                                ui.label(tip);
+                            })
+                        } else {
+                            row.on_hover_text(tip)
+                        };
+                        let modifiers = ui.input(|inp| inp.modifiers);
+                        let at = row.interact_pointer_pos();
+                        let on = |r: Option<Rect>| {
+                            at.is_some_and(|p| r.is_some_and(|r| r.expand(2.0).contains(p)))
+                        };
+                        // Alt over the line between two rows: clipping the one
+                        // above to the one below, like Photoshop (its cursor
+                        // says so before the click).
+                        let clip_line = |p: Pos2| {
+                            if (p.y - rect.bottom()).abs() <= CLIP_LINE {
+                                Some(i)
+                            } else if (p.y - rect.top()).abs() <= CLIP_LINE && i + 1 < doc.layers.len()
+                            {
+                                Some(i + 1)
+                            } else {
+                                None
+                            }
+                        };
+                        if modifiers.alt
+                            && !modifiers.command
+                            && row.hover_pos().is_some_and(|p| clip_line(p).is_some())
+                        {
+                            ui.ctx().set_cursor_icon(CursorIcon::Alias);
+                        }
+                        let clip = at.filter(|_| modifiers.alt).and_then(clip_line);
+                        let part = if let Some(above) = clip {
+                            RowPart::ClipLine(above)
+                        } else if on(mask_rect) {
+                            RowPart::Mask
+                        } else if on(chain_rect) {
+                            RowPart::Chain
+                        } else if on(Some(thumb)) {
+                            RowPart::Thumbnail
+                        } else {
+                            RowPart::Name
+                        };
+                        // Double-click: on the name, renames it; beside it, the
+                        // layer's style, like Photoshop.
+                        let on_name = on(Some(name_rect)) || !layer.has_pixels();
+                        if row.double_clicked() {
+                            if part == RowPart::Name && on_name {
+                                rename = true;
+                            } else if layer.artboard.is_some() {
+                                // Zoom to fit the artboard.
+                                let fit = artboard_tool::Command::Fit(i);
+                                menu_action = Some(Action::Artboard(fit));
+                            } else if part == RowPart::Thumbnail && layer.is_smart() {
+                                let edit = smart_ui::Command::EditContents;
+                                menu_action = Some(Action::Smart(edit));
+                            } else if part == RowPart::Mask {
+                                // The mask, in Properties (its density and
+                                // feather), not the layer's style.
+                                click = Some((i, RowPart::Mask, Modifiers::NONE));
+                            } else if layer.styleable() {
+                                menu_action = Some(Action::LayerStyle(None));
+                            }
+                        } else if row.clicked() {
+                            click = Some((i, part, modifiers));
+                        }
+                        if row.drag_started() {
+                            drag_started = Some(i);
+                        }
+                        // Right click: the layer's menu, for that layer.
+                        if row.secondary_clicked() && !picked.contains(&i) {
+                            click = Some((i, RowPart::Name, Modifiers::NONE));
+                        }
+                        row.context_menu(|ui| {
+                            super::menus::menu_entries(ui, &layer_menu, &mut menu_action);
+                        });
+                        smart_rows::filter_rows(
+                            ui,
+                            doc,
+                            i,
+                            (rect.left() + 4.0, thumb.left()),
+                            filter_masks.get(&i).copied(),
+                            &mut filter_rows,
+                            &mut click,
+                            &mut menu_action,
+                        );
+                    });
                 }
             });
+        if in_view != self.layer_list_view {
+            // Rows came into view without their thumbnails.
+            ui.ctx().request_repaint();
+        }
+        self.layer_list_view = in_view;
         self.drag_filter_rows(ui, filter_rows, &mut menu_action);
 
         // Reordering: the insertion line follows the pointer.
@@ -1286,10 +1330,12 @@ impl AtelierApp {
                 }
                 return;
             }
-            RowPart::Thumbnail if modifiers.command => return self.select_layer_pixels(i),
+            RowPart::Thumbnail if modifiers.command => {
+                return self.select_layer_pixels(i, modifiers);
+            }
             RowPart::Mask if modifiers.command => {
                 if let Some(found) = self.doc.as_ref().and_then(|d| d.mask_selection(i)) {
-                    let mode = self.selection_mode(modifiers.shift, modifiers.alt);
+                    let mode = self.load_mode(modifiers.shift, modifiers.alt);
                     self.sel.step_name = Some(select_menu::step_label(t!("sel-menu-load")));
                     self.apply_selection(Some(found), mode);
                 }
@@ -1887,7 +1933,7 @@ fn mask_fields(
     let unit = i18n::percent("");
     let track = dialogs::Track::Accent;
     let label = t!("core-mask-density");
-    dialogs::slider_row(
+    if dialogs::slider_row(
         ui,
         &label,
         None,
@@ -1896,8 +1942,9 @@ fn mask_fields(
         &unit,
         track,
         100.0,
-    );
-    *density = percent / 100.0;
+    ) {
+        *density = percent / 100.0;
+    }
     let label = t!("core-mask-feather");
     dialogs::slider_row(ui, &label, None, feather, 0.0..=250.0, " px", track, 0.0);
     let mask = doc.as_ref().and_then(|d| d.active_layer().mask.as_ref());
@@ -2198,6 +2245,9 @@ pub(super) struct BelowHistogram {
     )>,
     /// The layers reduced, kept between them (of a document).
     cache: Option<(u64, crate::compose::LevelCache)>,
+    /// The fingerprint whose job failed (a panic): not started again until
+    /// the layers below change.
+    failed: Option<u64>,
 }
 
 impl BelowHistogram {

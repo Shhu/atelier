@@ -4,12 +4,40 @@
 
 use super::*;
 use crate::paint::gradient::{self, Gradient, Shape};
-use crate::paint::{Preset, StrokeMode, Tip, ToneRange};
+use crate::paint::{Preset, StrokeMode, Tip, ToneRange, blend_pixel};
 
 /// Smoothing at 100 %: the brush trails the pointer by this many points.
 const SMOOTHING_REACH: f32 = 40.0;
 /// Airbrush: a dab every this many seconds while the button is held.
 const AIRBRUSH_INTERVAL: f64 = 0.05;
+/// Shift + drag: the axis is chosen once the pointer is this far (points).
+const AXIS_DECIDE: f32 = 4.0;
+
+/// Shift + drag with a brush tool: the stroke stays on the horizontal or
+/// vertical (on screen) through the press, the one the pointer goes along
+/// first.
+#[derive(Clone, Copy)]
+struct AxisLock {
+    /// The press (upright screen).
+    origin: Pos2,
+    /// Horizontal (`true`) or vertical; `None` until the pointer has moved.
+    horizontal: Option<bool>,
+}
+
+impl AxisLock {
+    /// `pos` (upright screen) held on the axis.
+    fn hold(&mut self, pos: Pos2) -> Pos2 {
+        let d = pos - self.origin;
+        if self.horizontal.is_none() && d.length() >= AXIS_DECIDE {
+            self.horizontal = Some(d.x.abs() >= d.y.abs());
+        }
+        match self.horizontal {
+            Some(true) => pos2(pos.x, self.origin.y),
+            Some(false) => pos2(self.origin.x, pos.y),
+            None => self.origin,
+        }
+    }
+}
 
 /// Settings of the painting tools (shared tip, per-tool amounts) and the
 /// gesture in progress.
@@ -53,6 +81,15 @@ pub(super) struct PaintTools {
     /// Where the brush is (canvas coordinates): with smoothing, it trails
     /// the pointer.
     brush_at: Option<Pos2>,
+    /// Shift held at the press: the stroke's axis.
+    axis_lock: Option<AxisLock>,
+    /// The stroke's own copy of a large layer's pixels, made on a worker
+    /// thread at the press (see [`StrokeCopy`]), and the pointer's samples
+    /// held until it is there.
+    copy: Option<StrokeCopy>,
+    held: Vec<(Pos2, Option<f32>)>,
+    /// Brush blend mode.
+    pub mode: BlendMode,
     /// Time of the last airbrush dab.
     last_dab: f64,
     /// Previews of the brush presets, made on first use.
@@ -70,6 +107,26 @@ pub(super) struct PaintTools {
     pub(super) size_drag_ended: bool,
     pub bucket: BucketSettings,
 }
+
+/// The pixels a stroke paints are shared with the step recorded at its
+/// press and with the stroke itself: the first dab would copy them all on
+/// the UI thread (a hundred megabytes for a 24 MP layer, tens of
+/// milliseconds). A worker thread copies them instead, the dabs waiting a
+/// frame or two.
+struct StrokeCopy {
+    /// The pixels copied, as the layer has them.
+    of: Arc<image::RgbaImage>,
+    job: std::thread::JoinHandle<image::RgbaImage>,
+}
+
+/// Tests: the copies wait while set (see [`StrokeCopy`]).
+#[cfg(test)]
+pub(super) static HOLD_STROKE_COPY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Layers from this many pixels have their copy made on a worker thread
+/// (below, it takes under a millisecond).
+const COPY_LATER_PIXELS: u64 = 1 << 21;
 
 /// Options of the Paint Bucket (besides its tolerance and Contiguous).
 pub(super) struct BucketSettings {
@@ -135,6 +192,10 @@ impl Default for PaintTools {
             editor: None,
             pressure: None,
             brush_at: None,
+            axis_lock: None,
+            copy: None,
+            held: Vec::new(),
+            mode: BlendMode::Normal,
             last_dab: 0.0,
             previews: Vec::new(),
             rasterize_confirm: None,
@@ -164,6 +225,11 @@ impl PaintTools {
 }
 
 impl Tool {
+    /// Tools with the Smoothing option (it applies to them only).
+    pub(super) fn has_smoothing(self) -> bool {
+        matches!(self, Tool::Brush | Tool::Eraser)
+    }
+
     /// Tools with the Airbrush option.
     pub(super) fn has_airbrush(self) -> bool {
         matches!(
@@ -229,33 +295,6 @@ fn sync_paint(doc: &mut Document, offset: (i64, i64), r: DirtyRect) {
         w: r.w,
         h: r.h,
     }));
-}
-
-/// Gradient pixel `s` over layer pixel `d` in `mode` (Dissolve: at canvas
-/// pixel (x, y)).
-fn blend_pixel(d: [u8; 4], s: [u8; 4], mode: BlendMode, x: i64, y: i64) -> [u8; 4] {
-    use crate::compose::blend;
-    let da = d[3] as f32 / 255.0;
-    let c = |i: usize| d[i] as f32 / 255.0 * da;
-    let mut px = [c(0), c(1), c(2), da];
-    let mut a = s[3] as f32 / 255.0;
-    let mode = if mode == BlendMode::Dissolve {
-        a = blend::dissolve(a, x, y);
-        BlendMode::Normal
-    } else {
-        mode
-    };
-    blend::over(&mut px, [0, 1, 2].map(|i| s[i] as f32 / 255.0), a, mode);
-    if px[3] <= 0.0 {
-        return [0, 0, 0, 0];
-    }
-    let c = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
-    [
-        c(px[0] / px[3]),
-        c(px[1] / px[3]),
-        c(px[2] / px[3]),
-        c(px[3]),
-    ]
 }
 
 /// `to`, moved so that the line from `from` is a multiple of 45°.
@@ -327,6 +366,7 @@ impl AtelierApp {
                 if self.tool == Tool::Eraser {
                     StrokeMode::Erase
                 } else {
+                    s.mode = p.mode;
                     StrokeMode::Paint
                 }
             }
@@ -351,7 +391,26 @@ impl AtelierApp {
         }
         // Shift + click: straight line from the end of the previous stroke.
         let line_from = self.last_paint.filter(|_| start && shift);
-        let samples = frame_samples(&self.ctx, pointer, self.view_turn);
+        let mut samples = frame_samples(&self.ctx, pointer, self.view_turn);
+        if start {
+            // Shift + drag: on the axis through the press.
+            let origin = samples.first().map(|s| s.0).or(pointer);
+            self.paint.axis_lock = origin.filter(|_| shift).map(|origin| AxisLock {
+                origin,
+                horizontal: None,
+            });
+        } else if self.stroke.is_none() {
+            self.paint.axis_lock = None;
+        }
+        let pointer = match &mut self.paint.axis_lock {
+            Some(lock) => {
+                for s in &mut samples {
+                    s.0 = lock.hold(s.0);
+                }
+                pointer.map(|p| lock.hold(p))
+            }
+            None => pointer,
+        };
         let (now, alt) = self.ctx.input(|i| (i.time, i.modifiers.alt));
         if start && let Some(doc) = &self.doc {
             let on_mask = doc.mask_targeted();
@@ -393,10 +452,34 @@ impl AtelierApp {
                 self.retouch
                     .prepare(self.tool, doc, &self.parked, stroke, at.unwrap_or_default());
             self.stroke = Some(stroke);
+            self.paint.held.clear();
+            self.paint.copy = None;
+            if let Some(doc) = &self.doc
+                && line_from.is_none()
+                && !self.tool.clones()
+                && !matches!(self.tool, Tool::HealingBrush | Tool::SpotHealing)
+            {
+                let of = doc.active_layer().shared_image();
+                if u64::from(of.width()) * u64::from(of.height()) >= COPY_LATER_PIXELS {
+                    let source = Arc::clone(&of);
+                    let job = std::thread::Builder::new()
+                        .name("stroke copy".into())
+                        .spawn(move || {
+                            #[cfg(test)]
+                            while HOLD_STROKE_COPY.load(std::sync::atomic::Ordering::SeqCst) {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            (*source).clone()
+                        });
+                    self.paint.copy = job.ok().map(|job| StrokeCopy { of, job });
+                }
+            }
             self.paint.pressure = None;
             self.paint.brush_at = None;
             self.paint.last_dab = now;
             if let Some(from) = line_from {
+                // At the pen's pressure of the press, both ends.
+                self.paint.pressure = samples.iter().find_map(|s| s.1);
                 self.paint.brush_at = Some(from);
                 self.stroke_to(from);
             }
@@ -407,8 +490,19 @@ impl AtelierApp {
             }
             return;
         }
+        // The pixels' copy still being made: the samples wait for it (on
+        // release, it is waited for).
+        if !self.stroke_copy_ready(released || !down) {
+            self.paint.held.extend(samples);
+            return;
+        }
+        if !self.paint.held.is_empty() {
+            let mut held = std::mem::take(&mut self.paint.held);
+            held.append(&mut samples);
+            samples = held;
+        }
         // Lazy brush: it follows the pointer only beyond the smoothing's reach.
-        let reach = self.paint.smoothing * SMOOTHING_REACH / view.zoom;
+        let reach = self.smoothing_reach() / view.zoom;
         let last = samples.last().map(|s| s.0).or(pointer);
         for (pos, force) in samples {
             if force.is_some() {
@@ -450,6 +544,40 @@ impl AtelierApp {
         self.last_paint = self.paint.brush_at;
         if released || !down {
             self.finish_stroke();
+        }
+    }
+
+    /// The stroke is over: its copy of the pixels, if still being made,
+    /// and the samples waiting for it go.
+    pub(super) fn forget_stroke_copy(&mut self) {
+        self.paint.copy = None;
+        self.paint.held.clear();
+    }
+
+    /// Whether the stroke's copy of the pixels (see [`StrokeCopy`]) is
+    /// there, or not needed: the layer then takes it (`wait`: once made).
+    fn stroke_copy_ready(&mut self, wait: bool) -> bool {
+        let Some(copy) = &self.paint.copy else {
+            return true;
+        };
+        if !wait && !copy.job.is_finished() {
+            self.ctx.request_repaint();
+            return false;
+        }
+        let copy = self.paint.copy.take().expect("checked above");
+        if let (Ok(pixels), Some(doc)) = (copy.job.join(), &mut self.doc) {
+            doc.active_layer_mut().adopt_copy(&copy.of, pixels);
+        }
+        true
+    }
+
+    /// How far the brush trails the pointer (screen points): the Smoothing
+    /// of the tools that have it.
+    fn smoothing_reach(&self) -> f32 {
+        if self.tool.has_smoothing() {
+            self.paint.smoothing * SMOOTHING_REACH
+        } else {
+            0.0
         }
     }
 
@@ -524,7 +652,20 @@ impl AtelierApp {
     /// `false` when too small to show (a crosshair then).
     pub(super) fn draw_brush_cursor(&self, painter: &Painter, pos: Pos2, view: View) -> bool {
         // Resized with Alt + right drag: where the drag started.
-        let pos = self.paint.size_drag.map_or(pos, |d| self.view_turn.to_upright(d.0));
+        let mut pos = self.paint.size_drag.map_or(pos, |d| self.view_turn.to_upright(d.0));
+        // Smoothing: the outline is where the paint goes, on a leash from
+        // the pointer.
+        if self.stroke.is_some()
+            && self.smoothing_reach() > 0.0
+            && let Some(at) = self.paint.brush_at
+        {
+            let at = view.to_screen(at);
+            if at.distance(pos) >= 1.0 {
+                painter.line_segment([at, pos], UiStroke::new(2.0, Color32::BLACK));
+                painter.line_segment([at, pos], UiStroke::new(1.0, Color32::WHITE));
+            }
+            pos = at;
+        }
         let radius = self.brush_size * 0.5 * view.zoom;
         if radius < 3.0 {
             return false;

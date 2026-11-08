@@ -218,7 +218,13 @@ impl LayoutKey {
 
 impl TextEngine {
     pub fn new() -> Self {
-        let fonts = FontSystem::new();
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut fonts = FontSystem::new();
+        // Tests run against a font every machine has, fonts installed or not.
+        #[cfg(test)]
+        fonts
+            .db_mut()
+            .load_font_data(include_bytes!("../../assets/fonts/Inter-Variable.ttf").to_vec());
         let mut families: Vec<String> = fonts
             .db()
             .faces()
@@ -906,23 +912,20 @@ mod tests {
     use super::*;
     use crate::text::TextAlign;
 
-    /// An engine, with a font whose metrics are known when the machine has
-    /// it (no fonts at all: `None`, the test is skipped).
-    fn engine() -> Option<(TextEngine, CharStyle)> {
+    /// An engine, with a font whose metrics are known: the machine's when
+    /// it has one of these, else the bundled Inter (always there in tests).
+    fn engine() -> (TextEngine, CharStyle) {
         let engine = TextEngine::new();
-        if engine.families().is_empty() {
-            return None;
-        }
-        let family = ["DejaVu Sans", "Liberation Sans", "Arial"]
+        let family = ["DejaVu Sans", "Liberation Sans", "Arial", "Inter"]
             .into_iter()
             .find(|f| engine.families().iter().any(|e| e == f))
-            .unwrap_or_default();
+            .expect("the bundled font");
         let style = CharStyle {
             family: family.into(),
             size: 20.0,
             ..Default::default()
         };
-        Some((engine, style))
+        (engine, style)
     }
 
     const LONG: &str = "The quick brown fox jumps over the lazy dog again and again";
@@ -938,9 +941,7 @@ mod tests {
 
     #[test]
     fn paragraph_text_wraps_in_its_box() {
-        let Some((mut e, style)) = engine() else {
-            return;
-        };
+        let (mut e, style) = engine();
         let d = boxed(LONG, &style, 200.0, 1000.0, TextAlign::Left);
         let l = e.layout(&d);
         assert!(l.lines.len() >= 3, "{} lines", l.lines.len());
@@ -961,9 +962,7 @@ mod tests {
 
     #[test]
     fn leading_is_the_distance_between_baselines() {
-        let Some((mut e, style)) = engine() else {
-            return;
-        };
+        let (mut e, style) = engine();
         let tops = |e: &mut TextEngine, style: &CharStyle| -> Vec<f32> {
             let l = e.layout(&TextData::plain("Ab\nCd\n\nEf", style.clone()));
             l.lines.iter().map(|l| l.top).collect()
@@ -988,9 +987,7 @@ mod tests {
 
     #[test]
     fn tracking_and_kerning_change_the_width() {
-        let Some((mut e, style)) = engine() else {
-            return;
-        };
+        let (mut e, style) = engine();
         let width = |e: &mut TextEngine, text: &str, style: CharStyle| {
             let l = e.layout(&TextData::plain(text, style));
             l.lines[0].x1 - l.lines[0].x0
@@ -1031,9 +1028,7 @@ mod tests {
 
     #[test]
     fn paragraphs_align_in_their_box_or_around_the_origin() {
-        let Some((mut e, style)) = engine() else {
-            return;
-        };
+        let (mut e, style) = engine();
         let line = |e: &mut TextEngine, d: &TextData| {
             let l = e.layout(d);
             (l.lines[0].x0, l.lines[0].x1)
@@ -1073,9 +1068,7 @@ mod tests {
 
     #[test]
     fn indents_and_paragraph_spacing() {
-        let Some((mut e, style)) = engine() else {
-            return;
-        };
+        let (mut e, style) = engine();
         let mut d = boxed(LONG, &style, 250.0, 1000.0, TextAlign::Left);
         d.paragraphs[0].indent_left = 20.0;
         d.paragraphs[0].indent_first = 30.0;
@@ -1094,9 +1087,7 @@ mod tests {
 
     #[test]
     fn caret_hit_testing_and_selection() {
-        let Some((mut e, style)) = engine() else {
-            return;
-        };
+        let (mut e, style) = engine();
         let l = e.layout(&TextData::plain("ab\ncd", style));
         let (x0, top, bottom) = l.caret(0);
         assert!(x0.abs() < 0.01 && top < 0.0 && bottom > 0.0);
@@ -1119,9 +1110,7 @@ mod tests {
 
     #[test]
     fn caps_keep_caret_positions_in_the_text() {
-        let Some((mut e, style)) = engine() else {
-            return;
-        };
+        let (mut e, style) = engine();
         let lower = e.layout(&TextData::plain("abß", style.clone()));
         let caps = e.layout(&TextData::plain(
             "abß",
@@ -1150,9 +1139,7 @@ mod tests {
 
     #[test]
     fn renders_styles_runs_and_antialiasing() {
-        let Some((mut e, style)) = engine() else {
-            return;
-        };
+        let (mut e, style) = engine();
         let mut d = TextData::plain("HH", style.clone());
         d.restyle(1..2, |s| s.color = [255, 0, 0, 255]);
         let img = e.render(&d).image;
@@ -1185,9 +1172,7 @@ mod tests {
 
     #[test]
     fn rendering_follows_the_transformation_and_keeps_the_anchor() {
-        let Some((mut e, style)) = engine() else {
-            return;
-        };
+        let (mut e, style) = engine();
         let mut d = TextData::plain("Hello world", style);
         d.anchor = (0.25, 0.75);
         let flat = e.render(&d);
@@ -1211,9 +1196,7 @@ mod tests {
 
     #[test]
     fn empty_texts_have_a_caret_line() {
-        let Some((mut e, style)) = engine() else {
-            return;
-        };
+        let (mut e, style) = engine();
         let d = TextData::new(style, Default::default());
         let l = e.layout(&d);
         assert_eq!(l.lines.len(), 1);
@@ -1225,7 +1208,7 @@ mod tests {
 
     #[test]
     fn families_have_their_faces() {
-        let Some((e, style)) = engine() else { return };
+        let (e, style) = engine();
         let faces = e.faces(&style.family);
         assert!(!faces.is_empty());
         if style.family == "DejaVu Sans" {
@@ -1241,9 +1224,7 @@ mod tests {
     #[test]
     #[ignore = "timing, in release"]
     fn text_render_speed() {
-        let Some((mut e, style)) = engine() else {
-            return;
-        };
+        let (mut e, style) = engine();
         let text = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(40);
         let mut d = TextData::plain(
             &text,

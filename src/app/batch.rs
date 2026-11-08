@@ -232,6 +232,9 @@ struct BatchRun {
     errors: usize,
     serial: u32,
     current: Option<Current>,
+    /// Where the action's Export steps without a folder of their own write
+    /// (the destination folder): never among the files processed.
+    export_folder: Option<PathBuf>,
 }
 
 /// Batch, Image Processor and Fit Image windows, and the batch running.
@@ -257,6 +260,11 @@ impl Automate {
 
     pub(super) fn running(&self) -> bool {
         self.run.is_some()
+    }
+
+    /// Where an Export step without a folder writes during the batch.
+    pub(super) fn export_folder(&self) -> Option<&Path> {
+        self.run.as_ref()?.export_folder.as_deref()
     }
 }
 
@@ -305,9 +313,34 @@ pub(super) fn format_of(path: &Path) -> Option<ExportFormat> {
         .find(|f| f.extensions().iter().any(|x| x.eq_ignore_ascii_case(ext)))
 }
 
+/// Formats Atelier opens and Save and Close writes back, though Export
+/// doesn't offer them: plain pixels, no profile or metadata.
+fn plain_format(path: &Path) -> Option<image::ImageFormat> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "bmp" => Some(image::ImageFormat::Bmp),
+        "tga" => Some(image::ImageFormat::Tga),
+        "qoi" => Some(image::ImageFormat::Qoi),
+        _ => None,
+    }
+}
+
+/// `image` in a plain format: without its alpha channel when opaque.
+fn encode_plain(
+    image: image::RgbaImage,
+    format: image::ImageFormat,
+) -> Result<Vec<u8>, crate::document::FileError> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    let image = image::DynamicImage::ImageRgba8(image);
+    let opaque = image.as_rgba8().is_some_and(|i| i.pixels().all(|p| p.0[3] == 255));
+    let image = if opaque { image::DynamicImage::ImageRgb8(image.to_rgb8()) } else { image };
+    image.write_to(&mut out, format)?;
+    Ok(out.into_inner())
+}
+
 /// A folder chosen with the system dialog.
 fn pick_folder(title: &str, from: Option<&Path>) -> Option<PathBuf> {
-    let mut dialog = rfd::FileDialog::new().set_title(title);
+    let mut dialog = file_dialog::new().set_title(title);
     if let Some(dir) = from {
         dialog = dialog.set_directory(dir);
     }
@@ -596,7 +629,7 @@ impl AtelierApp {
                         ui.horizontal(|ui| {
                             if ui_kit::button(ui, &t!("actions-save-as"), Kind::Normal, None, true)
                                 .clicked()
-                                && let Some(p) = rfd::FileDialog::new()
+                                && let Some(p) = file_dialog::new()
                                     .set_title(t!("actions-batch-errors"))
                                     .set_file_name("batch-errors.txt")
                                     .save_file()
@@ -834,6 +867,9 @@ impl AtelierApp {
             errors: 0,
             serial: d.serial,
             current: None,
+            export_folder: (d.destination == Destination::Folder)
+                .then(|| d.dest_folder.clone())
+                .flatten(),
         });
     }
 
@@ -892,6 +928,7 @@ impl AtelierApp {
             errors: 0,
             serial: 1,
             current: None,
+            export_folder: folder,
         });
     }
 
@@ -1195,11 +1232,16 @@ impl AtelierApp {
                 ));
             }
         }
-        if crate::document::is_native(&path) || files::has_extension(&path, "psd") {
+        if crate::document::is_native(&path) || crate::document::is_psd(&path) {
             return doc.save(&path).map(|_| ()).map_err(|e| crate::i18n::Message::of(|| e.to_string()));
         }
-        let Some(format) = format_of(&path) else {
-            return Err(tm!("actions-error-format", name = files::file_name(&path)));
+        // `Err`: a format Export doesn't offer.
+        let format = match (format_of(&path), plain_format(&path)) {
+            (Some(format), _) => Ok(format),
+            (None, Some(plain)) => Err(plain),
+            (None, None) => {
+                return Err(tm!("actions-error-format", name = files::file_name(&path)));
+            }
         };
         // Nor an image replaced by one holding less (its other frames or
         // pages, its depth, its inks, its metadata).
@@ -1210,6 +1252,22 @@ impl AtelierApp {
                 notes = doc.file_notes.join(" · ")
             ));
         }
+        let format = match format {
+            Ok(format) => format,
+            Err(plain) => {
+                encode_plain(doc.flatten(), plain)
+                    .and_then(|b| crate::export::write(&path, &b))
+                    .map_err(|e| {
+                        tm!(
+                            "file-status-export-failed",
+                            name = files::file_name(&path),
+                            error = crate::i18n::Message::of(|| e.to_string())
+                        )
+                    })?;
+                doc.mark_saved();
+                return Ok(());
+            }
+        };
         // Its own profile and EXIF back.
         let options = ExportOptions {
             format,
@@ -1437,6 +1495,10 @@ fn naming_slots(ui: &mut egui::Ui, slots: &mut [Option<NamePart>; 4]) {
 }
 
 #[cfg(test)]
+#[path = "batch14_tests.rs"]
+mod batch14_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::actions::{Sequence, Set, Step};
@@ -1470,10 +1532,7 @@ mod tests {
     }
 
     fn folder(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("atelier-batch-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testing::test_dir(&format!("batch-{name}"))
     }
 
     fn png(path: &Path, (w, h): (u32, u32), v: u8) {

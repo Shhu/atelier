@@ -745,8 +745,7 @@ fn number_field_in<N: Numeric>(
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
     frameless(&mut child);
-    let mut drag = egui::DragValue::new(value)
-        .range(range)
+    let mut drag = bounded_drag(value, range)
         .suffix(if empty { "" } else { suffix })
         .speed(0.5)
         .custom_parser(|text| {
@@ -769,6 +768,23 @@ fn number_field_in<N: Numeric>(
         .accesskit_node_builder(response.id, |node| node.set_label(label));
     painter.set(frame, field_shape(rect, hovered, response.has_focus()));
     response
+}
+
+/// A [`egui::DragValue`] keeping what the user enters within `range`,
+/// but showing a value set elsewhere (read from a file, turned with the
+/// canvas) as it is: clamping it on display would write back a change no
+/// one made, and record it.
+pub fn bounded_drag<N: Numeric>(value: &mut N, range: RangeInclusive<N>) -> egui::DragValue<'_> {
+    let (lo, hi) = (range.start().to_f64(), range.end().to_f64());
+    let drag = egui::DragValue::from_get_set(move |v: Option<f64>| {
+        if let Some(v) = v {
+            *value = N::from_f64(v.max(lo).min(hi));
+        }
+        value.to_f64()
+    })
+    .range(range)
+    .clamp_existing_to_range(false);
+    if N::INTEGRAL { drag.max_decimals(0).speed(0.25) } else { drag }
 }
 
 /// [`number_field`] labelled by a glyph: `name` is its tooltip and what
@@ -1403,7 +1419,9 @@ mod tests {
         let context = |fonts: FontDefinitions| {
             let ctx = egui::Context::default();
             ctx.set_fonts(fonts);
-            let _ = ctx.run_ui(Default::default(), |_| {});
+            // A dropped output with unapplied texture deltas trips a debug
+            // assertion in epaint.
+            ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
             ctx
         };
         let alone = |name: &str| {

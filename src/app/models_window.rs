@@ -114,10 +114,11 @@ impl AtelierApp {
 
     /// The active document goes away (closed, or set aside for another
     /// tab): what was going to act on it is forgotten, so that it never
-    /// lands on another document.
+    /// lands on another document. A subject search goes on: it lands when
+    /// its document is active again (dropped if it is closed, see
+    /// [`Self::poll_subject`]).
     pub(super) fn forget_document_jobs(&mut self) {
         self.model_prompt = None;
-        self.subject_job = None;
         self.subject_waiting = None;
         self.after_download.clear();
         self.forget_waiting_fill();
@@ -249,6 +250,11 @@ impl AtelierApp {
         let confirm = window.confirm_delete;
         let total: u64 = Model::ALL.iter().map(|m| m.size_on_disk()).sum();
         let center = ctx.content_rect().center();
+        // A run no job of the window follows (its document closed): its end
+        // enables Delete again.
+        if Model::ALL.iter().any(|m| m.running()) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
         let mut actions = Vec::new();
         let out = floating_dialog(
             ctx,
@@ -289,7 +295,7 @@ impl AtelierApp {
         if out.other {
             let root = models::root();
             if let Err(e) = open_folder(&root) {
-                self.status_failed(tm!("models-open-folder-failed", error = crate::i18n::Message::of(|| e.to_string())));
+                self.status_failed(tm!("models-open-folder-failed", error = crate::i18n::Message::of(|| crate::i18n::io_error(&e))));
             }
         }
         if out.ok || out.cancel {
@@ -304,6 +310,7 @@ impl AtelierApp {
     /// Is `model` being used (its files must stay)?
     fn model_in_use(&self, model: Model) -> bool {
         self.downloads.is_downloading(model)
+            || model.running()
             || match model {
                 Model::Subject => self.subject_job.is_some(),
                 Model::Objects => self.object_select.busy(),
@@ -558,12 +565,16 @@ fn progress_bar(ui: &mut egui::Ui, fraction: f32) {
 /// Shows `path` in the system's file manager (created if needed).
 pub(super) fn open_folder(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
-    let program = if cfg!(windows) {
-        "explorer"
+    // By its full path on Windows: a bare name would first be looked for
+    // next to the .exe (an `explorer.exe` planted in Downloads).
+    let program: PathBuf = if cfg!(windows) {
+        std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from)
+            .join("explorer.exe")
     } else if cfg!(target_os = "macos") {
-        "open"
+        "open".into()
     } else {
-        "xdg-open"
+        "xdg-open".into()
     };
     let mut child = std::process::Command::new(program).arg(path).spawn()?;
     // Reaped in the background.

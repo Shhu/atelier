@@ -119,11 +119,13 @@ impl Default for Posterize {
 }
 
 /// Photoshop's posterize: `levels` equal bands per channel, spread from
-/// black to white.
+/// black to white at rounded levels (5 levels: 0, 64, 128, 191, 255).
 pub fn posterize(image: &mut RgbaImage, levels: u8) {
     let n = levels.max(2) as u32;
-    let lut: [u8; 256] =
-        std::array::from_fn(|v| ((v as u32 * n / 256) * 255 / (n - 1)).min(255) as u8);
+    let lut: [u8; 256] = std::array::from_fn(|v| {
+        let band = v as u32 * n / 256;
+        ((band * 255 + (n - 1) / 2) / (n - 1)).min(255) as u8
+    });
     par_pixels(image, |p| {
         for c in &mut p[..3] {
             *c = lut[*c as usize];
@@ -189,6 +191,21 @@ mod tests {
 
     fn one(c: [u8; 3]) -> RgbaImage {
         RgbaImage::from_pixel(1, 1, Rgba([c[0], c[1], c[2], 255]))
+    }
+
+    #[test]
+    fn posterize_rounds_its_levels() {
+        let levels = |n: u8| {
+            let mut ramp = RgbaImage::from_fn(256, 1, |x, _| Rgba([x as u8, 0, 0, 255]));
+            posterize(&mut ramp, n);
+            let mut v: Vec<u8> = ramp.pixels().map(|p| p.0[0]).collect();
+            v.dedup();
+            v
+        };
+        assert_eq!(levels(2), [0, 255]);
+        assert_eq!(levels(4), [0, 85, 170, 255]);
+        assert_eq!(levels(5), [0, 64, 128, 191, 255]);
+        assert_eq!(levels(7), [0, 43, 85, 128, 170, 213, 255]);
     }
 
     #[test]

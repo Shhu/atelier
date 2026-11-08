@@ -133,6 +133,19 @@ impl Mask {
         &self.image
     }
 
+    /// Address and size of its image and of its feathered images (kept
+    /// with each copy in the history), for the history's memory budget.
+    pub(super) fn buffers(&self, out: &mut Vec<(usize, usize)>) {
+        let mut raw = |r: &[u8]| out.push((r.as_ptr() as usize, r.len()));
+        raw(self.image.as_raw());
+        if let Some(f) = self.feathered.borrow().as_ref() {
+            raw(f.image.as_raw());
+            if let Some((_, reduced)) = &f.reduced {
+                raw(reduced.as_raw());
+            }
+        }
+    }
+
     pub fn rev(&self) -> u64 {
         self.rev
     }
@@ -722,20 +735,27 @@ impl Mask {
         self.replace(image, (x0, y0), layer_offset);
     }
 
-    /// The image enlarged (with its default value) to cover `area` (canvas).
-    fn grown_to(&mut self, area: PixelRect, layer_offset: (i64, i64)) {
+    /// Box of the image in the canvas, without its feathered edge.
+    fn image_box(&self, layer_offset: (i64, i64)) -> PixelRect {
         let (x, y) = self.origin(layer_offset);
-        let own = PixelRect {
+        PixelRect {
             x,
             y,
             w: self.image.width(),
             h: self.image.height(),
-        };
-        let u = if own.w == 0 || own.h == 0 {
-            area
-        } else {
-            own.union(area)
-        };
+        }
+    }
+
+    /// The box [`Self::grown_to`] gives the image.
+    fn grown_box(&self, area: PixelRect, layer_offset: (i64, i64)) -> PixelRect {
+        let own = self.image_box(layer_offset);
+        if own.w == 0 || own.h == 0 { area } else { own.union(area) }
+    }
+
+    /// The image enlarged (with its default value) to cover `area` (canvas).
+    fn grown_to(&mut self, area: PixelRect, layer_offset: (i64, i64)) {
+        let own = self.image_box(layer_offset);
+        let u = self.grown_box(area, layer_offset);
         if u == own {
             return;
         }
@@ -774,6 +794,17 @@ impl Mask {
 }
 
 impl Document {
+    /// The pixel operations have nothing to change: the active layer is
+    /// one of pixels without any (nor a mask), and its pixels are what
+    /// they edit.
+    pub fn target_empty(&self) -> bool {
+        let layer = self.real_active();
+        !self.mask_targeted()
+            && layer.has_pixels()
+            && layer.mask.is_none()
+            && layer.content_bounds().is_none()
+    }
+
     /// Whether the painting tools and pixel operations edit the active
     /// layer's mask: chosen by clicking its thumbnail; always for a layer
     /// without pixels.
@@ -875,7 +906,24 @@ impl Document {
         self.checkpoint(t!("xchg-hist-delete-mask"));
         self.layers[self.active].mask = None;
         self.release_stand_in();
+        self.drop_stale_mask_target();
         true
+    }
+
+    /// The targeted mask gone (deleted, applied, merged): the layer is
+    /// targeted again.
+    pub(super) fn drop_stale_mask_target(&mut self) {
+        let stale = self.mask_target.is_some_and(|id| {
+            let filter = self.filter_mask_target;
+            !self
+                .layers
+                .iter()
+                .any(|l| l.id == id && target_mask(l, filter).is_some())
+        });
+        if stale {
+            self.mask_target = None;
+            self.filter_mask_target = false;
+        }
     }
 
     /// Applies the mask to the pixels (they lose the opacity it hid), and
@@ -897,6 +945,7 @@ impl Document {
         layer.text = text.filter(|_| mask_was_white(layer.mask.as_ref()));
         layer.mask = None;
         self.release_stand_in();
+        self.drop_stale_mask_target();
         true
     }
 
@@ -1182,14 +1231,14 @@ impl Document {
             self.swapped = Some(Box::new(std::mem::replace(layer, proxy)));
             return;
         }
+        // The stand-in covers the canvas; the mask itself grows only once
+        // painted (see `write_back`): the step recorded before keeps it as
+        // it was.
         let canvas = self.full_rect();
         let layer = &mut self.layers[self.active];
-        let offset = layer.offset;
         let filter = self.filter_mask_target;
-        if let Some(m) = target_mask_mut(layer, filter) {
-            m.grown_to(canvas, offset);
-        }
-        let proxy = stand_in(layer, canvas, filter);
+        let area = target_mask(layer, filter).expect("a mask").grown_box(canvas, layer.offset);
+        let proxy = stand_in_over(layer, area, filter);
         self.swapped = Some(Box::new(std::mem::replace(layer, proxy)));
     }
 
@@ -1302,6 +1351,7 @@ fn stand_in_shell(layer: &Layer) -> Layer {
         kind: LayerKind::Pixels,
         bounds: std::cell::Cell::new(None),
         styles_cache: RefCell::new(None),
+        look: RefCell::new(None),
         styles_job: Default::default(),
         effects: Default::default(),
         locks: Default::default(),
@@ -1320,8 +1370,43 @@ fn stand_in_shell(layer: &Layer) -> Layer {
 /// pixels hide.
 fn write_back(proxy: &Layer, real: &mut Layer, area: Option<PixelRect>, filter: bool) {
     let offset = real.offset;
-    let Some(mask) = target_mask_mut(real, filter) else {
-        return;
+    let p = proxy.rect();
+    // A stand-in larger than the mask (see `swap_in_mask`): compared with
+    // the mask grown to it, which takes the mask's place only if painted.
+    let mut grown = target_mask(real, filter)
+        .filter(|m| {
+            let own = m.image_box(offset);
+            own != p && m.grown_box(p, offset) == p
+        })
+        .cloned();
+    if let Some(m) = &mut grown {
+        m.grown_to(p, offset);
+    }
+    let changed = write_back_into(proxy, grown.as_mut(), real, area, filter);
+    if let (Some(grown), Some(area)) = (grown, changed)
+        && let Some(mask) = target_mask_mut(real, filter)
+    {
+        *mask = grown;
+        if filter {
+            real.remix_filter_mask(area);
+        }
+    }
+}
+
+/// [`write_back`] into `grown` if given (else into `real`'s mask): the
+/// area changed (`Some(None)`: all of it), `None` if nothing did.
+fn write_back_into(
+    proxy: &Layer,
+    grown: Option<&mut Mask>,
+    real: &mut Layer,
+    area: Option<PixelRect>,
+    filter: bool,
+) -> Option<Option<PixelRect>> {
+    let offset = real.offset;
+    let into_real = grown.is_none();
+    let mask = match grown {
+        Some(m) => m,
+        None => target_mask_mut(real, filter)?,
     };
     let (x, y) = mask.origin(offset);
     let p = proxy.rect();
@@ -1360,17 +1445,14 @@ fn write_back(proxy: &Layer, real: &mut Layer, area: Option<PixelRect>, filter: 
             .iter()
             .enumerate()
             .filter_map(|(j, c)| c.map(|c| (j, c)));
-        let Some(local) = changed
+        let local = changed
             .map(|(j, (a, b))| PixelRect {
                 x: a as i64,
                 y: (r.y - p.y) + j as i64,
                 w: (b - a) as u32,
                 h: 1,
             })
-            .reduce(PixelRect::union)
-        else {
-            return;
-        };
+            .reduce(PixelRect::union)?;
         let before = mask.rev();
         let image = mask.pixels_mut();
         let (lx0, lx1) = (local.x as usize, local.right() as usize);
@@ -1390,11 +1472,12 @@ fn write_back(proxy: &Layer, real: &mut Layer, area: Option<PixelRect>, filter: 
             ..local
         });
     } else {
-        return;
+        return None;
     }
-    if filter {
+    if filter && into_real {
         real.remix_filter_mask(area);
     }
+    Some(area)
 }
 
 /// Values blurred as a difference from the default `d`, as mask values.
@@ -1481,6 +1564,31 @@ fn gray([r, g, b, a]: [u8; 4]) -> u8 {
 mod tests {
     use super::*;
     use image::Rgba;
+
+    /// The mask targeted goes with its mask (deleted, applied, merged):
+    /// no target is left on a layer without one.
+    #[test]
+    fn the_mask_target_goes_with_its_mask() {
+        let image = RgbaImage::from_pixel(8, 8, Rgba([9, 9, 9, 255]));
+        let mut doc = Document::new(image, None);
+        for delete in [true, false] {
+            doc.add_mask(NewMask::HideAll, None);
+            assert!(doc.mask_target.is_some());
+            match delete {
+                true => assert!(doc.delete_mask()),
+                false => assert!(doc.apply_mask()),
+            }
+            assert_eq!(doc.mask_target, None);
+            doc.undo();
+            assert!(doc.mask_target.is_some(), "back with its mask");
+            doc.redo();
+        }
+        doc.add_mask(NewMask::HideAll, None);
+        doc.add_layer("top".into(), RgbaImage::from_pixel(2, 2, Rgba([1; 4])), (0, 0));
+        doc.add_mask(NewMask::RevealAll, None);
+        assert!(doc.merge_down().is_ok());
+        assert_eq!(doc.mask_target, None);
+    }
 
     /// Feathering blurs only around the values that differ from the
     /// default, with the same result as blurring all of the image.
@@ -1917,6 +2025,30 @@ mod tests {
         for (x, y, p) in applied.enumerate_pixels() {
             let v = m.value_at(x as i64 - 2, y as i64 - 1, (-2, -1));
             assert_eq!(p.0[3], (200.0 * v).round() as u8, "{x}, {y}");
+        }
+    }
+
+    /// The history's budget counts the feathered images each mask edit
+    /// leaves in the history (made again by every composite).
+    #[test]
+    fn history_counts_feathered_masks() {
+        let mut doc = Document::new(RgbaImage::from_pixel(200, 100, Rgba([9, 9, 9, 255])), None);
+        doc.active_layer_mut().mask = Some(Mask::new(noisy(200, 100), (0, 0), 255, (0, 0)));
+        doc.active_layer_mut().mask.as_mut().unwrap().feather = 4.0;
+        // A composite: the current mask is feathered.
+        let feathered = |doc: &Document| {
+            let m = doc.active_layer().mask.as_ref().unwrap();
+            m.shaped((0, 0)).0.as_raw().len()
+        };
+        let each = feathered(&doc);
+        assert!(each > 200 * 100, "with its margin");
+        for step in 1..=3 {
+            doc.checkpoint(format!("edit {step}"));
+            let m = doc.active_layer_mut().mask.as_mut().unwrap();
+            m.pixels_mut().put_pixel(step, 0, Luma([7]));
+            feathered(&doc);
+            // Each state in the history keeps its mask and its feathered image.
+            assert_eq!(doc.history_bytes(), step as usize * (200 * 100 + each));
         }
     }
 }

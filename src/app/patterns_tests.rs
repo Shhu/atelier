@@ -60,7 +60,7 @@ fn fill_dialog(pattern: u64) -> FillDialog {
 
 /// Runs frames until `done`, the workers having their time.
 fn settle(h: &mut Harness<'static, AtelierApp>, done: impl Fn(&AtelierApp) -> bool) {
-    for _ in 0..500 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if done(h.state()) {
             return;
@@ -821,8 +821,7 @@ fn pattern_tiles_count_in_the_history_budget() {
 
 #[test]
 fn a_disabled_overlay_keeps_its_settings_and_tile_in_a_file() {
-    let dir = std::env::temp_dir().join(format!("atelier-overlay-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("overlay");
     let path = dir.join("x.atelier");
     let mut doc = Document::new(RgbaImage::from_pixel(10, 10, Rgba(WHITE)), None);
     doc.add_layer("x".into(), RgbaImage::from_pixel(4, 4, Rgba(RED)), (1, 1));
@@ -842,8 +841,7 @@ fn a_disabled_overlay_keeps_its_settings_and_tile_in_a_file() {
 
 #[test]
 fn two_names_of_a_tile_survive_a_file() {
-    let dir = std::env::temp_dir().join(format!("atelier-names-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("names");
     let path = dir.join("x.atelier");
     let t = asym();
     let mut doc = Document::new(RgbaImage::from_pixel(10, 10, Rgba(WHITE)), None);
@@ -864,8 +862,7 @@ fn two_names_of_a_tile_survive_a_file() {
 
 #[test]
 fn values_that_are_not_numbers_still_give_a_file_that_opens() {
-    let dir = std::env::temp_dir().join(format!("atelier-nan-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("nan");
     let path = dir.join("x.atelier");
     let mut doc = Document::new(RgbaImage::from_pixel(10, 10, Rgba(WHITE)), None);
     let fill = PatternFill {
@@ -897,8 +894,7 @@ fn the_last_pattern_comes_back_in_the_next_session() {
 
 #[test]
 fn documents_keep_their_tiles_in_both_formats() {
-    let dir = std::env::temp_dir().join(format!("atelier-pattern-doc-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("pattern-doc");
     let mut doc = Document::new(RgbaImage::from_pixel(20, 20, Rgba(WHITE)), None);
     let fill = PatternFill {
         scale: 2.0,

@@ -435,6 +435,8 @@ impl AtelierApp {
         if over {
             hints.push((keys::key(Key::Enter), t!("hint-apply")));
             hints.push((keys::key(Key::Escape), t!("hint-cancel")));
+        } else if self.subject_searching() {
+            hints.push((keys::key(Key::Escape), t!("selection14-hint-stop-search")));
         }
         hints
     }

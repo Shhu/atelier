@@ -73,6 +73,25 @@ impl GpuImage {
         self.set_levels(ctx, image, levels);
     }
 
+    /// Sends area `[x, y, w, h]` of `image`, the image shown (of the same
+    /// size), changed only there.
+    pub(super) fn set_region(&mut self, ctx: &egui::Context, image: &RgbaImage, area: [u32; 4]) {
+        if self.size != [image.width(), image.height()] || !self.levels.is_empty() {
+            return self.set(ctx, image, self.levels.len());
+        }
+        let [x, y, w, h] = area;
+        let rects: Vec<_> = self.tile_rects().collect();
+        for (tex, [tx, ty, tw, th]) in self.tiles.iter_mut().zip(rects) {
+            let (x0, y0) = (x.max(tx), y.max(ty));
+            let (x1, y1) = ((x + w).min(tx + tw), (y + h).min(ty + th));
+            if x0 < x1 && y0 < y1 {
+                let pixels = color_region(image, [x0, y0, x1 - x0, y1 - y0]);
+                let at = [(x0 - tx) as usize, (y0 - ty) as usize];
+                tex.set_partial(at, pixels, IMAGE_TEX_OPTIONS);
+            }
+        }
+    }
+
     /// Keeps `levels` reduced copies of `image`, the image shown.
     pub(super) fn set_levels(&mut self, ctx: &egui::Context, image: &RgbaImage, levels: usize) {
         self.levels.truncate(levels);
@@ -274,6 +293,19 @@ pub(super) struct ShownPreview {
     /// That mask is the Quick Mask's: shown by its overlay, not on the
     /// layer.
     pub(super) quick_mask: bool,
+    /// `image` reduced for the display, made with it (see [`Reduction`]).
+    pub(super) reduced: Reduction,
+}
+
+/// Pixels reduced for the display at a level, made on the worker that
+/// computed them: the UI thread need not reduce them (tens of
+/// milliseconds for a large layer).
+pub(super) type Reduction = Option<(u32, Arc<RgbaImage>)>;
+
+/// `image` reduced for `level` (none at full size).
+pub(super) fn reduction(level: Option<u32>, image: &RgbaImage) -> Reduction {
+    let level = level.filter(|l| *l > 0)?;
+    Some((level, Arc::new(compose::levels::reduce_rgba(image, 1 << level))))
 }
 
 impl ShownPreview {
@@ -288,6 +320,7 @@ impl ShownPreview {
             mask: None,
             origin: None,
             quick_mask: false,
+            reduced: None,
         }
     }
 
@@ -365,7 +398,7 @@ pub(super) struct CanvasView {
     spare: Option<compose::LevelCache>,
     /// The reductions of this level being made on a worker thread (the
     /// level changed): meanwhile, `stale` shows.
-    pending: Option<std::thread::JoinHandle<compose::LevelCache>>,
+    pending: Option<Reducing>,
     /// The layers as last composited.
     sigs: Vec<compose::Sig>,
     /// Tiles (column, row, in tiles of the level).
@@ -524,12 +557,153 @@ impl CanvasView {
 /// they are made again on a worker thread when it shows again).
 const KEPT_SOURCES_BYTES: usize = 192 << 20;
 
+/// The reductions of the level left, kept as the view's `spare` to go
+/// back to it at once: only those of a neighbouring level, within
+/// [`KEPT_SOURCES_BYTES`] (beyond, made again on a worker thread).
+fn kept_spare(left: compose::LevelCache, level: u32) -> Option<compose::LevelCache> {
+    let near = compose::Sources::level(&left).abs_diff(level) <= 1;
+    (near && left.bytes() <= KEPT_SOURCES_BYTES).then_some(left)
+}
+
 /// Pixels of `layers` to reduce.
 fn layer_pixels(layers: &[Layer]) -> u64 {
     layers
         .iter()
         .map(|l| u64::from(l.image().width()) * u64::from(l.image().height()))
         .sum()
+}
+
+/// Reductions of a level being made on a worker thread. Replaced or
+/// dropped (another level, another tab), they stop at the next layer: the
+/// one wanted then doesn't share the processor with them.
+struct Reducing {
+    job: Option<std::thread::JoinHandle<compose::LevelCache>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Reducing {
+    fn is_finished(&self) -> bool {
+        self.job.as_ref().is_none_or(|j| j.is_finished())
+    }
+
+    fn join(mut self) -> std::thread::Result<compose::LevelCache> {
+        self.job.take().expect("joined once").join()
+    }
+}
+
+impl Drop for Reducing {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Tests: level reductions of canvases of these sizes wait to start
+/// while listed (their stop still heard), and the layers each size's
+/// reductions really reduced.
+#[cfg(test)]
+pub(super) mod reduce_watch {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    pub static HELD: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+    pub static REDUCED: Mutex<Option<HashMap<(u32, u32), usize>>> = Mutex::new(None);
+
+    pub fn held(size: (u32, u32)) -> bool {
+        HELD.lock().unwrap().contains(&size)
+    }
+
+    pub fn add(size: (u32, u32), n: usize) {
+        *REDUCED.lock().unwrap().get_or_insert_default().entry(size).or_default() += n;
+    }
+
+    pub fn reduced(size: (u32, u32)) -> usize {
+        REDUCED.lock().unwrap().as_ref().and_then(|m| m.get(&size).copied()).unwrap_or(0)
+    }
+}
+
+/// A level's reductions, made until `stop`: then only stand-ins (the
+/// result is not used).
+struct Stoppable<'a> {
+    cache: &'a mut compose::LevelCache,
+    stop: &'a std::sync::atomic::AtomicBool,
+    /// Images really reduced (tests).
+    #[cfg(test)]
+    passed: usize,
+}
+
+impl Stoppable<'_> {
+    fn stopped(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn stand_in<P: image::Pixel<Subpixel = u8>>() -> compose::Src<P> {
+    compose::Src {
+        image: Arc::new(image::ImageBuffer::new(1, 1)),
+        at: (0, 0),
+    }
+}
+
+impl compose::Sources for Stoppable<'_> {
+    fn level(&self) -> u32 {
+        self.cache.level()
+    }
+
+    fn rgba(
+        &mut self,
+        key: compose::SourceKey,
+        version: u64,
+        image: &Arc<RgbaImage>,
+        at: (i64, i64),
+    ) -> compose::Src<image::Rgba<u8>> {
+        if self.stopped() {
+            return stand_in();
+        }
+        #[cfg(test)]
+        {
+            self.passed += 1;
+        }
+        self.cache.rgba(key, version, image, at)
+    }
+
+    fn gray(
+        &mut self,
+        key: compose::SourceKey,
+        version: u64,
+        image: &Arc<image::GrayImage>,
+        at: (i64, i64),
+    ) -> compose::Src<image::Luma<u8>> {
+        if self.stopped() {
+            return stand_in();
+        }
+        #[cfg(test)]
+        {
+            self.passed += 1;
+        }
+        self.cache.gray(key, version, image, at)
+    }
+
+    fn gray_reduced(
+        &mut self,
+        key: compose::SourceKey,
+        version: u64,
+        image: &Arc<image::GrayImage>,
+        at: (i64, i64),
+        reduced: Arc<image::GrayImage>,
+    ) -> compose::Src<image::Luma<u8>> {
+        if self.stopped() {
+            return stand_in();
+        }
+        #[cfg(test)]
+        {
+            self.passed += 1;
+        }
+        self.cache.gray_reduced(key, version, image, at, reduced)
+    }
+
+    fn coarse(&self) -> bool {
+        self.cache.coarse()
+    }
 }
 
 /// Makes the reductions of `level` on a worker thread, from those of the
@@ -540,22 +714,43 @@ fn reduce_later(
     canvas: PixelRect,
     layers: &[Layer],
     held: bool,
-) -> Option<std::thread::JoinHandle<compose::LevelCache>> {
+) -> Option<Reducing> {
     let layers = layers.to_vec();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
     let job = std::thread::Builder::new()
         .name("level".into())
         .spawn(move || {
+            #[cfg(test)]
+            while reduce_watch::held((canvas.w, canvas.h))
+                && !stopped.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             crate::document::watch_styles_only();
             let mut cache = match seed {
-                Some(finer) => finer.coarser(),
-                None => compose::LevelCache::new(level),
+                Some(finer) if !stopped.load(std::sync::atomic::Ordering::Relaxed) => {
+                    finer.coarser()
+                }
+                _ => compose::LevelCache::new(level),
             };
             let opts = compose::Options {
                 held,
                 later_styles: true,
                 ..Default::default()
             };
-            compose::plan(&layers, canvas, &mut cache, &opts);
+            let mut sources = Stoppable {
+                cache: &mut cache,
+                stop: &stopped,
+                #[cfg(test)]
+                passed: 0,
+            };
+            compose::plan(&layers, canvas, &mut sources, &opts);
+            #[cfg(test)]
+            reduce_watch::add((canvas.w, canvas.h), sources.passed);
+            if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                return cache;
+            }
             // The masks it feathered show as such in the document at once
             // (not feathered again on the UI thread).
             for m in layers.iter().filter_map(|l| l.mask.as_ref()) {
@@ -563,7 +758,10 @@ fn reduce_later(
             }
             cache
         });
-    job.ok()
+    job.ok().map(|job| Reducing {
+        job: Some(job),
+        stop,
+    })
 }
 
 /// `slot` brought to show document `uid` at `level`… (see
@@ -651,13 +849,13 @@ fn view_for(
         match spare {
             Some(s) if compose::Sources::level(&s) == level => {
                 v.sources = s;
-                v.spare = Some(finer);
+                v.spare = kept_spare(finer, level);
             }
-            _ if level == 0 || work < AT_ONCE_PIXELS => v.spare = Some(finer),
+            _ if level == 0 || work < AT_ONCE_PIXELS => v.spare = kept_spare(finer, level),
             _ => {
                 let seed = (compose::Sources::level(&finer) + 1 == level).then(|| finer.clone());
                 v.pending = reduce_later(seed, level, canvas, layers, held);
-                v.spare = Some(finer);
+                v.spare = kept_spare(finer, level);
             }
         }
         return;
@@ -726,6 +924,36 @@ fn view_options<'a>(
 }
 
 impl AtelierApp {
+    /// The level the canvas shows layers at, when reductions made on a
+    /// worker for it can be used: a layer's pixels shown (not a mask's).
+    pub(super) fn reduction_level(&self) -> Option<u32> {
+        let doc = self.doc.as_ref()?;
+        let level = render_level(self.zoom);
+        (level > 0 && !doc.mask_targeted() && doc.quick_mask().is_none()).then_some(level)
+    }
+
+    /// The reductions of the canvas view take `reduced` for version
+    /// `version` of layer `layer`'s pixels (of `size`, at `at`), when they
+    /// are of its level.
+    pub(super) fn seed_reduction(
+        &mut self,
+        layer: u64,
+        version: u64,
+        at: (i64, i64),
+        size: (u32, u32),
+        reduced: &Reduction,
+    ) {
+        let (Some(doc), Some(cv), Some((level, image))) =
+            (&self.doc, self.canvas_view.as_mut(), reduced)
+        else {
+            return;
+        };
+        if cv.doc == doc.uid() && cv.level == *level && cv.pending.is_none() {
+            let key = compose::SourceKey { layer, slot: 0 };
+            cv.sources.seed_rgba(key, version, at, size, Arc::clone(image));
+        }
+    }
+
     /// Draws the composited document over `frame` (canvas coordinates),
     /// with layer `skip` left out; composites what changed first.
     pub(super) fn draw_document(

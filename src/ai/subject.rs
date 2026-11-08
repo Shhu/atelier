@@ -71,22 +71,73 @@ fn run(slot: &'static Slot, image: &RgbaImage) -> Result<GrayImage, super::Error
     if logits.len() < (SIZE * SIZE) as usize {
         return Err(super::Error::of(|| t!("ai-error-model-corrupt")));
     }
-    let mask = GrayImage::from_fn(SIZE, SIZE, |x, y| {
-        let v = 1.0 / (1.0 + (-logits[(y * SIZE + x) as usize]).exp());
-        image::Luma([(v * 255.0).round() as u8])
-    });
     // Not limited by the pixels' opacity: Remove Background's mask comes on
     // top of it (Select Subject limits it, see `select_tools`).
-    Ok(image::imageops::resize(
-        &mask,
-        image.width(),
-        image.height(),
-        FilterType::Triangle,
-    ))
+    Ok(upscaled(&logits, SIZE, image.dimensions()))
+}
+
+/// Coverage of a `side` × `side` grid of logits stretched to `size`: the
+/// scores are interpolated (bilinear, pixel centers aligned) before the
+/// sigmoid, so a hard contour stays about a pixel wide however large the
+/// image, while the model's soft edges (hair) stay soft.
+fn upscaled(logits: &[f32], side: u32, (w, h): (u32, u32)) -> GrayImage {
+    let taps = |out: u32| -> Vec<(usize, usize, f32)> {
+        (0..out)
+            .map(|i| {
+                let s = ((i as f32 + 0.5) * side as f32 / out as f32 - 0.5)
+                    .clamp(0.0, (side - 1) as f32);
+                let a = s as usize;
+                (a, (a + 1).min(side as usize - 1), s - a as f32)
+            })
+            .collect()
+    };
+    let (cols, rows, n) = (taps(w), taps(h), side as usize);
+    let mut mask = GrayImage::new(w, h);
+    crate::mask_ops::par_rows(mask.as_mut(), w as usize, |first, band| {
+        for (j, line) in band.chunks_exact_mut(w as usize).enumerate() {
+            let (r0, r1, ty) = rows[first + j];
+            let (top, bottom) = (&logits[r0 * n..][..n], &logits[r1 * n..][..n]);
+            for (v, &(c0, c1, tx)) in line.iter_mut().zip(&cols) {
+                let t = top[c0] * (1.0 - tx) + top[c1] * tx;
+                let b = bottom[c0] * (1.0 - tx) + bottom[c1] * tx;
+                let l = t * (1.0 - ty) + b * ty;
+                *v = (255.0 / (1.0 + (-l).exp())).round() as u8;
+            }
+        }
+    });
+    mask
 }
 
 #[cfg(test)]
 mod tests {
+    /// A hard contour of the model, stretched 8 times, keeps an edge of
+    /// about a pixel (stretching the coverage would make it 8 wide); a
+    /// soft one stays soft.
+    #[test]
+    fn stretched_contours_stay_sharp() {
+        let side = 16u32;
+        // Steep scores across x = 8 (in grid cells), as the model gives.
+        let hard: Vec<f32> = (0..side * side)
+            .map(|i| ((i % side) as f32 + 0.5 - 8.0) * 40.0)
+            .collect();
+        let mask = super::upscaled(&hard, side, (128, 40));
+        let soft_pixels = |m: &image::GrayImage| {
+            (0..m.width())
+                .filter(|&x| (8..=247).contains(&m.get_pixel(x, 20).0[0]))
+                .count()
+        };
+        assert!(soft_pixels(&mask) <= 2, "{}", soft_pixels(&mask));
+        assert!(mask.get_pixel(60, 20).0[0] < 8 && mask.get_pixel(68, 20).0[0] > 247);
+        // Gentle scores: a wide transition is kept.
+        let gentle: Vec<f32> = hard.iter().map(|v| v / 40.0).collect();
+        let mask = super::upscaled(&gentle, side, (128, 40));
+        assert!(soft_pixels(&mask) > 20, "{}", soft_pixels(&mask));
+        // Same size: the sigmoid of each score.
+        let same = super::upscaled(&hard, side, (side, side));
+        assert_eq!(same.get_pixel(8, 3).0[0], 255);
+        assert_eq!(same.get_pixel(7, 3).0[0], 0);
+    }
+
     /// A disc on a plain background is the subject. On Windows, this also
     /// loads the ONNX Runtime embedded in the .exe, before any other call
     /// to it. Needs the downloaded model.

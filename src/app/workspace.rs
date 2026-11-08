@@ -27,6 +27,16 @@ pub(super) const SHORTCUT_SIDE_PANEL: KeyboardShortcut =
 /// Window › Info.
 pub(super) const SHORTCUT_INFO: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::NONE, Key::F8);
+/// Window › Layers (the side panel, with Properties).
+pub(super) const SHORTCUT_LAYERS: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::NONE, Key::F7);
+/// Help › Keyboard Shortcuts.
+pub(super) const SHORTCUT_SHORTCUTS: KeyboardShortcut = KeyboardShortcut::new(
+    Modifiers::COMMAND
+        .plus(Modifiers::SHIFT)
+        .plus(Modifiers::ALT),
+    Key::K,
+);
 
 /// How long Full Screen says how to leave it (s).
 const NOTICE: f64 = 4.0;
@@ -106,8 +116,7 @@ impl Layout {
             return;
         }
         if let Ok(json) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::create_dir_all(crate::config::dir());
-            let _ = std::fs::write(settings_file(), json);
+            let _ = crate::store::write(&settings_file(), &json);
         }
     }
 }
@@ -520,14 +529,15 @@ impl AtelierApp {
         entries
     }
 
-    /// An action was given F8, which otherwise opens the Info panel.
-    pub(super) fn f8_has_action(&self) -> bool {
-        let f8 = crate::actions::FnKey {
-            number: 8,
+    /// An action was given F`number` alone, which otherwise shows a panel
+    /// (F7 Layers, F8 Info).
+    pub(super) fn fn_key_has_action(&self, number: u8) -> bool {
+        let key = crate::actions::FnKey {
+            number,
             shift: false,
             ctrl: false,
         };
-        self.actions.library.with_key(f8).is_some()
+        self.actions.library.with_key(key).is_some()
     }
 
     /// Window menu: every panel, in the alphabetical order of the
@@ -569,7 +579,7 @@ impl AtelierApp {
                 true,
                 self.info.open,
                 // An action given F8 keeps the key (see `keyboard`).
-                (!self.f8_has_action()).then_some(&SHORTCUT_INFO),
+                (!self.fn_key_has_action(8)).then_some(&SHORTCUT_INFO),
                 Action::Workspace(Command::Info),
             ),
             Check(
@@ -631,7 +641,12 @@ impl AtelierApp {
         use MenuEntry::{Item, Separator};
         let item = |label, command| Item(label, true, None, Action::Workspace(command));
         vec![
-            item(t!("ui3-menu-shortcuts"), Command::Shortcuts),
+            Item(
+                t!("ui3-menu-shortcuts"),
+                true,
+                Some(&SHORTCUT_SHORTCUTS),
+                Action::Workspace(Command::Shortcuts),
+            ),
             Separator,
             item(t!("ui3-menu-website"), Command::Website),
             item(t!("ui3-menu-report-problem"), Command::ReportProblem),
@@ -823,19 +838,21 @@ impl AtelierApp {
         }
     }
 
-    /// (section, what, keys) of every shortcut.
+    /// (section, what, keys) of every shortcut: the tools', the menus' (with
+    /// the other keys that do the same), the other keys, and where an AZERTY
+    /// keyboard has them elsewhere.
     pub(super) fn shortcut_rows(&self, ctx: &egui::Context) -> Vec<(String, String, String)> {
-        fn walk(
-            ctx: &egui::Context,
-            entries: &[MenuEntry],
-            path: &str,
-            section: &str,
-            out: &mut Vec<(String, String, String)>,
-        ) {
+        struct Walk<'a> {
+            ctx: &'a egui::Context,
+            app: &'a AtelierApp,
+            rows: Vec<(String, String, String)>,
+            azerty: Vec<(String, String)>,
+        }
+        fn walk(w: &mut Walk, entries: &[MenuEntry], path: &str, section: &str) {
             for entry in entries {
                 match entry {
                     MenuEntry::Submenu(label, sub) => {
-                        walk(ctx, sub, &format!("{path} › {label}"), section, out);
+                        walk(w, sub, &format!("{path} › {label}"), section);
                     }
                     MenuEntry::Item(label, _, Some(s), _)
                     | MenuEntry::Check(label, _, _, Some(s), _) => {
@@ -843,7 +860,18 @@ impl AtelierApp {
                             Some((_, rest)) => format!("{rest} › {label}"),
                             None => label.clone(),
                         };
-                        out.push((section.to_owned(), what, keys::shortcut(ctx, s)));
+                        let all: Vec<_> = std::iter::once(**s)
+                            .chain(w.app.shortcut_twins(s))
+                            .collect();
+                        let key = all
+                            .iter()
+                            .map(|s| keys::shortcut(w.ctx, s))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if let Some(azerty) = keys::azerty(w.ctx, s) {
+                            w.azerty.push((what.clone(), azerty));
+                        }
+                        w.rows.push((section.to_owned(), what, key));
                     }
                     _ => {}
                 }
@@ -870,37 +898,106 @@ impl AtelierApp {
             };
             rows.push((tools.clone(), names.join(", "), key));
         }
+        let mut w = Walk {
+            ctx,
+            app: self,
+            rows,
+            azerty: Vec::new(),
+        };
         for (title, entries) in self.menus() {
-            walk(ctx, &entries, &title, &title, &mut rows);
+            walk(&mut w, &entries, &title, &title);
         }
-        let other = t!("ui3-shortcuts-other");
+        let Walk {
+            mut rows,
+            mut azerty,
+            ..
+        } = w;
+        let shortcut = |s: KeyboardShortcut| keys::shortcut(ctx, &s);
+        let combo = |m: Modifiers, what: &str| keys::combo(ctx, m, what);
+        let both = |a: String, b: String| format!("{a}, {b}");
+        let (alt, shift, ctrl) = (Modifiers::ALT, Modifiers::SHIFT, Modifiers::COMMAND);
+        let delete = both(keys::key(Key::Delete), keys::key(Key::Backspace));
+        let space_click = format!("{}+{}", keys::key(Key::Space), t!("hint-key-click"));
         let more = [
             (
                 t!("ui3-shortcuts-palette"),
-                keys::shortcut(ctx, &super::palette::SHORTCUT_PALETTE),
-            ),
-            (
-                t!("ui3-menu-hide-panels"),
-                keys::shortcut(ctx, &SHORTCUT_PANELS),
-            ),
-            (
-                t!("ui3-shortcuts-hide-side"),
-                keys::shortcut(ctx, &SHORTCUT_SIDE_PANEL),
+                shortcut(super::palette::SHORTCUT_PALETTE),
             ),
             (t!("panels8-shortcut-screen-mode"), "F".to_owned()),
             (
                 t!("ui9-shortcut-screen-mode-back"),
-                keys::shortcut(ctx, &KeyboardShortcut::new(Modifiers::SHIFT, Key::F)),
+                shortcut(KeyboardShortcut::new(Modifiers::SHIFT, Key::F)),
             ),
             (t!("ui9-shortcut-rotate-view-hold"), "R".to_owned()),
             (t!("panel-swap-colors"), "X".to_owned()),
             (t!("panel-default-colors"), "D".to_owned()),
             (t!("ui3-shortcuts-brush-size"), "[ ]".to_owned()),
+            (t!("input14-shortcuts-hardness"), combo(shift, "[ ]")),
+            (
+                t!("input14-shortcuts-brush-drag"),
+                combo(alt, &t!("input14-key-right-drag")),
+            ),
+            (t!("input14-shortcuts-opacity"), "0–9".to_owned()),
+            (t!("input14-shortcuts-flow"), combo(shift, "0–9")),
+            (t!("input14-shortcuts-layer-step"), combo(alt, "[ ]")),
+            (t!("input14-shortcuts-layer-edge"), combo(alt, ", .")),
+            (t!("input14-shortcuts-blend-step"), combo(shift, "+ −")),
+            (
+                t!("input14-shortcuts-blend-letter"),
+                combo(alt.plus(shift), &t!("input14-key-letter")),
+            ),
+            (t!("input14-shortcuts-channels"), combo(ctrl, "2–9")),
+            (
+                t!("input14-shortcuts-documents"),
+                both(
+                    shortcut(super::SHORTCUT_NEXT_DOCUMENT),
+                    shortcut(super::SHORTCUT_PREVIOUS_DOCUMENT),
+                ),
+            ),
+            (
+                t!("input14-shortcuts-nudge"),
+                both(t!("input14-key-arrows"), combo(shift, &t!("input14-key-arrows"))),
+            ),
+            (t!("input14-shortcuts-delete"), delete),
+            (
+                t!("input14-shortcuts-fill-keep"),
+                both(
+                    shortcut(super::SHORTCUT_FILL_PRIMARY_KEEP),
+                    shortcut(super::SHORTCUT_FILL_SECONDARY_KEEP),
+                ),
+            ),
             (t!("ui3-shortcuts-pan"), keys::key(Key::Space)),
+            (
+                t!("input14-shortcuts-click-zoom"),
+                both(combo(ctrl, &space_click), combo(alt, &space_click)),
+            ),
+            (
+                t!("input14-shortcuts-wheel-zoom"),
+                combo(alt, &t!("key-wheel")),
+            ),
+            (
+                t!("input14-shortcuts-apply"),
+                both(keys::key(Key::Enter), keys::key(Key::Escape)),
+            ),
         ];
+        let other = t!("ui3-shortcuts-other");
         rows.extend(
             more.into_iter()
                 .map(|(what, key)| (other.clone(), what, key)),
+        );
+        // AZERTY: the [ ] keys are ^ $ (they need AltGr), ' is ù, and "/"
+        // is typed with Shift.
+        let brackets = |m: Modifiers| combo(m, "^ $");
+        azerty.extend([
+            (t!("ui3-shortcuts-brush-size"), "^ $".to_owned()),
+            (t!("input14-shortcuts-hardness"), brackets(shift)),
+            (t!("input14-shortcuts-layer-step"), brackets(alt)),
+        ]);
+        let section = t!("input14-shortcuts-azerty");
+        rows.extend(
+            azerty
+                .into_iter()
+                .map(|(what, key)| (section.clone(), what, key)),
         );
         rows
     }
@@ -1133,8 +1230,7 @@ mod tests {
 
     #[test]
     fn open_recent_opens_and_clears() {
-        let dir = std::env::temp_dir().join(format!("atelier-ui3-recent-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("ui3-recent");
         let path = dir.join("recent.png");
         image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]))
             .save(&path)
@@ -1160,8 +1256,7 @@ mod tests {
     /// RAW file, which opens later through Camera Raw, stays.
     #[test]
     fn a_missing_recent_file_leaves_the_menu_and_a_raw_one_stays() {
-        let dir = std::env::temp_dir().join(format!("atelier-ui4-recent-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("ui4-recent");
         let gone = dir.join("gone.png");
         let raw = dir.join("photo.dng");
         std::fs::write(&raw, b"not really a raw file").unwrap();
@@ -1180,8 +1275,7 @@ mod tests {
     /// on the canvas: where an OS drag ends is known on no platform.
     #[test]
     fn a_drop_on_the_tabs_or_on_the_canvas_places() {
-        let dir = std::env::temp_dir().join(format!("atelier-ui4-drop-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("ui4-drop");
         let path = dir.join("dropped.png");
         image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]))
             .save(&path)
@@ -1237,7 +1331,7 @@ mod tests {
     #[test]
     fn a_failed_open_is_reported_in_an_alert() {
         let mut h = app([1280.0, 800.0], false);
-        let path = std::env::temp_dir().join("atelier-ui3-missing.png");
+        let path = crate::testing::root().join("ui3-missing.png");
         h.state_mut().open_path(&path);
         h.run_steps(3);
         assert!(h.state().workspace.alert.is_some());
@@ -1247,7 +1341,7 @@ mod tests {
         h.run_steps(2);
         assert!(h.state().workspace.alert.is_none());
         // The status keeps it, in the warning color, with the name only.
-        assert!(h.state().status.contains("atelier-ui3-missing.png"));
+        assert!(h.state().status.contains("ui3-missing.png"));
         assert!(!h.state().status.contains(&path.display().to_string()) || cfg!(windows));
     }
 

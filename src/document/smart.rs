@@ -37,6 +37,12 @@ pub struct Contents {
 }
 
 impl Contents {
+    /// Levels of smart objects these contents make, theirs inside
+    /// included (1: none inside).
+    pub fn nesting(&self) -> u32 {
+        1 + nesting(&self.layers)
+    }
+
     /// Canvas size.
     pub fn size(&self) -> (u32, u32) {
         self.canvas
@@ -215,8 +221,10 @@ impl SmartObject {
         for l in &c.layers {
             l.buffers(out);
         }
+        if let Some(m) = &self.filter_mask {
+            m.buffers(out);
+        }
         let grays = c.channels.iter().map(|ch| ch.mask.as_raw());
-        let grays = grays.chain(self.filter_mask.iter().map(|m| m.image().as_raw()));
         let rgba = std::iter::once(&c.flat).chain(self.cache.iter().flat_map(|(a, b)| [a, b]));
         for raw in grays.chain(rgba.map(|i| i.as_raw())) {
             out.push((raw.as_ptr() as usize, raw.len()));
@@ -397,7 +405,8 @@ pub struct RenderJob {
 
 /// A smart object's rendering (see [`Layer::put_smart`]).
 pub struct SmartRender {
-    image: RgbaImage,
+    /// Without a filter mask, `filtered` itself (shared).
+    image: Arc<RgbaImage>,
     /// Canvas position of the image.
     origin: (i64, i64),
     /// Contents → canvas.
@@ -411,11 +420,15 @@ impl SmartRender {
     /// The pixels taken out (a preview's, shown), the rest kept to be put
     /// in later with [`Self::with_image`] (the preview applied).
     pub fn take_image(mut self) -> (RgbaImage, Self) {
-        (std::mem::take(&mut self.image), self)
+        let image = std::mem::take(&mut self.image);
+        (Arc::try_unwrap(image).unwrap_or_else(|a| (*a).clone()), self)
     }
 
     pub fn with_image(self, image: RgbaImage) -> Self {
-        Self { image, ..self }
+        Self {
+            image: Arc::new(image),
+            ..self
+        }
     }
 }
 
@@ -470,13 +483,14 @@ impl RenderJob {
                 Arc::new(image)
             }
         };
+        // Painting on the layer copies it then (it is rasterized anyway).
         let image = match &self.mask {
             Some(m) => {
                 let mut image = (*filtered).clone();
                 remix(&mut image, &base, &filtered, origin, m, None);
-                image
+                Arc::new(image)
             }
-            None => (*filtered).clone(),
+            None => Arc::clone(&filtered),
         };
         SmartRender {
             image,
@@ -649,7 +663,7 @@ impl Layer {
             m.replace(image, origin, r.origin);
         }
         self.offset = r.origin;
-        self.image = Arc::new(r.image);
+        self.image = r.image;
         self.rev = next_rev();
     }
 
@@ -926,6 +940,15 @@ pub struct LinkReport {
     pub unreadable: Vec<String>,
 }
 
+/// Levels of smart objects nested in `layers` (0: none).
+pub(super) fn nesting(layers: &[Layer]) -> u32 {
+    (layers.iter())
+        .filter_map(|l| l.smart.as_ref())
+        .map(|s| s.contents.nesting())
+        .max()
+        .unwrap_or(0)
+}
+
 impl Document {
     /// These contents (its layers, canvas, guides, channels, paths), the
     /// composite made once.
@@ -1055,7 +1078,9 @@ impl Document {
         );
         smart.depth = top_layer.depth;
         smart.locks.position = position;
-        if single {
+        // An empty group keeps its settings inside, as one with content
+        // does (its Pass Through means nothing on a smart object).
+        if single && !moved[0].is_group() {
             let l = &mut moved[0];
             (smart.visible, smart.opacity, smart.blend) = (l.visible, l.opacity, l.blend);
             (smart.clipped, smart.link) = (l.clipped, l.link);
@@ -1076,6 +1101,7 @@ impl Document {
         self.layers.insert(at, smart);
         self.active = at;
         self.fix_depths();
+        self.drop_stale_mask_target();
         true
     }
 
@@ -1487,7 +1513,7 @@ impl Document {
             s.filters.truncate(k.unwrap_or(s.filters.len()));
             s.filter_mask = None;
         })?;
-        Some(Arc::new(job.run().image))
+        Some(job.run().image)
     }
 
     /// Shows `r` on the smart object `id`, if still there (no new step).
@@ -1923,9 +1949,7 @@ mod tests {
 
     #[test]
     fn placed_files_linked_or_not() {
-        let dir = std::env::temp_dir().join("atelier-smart-place");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("smart-place");
         let path = dir.join("big.png");
         RgbaImage::from_pixel(400, 300, Rgba([0, 0, 255, 255]))
             .save(&path)
@@ -1979,9 +2003,7 @@ mod tests {
     /// that artboard.
     #[test]
     fn placed_files_fit_the_active_artboard() {
-        let dir = std::env::temp_dir().join("atelier-smart-place-artboard");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("smart-place-artboard");
         let path = dir.join("photo.png");
         RgbaImage::from_pixel(1920, 1080, Rgba([200, 0, 0, 255]))
             .save(&path)
@@ -2009,9 +2031,7 @@ mod tests {
     /// nothing in the document.
     #[test]
     fn links_read_later_and_missing_files() {
-        let dir = std::env::temp_dir().join("atelier-smart-links-later");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("smart-links-later");
         let path = dir.join("logo.png");
         RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255]))
             .save(&path)
@@ -2066,9 +2086,7 @@ mod tests {
     /// shared (one copy in memory), each rendered with its own transform.
     #[test]
     fn instances_of_a_link_read_once() {
-        let dir = std::env::temp_dir().join("atelier-smart-links-instances");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("smart-links-instances");
         let path = dir.join("logo.png");
         RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255]))
             .save(&path)
@@ -2109,9 +2127,7 @@ mod tests {
     #[test]
     fn network_links_looked_at_only_when_asked() {
         let mut doc = Document::new(RgbaImage::from_pixel(100, 100, Rgba([255; 4])), None);
-        let dir = std::env::temp_dir().join("atelier-smart-links-network");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("smart-links-network");
         let path = dir.join("logo.png");
         RgbaImage::from_pixel(20, 20, Rgba([0, 0, 255, 255]))
             .save(&path)
@@ -2171,10 +2187,7 @@ mod tests {
     }
 
     fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("atelier-smart5-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testing::test_dir(&format!("smart5-{name}"))
     }
 
     /// A linked logo.png (blue) placed, and an instance of it moved aside.
@@ -2379,5 +2392,16 @@ mod tests {
         let (ca, cb) = (a.to_contents(1, "a".into()), b.to_contents(1, "b".into()));
         assert!(!ca.same_as(&cb));
         assert!(ca.same_as(&a.to_contents(1, "a".into())));
+    }
+
+    /// Without a filter mask, the layer shows the rendering itself: one
+    /// buffer, not a copy of it (and none for filters it doesn't have).
+    #[test]
+    fn a_smart_object_shares_its_rendering() {
+        let doc = doc();
+        let l = doc.active_layer();
+        let (base, filtered) = l.smart.as_deref().unwrap().cache.as_ref().expect("rendered");
+        assert!(Arc::ptr_eq(base, filtered));
+        assert!(Arc::ptr_eq(&l.image, filtered));
     }
 }

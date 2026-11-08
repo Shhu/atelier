@@ -412,6 +412,12 @@ impl AtelierApp {
                     });
                 }
             }
+            // Without filters (nor a filter mask), nothing to do: no step.
+            ToggleFilters if self.active_smart().is_none_or(|s| s.filters.is_empty()) => {}
+            ClearFilters
+                if self
+                    .active_smart()
+                    .is_none_or(|s| s.filters.is_empty() && s.filter_mask.is_none()) => {}
             ToggleFilters => {
                 let on = self.active_smart().is_some_and(|s| !s.filters_enabled);
                 let name = Message::of(|| match on {
@@ -428,8 +434,9 @@ impl AtelierApp {
             }
             AddFilterMask => {
                 let selection = self.selection.clone();
-                if let Some(doc) = &mut self.doc {
-                    doc.add_filter_mask(doc.active, selection.as_ref());
+                if let Some(doc) = &mut self.doc
+                    && doc.add_filter_mask(doc.active, selection.as_ref())
+                {
                     doc.target_filter_mask(true);
                 }
             }
@@ -1420,7 +1427,7 @@ impl AtelierApp {
                     self.smart.preview = None;
                     if on && !stopped {
                         let (image, rest) = done.take_image();
-                        self.show_preview(LayerPreview::Filter(k), image);
+                        self.show_preview(LayerPreview::Filter(k), image, None);
                         let shown = self.preview_shown.as_ref().is_some_and(
                             |p| matches!(p.preview, LayerPreview::Filter(x) if x == k),
                         );
@@ -1566,7 +1573,7 @@ impl AtelierApp {
                 );
                 gap_between_blocks(ui);
                 let mut opacity = b.filter.opacity * 100.0;
-                slider_row(
+                if slider_row(
                     ui,
                     &t!("panel-opacity"),
                     None,
@@ -1575,8 +1582,9 @@ impl AtelierApp {
                     &i18n::percent(""),
                     Track::Accent,
                     100.0,
-                );
-                b.filter.opacity = opacity / 100.0;
+                ) {
+                    b.filter.opacity = opacity / 100.0;
+                }
             },
         );
         b.preview = preview;

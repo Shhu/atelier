@@ -727,7 +727,7 @@ fn app_with(doc: Document) -> Harness<'static, AtelierApp> {
 }
 
 fn settle(h: &mut Harness<'static, AtelierApp>) {
-    for _ in 0..4000 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if !h.state().transform_busy() {
             return;
@@ -833,8 +833,7 @@ fn the_resolution_is_a_step_of_its_own_and_saved() {
     assert_eq!(density(&h), Some((300.0, 300.0)));
     assert_eq!(doc(&h).history().1, steps + 1, "a step");
     assert!(doc(&h).modified, "the close prompt knows");
-    let dir = std::env::temp_dir().join(format!("atelier-crop-res-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("crop-res");
     let (psd, native) = (dir.join("a.psd"), dir.join("a.atelier"));
     h.state_mut().doc.as_mut().unwrap().save(&native).unwrap();
     let Ok(back) = Document::open(&native) else { panic!("opens") };
@@ -1232,22 +1231,23 @@ fn a_size_keeps_a_text_as_text_scaled_with_the_image() {
     assert!(l.rect().w < old_w, "sized with the image");
 }
 
-/// Past the budget, the crop's undo still has the original pixels: 1.1 GiB
-/// of layers (run with `--ignored`).
+/// Past the budget, the crop's undo still has the original pixels: 11 MB
+/// of layers over a budget lowered to 8 MB (1.1 GiB over 1 GiB in use).
 #[test]
-#[ignore]
 fn a_turned_crop_undoes_past_the_history_budget() {
-    let mut h = app_with(layered(12, 6000, 4000));
+    crate::document::TEST_HISTORY_BUDGET.set(Some(8 << 20));
+    let mut h = app_with(layered(12, 600, 400));
     let before = doc(&h).flatten();
     h.state_mut().apply_crop(CropPlan {
         angle: 12.5,
-        ..CropPlan::plain(PixelRect { x: 1000, y: 800, w: 4000, h: 2400 })
+        ..CropPlan::plain(PixelRect { x: 100, y: 80, w: 400, h: 240 })
     });
     settle(&mut h);
-    assert_eq!(size(&h), (4000, 2400));
+    assert_eq!(size(&h), (400, 240));
+    assert!(doc(&h).history_bytes() > 8 << 20, "past the budget");
     h.state_mut().run(Action::Undo);
     h.run_steps(2);
-    assert_eq!(size(&h), (6000, 4000), "not the turned intermediate");
+    assert_eq!(size(&h), (600, 400), "not the turned intermediate");
     assert_eq!(pixel_diff(&doc(&h).flatten(), &before), 0);
 }
 
@@ -1321,7 +1321,7 @@ fn frame(h: &mut Harness<'static, AtelierApp>) {
 /// Frames through the hook until the job has landed and what was held is
 /// given back.
 fn settle_held(h: &mut Harness<'static, AtelierApp>) {
-    for _ in 0..4000 {
+    for _ in crate::testing::patience() {
         frame(h);
         if !h.state().transform_busy() {
             for _ in 0..8 {
@@ -1355,7 +1355,7 @@ fn window_closes(h: &mut Harness<'static, AtelierApp>) -> bool {
             .unwrap_or_default()
     };
     let (mut asked, mut idle) = (true, 0);
-    for _ in 0..4000 {
+    for _ in crate::testing::patience() {
         if asked {
             h.input_mut()
                 .viewports
@@ -1418,8 +1418,10 @@ fn closing_the_window_during_a_cancelled_job_keeps_it_open() {
     assert!(window_closes(&mut h));
 }
 
-/// A 2600 × 2400 layer distorted with Free Transform: applied aside.
+/// A 2600 × 2400 layer distorted with Free Transform: applied aside (held
+/// there by `transform::HOLD` until seen so, then let go).
 fn transform_aside(h: &mut Harness<'static, AtelierApp>) {
+    super::transform::HOLD.with(|hold| hold.store(true, std::sync::atomic::Ordering::Relaxed));
     h.state_mut().set_tool(Tool::Transform);
     h.run_steps(1);
     key(h, Key::T, Modifiers::COMMAND);
@@ -1428,6 +1430,7 @@ fn transform_aside(h: &mut Harness<'static, AtelierApp>) {
     h.run_steps(1);
     key(h, Key::Enter, Modifiers::NONE);
     assert!(h.state().transform_busy(), "applied aside");
+    super::transform::HOLD.with(|hold| hold.store(false, std::sync::atomic::Ordering::Relaxed));
 }
 
 fn big_layer() -> Document {
@@ -1569,8 +1572,7 @@ fn a_psds_resolution_reaches_the_document() {
     let app = h.state_mut();
     let meta = app.doc.as_mut().unwrap().file_metadata.image.get_or_insert_default();
     std::sync::Arc::make_mut(meta).density = Some((300.0, 300.0));
-    let dir = std::env::temp_dir().join(format!("atelier-crop-psd-res-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("crop-psd-res");
     let psd = dir.join("a.psd");
     app.doc.as_mut().unwrap().save(&psd).unwrap();
     let Ok(back) = Document::open(&psd) else { panic!("opens") };
@@ -1653,7 +1655,7 @@ fn background_jobs_have_english_names_in_diagnostics() {
     h.state_mut().run(Action::RotateCanvas(33));
     assert!(h.state().transform_busy());
     let mut seen = false;
-    for _ in 0..200 {
+    for _ in crate::testing::patience() {
         seen |= crate::diag::running_jobs().iter().any(|j| j == "Image Rotation");
         if seen {
             break;

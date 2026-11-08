@@ -28,8 +28,39 @@ pub fn note_painted(doc: u64, strokes: &[(u64, PixelRect)]) {
     }
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = last.as_mut().filter(|s| s.doc == doc) {
-        s.painted.extend_from_slice(strokes);
+        // One area per layer (only their union counts): bounded however
+        // long one paints between two composites.
+        for &(layer, rect) in strokes {
+            match s.painted.iter_mut().find(|p| p.0 == layer) {
+                Some(p) => p.1 = p.1.union(rect),
+                None => s.painted.push((layer, rect)),
+            }
+        }
     }
+}
+
+/// Document `doc` is closed: its composite leaves memory.
+pub fn forget_shared_composite(doc: u64) {
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_ref().is_some_and(|s| s.doc == doc) {
+        *last = None;
+    }
+}
+
+/// Is a composite of document `doc` kept?
+#[cfg(test)]
+pub fn shared_composite_kept(doc: u64) -> bool {
+    let last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    last.as_ref().is_some_and(|s| s.doc == doc)
+}
+
+/// Areas noted for document `doc` since its last composite.
+#[cfg(test)]
+pub fn shared_painted(doc: u64) -> Vec<(u64, PixelRect)> {
+    let last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    last.as_ref()
+        .filter(|s| s.doc == doc)
+        .map_or_else(Vec::new, |s| s.painted.clone())
 }
 
 impl Document {

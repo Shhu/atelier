@@ -144,11 +144,7 @@ pub fn init() {
 /// Switches language and remembers it for the next launches.
 pub fn choose(lang: Lang) {
     set_lang(lang);
-    let file = settings_file();
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(file, lang.code());
+    let _ = crate::store::write(&settings_file(), lang.code().as_bytes());
 }
 
 fn settings_file() -> PathBuf {
@@ -224,6 +220,23 @@ impl From<&String> for Message {
 impl From<&str> for Message {
     fn from(shown: &str) -> Self {
         shown.to_owned().into()
+    }
+}
+
+/// Why a file operation failed, in the interface's language for the common
+/// causes (Rust never sets the C locale: the system's own text is English
+/// on Linux and macOS), the system's text otherwise.
+pub fn io_error(e: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::NotFound => t!("file-error-not-found"),
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => {
+            t!("file-error-permission")
+        }
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => t!("file-error-disk-full"),
+        ErrorKind::ResourceBusy => t!("platforms14-file-error-in-use"),
+        ErrorKind::UnexpectedEof | ErrorKind::InvalidData => t!("file-error-damaged"),
+        _ => e.to_string(),
     }
 }
 
@@ -615,6 +628,26 @@ mod tests {
         assert_eq!(parse_decimal("nan"), None);
         assert_eq!(parse_decimal("inf"), None);
         assert_eq!(parse_decimal("abc"), None);
+    }
+
+    /// The system's error text is English on Linux and macOS: the common
+    /// causes are said in the interface's language, wherever they are shown.
+    #[test]
+    fn file_errors_speak_the_language() {
+        // Nothing is created there.
+        let dir = format!("atelier-words14-{}", std::process::id());
+        let e = std::fs::read(std::env::temp_dir().join(dir).join("absent")).unwrap_err();
+        set_lang(Lang::Fr);
+        let shown = io_error(&e);
+        let actions = crate::actions::FileError::Io(e).to_string();
+        let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        let other = std::io::Error::other("x");
+        let (full, other) = (io_error(&full), io_error(&other));
+        set_lang(Lang::En);
+        assert_eq!(shown, "fichier introuvable");
+        assert_eq!(actions, shown);
+        assert_eq!(full, "espace disque insuffisant");
+        assert_eq!(other, "x");
     }
 
     #[test]

@@ -138,7 +138,7 @@ fn key(h: &mut Harness<'_, AtelierApp>, key: Key, modifiers: Modifiers) {
 }
 
 fn wait_for_fill(h: &mut Harness<'static, AtelierApp>) {
-    for _ in 0..3000 {
+    for _ in crate::testing::patience() {
         if !h.state().retouch.busy() {
             return;
         }
@@ -411,9 +411,7 @@ fn transform_again_turns_an_ellipse_around_the_same_pivot() {
 #[test]
 fn ctrl_y_while_typing_toggles_proof_colors_and_goes_on_typing() {
     let mut h = app_doc(Document::new(RgbaImage::from_pixel(400, 300, RED), None));
-    if !has_fonts(&mut h) {
-        return;
-    }
+    assert!(has_fonts(&mut h), "the bundled font at least");
     h.state_mut().set_tool(Tool::Text);
     h.run_steps(1);
     h.state_mut().create_text(pos2(50.0, 80.0), None);
@@ -429,9 +427,7 @@ fn ctrl_y_while_typing_toggles_proof_colors_and_goes_on_typing() {
 #[test]
 fn an_edit_typed_back_to_its_text_leaves_no_step() {
     let mut h = app_doc(Document::new(RgbaImage::from_pixel(400, 300, RED), None));
-    if !has_fonts(&mut h) {
-        return;
-    }
+    assert!(has_fonts(&mut h), "the bundled font at least");
     h.state_mut().set_tool(Tool::Text);
     h.run_steps(1);
     h.state_mut().create_text(pos2(50.0, 80.0), None);

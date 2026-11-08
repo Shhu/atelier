@@ -20,6 +20,10 @@ use crate::i18n::t;
 use crate::mask_ops::{self, Affine, Modify, par_rows};
 use crate::selection::Channel;
 
+/// Smallest feather radius: below it, the softened edge rounds back to a hard
+/// one.
+const FEATHER_LEAST: f32 = 0.2;
+
 pub(super) const SHORTCUT_FEATHER: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::SHIFT, Key::F6);
 pub(super) const SHORTCUT_SELECT_AND_MASK: KeyboardShortcut =
@@ -263,7 +267,26 @@ pub(super) struct SelState {
     /// it, when the tool doesn't say), see `commit_selection`.
     pub(super) step_name: Option<String>,
     /// Mask shown over the canvas: what it was drawn for, image and place.
-    overlay: Option<(u64, GpuImage, Rect)>,
+    pub(super) overlay: Option<(u64, GpuImage, Rect)>,
+    /// Its pixels when it shows the quick mask, being painted: drawn again
+    /// only where the brush went.
+    pub(super) overlay_kept: Option<KeptOverlay>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: overlays drawn whole, and again in part, on this thread.
+    pub(super) static OVERLAYS_DRAWN: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The overlay's pixels (see [`SelState::overlay_kept`]): the view they
+/// were drawn for, the document and the quick mask's key then.
+pub(super) struct KeptOverlay {
+    view: u64,
+    doc: u64,
+    rev: u64,
+    pub(super) image: RgbaImage,
 }
 
 impl Default for SelState {
@@ -283,6 +306,7 @@ impl Default for SelState {
             transform: None,
             step_name: None,
             overlay: None,
+            overlay_kept: None,
         }
     }
 }
@@ -743,7 +767,8 @@ impl AtelierApp {
                 let width = ui.available_width();
                 if d.kind == ModifyKind::Feather {
                     let max = d.kind.max() as f32;
-                    ui_kit::number_field(ui, &label, &mut d.amount, 0.1..=max, " px", width);
+                    let range = FEATHER_LEAST..=max;
+                    ui_kit::number_field(ui, &label, &mut d.amount, range, " px", width);
                 } else {
                     let mut amount = d.amount.round().max(1.0) as u32;
                     let range = 1..=d.kind.max();
@@ -797,7 +822,7 @@ impl AtelierApp {
         dialog: bool,
     ) {
         let least = if kind == ModifyKind::Feather {
-            0.1
+            FEATHER_LEAST
         } else {
             1.0
         };
@@ -818,18 +843,26 @@ impl AtelierApp {
 
     /// Pixels the Magic Wand's options sample (active layer, or all layers
     /// as displayed), placed on the canvas: made later, on another thread.
-    fn wand_pixels_later(&self) -> Option<Box<dyn FnOnce() -> RgbaImage + Send>> {
+    /// A layer has no edge: the transparency around its pixels reaches the
+    /// canvas edges.
+    pub(super) fn wand_pixels_later(
+        &self,
+    ) -> Option<Box<dyn FnOnce() -> std::sync::Arc<RgbaImage> + Send>> {
         let doc = self.doc.as_ref()?;
         if self.wand_all_layers {
-            return Some(Box::new(doc.flatten_later()));
+            let flatten = doc.flatten_later();
+            return Some(Box::new(move || std::sync::Arc::new(flatten())));
         }
         let canvas = doc.full_rect();
         let layer = doc.active_layer();
         let (pixels, offset) = (layer.shared_image(), layer.offset);
         Some(Box::new(move || {
+            if offset == (0, 0) && pixels.dimensions() == (canvas.w, canvas.h) {
+                return pixels;
+            }
             let mut out = RgbaImage::new(canvas.w, canvas.h);
             image::imageops::replace(&mut out, &*pixels, offset.0, offset.1);
-            out
+            std::sync::Arc::new(out)
         }))
     }
 
@@ -1259,6 +1292,7 @@ impl AtelierApp {
         }
         let Some(source) = source else {
             self.sel.overlay = None;
+            self.sel.overlay_kept = None;
             return;
         };
         let ppp = self.ctx.pixels_per_point();
@@ -1269,7 +1303,7 @@ impl AtelierApp {
             return;
         }
         let turn = self.view_turn;
-        let key = hash_of((
+        let view_key = hash_of((
             [view.origin.x, view.origin.y, view.zoom, ppp].map(f32::to_bits),
             [shown.min.x, shown.min.y, shown.max.x, shown.max.y].map(f32::to_bits),
             [turn.angle, turn.center.x, turn.center.y].map(f32::to_bits),
@@ -1278,25 +1312,74 @@ impl AtelierApp {
             area.min.y.to_bits(),
             area.max.x.to_bits(),
             area.max.y.to_bits(),
-            source.key,
             format!("{:?}", source.style),
         ));
+        let key = hash_of((view_key, source.key));
         if self.sel.overlay.as_ref().is_none_or(|(k, ..)| *k != key) {
             let (x0, y0) = ((shown.min.x * ppp).floor(), (shown.min.y * ppp).floor());
             let (x1, y1) = ((shown.max.x * ppp).ceil(), (shown.max.y * ppp).ceil());
             let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
-            // Pixels partly in the area are kept.
-            let shows = (!turn.is_identity()).then(|| (turn, area.expand(1.0)));
-            let image = overlay_image(&source, view, ppp, (x0, y0), (w, h), shows);
             let rect = Rect::from_min_max(pos2(x0, y0) / ppp, pos2(x1, y1) / ppp);
-            let gpu = match self.sel.overlay.take() {
-                Some((_, mut gpu, _)) => {
-                    gpu.set(&self.ctx, &image, 0);
-                    gpu
+            // The quick mask itself (not a preview of it, nor its moved
+            // image), on an upright view: its key is known.
+            let doc = self.doc.as_ref().expect("checked above");
+            let quick = (turn.is_identity()
+                && doc.quick_mask().is_some()
+                && source.key == hash_of((doc.uid(), doc.quick_mask_key())))
+            .then(|| (doc.uid(), doc.quick_mask_key()));
+            // Painted since: only there again.
+            let kept = self.sel.overlay_kept.take().filter(|k| {
+                quick.is_some_and(|(uid, _)| k.doc == uid)
+                    && k.view == view_key
+                    && k.image.dimensions() == (w, h)
+            });
+            let changed = kept
+                .as_ref()
+                .and_then(|k| doc.quick_mask_changes(k.rev))
+                .filter(|_| self.sel.overlay.is_some());
+            match (kept, changed) {
+                (Some(mut kept), Some(changed)) => {
+                    // The screen pixels the change reaches (bilinear: one
+                    // more around).
+                    let r = view.rect_to_screen(to_rect(changed));
+                    let clamp = |v: f32, most: u32| v.clamp(0.0, most as f32) as u32;
+                    let rx0 = clamp((r.min.x * ppp - x0).floor() - 2.0, w);
+                    let ry0 = clamp((r.min.y * ppp - y0).floor() - 2.0, h);
+                    let rx1 = clamp((r.max.x * ppp - x0).ceil() + 2.0, w);
+                    let ry1 = clamp((r.max.y * ppp - y0).ceil() + 2.0, h);
+                    let region = [rx0, ry0, rx1 - rx0, ry1 - ry0];
+                    overlay_into(&mut kept.image, &source, view, ppp, (x0, y0), None, region);
+                    #[cfg(test)]
+                    OVERLAYS_DRAWN.with(|n| n.set((n.get().0, n.get().1 + 1)));
+                    if let Some((k, gpu, _)) = &mut self.sel.overlay {
+                        gpu.set_region(&self.ctx, &kept.image, region);
+                        *k = key;
+                    }
+                    kept.rev = quick.map_or(0, |q| q.1);
+                    self.sel.overlay_kept = Some(kept);
                 }
-                None => GpuImage::new(&self.ctx, "selection overlay".into(), &image, 0),
-            };
-            self.sel.overlay = Some((key, gpu, rect));
+                _ => {
+                    // Pixels partly in the area are kept.
+                    let shows = (!turn.is_identity()).then(|| (turn, area.expand(1.0)));
+                    let image = overlay_image(&source, view, ppp, (x0, y0), (w, h), shows);
+                    #[cfg(test)]
+                    OVERLAYS_DRAWN.with(|n| n.set((n.get().0 + 1, n.get().1)));
+                    let gpu = match self.sel.overlay.take() {
+                        Some((_, mut gpu, _)) => {
+                            gpu.set(&self.ctx, &image, 0);
+                            gpu
+                        }
+                        None => GpuImage::new(&self.ctx, "selection overlay".into(), &image, 0),
+                    };
+                    self.sel.overlay = Some((key, gpu, rect));
+                    self.sel.overlay_kept = quick.map(|(doc, rev)| KeptOverlay {
+                        view: view_key,
+                        doc,
+                        rev,
+                        image,
+                    });
+                }
+            }
         }
         if let Some((_, gpu, rect)) = &self.sel.overlay {
             gpu.paint_all(painter, *rect, Color32::WHITE);
@@ -1331,17 +1414,33 @@ pub(super) fn overlay_image(
     shows: Option<(super::view_turn::ViewTurn, Rect)>,
 ) -> RgbaImage {
     let mut image = RgbaImage::new(w, h);
+    overlay_into(&mut image, source, view, ppp, origin, shows, [0, 0, w, h]);
+    image
+}
+
+/// [`overlay_image`] drawn again into `image` over `[x, y, w, h]` (its
+/// pixels) only.
+fn overlay_into(
+    image: &mut RgbaImage,
+    source: &OverlaySource,
+    view: View,
+    ppp: f32,
+    origin: (f32, f32),
+    shows: Option<(super::view_turn::ViewTurn, Rect)>,
+    [rx, ry, rw, rh]: [u32; 4],
+) {
     let (mw, mh, raw) = match &source.mask {
         OverlayMask::Gray(m) => (m.width() as i64, m.height() as i64, m.as_raw()),
     };
     if mw == 0 || mh == 0 {
-        return image;
+        return;
     }
     let at = |x: i64, y: i64| raw[(y.clamp(0, mh - 1) * mw + x.clamp(0, mw - 1)) as usize] as f32;
-    let row = w as usize;
-    if row == 0 {
-        return image;
+    let row = image.width() as usize;
+    if row == 0 || rw == 0 || rh == 0 {
+        return;
     }
+    let (cols, rows) = (rx as usize..(rx + rw) as usize, ry as usize..(ry + rh) as usize);
     let checker_a = ui_kit::color::CHECKER_A.to_array();
     let checker_b = ui_kit::color::CHECKER_B.to_array();
     // On a turned view, the canvas area as a polygon of this image's
@@ -1410,20 +1509,18 @@ pub(super) fn overlay_image(
     // rows' lengths differ.
     const BAND: usize = 8;
     use rayon::prelude::*;
-    image
-        .as_mut()
+    image.as_mut()[rows.start * row * 4..rows.end * row * 4]
         .par_chunks_mut((row * 4 * BAND).max(1))
         .enumerate()
         .for_each(|(k, band)| {
             for (j, line) in band.chunks_exact_mut(row * 4).enumerate() {
-                let y = k * BAND + j;
+                let y = rows.start + k * BAND + j;
                 let sy = origin.1 + y as f32 + 0.5;
                 let (first, end) = span(y);
-                for x in first..end {
+                for x in first.max(cols.start)..end.min(cols.end) {
                     let out = pixel(origin.0 + x as f32 + 0.5, sy);
                     line[x * 4..x * 4 + 4].copy_from_slice(&out);
                 }
             }
         });
-    image
 }

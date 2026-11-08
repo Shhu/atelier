@@ -19,6 +19,9 @@ pub(super) struct HistoryPanel {
     /// Active document, its history position and the number of tabs when
     /// the histories were last trimmed (see `trim_histories`).
     pub budget_key: Option<(u64, u64, usize)>,
+    /// When the active document's history was last trimmed again (see
+    /// `trim_histories`).
+    pub trimmed_at: Option<std::time::Instant>,
 }
 
 impl AtelierApp {

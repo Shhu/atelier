@@ -53,21 +53,32 @@ fn press(h: &mut H, at: Pos2) {
     button(h, at, true);
 }
 
-/// A document whose whole count takes a while: layers over a large canvas.
+/// A document with layers whose count is started and held (see
+/// `HistogramPanel::hold`) until `release`.
 fn slow_to_count(tool: Tool) -> H {
-    let mut h = app_with(noise(4000, 3000), tool, [1400.0, 1000.0], 0.02);
+    let mut h = app_with(noise(400, 300), tool, [1400.0, 1000.0], 0.02);
     let doc = h.state_mut().doc.as_mut().expect("a document");
-    for i in 0..12 {
-        doc.add_layer(format!("l{i}"), noise(3000, 2000), (i * 40, i * 30));
+    for i in 0..3 {
+        doc.add_layer(format!("l{i}"), noise(300, 200), (i * 40, i * 30));
         doc.active_layer_mut().opacity = 0.5;
     }
+    h.state_mut().hist_panel.hold.store(true, std::sync::atomic::Ordering::Relaxed);
     h.state_mut().hist_panel.open = true;
-    h.run_steps(2);
+    let started = std::time::Instant::now();
+    while !h.state().hist_panel.counting() {
+        assert!(started.elapsed().as_secs() < 60, "a count started");
+        h.run_steps(1);
+    }
     h
 }
 
+fn release(h: &mut H) {
+    h.state_mut().hist_panel.hold.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn count_done(h: &mut H) {
-    for _ in 0..500 {
+    let started = std::time::Instant::now();
+    while started.elapsed().as_secs() < 60 {
         h.run_steps(1);
         let p = &h.state().hist_panel;
         if p.counts().is_some() && !p.counting() {
@@ -82,8 +93,7 @@ fn count_done(h: &mut H) {
 fn a_pan_keeps_the_histogram_count_a_stroke_stops_it() {
     // The Hand tool pans: what is counted stays right.
     let mut h = slow_to_count(Tool::Hand);
-    assert!(h.state().hist_panel.counting(), "a count started");
-    let at = screen(&h, 2000.0, 1500.0);
+    let at = screen(&h, 200.0, 150.0);
     press(&mut h, at);
     h.hover_at(at + vec2(4.0, 0.0));
     h.run_steps(1);
@@ -92,12 +102,12 @@ fn a_pan_keeps_the_histogram_count_a_stroke_stops_it() {
         "the pan doesn't cancel the count"
     );
     button(&mut h, at + vec2(4.0, 0.0), false);
+    release(&mut h);
     count_done(&mut h);
     let counted = h.state().hist_panel.counts().cloned();
 
     // A brush press may change the layers: the count gives them back.
     let mut h = slow_to_count(Tool::Brush);
-    assert!(h.state().hist_panel.counting());
     let at = screen(&h, 100.0, 100.0);
     press(&mut h, at);
     assert!(
@@ -111,6 +121,7 @@ fn a_pan_keeps_the_histogram_count_a_stroke_stops_it() {
         assert!(!h.state().hist_panel.counting() || h.state().hist_panel.cancelled());
     }
     button(&mut h, at, false);
+    release(&mut h);
     count_done(&mut h);
     assert!(counted.is_some());
 }
@@ -130,7 +141,7 @@ fn histogram_and_navigator_follow_the_image_while_a_button_is_held_elsewhere() {
     let doc = h.state_mut().doc.as_mut().expect("a document");
     doc.add_layer("x".into(), black, (0, 0));
     let mut updated = (false, false);
-    for _ in 0..200 {
+    for _ in crate::testing::patience() {
         std::thread::sleep(std::time::Duration::from_millis(5));
         h.run_steps(1);
         updated.0 |= h.state().hist_panel.counts().cloned() != before;

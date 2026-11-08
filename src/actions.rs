@@ -211,6 +211,14 @@ pub enum Recorded {
         /// A blend mode's name.
         mode: String,
     },
+    /// Opacity and/or blend mode (a blend mode's name) of the selected
+    /// layers, as the Layers panel, the digits or Shift++ set them.
+    LayerLook {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opacity: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+    },
     /// Edit › Stroke.
     Stroke {
         width: u32,
@@ -237,6 +245,14 @@ pub enum Recorded {
     Deselect,
     Reselect,
     InvertSelection,
+    /// Select › Color Range: the colors sampled (CIE Lab; `add` false: taken
+    /// out of the range), Fuzziness (0 to 200), Invert; within the
+    /// selection when there is one.
+    ColorRange {
+        samples: Vec<RangeColor>,
+        fuzziness: f32,
+        invert: bool,
+    },
     /// Select › Modify, by `amount` px.
     ModifySelection {
         modify: Modify,
@@ -246,9 +262,14 @@ pub enum Recorded {
     /// Free Transform: where the corners of the transformed element's box
     /// go (top-left first, clockwise), in units of that box (0,0 its
     /// top-left corner, 1,1 its bottom-right one): a scale, a turn, a skew
-    /// or a distortion, of whatever is transformed when played.
+    /// or a distortion, of whatever is transformed when played. A frame
+    /// without distortion is also kept as its move, scale, turn and skew,
+    /// which are played instead: a turn stays a turn on a box of another
+    /// shape (the corners alone would stretch it).
     Transform {
         corners: [[f64; 2]; 4],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<Frame>,
     },
     /// File › Place Embedded or Place Linked: the file, fitted and
     /// centered as when placed, then its Free Transform (as `Transform`).
@@ -402,6 +423,77 @@ pub enum MenuItem {
     CropToContent,
     ConvertToSmartObject,
     ConvertForSmartFilters,
+    LayerViaCut,
+    StampVisible,
+    Desaturate,
+    CopyMerged,
+    SelectSubject,
+}
+
+/// A color of Color Range's (see `Recorded::ColorRange`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RangeColor {
+    pub lab: [f32; 3],
+    pub add: bool,
+}
+
+/// A Free Transform without distortion, rebuilt on the box of what it
+/// plays on: its center moved by `offset`, sized by `scale` (both in
+/// fractions of the box's width and height; a negative scale flips),
+/// skewed by `skew` then turned by `angle` (degrees, clockwise on screen).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Frame {
+    pub offset: [f64; 2],
+    pub scale: [f64; 2],
+    pub angle: f64,
+    pub skew: f64,
+}
+
+impl Frame {
+    /// The frame of `corners` (in units of a `w` × `h` box); `None` for a
+    /// distortion or a perspective (not a parallelogram), or a flat one.
+    pub fn of(corners: [[f64; 2]; 4], w: f64, h: f64) -> Option<Frame> {
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let p = corners.map(|[u, v]| [u * w, v * h]);
+        let tolerance = 1e-6 * w.max(h);
+        let parallelogram = (0..2).all(|i| (p[0][i] + p[2][i] - p[1][i] - p[3][i]).abs() <= tolerance);
+        if !parallelogram {
+            return None;
+        }
+        let e1 = [p[1][0] - p[0][0], p[1][1] - p[0][1]];
+        let e2 = [p[3][0] - p[0][0], p[3][1] - p[0][1]];
+        let angle = e1[1].atan2(e1[0]);
+        let (sin, cos) = angle.sin_cos();
+        // The left edge turned back: its lean (the skew) and its height.
+        let (along, across) = (e2[0] * cos + e2[1] * sin, e2[1] * cos - e2[0] * sin);
+        if across.abs() <= tolerance || e1[0].hypot(e1[1]) <= tolerance {
+            return None;
+        }
+        let center = [(p[0][0] + p[2][0]) / 2.0, (p[0][1] + p[2][1]) / 2.0];
+        Some(Frame {
+            offset: [center[0] / w - 0.5, center[1] / h - 0.5],
+            scale: [e1[0].hypot(e1[1]) / w, across / h],
+            angle: angle.to_degrees(),
+            skew: (along / across).atan().to_degrees(),
+        })
+    }
+
+    /// Its corners on a `w` × `h` box, in units of that box.
+    pub fn corners(&self, w: f64, h: f64) -> [[f64; 2]; 4] {
+        let center = [(0.5 + self.offset[0]) * w, (0.5 + self.offset[1]) * h];
+        let (sin, cos) = self.angle.to_radians().sin_cos();
+        let lean = self.skew.to_radians().tan();
+        [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]].map(|[u, v]| {
+            let y = self.scale[1] * v * h;
+            let x = self.scale[0] * u * w + lean * y;
+            [
+                (center[0] + x * cos - y * sin) / w,
+                (center[1] + x * sin + y * cos) / h,
+            ]
+        })
+    }
 }
 
 /// Unknown commands are read as they are, and written back the same.
@@ -419,6 +511,17 @@ mod lenient {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Recorded, D::Error> {
         let value = serde_json::Value::deserialize(d)?;
         Ok(Recorded::deserialize(&value).unwrap_or(Recorded::Unknown(value)))
+    }
+}
+
+impl Recorded {
+    /// An unknown step whose command (and the names it holds) this version
+    /// knows: its settings were damaged, not written by a newer version.
+    pub fn damaged(&self) -> bool {
+        let Recorded::Unknown(value) = self else {
+            return false;
+        };
+        matches!(Recorded::deserialize(value), Err(e) if !e.to_string().starts_with("unknown variant"))
     }
 }
 
@@ -505,7 +608,7 @@ pub enum FileError {
 impl std::fmt::Display for FileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FileError::Io(e) => write!(f, "{e}"),
+            FileError::Io(e) => f.write_str(&crate::i18n::io_error(e)),
             FileError::Invalid => f.write_str(&t!("actions-error-not-actions")),
             FileError::Newer(v) => f.write_str(&t!("file-error-newer-version", version = *v)),
         }
@@ -520,32 +623,39 @@ impl Library {
     /// this session (`Load::saving` false).
     pub fn load() -> Load {
         if cfg!(test) {
-            return Load::fine(Self::defaults());
+            return Load::fine(Self::defaults(), None);
         }
         Self::load_from(&library_file())
     }
 
     fn load_from(path: &Path) -> Load {
-        let mut result = read(path);
-        // Locked a moment (antivirus, file sync): read again once.
-        if let Err(FileError::Io(e)) = &result
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            result = read(path);
-        }
-        let error = match result {
-            Ok(sets) => return Load::fine(Self { sets }),
-            Err(FileError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Load::fine(Self::defaults());
+        use crate::store::{Found, Store};
+        let mut store = Store::new(path.to_path_buf(), LIBRARY_FILE)
+            .accepting(|v| !matches!(sets_of(v), Err(FileError::Newer(_))));
+        let (found, error) = match store.read() {
+            Found::Value(value) => match sets_of(&value) {
+                Ok(sets) => return Load::fine(Self { sets }, Some(store)),
+                Err(e @ FileError::Newer(_)) => {
+                    store.refuse_saving();
+                    (None, e)
+                }
+                Err(e) => match store.set_aside() {
+                    found @ Found::SetAside(_) => (Some(found), e),
+                    _ => (None, e),
+                },
+            },
+            Found::Missing => {
+                // What this window's changes are made from.
+                let defaults = Self::defaults();
+                if let Ok(value) = defaults.file_value() {
+                    store.adopt(&value);
+                }
+                return Load::fine(defaults, Some(store));
             }
-            Err(e) => e,
+            found => (Some(found), FileError::Invalid),
         };
-        let backup = matches!(error, FileError::Invalid)
-            .then(|| set_aside(path))
-            .flatten();
-        let notice = match &backup {
-            Some(b) => t!(
+        let notice = match found {
+            Some(Found::SetAside(b)) => t!(
                 "smart3-actions-damaged",
                 error = error.to_string(),
                 backup = b
@@ -554,22 +664,32 @@ impl Library {
                     .to_string_lossy()
                     .into_owned()
             ),
-            None => t!("smart4-actions-unreadable", error = error.to_string()),
+            Some(Found::Unreadable(e)) => {
+                t!("smart4-actions-unreadable", error = FileError::Io(e).to_string())
+            }
+            _ => t!("smart4-actions-unreadable", error = error.to_string()),
         };
         Load {
             library: Self::defaults(),
-            saving: backup.is_some(),
+            saving: store.saving(),
             notice: Some(notice),
+            store: Some(store),
         }
     }
 
-    /// Saved over the actions file, atomically.
-    pub fn save(&self) -> Result<(), FileError> {
-        if cfg!(test) {
-            return Ok(());
-        }
-        std::fs::create_dir_all(crate::config::dir()).map_err(FileError::Io)?;
-        write(&library_file(), &self.sets)
+    /// Saved over the actions file, atomically, merged with what another
+    /// window saved meanwhile (see `store`).
+    pub fn save(&self, store: &mut crate::store::Store) -> Result<(), FileError> {
+        store.save(self.file_value()?).map(drop).map_err(FileError::Io)
+    }
+
+    /// As in an actions file.
+    fn file_value(&self) -> Result<serde_json::Value, FileError> {
+        let file = File {
+            version: VERSION,
+            sets: self.sets.clone(),
+        };
+        serde_json::to_value(&file).map_err(|_| FileError::Invalid)
     }
 
     /// The actions Atelier comes with, built from its commands.
@@ -611,6 +731,7 @@ impl Library {
                     saturation: 0.25,
                     lightness: 0.0,
                     colorize: true,
+                    ranges: Default::default(),
                 }),
             }),
         ];
@@ -653,6 +774,31 @@ impl Library {
             Some((s, a))
         })
     }
+
+    /// Loaded sets added after the others. A function key plays one action
+    /// only: a loaded action whose key is already used loses it. Returns
+    /// how many lost theirs.
+    pub fn add_sets(&mut self, sets: Vec<Set>) -> usize {
+        let mut used: Vec<FnKey> = self
+            .sets
+            .iter()
+            .flat_map(|s| s.actions.iter().filter_map(|a| a.key))
+            .collect();
+        let mut dropped = 0;
+        for mut set in sets {
+            for action in &mut set.actions {
+                let Some(key) = action.key else { continue };
+                if used.contains(&key) {
+                    action.key = None;
+                    dropped += 1;
+                } else {
+                    used.push(key);
+                }
+            }
+            self.sets.push(set);
+        }
+        dropped
+    }
 }
 
 /// The library read at start, and what the user must know about it.
@@ -661,29 +807,19 @@ pub struct Load {
     /// The actions file may be written.
     pub saving: bool,
     pub notice: Option<String>,
+    /// The actions file (none in tests).
+    pub store: Option<crate::store::Store>,
 }
 
 impl Load {
-    fn fine(library: Library) -> Self {
+    fn fine(library: Library, store: Option<crate::store::Store>) -> Self {
         Self {
             library,
             saving: true,
             notice: None,
+            store,
         }
     }
-}
-
-/// `path` renamed to "name.bak", "name.bak-2"…: its new path.
-pub(crate) fn set_aside(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?.to_string_lossy().into_owned();
-    let backup = (1..1000)
-        .map(|n| match n {
-            1 => path.with_file_name(format!("{name}.bak")),
-            n => path.with_file_name(format!("{name}.bak-{n}")),
-        })
-        .find(|p| !p.exists())?;
-    std::fs::rename(path, &backup).ok()?;
-    Some(backup)
 }
 
 fn library_file() -> PathBuf {
@@ -694,10 +830,33 @@ fn library_file() -> PathBuf {
 pub fn read(path: &Path) -> Result<Vec<Set>, FileError> {
     let json = std::fs::read(path).map_err(FileError::Io)?;
     let value: serde_json::Value = serde_json::from_slice(&json).map_err(|_| FileError::Invalid)?;
+    sets_of(&value)
+}
+
+/// The library's file: JSON, the actions this version reads written as it
+/// writes them (what another window saved compares with what this one
+/// read).
+const LIBRARY_FILE: crate::store::Format = crate::store::Format {
+    decode: |bytes| {
+        let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        let same = sets_of(&value).ok().and_then(|sets| {
+            let file = File {
+                version: VERSION,
+                sets,
+            };
+            serde_json::to_value(file).ok()
+        });
+        Some(same.unwrap_or(value))
+    },
+    encode: crate::store::JSON.encode,
+};
+
+/// The sets of an actions file's contents.
+fn sets_of(value: &serde_json::Value) -> Result<Vec<Set>, FileError> {
     let version = value.get("version").and_then(serde_json::Value::as_u64);
     match version {
         Some(v) if v > VERSION as u64 => Err(FileError::Newer(v as u32)),
-        Some(_) => File::deserialize(&value)
+        Some(_) => File::deserialize(value)
             .map(|f| f.sets)
             .map_err(|_| FileError::Invalid),
         None => Err(FileError::Invalid),
@@ -921,6 +1080,7 @@ mod tests {
             }),
             Step::new(Recorded::Transform {
                 corners: [[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0]],
+                frame: Frame::of([[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0]], 1.0, 1.0),
             }),
             Step::new(Recorded::Stop {
                 message: "Check".into(),
@@ -958,8 +1118,7 @@ mod tests {
 
     #[test]
     fn actions_files_round_trip() {
-        let dir = std::env::temp_dir().join("atelier-actions-round-trip");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("actions-round-trip");
         let path = dir.join("set.json");
         let sets = sample();
         write(&path, &sets).unwrap();
@@ -975,8 +1134,7 @@ mod tests {
                 {"do": {"command": "select-all"}},
             ]}]}],
         });
-        let dir = std::env::temp_dir().join("atelier-actions-unknown");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("actions-unknown");
         let path = dir.join("set.json");
         std::fs::write(&path, json.to_string()).unwrap();
         let sets = read(&path).unwrap();
@@ -1000,9 +1158,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_library_is_never_overwritten() {
-        let dir = std::env::temp_dir().join("atelier-actions-library-load");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("actions-library-load");
         let path = dir.join("actions.json");
         // None yet: the defaults, saved as usual.
         let load = Library::load_from(&path);
@@ -1025,6 +1181,39 @@ mod tests {
         std::fs::write(&path, "x").unwrap();
         Library::load_from(&path);
         assert!(dir.join("actions.json.bak-2").exists());
+    }
+
+    /// Two windows of Atelier: an action recorded in one stays when the
+    /// other changes its own library.
+    #[test]
+    fn two_windows_never_erase_each_others_actions() {
+        let dir = crate::testing::test_dir("actions-two-windows");
+        let path = dir.join("actions.json");
+        let (mut a, mut b) = (Library::load_from(&path), Library::load_from(&path));
+        let (mut sa, mut sb) = (a.store.take().unwrap(), b.store.take().unwrap());
+        let recorded = Sequence {
+            name: "Recorded in A".into(),
+            key: None,
+            steps: vec![Step::new(Recorded::Deselect)],
+            expanded: false,
+        };
+        a.library.sets[0].actions.push(recorded.clone());
+        a.library.save(&mut sa).unwrap();
+        // B renames a default action, then adds a set.
+        b.library.sets[0].actions[0].name = "Renamed in B".into();
+        b.library.save(&mut sb).unwrap();
+        b.library.sets.push(Set {
+            name: "B's set".into(),
+            actions: Vec::new(),
+            expanded: true,
+        });
+        b.library.save(&mut sb).unwrap();
+        let sets = read(&path).unwrap();
+        assert_eq!(sets.len(), 2);
+        let names: Vec<&str> = sets[0].actions.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"Recorded in A") && names.contains(&"Renamed in B"));
+        assert_eq!(sets[0].actions.len(), Library::defaults().sets[0].actions.len() + 1);
+        assert_eq!(sets[1].name, "B's set");
     }
 
     #[test]

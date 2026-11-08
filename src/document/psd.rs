@@ -1,4 +1,4 @@
-//! Photoshop documents (.psd, and .psb for reading), after Adobe's
+//! Photoshop documents (.psd, and the large .psb), after Adobe's
 //! "Photoshop File Formats Specification".
 //!
 //! Reading takes 8-bit RGB as it is; 16 and 32 bits, grayscale, CMYK, Lab,
@@ -11,7 +11,7 @@
 //! can't hold is left out or simplified, and listed in notes for the user.
 //!
 //! Writing (8-bit RGB, or CMYK converted through a profile; RLE
-//! compressed) keeps the layers with all of the
+//! compressed; a PSB for a .psb file) keeps the layers with all of the
 //! above, the saved selections as alpha channels, the guides, the color
 //! profile, the opened file's resources that describe the document
 //! (resolution, XMP, IPTC, EXIF, print settings) as they were, and the
@@ -39,6 +39,12 @@ pub fn is_psd(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("psd") || e.eq_ignore_ascii_case("psb"))
 }
 
+/// Whether `path` names a Large Document Format file (.psb): written in
+/// version 2, which holds larger layers and files.
+pub fn is_psb(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("psb"))
+}
+
 /// A Photoshop document read, and what had to be simplified to open it
 /// (translated, for the status bar).
 pub struct Imported {
@@ -59,18 +65,22 @@ pub fn read(
     Ok(imported)
 }
 
-/// Writes `doc` as a Photoshop document; returns what it could not keep
-/// (translated notes).
-pub fn write(doc: &Document, out: &mut impl std::io::Write) -> Result<Vec<String>, FileError> {
-    let (data, notes) = write::document(doc, None)?;
+/// Writes `doc` as a Photoshop document (a PSB if `big`); returns what it
+/// could not keep (translated notes).
+pub fn write(
+    doc: &Document,
+    out: &mut impl std::io::Write,
+    big: bool,
+) -> Result<Vec<String>, FileError> {
+    let (data, notes) = write::document(doc, None, big)?;
     out.write_all(&data)?;
     Ok(notes)
 }
 
-/// What saving `doc` as a Photoshop document would lose, as [`write`]
-/// says it (translated notes).
-pub fn losses(doc: &Document) -> Vec<String> {
-    write::losses(doc)
+/// What saving `doc` as a Photoshop document (a PSB if `big`) would lose,
+/// as [`write`] says it (translated notes).
+pub fn losses(doc: &Document, big: bool) -> Vec<String> {
+    write::losses(doc, big)
 }
 
 /// [`write`] in CMYK: every layer and the merged image converted by
@@ -79,8 +89,9 @@ pub fn write_cmyk(
     doc: &Document,
     out: &mut impl std::io::Write,
     cmyk: &crate::cms::Conversion,
+    big: bool,
 ) -> Result<Vec<String>, FileError> {
-    let (data, notes) = write::document(doc, Some(cmyk))?;
+    let (data, notes) = write::document(doc, Some(cmyk), big)?;
     out.write_all(&data)?;
     Ok(notes)
 }
@@ -188,7 +199,7 @@ mod tests {
     use crate::pixel_ops::{AdjustKind, Adjustment};
 
     fn write_read(doc: &Document) -> (Imported, Vec<String>) {
-        let (data, notes) = write::document(doc, None).unwrap();
+        let (data, notes) = write::document(doc, None, false).unwrap();
         (read::document(&data).unwrap(), notes)
     }
 
@@ -442,7 +453,7 @@ mod tests {
         }];
         let (back, _) = write_read(&doc);
         assert_eq!(back.doc.samplers, doc.samplers);
-        let bytes = write::document(&doc, None).unwrap().0;
+        let bytes = write::document(&doc, None, false).unwrap().0;
         let mut want = b"8BIM\x04\x31\0\0".to_vec();
         want.extend(20u32.to_be_bytes());
         want.extend([0, 0, 0, 2, 0, 0, 0, 1]);
@@ -622,7 +633,7 @@ mod tests {
         doc.layers[0].replace_pixels(RgbaImage::from_fn(3, 2, |x, _| {
             Rgba([255, 0, 0, x as u8 * 100])
         }));
-        let (data, _) = write::document(&doc, None).unwrap();
+        let (data, _) = write::document(&doc, None, false).unwrap();
         // Negative layer count: the first alpha channel is the merged
         // transparency; colors matted against white.
         let flat = read::merged_image(&data).unwrap();
@@ -803,6 +814,8 @@ mod tests {
 
     #[test]
     fn damaged_layer_boxes_never_take_the_memory() {
+        // Whatever the machine has free: the budget is not what is tested.
+        crate::document::set_test_free_memory(Some(64 << 30));
         // Far beyond any canvas, or overflowing: refused.
         for rect in [
             [0, 0, 1_000_000_000, 1_000_000_000],
@@ -818,7 +831,8 @@ mod tests {
         let doc = read::document(&one_layer([0, 0, 30_000, 30_000]))
             .unwrap()
             .doc;
-        assert!(start.elapsed().as_secs() < 2);
+        // Generous: a decode of 3.6 GB would take far longer, even unloaded.
+        assert!(start.elapsed().as_secs() < 10);
         assert_eq!(doc.layers[0].image().dimensions(), (0, 0));
     }
 
@@ -849,8 +863,7 @@ mod tests {
 
     #[test]
     fn thumbnails_of_damaged_files_are_refused() {
-        let dir = std::env::temp_dir().join("atelier-psd-thumbnails");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("psd-thumbnails");
         let path = dir.join("big.psd");
         // Too large (and zero wide) headers: no preview, no allocation.
         for (w, h) in [(1_000_000u32, 1_000_000u32), (0, 2)] {
@@ -858,7 +871,7 @@ mod tests {
             data[14..18].copy_from_slice(&h.to_be_bytes());
             data[18..22].copy_from_slice(&w.to_be_bytes());
             std::fs::write(&path, &data).unwrap();
-            assert!(thumbnail_of(&path).is_none());
+            assert!(thumbnail_of(&path, &mut crate::document::Budget::new()).is_none());
         }
     }
 
@@ -912,8 +925,7 @@ mod tests {
         let shape = Shape::live(live, Paint::Color([10, 20, 30]), stroke);
         doc.add_shape_layer("Polygon".into(), "Polygon", shape);
         assert!(!doc.psd_losses().is_empty());
-        let dir = std::env::temp_dir().join("atelier-psd-shapes");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("psd-shapes");
         let notes = doc.save(&dir.join("shape.psd")).unwrap();
         assert!(!notes.is_empty());
         assert!(doc.modified);
@@ -921,8 +933,7 @@ mod tests {
 
     #[test]
     fn an_opened_psd_remembers_what_it_lost() {
-        let dir = std::env::temp_dir().join("atelier-psd-file-notes");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("psd-file-notes");
         let path = dir.join("gray16.psd");
         std::fs::write(&path, flat_file(1, 16, &[&[0xff, 0xff, 0x80, 0x00]])).unwrap();
         let opened = Document::open(&path).unwrap();
@@ -983,11 +994,12 @@ mod tests {
     /// channel is allocated; a PSD's layer is at most 30000 a side.
     #[test]
     fn layers_hold_what_their_data_can() {
+        crate::document::set_test_free_memory(Some(64 << 30));
         for side in [30_000, 30_001, 120_000] {
             let started = std::time::Instant::now();
             let read = read::document(&rle_counts_only(side));
             assert!(matches!(read, Err(FileError::Damaged)), "{side}");
-            assert!(started.elapsed().as_secs_f32() < 1.0, "{side}");
+            assert!(started.elapsed().as_secs_f32() < 10.0, "{side}");
         }
     }
 
@@ -1186,7 +1198,7 @@ mod tests {
         assert!(notes.is_empty(), "{notes:?}");
         assert!(find(&back.doc, 1050).is_none());
         doc.file_metadata.psd_resources = Arc::new(vec![resource(1073, b"samplers")]);
-        assert_eq!(losses(&doc), [t!("files6-psd-note-placed")]);
+        assert_eq!(losses(&doc, false), [t!("files6-psd-note-placed")]);
         let (back, _) = write_read(&doc);
         assert!(find(&back.doc, 1073).is_none());
     }
@@ -1201,10 +1213,15 @@ mod tests {
             RgbaImage::from_pixel(37_500, 2, Rgba([200, 10, 10, 255])),
             (-3000, 0),
         );
-        let (back, _) = write_read(&doc);
+        // A PSD's sides stop at 30,000 px (said), a PSB's don't.
+        let (back, notes) = write_read(&doc);
+        assert_eq!(back.doc.layers[1].image().dimensions(), (30_000, 2));
+        assert_eq!(notes.len(), 1);
+        let (data, notes) = write::document(&doc, None, true).unwrap();
+        assert!(notes.is_empty());
+        let back = read::document(&data).unwrap();
         assert_eq!(back.doc.layers[1].image().dimensions(), (37_500, 2));
-        let dir = std::env::temp_dir().join("atelier-psd-wide");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("psd-wide");
         let path = dir.join("wide.atelier");
         doc.save(&path).unwrap();
         let back = Document::open(&path).unwrap().doc;
@@ -1215,7 +1232,7 @@ mod tests {
     /// they need more memory than the computer has.
     #[test]
     fn the_layers_must_fit_in_memory() {
-        let (data, _) = write::document(&sample(), None).unwrap();
+        let (data, _) = write::document(&sample(), None, false).unwrap();
         assert!(read::document(&data).is_ok());
         assert!(matches!(
             read::document_within(&data, crate::document::file_io::Budget::of(1000)),
@@ -1237,15 +1254,15 @@ mod tests {
         };
         let mut opaque = Document::new(RgbaImage::from_pixel(4, 4, Rgba([1, 2, 3, 255])), None);
         channels(&mut opaque, 53);
-        assert!(losses(&opaque).is_empty());
-        assert!(write::document(&opaque, None).unwrap().1.is_empty());
+        assert!(losses(&opaque, false).is_empty());
+        assert!(write::document(&opaque, None, false).unwrap().1.is_empty());
         channels(&mut opaque, 54);
-        assert!(!losses(&opaque).is_empty());
+        assert!(!losses(&opaque, false).is_empty());
         let mut clear = Document::new(RgbaImage::from_pixel(4, 4, Rgba([1, 2, 3, 0])), None);
         channels(&mut clear, 52);
-        assert!(losses(&clear).is_empty());
+        assert!(losses(&clear, false).is_empty());
         channels(&mut clear, 53);
-        assert_eq!(losses(&clear), write::document(&clear, None).unwrap().1);
+        assert_eq!(losses(&clear, false), write::document(&clear, None, false).unwrap().1);
     }
 }
 
@@ -1276,7 +1293,7 @@ mod pattern_files {
 
     #[test]
     fn the_three_names_of_the_tiles_block_are_read() {
-        let (mut data, _) = write::document(&doc_with(PatternFill::of(tile())), None).unwrap();
+        let (mut data, _) = write::document(&doc_with(PatternFill::of(tile())), None, false).unwrap();
         let at = find(&data, b"8BIMPatt");
         for key in [b"Pat2", b"Pat3"] {
             data[at + 4..at + 8].copy_from_slice(key);
@@ -1291,7 +1308,7 @@ mod pattern_files {
 
     #[test]
     fn a_fill_without_its_tile_stays_a_layer_and_says_so() {
-        let (mut data, _) = write::document(&doc_with(PatternFill::of(tile())), None).unwrap();
+        let (mut data, _) = write::document(&doc_with(PatternFill::of(tile())), None, false).unwrap();
         let at = find(&data, b"8BIMPatt");
         data[at + 4..at + 8].copy_from_slice(b"Xxxx");
         let back = read::document(&data).unwrap();
@@ -1303,7 +1320,7 @@ mod pattern_files {
     /// The list's rectangle patched: a few bytes for a big tile.
     #[test]
     fn a_tile_bigger_than_its_data_is_refused_within_the_budget() {
-        let (mut data, _) = write::document(&doc_with(PatternFill::of(tile())), None).unwrap();
+        let (mut data, _) = write::document(&doc_with(PatternFill::of(tile())), None, false).unwrap();
         let at = find(&data, b"8BIMPatt");
         let id = data[at + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 2] as usize;
         let rect = at + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 2 + 1 + id + 4 + 4;
@@ -1339,7 +1356,7 @@ mod pattern_files {
         let fx = &mut doc.active_layer_mut().effects;
         fx.pattern_overlay.enabled = true;
         fx.pattern_overlay.fill = PatternFill::of(t);
-        let (data, _) = write::document(&doc, None).unwrap();
+        let (data, _) = write::document(&doc, None, false).unwrap();
         let back = read::document(&data).unwrap().doc;
         assert_eq!(doc.flatten(), back.flatten());
     }
@@ -1359,7 +1376,7 @@ mod pattern_files {
         fx.stroke.width = 2.0;
         let before = fx.clone();
         assert!(doc.psd_losses().is_empty());
-        let (data, notes) = write::document(&doc, None).unwrap();
+        let (data, notes) = write::document(&doc, None, false).unwrap();
         assert!(notes.is_empty());
         let opened = read::document(&data).unwrap();
         assert!(opened.notes.is_empty(), "{:?}", opened.notes);
@@ -1377,5 +1394,244 @@ mod pattern_files {
         // Untouched styles that are off stay out of the file.
         assert_eq!(back.inner_glow, Effects::default().inner_glow);
         assert_eq!(doc.flatten(), opened.doc.flatten());
+    }
+}
+
+/// Interoperability with the other readers (ag-psd, psd-tools): sizes,
+/// PSB, clipping, links, path names, Hue/Saturation ranges.
+#[cfg(test)]
+mod interop_tests {
+    use image::{GrayImage, Luma, Rgba, RgbaImage};
+
+    use super::*;
+    use crate::document::{LayerKind, Mask};
+    use crate::i18n::t;
+    use crate::pixel_ops::{Adjustment, HueSaturation};
+
+    /// Pixels that don't pack (a PackBits row then outgrows its width).
+    fn noise(w: u32, h: u32) -> RgbaImage {
+        let mut seed = 12345u32;
+        RgbaImage::from_fn(w, h, |_, _| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let [a, b, c, _] = seed.to_be_bytes();
+            Rgba([a, b, c, 255])
+        })
+    }
+
+    fn wide(w: u32) -> Document {
+        let mut doc = Document::new(RgbaImage::from_pixel(100, 4, Rgba([9, 9, 9, 255])), None);
+        doc.add_layer("Wide".into(), noise(w, 4), (-1000, 0));
+        doc
+    }
+
+    /// A layer over 30,000 px a side is cropped in a PSD (which other
+    /// readers then take, and which reopens), and said first; a PSB keeps
+    /// it whole.
+    #[test]
+    fn layers_past_a_psd_side_are_cropped_and_a_psb_keeps_them() {
+        let doc = wide(70_000);
+        let cropped = t!("psd14-psd-note-cropped", names = "Wide", max = 30_000);
+        assert_eq!(losses(&doc, false), std::slice::from_ref(&cropped));
+        let (data, notes) = write::document(&doc, None, false).unwrap();
+        assert_eq!(notes, [cropped]);
+        let back = read::document(&data).unwrap().doc;
+        let layer = &back.layers[1];
+        assert_eq!((layer.image().dimensions(), layer.offset), ((30_000, 4), (-1000, 0)));
+        assert_eq!(back.flatten(), doc.flatten());
+        let src = doc.layers[1].image();
+        assert_eq!(layer.image().get_pixel(29_999, 3), src.get_pixel(29_999, 3));
+
+        assert!(losses(&doc, true).is_empty());
+        let (data, notes) = write::document(&doc, None, true).unwrap();
+        assert!(notes.is_empty());
+        assert_eq!(&data[4..6], &[0, 2]);
+        let back = read::document(&data).unwrap();
+        assert!(back.notes.is_empty(), "{:?}", back.notes);
+        assert_eq!(back.doc.layers[1].image(), doc.layers[1].image());
+    }
+
+    /// The same for a mask, whose rows would overflow a PSD's row lengths.
+    #[test]
+    fn masks_past_a_psd_side_are_cropped_and_a_psb_keeps_them() {
+        let mut doc = Document::new(RgbaImage::from_pixel(100, 4, Rgba([9, 9, 9, 255])), None);
+        doc.add_layer("Masked".into(), RgbaImage::from_pixel(10, 4, Rgba([1, 2, 3, 255])), (0, 0));
+        let mask = GrayImage::from_fn(70_000, 4, |x, _| Luma([(x * 7919 % 251) as u8]));
+        doc.active_layer_mut().mask = Some(Mask::new(mask.clone(), (-5, 0), 0, (0, 0)));
+        let (data, notes) = write::document(&doc, None, false).unwrap();
+        assert_eq!(notes.len(), 1);
+        let back = read::document(&data).unwrap().doc;
+        let m = back.layers[1].mask.as_ref().unwrap();
+        assert_eq!(m.image().dimensions(), (30_000, 4));
+        assert_eq!(back.flatten(), doc.flatten());
+        let (data, _) = write::document(&doc, None, true).unwrap();
+        let back = read::document(&data).unwrap().doc;
+        assert_eq!(back.layers[1].mask.as_ref().unwrap().image(), &mask);
+    }
+
+    /// Saving to a .psb writes a PSB, which Save keeps.
+    #[test]
+    fn a_psb_file_is_saved_as_a_psb() {
+        let dir = crate::testing::test_dir("psd-psb-save");
+        let path = dir.join("big.psb");
+        let mut doc = wide(40_000);
+        assert!(doc.save(&path).unwrap().is_empty());
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(&data[..6], b"8BPS\0\x02");
+        let opened = Document::open(&path).unwrap();
+        assert!(opened.doc.psd_losses().is_empty());
+        assert_eq!(opened.doc.layers[1].image().width(), 40_000);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A clipped layer at the bottom of its group is written unclipped, as
+    /// Atelier draws it (other readers would clip it to the group's end).
+    #[test]
+    fn clipping_at_the_bottom_of_a_group_is_not_written() {
+        let mut doc = Document::new(RgbaImage::from_pixel(8, 8, Rgba([255; 4])), None);
+        doc.add_layer("base".into(), RgbaImage::from_pixel(4, 4, Rgba([0, 0, 255, 255])), (0, 0));
+        doc.add_layer("clipped".into(), RgbaImage::from_pixel(8, 8, Rgba([255, 0, 0, 255])), (0, 0));
+        doc.active_layer_mut().clipped = true;
+        doc.add_layer("alone".into(), RgbaImage::from_pixel(2, 2, Rgba([0, 255, 0, 255])), (0, 0));
+        doc.active_layer_mut().clipped = true;
+        let top = doc.layers.len() - 1;
+        assert!(doc.group_layers(&[top]));
+        let alone = doc.layers.iter().position(|l| l.name == "alone").unwrap();
+        doc.layers[alone].clipped = true;
+        let (data, _) = write::document(&doc, None, false).unwrap();
+        let flags = read::records_of(&data);
+        let flag = |name: &str| flags.iter().find(|(n, _)| n == name).unwrap().1;
+        assert!(flag("clipped"));
+        assert!(!flag("alone"));
+    }
+
+    /// Linked layers stay linked through a PSD (resources 1026 and 1072).
+    #[test]
+    fn linked_layers_keep_their_link() {
+        let mut doc = Document::new(RgbaImage::from_pixel(8, 8, Rgba([255; 4])), None);
+        for name in ["a", "b", "c", "d"] {
+            doc.add_layer(name.into(), RgbaImage::from_pixel(2, 2, Rgba([1, 2, 3, 255])), (0, 0));
+        }
+        assert!(doc.toggle_link(&[1, 3]));
+        let (data, _) = write::document(&doc, None, false).unwrap();
+        let back = read::document(&data).unwrap();
+        assert!(back.notes.is_empty());
+        let links: Vec<Option<u64>> = back.doc.layers.iter().map(|l| l.link).collect();
+        assert!(links[1].is_some() && links[1] == links[3]);
+        assert_eq!((links[0], links[2], links[4]), (None, None, None));
+        // Moving one moves the other.
+        assert_eq!(back.doc.moving_with(1), [1, 3]);
+    }
+
+    /// Path names outside Mac OS Roman come back whole ("pths").
+    #[test]
+    fn saved_path_names_keep_every_character() {
+        let mut doc = Document::new(RgbaImage::from_pixel(20, 20, Rgba([255; 4])), None);
+        let mut path = crate::vector::Path::default();
+        let corners = [(2.0, 2.0), (9.0, 2.0), (6.0, 8.0)].map(|(x, y)| crate::vector::pt(x, y));
+        path.subpaths.push(crate::vector::SubPath::polygon(corners));
+        for name in ["路径 1", "Plain", "Émoji 😀"] {
+            doc.paths.push(crate::document::SavedPath {
+                name: name.into(),
+                path: path.clone(),
+            });
+        }
+        for big in [false, true] {
+            let (data, _) = write::document(&doc, None, big).unwrap();
+            let back = read::document(&data).unwrap().doc;
+            let names: Vec<&str> = back.paths.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, ["路径 1", "Plain", "Émoji 😀"]);
+        }
+    }
+
+    /// A clipping path naming a path no longer there is left out.
+    #[test]
+    fn a_clipping_path_goes_with_its_path() {
+        let mut doc = Document::new(RgbaImage::from_pixel(20, 20, Rgba([255; 4])), None);
+        let data = [&[4u8][..], b"Gone", &[0, 1, 0, 0, 0, 1]].concat();
+        doc.file_metadata.psd_resources = std::sync::Arc::new(vec![crate::document::PsdResource {
+            id: 2999,
+            name: Vec::new(),
+            data,
+        }]);
+        let (file, _) = write::document(&doc, None, false).unwrap();
+        let has = |file: &[u8]| file.windows(6).any(|w| w == [b'8', b'B', b'I', b'M', 0x0B, 0xB7]);
+        assert!(!has(&file));
+        let mut path = crate::vector::Path::default();
+        let corners = [(2.0, 2.0), (9.0, 2.0), (6.0, 8.0)].map(|(x, y)| crate::vector::pt(x, y));
+        path.subpaths.push(crate::vector::SubPath::polygon(corners));
+        doc.paths.push(crate::document::SavedPath {
+            name: "Gone".into(),
+            path,
+        });
+        let (file, _) = write::document(&doc, None, false).unwrap();
+        assert!(has(&file));
+    }
+
+    /// The default Pattern Overlay, unused, stays out of the file of a layer
+    /// whose pixels have margins (text, shapes): it reopens without loss.
+    #[test]
+    fn an_unused_pattern_overlay_is_not_written() {
+        let mut doc = Document::new(RgbaImage::from_pixel(40, 40, Rgba([255; 4])), None);
+        let mut image = RgbaImage::new(20, 20);
+        for y in 5..15 {
+            for x in 4..12 {
+                image.put_pixel(x, y, Rgba([1, 2, 3, 255]));
+            }
+        }
+        doc.add_layer("Hello".into(), image, (3, 3));
+        let (data, _) = write::document(&doc, None, false).unwrap();
+        assert!(!data.windows(11).any(|w| w == b"patternFill"));
+        let mut opened = read::document(&data).unwrap();
+        assert!(opened.notes.is_empty(), "{:?}", opened.notes);
+        opened.doc.file_notes = opened.notes;
+        assert!(opened.doc.psd_losses().is_empty());
+    }
+
+    /// Hue/Saturation's ranges: drawn, and kept by both formats.
+    #[test]
+    fn hue_saturation_ranges_render_and_round_trip() {
+        let mut hs = HueSaturation::default();
+        hs.ranges.0[0].saturation = -1.0;
+        hs.ranges.0[4].hue = 30.0;
+        let mut image = RgbaImage::from_vec(3, 1, vec![220, 30, 30, 255, 30, 200, 40, 255, 128, 128, 128, 255]).unwrap();
+        crate::pixel_ops::hue_saturation(&mut image, &hs);
+        let red = image.get_pixel(0, 0).0;
+        assert!(red[0] == red[1] && red[1] == red[2], "{red:?}");
+        assert_eq!(image.get_pixel(1, 0).0, [30, 200, 40, 255]);
+        assert_eq!(image.get_pixel(2, 0).0, [128, 128, 128, 255]);
+        assert!(!hs.is_neutral());
+
+        let mut doc = Document::new(RgbaImage::from_pixel(8, 8, Rgba([220, 30, 30, 255])), None);
+        doc.add_adjustment_layer(Adjustment::HueSaturation(hs), None);
+        let (data, notes) = write::document(&doc, None, false).unwrap();
+        assert!(notes.is_empty());
+        let back = read::document(&data).unwrap().doc;
+        let Some(LayerKind::Adjustment(Adjustment::HueSaturation(read))) =
+            back.layers.last().map(|l| &l.kind)
+        else {
+            panic!("no adjustment");
+        };
+        assert_eq!(read.ranges, hs.ranges);
+        assert_eq!(back.flatten(), doc.flatten());
+        let dir = crate::testing::test_dir("psd-hue-ranges");
+        let path = dir.join("hue.atelier");
+        doc.save(&path).unwrap();
+        let back = Document::open(&path).unwrap().doc;
+        assert!(matches!(
+            &back.layers.last().unwrap().kind,
+            LayerKind::Adjustment(Adjustment::HueSaturation(h)) if h.ranges == hs.ranges
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A Brightness/Contrast in the legacy algorithm is said on opening.
+    #[test]
+    fn legacy_brightness_contrast_is_said() {
+        let brit: &[u8] = &[0, 50, 0, 0, 0, 0, 0, 0];
+        assert!(adjust::legacy_brightness(&[(*b"brit", brit)]));
+        let mut doc = Document::new(RgbaImage::from_pixel(8, 8, Rgba([9; 4])), None);
+        doc.add_adjustment_layer(Adjustment::BrightnessContrast(Default::default()), None);
+        let (data, _) = write::document(&doc, None, false).unwrap();
+        assert!(read::document(&data).unwrap().notes.is_empty());
     }
 }

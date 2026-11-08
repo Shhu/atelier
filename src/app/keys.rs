@@ -43,6 +43,8 @@ pub(super) fn key(key: Key) -> String {
         Key::Enter => t!("hint-key-enter"),
         Key::Escape => t!("hint-key-esc"),
         Key::Space => t!("hint-key-space"),
+        // egui has no symbol for it, only the name "Quote".
+        Key::Quote => "'".to_owned(),
         _ => {
             let symbol = key.symbol_or_name();
             if symbol.chars().count() == 1 {
@@ -51,6 +53,20 @@ pub(super) fn key(key: Key) -> String {
                 key.name().to_owned()
             }
         }
+    }
+}
+
+/// Where an AZERTY keyboard has `shortcut`, if its key is elsewhere: the
+/// "'" of Ctrl+' is ù (the 4 key is the green channel), "[ ]" are ^ $, and
+/// "/" is typed with Shift on the ":" key.
+pub(super) fn azerty(ctx: &Context, shortcut: &KeyboardShortcut) -> Option<String> {
+    let m = shortcut.modifiers;
+    match shortcut.logical_key {
+        Key::Quote => Some(combo(ctx, m, "ù")),
+        Key::OpenBracket => Some(combo(ctx, m, "^")),
+        Key::CloseBracket => Some(combo(ctx, m, "$")),
+        Key::Slash => Some(combo(ctx, m.plus(Modifiers::SHIFT), ":")),
+        _ => None,
     }
 }
 
@@ -81,15 +97,18 @@ fn modifier_names(ctx: &Context, m: Modifiers) -> String {
         return s;
     }
     let mac = ctx.os().is_mac();
-    let (alt, ctrl) = if mac {
-        ("Option", "Cmd")
+    let (alt, command) = if mac { ("Option", "Cmd") } else { ("Alt", "Ctrl") };
+    // On macOS, Control (`Modifiers::CTRL`) and Command are two keys.
+    let (control, command_on) = if mac {
+        (m.ctrl, m.mac_cmd || m.command)
     } else {
-        ("Alt", "Ctrl")
+        (false, m.ctrl || m.command || m.mac_cmd)
     };
     [
         (m.alt, alt.to_owned()),
         (m.shift, t!("hint-key-shift")),
-        (m.ctrl || m.command || m.mac_cmd, ctrl.to_owned()),
+        (control, "Ctrl".to_owned()),
+        (command_on, command.to_owned()),
     ]
     .into_iter()
     .filter_map(|(on, name)| on.then_some(name))
@@ -125,5 +144,20 @@ mod tests {
         assert_eq!(shortcut(&ctx, &zoom_out), "Ctrl+−");
         assert_eq!(shortcut(&ctx, &raise), "Ctrl+]");
         assert_eq!(modifiers(&ctx, Modifiers::COMMAND), "Ctrl");
+        // Grid: egui only names the key "Quote".
+        let grid = KeyboardShortcut::new(Modifiers::COMMAND, Key::Quote);
+        assert_eq!(shortcut(&ctx, &grid), "Ctrl+'");
+        // Control is Ctrl on every system, Command only on macOS.
+        assert_eq!(modifiers(&ctx, Modifiers::CTRL), "Ctrl");
+        ctx.set_os(OperatingSystem::Mac);
+        // The fonts (for the symbols) come with a first frame.
+        ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
+        if mac_symbols(&ctx) {
+            assert_eq!(modifiers(&ctx, Modifiers::CTRL), "⌃");
+            assert_eq!(modifiers(&ctx, Modifiers::COMMAND), "⌘");
+        } else {
+            assert_eq!(modifiers(&ctx, Modifiers::CTRL), "Ctrl");
+            assert_eq!(modifiers(&ctx, Modifiers::COMMAND), "Cmd");
+        }
     }
 }

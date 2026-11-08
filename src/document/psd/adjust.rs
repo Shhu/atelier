@@ -8,8 +8,9 @@ use crate::document::{FileError, Fill, LayerKind};
 use crate::paint::gradient::{ColorStop, Gradient, OpacityStop, Shape, StopColor};
 use crate::pixel_ops::{
     Adjustment, BlackWhite, BrightnessContrast, ChannelMixer, ColorBalance, Curve, Curves,
-    Exposure, GradientMap, HueSaturation, Levels, LevelsChannel, MAX_CURVE_POINTS, PhotoFilter,
-    Posterize, SELECTIVE_RANGES, SelectiveColor, Threshold, Vibrance,
+    Exposure, GradientMap, HueRange, HueRanges, HueSaturation, Levels, LevelsChannel,
+    MAX_CURVE_POINTS, PhotoFilter, Posterize, SELECTIVE_RANGES, SelectiveColor, Threshold,
+    Vibrance,
 };
 
 /// Keys of the adjustment and fill layers Atelier doesn't have.
@@ -184,6 +185,21 @@ fn hue_saturation(d: &[u8]) -> Result<Adjustment> {
     let colorization = [r.i16()?, r.i16()?, r.i16()?];
     let master = [r.i16()?, r.i16()?, r.i16()?];
     let unit = |v: i16| (v as f32 / 100.0).clamp(-1.0, 1.0);
+    // The six ranges: their bounds (degrees), then their edit.
+    let mut ranges = HueRanges::default();
+    for range in &mut ranges.0 {
+        if r.remaining() < 14 {
+            break;
+        }
+        let bounds = [r.i16()?, r.i16()?, r.i16()?, r.i16()?];
+        let [h, s, l] = [r.i16()?, r.i16()?, r.i16()?];
+        *range = HueRange {
+            bounds: bounds.map(|b| f32::from(b).rem_euclid(360.0)),
+            hue: f32::from(h).clamp(-180.0, 180.0),
+            saturation: unit(s),
+            lightness: unit(l),
+        };
+    }
     Ok(Adjustment::HueSaturation(if colorize {
         let [h, s, l] = colorization;
         HueSaturation {
@@ -191,6 +207,7 @@ fn hue_saturation(d: &[u8]) -> Result<Adjustment> {
             saturation: unit(s).max(0.0),
             lightness: unit(l),
             colorize,
+            ranges,
         }
     } else {
         let [h, s, l] = master;
@@ -199,6 +216,7 @@ fn hue_saturation(d: &[u8]) -> Result<Adjustment> {
             saturation: unit(s),
             lightness: unit(l),
             colorize,
+            ranges,
         }
     }))
 }
@@ -232,6 +250,17 @@ fn brightness_contrast(d: &[u8]) -> Result<Adjustment> {
         d.num(b"Brgh").unwrap_or(0.0),
         d.num(b"Cntr").unwrap_or(0.0),
     ))
+}
+
+/// Whether a Brightness/Contrast layer uses the legacy algorithm (which
+/// Atelier doesn't have: it opens with the current one): "Use Legacy" on,
+/// or only the old block, of files from before it was an option.
+pub fn legacy_brightness(blocks: &[([u8; 4], &[u8])]) -> bool {
+    let get = |key: &[u8; 4]| blocks.iter().find(|(k, _)| k == key).map(|(_, d)| *d);
+    match get(b"CgEd") {
+        Some(d) => versioned(d).is_ok_and(|d| d.bool(b"useLegacy") == Some(true)),
+        None => get(b"brit").is_some(),
+    }
 }
 
 fn legacy_brightness_contrast(d: &[u8]) -> Result<Adjustment> {
@@ -519,7 +548,9 @@ pub fn gradient_fill(d: &Descriptor) -> Option<GradientFill> {
     Some(GradientFill {
         gradient: gradient_of(d.object(b"Grad")?)?,
         style,
-        angle: d.num(b"Angl").unwrap_or(90.0) as f32,
+        angle: crate::compose::gradient::normal_angle(
+            d.num(b"Angl").map(|a| a as f32).filter(|a| a.is_finite()).unwrap_or(90.0),
+        ),
         scale: (d.num(b"Scl ").unwrap_or(100.0) as f32 / 100.0).clamp(0.1, 10.0),
         reverse: d.bool(b"Rvrs").unwrap_or(false),
     })
@@ -678,18 +709,14 @@ fn write_adjustment(a: &Adjustment, w: &mut Writer) {
                     w.i16(v);
                 }
             }
-            // The six hue ranges, unchanged.
-            for k in 0..6i16 {
-                let start = (315 + 60 * k) % 360;
-                for v in [
-                    start,
-                    (start + 30) % 360,
-                    (start + 60) % 360,
-                    (start + 90) % 360,
-                ] {
+            // The six hue ranges.
+            for range in &hs.ranges.0 {
+                for v in range.bounds {
+                    w.i16(v.round().rem_euclid(360.0) as i16);
+                }
+                for v in [range.hue.round() as i16, pct(range.saturation), pct(range.lightness)] {
                     w.i16(v);
                 }
-                w.zeros(6);
             }
         }),
         Adjustment::ColorBalance(cb) => w.tagged(b"blnc", |w| {
@@ -859,12 +886,14 @@ mod tests {
                 saturation: -0.5,
                 lightness: 0.25,
                 colorize: false,
+                ranges: Default::default(),
             }),
             Adjustment::HueSaturation(HueSaturation {
                 hue: 250.0,
                 saturation: 0.4,
                 lightness: -0.1,
                 colorize: true,
+                ranges: Default::default(),
             }),
             Adjustment::ColorBalance(ColorBalance {
                 shadows: [0.1, -0.2, 0.3],

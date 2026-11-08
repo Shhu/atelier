@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 
 use super::dialogs::{DialogSpec, block, floating_dialog, gap_between_blocks, help};
 use super::select_menu::ModifyKind;
+use super::file_dialog::Filter as _;
 use super::*;
 use crate::pixel_ops::AutoMode;
 use crate::actions::{
@@ -175,10 +176,16 @@ pub(super) struct ActionsState {
     batch_error: Option<String>,
     /// The actions file may be written (it was read, or set aside).
     saving: bool,
+    /// The actions file (none in tests).
+    store: Option<crate::store::Store>,
     /// For the status bar: a problem with the actions file.
     notice: Option<String>,
     /// Told once that changes can't be saved (`saving` false).
     reminded: bool,
+    /// While recording, the document (uid, history step, newest state seen)
+    /// and the action's length when last checked: a step added since, with nothing
+    /// recorded, is told as not recorded.
+    watched: Option<(u64, u64, u64, usize)>,
 }
 
 impl Default for ActionsState {
@@ -188,6 +195,7 @@ impl Default for ActionsState {
             open: false,
             library: load.library,
             saving: load.saving,
+            store: load.store,
             notice: load.notice,
             reminded: false,
             selected: None,
@@ -200,6 +208,7 @@ impl Default for ActionsState {
             message: None,
             again: None,
             batch_error: None,
+            watched: None,
         }
     }
 }
@@ -252,7 +261,11 @@ impl ActionsState {
             if !std::mem::replace(&mut self.reminded, true) {
                 self.notice = Some(t!("smart4-actions-change-not-saved"));
             }
-        } else if let Err(e) = self.library.save() {
+        } else if let Some(store) = &mut self.store
+            && let Err(e) = self.library.save(store)
+        {
+            // Written meanwhile by a newer version: left to it from now on.
+            self.saving = store.saving();
             self.notice = Some(t!("smart3-actions-not-saved", error = e.to_string()));
         }
     }
@@ -324,6 +337,7 @@ fn has_dialog(r: &Recorded) -> bool {
         | Recorded::DefinePattern { .. }
         | Recorded::Stroke { .. }
         | Recorded::ModifySelection { .. }
+        | Recorded::ColorRange { .. }
         | Recorded::Transform { .. }
         | Recorded::Place { .. }
         | Recorded::Export { .. }
@@ -371,11 +385,12 @@ fn edits(r: &Recorded) -> bool {
             | Recorded::Reselect
             | Recorded::InvertSelection
             | Recorded::ModifySelection { .. }
+            | Recorded::ColorRange { .. }
             | Recorded::Export { .. }
             | Recorded::Stop { .. }
             | Recorded::DefinePattern { .. }
             | Recorded::Menu {
-                item: MenuItem::Copy
+                item: MenuItem::Copy | MenuItem::CopyMerged | MenuItem::SelectSubject
             }
     )
 }
@@ -416,6 +431,11 @@ impl MenuItem {
             MenuItem::CropToContent => Action::CropToContent,
             MenuItem::ConvertToSmartObject => Action::Smart(smart_ui::Command::Convert),
             MenuItem::ConvertForSmartFilters => Action::Smart(smart_ui::Command::ConvertForFilters),
+            MenuItem::LayerViaCut => Action::LayerViaCut,
+            MenuItem::StampVisible => Action::StampVisible,
+            MenuItem::Desaturate => Action::Desaturate,
+            MenuItem::CopyMerged => Action::CopyMerged,
+            MenuItem::SelectSubject => Action::SelectSubject,
         }
     }
 
@@ -445,14 +465,19 @@ impl MenuItem {
             Action::ApplyMask => MenuItem::ApplyMask,
             Action::Rasterize => MenuItem::Rasterize,
             // Auto commands are recorded once computed.
-            // A cut is recorded as a copy, then the clear it runs.
-            Action::Copy | Action::Cut => MenuItem::Copy,
+            Action::Copy => MenuItem::Copy,
+            Action::Cut => MenuItem::Cut,
             Action::Paste => MenuItem::Paste,
             Action::ClearSelection => MenuItem::Clear,
             Action::CropToSelection => MenuItem::CropToSelection,
             Action::CropToContent => MenuItem::CropToContent,
             Action::Smart(smart_ui::Command::Convert) => MenuItem::ConvertToSmartObject,
             Action::Smart(smart_ui::Command::ConvertForFilters) => MenuItem::ConvertForSmartFilters,
+            Action::LayerViaCut => MenuItem::LayerViaCut,
+            Action::StampVisible => MenuItem::StampVisible,
+            Action::Desaturate => MenuItem::Desaturate,
+            Action::CopyMerged => MenuItem::CopyMerged,
+            Action::SelectSubject => MenuItem::SelectSubject,
             _ => return None,
         })
     }
@@ -462,6 +487,8 @@ impl MenuItem {
         matches!(
             self,
             MenuItem::Clear
+                | MenuItem::Cut
+                | MenuItem::LayerViaCut
                 | MenuItem::CropToSelection
                 | MenuItem::RevealSelectionMask
                 | MenuItem::HideSelectionMask
@@ -503,6 +530,11 @@ impl MenuItem {
             MenuItem::CropToContent => t!("menu-image-trim"),
             MenuItem::ConvertToSmartObject => t!("smart-menu-convert"),
             MenuItem::ConvertForSmartFilters => t!("smart-menu-convert-for-filters"),
+            MenuItem::LayerViaCut => t!("input6-menu-layer-via-cut"),
+            MenuItem::StampVisible => t!("input6-menu-stamp-visible"),
+            MenuItem::Desaturate => t!("input6-menu-desaturate"),
+            MenuItem::CopyMerged => t!("files3-menu-copy-merged"),
+            MenuItem::SelectSubject => t!("menu-select-subject"),
         }
     }
 }
@@ -579,6 +611,16 @@ pub(super) fn modify(k: ModifyKind) -> Modify {
     }
 }
 
+/// A number from an actions file (shared, or edited by hand) within what
+/// its dialog allows; `default` when it is not a number.
+fn bounded(v: f32, range: std::ops::RangeInclusive<f32>, default: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(*range.start(), *range.end())
+    } else {
+        default
+    }
+}
+
 fn modify_kind(m: Modify) -> ModifyKind {
     match m {
         Modify::Border => ModifyKind::Border,
@@ -595,7 +637,7 @@ pub(super) fn rgb(c: Color32) -> [u8; 3] {
 }
 
 /// The function key pressed, if an action could have it.
-pub(super) fn fn_key_press(input: &mut egui::InputState) -> Option<FnKey> {
+pub(super) fn fn_key_press(input: &egui::InputState) -> Option<FnKey> {
     const KEYS: [Key; 11] = [
         Key::F2,
         Key::F3,
@@ -613,10 +655,13 @@ pub(super) fn fn_key_press(input: &mut egui::InputState) -> Option<FnKey> {
     if m.alt {
         return None;
     }
-    let (i, _) = KEYS
-        .iter()
-        .enumerate()
-        .find(|(_, k)| input.key_pressed(**k))?;
+    // A held key doesn't play its action again on each repeat.
+    let fresh = |key: Key| {
+        input.events.iter().any(|e| {
+            matches!(e, egui::Event::Key { key: k, pressed: true, repeat: false, .. } if *k == key)
+        })
+    };
+    let (i, _) = KEYS.iter().enumerate().find(|(_, k)| fresh(**k))?;
     Some(FnKey {
         number: i as u8 + 2,
         shift: m.shift,
@@ -754,6 +799,45 @@ impl AtelierApp {
         }
     }
 
+    /// While recording, every frame: a change of the document that added
+    /// no step to the action (a tool's work, a dialog that doesn't record)
+    /// is told, whatever made it. Checked when nothing is under way (a
+    /// dialog, a transform), as those record once applied.
+    pub(super) fn watch_unrecorded(&mut self) {
+        let Some(len) = self.actions.recording_len() else {
+            self.actions.watched = None;
+            return;
+        };
+        if self.actions.playing()
+            || self.actions.mute > 0
+            || self.actions_wait()
+            || self.transform_pending()
+            || self.transform_busy()
+            || self.filters.busy()
+            || self.retouch.busy()
+            || self.liquify.busy()
+            || self.camera_raw.busy()
+            || self.smart.busy()
+        {
+            return;
+        }
+        let Some(doc) = &self.doc else {
+            self.actions.watched = None;
+            return;
+        };
+        let mut now = (doc.uid(), doc.history_step(), doc.state_id(), len);
+        if let Some((uid, step, newest, was)) = self.actions.watched
+            && uid == now.0
+        {
+            // A new state; Undo and Redo give back states seen before.
+            if now.1 != step && now.2 > newest && len == was {
+                self.status.set(t!("smart3-actions-not-recorded"));
+            }
+            now.2 = now.2.max(newest);
+        }
+        self.actions.watched = Some(now);
+    }
+
     /// Records `command`, run from the history step `before` (document,
     /// step): a command that edits only once it changed the document.
     pub(super) fn record_done(&mut self, command: Recorded, before: Option<(u64, u64)>) {
@@ -828,13 +912,45 @@ impl AtelierApp {
             });
         }
         match self.recorded_frame() {
-            Some(corners) => self.record(Recorded::Transform { corners }),
+            Some(corners) => {
+                let frame = self
+                    .transform_box()
+                    .and_then(|(w, h)| act::Frame::of(corners, w, h));
+                self.record(Recorded::Transform { corners, frame });
+            }
             // Applied as it was: still the OK of a played step's transform.
             None if self.actions.playing() => self.record(Recorded::Transform {
                 corners: IDENTITY_FRAME,
+                frame: None,
             }),
             None => {}
         }
+    }
+
+    /// Opacity and/or blend mode set on the selected layers: a series of
+    /// changes of the same property (a slider dragged, a mode stepped
+    /// through) is one step, as in the history.
+    pub(super) fn record_layer_look(&mut self, opacity: Option<f32>, blend: Option<BlendMode>) {
+        let command = Recorded::LayerLook {
+            opacity,
+            mode: blend.map(|b| format!("{b:?}")),
+        };
+        let a = &mut self.actions;
+        if a.mute == 0
+            && a.player.is_none()
+            && a.again.is_none()
+            && let Some(at) = a.recording
+        {
+            let last = a.insert_at.checked_sub(1);
+            if let Some(step) = last.and_then(|k| a.action_mut(at)?.steps.get_mut(k))
+                && matches!(&step.command, Recorded::LayerLook { opacity: o, mode: m }
+                    if o.is_some() == opacity.is_some() && m.is_some() == blend.is_some())
+            {
+                step.command = command;
+                return a.changed();
+            }
+        }
+        self.record(command);
     }
 
     /// Runs `f` without recording what it commits.
@@ -942,6 +1058,7 @@ impl AtelierApp {
     /// being prepared (a transform with its dialog).
     pub(super) fn actions_wait(&self) -> bool {
         self.modal_open()
+            || self.sel.color_range.is_some()
             || self.select_busy()
             || self.crop.whole.is_some()
             || self.subject_job.is_some()
@@ -982,10 +1099,11 @@ impl AtelierApp {
                 return;
             };
             if let Some(c) = p.current.take() {
+                let batch = p.batch;
                 match c.stopped {
                     // Like Photoshop, a step cancelled stops the action
                     // (and a batch: a cancel is not a file's error).
-                    Some(Stopped::Cancelled) if !p.batch => {
+                    Some(Stopped::Cancelled) if !batch => {
                         self.status.set(t!("actions-status-stopped", name = c.action.as_str()));
                         return self.stop_playing();
                     }
@@ -998,7 +1116,11 @@ impl AtelierApp {
                 if let Some(error) = self.step_failed(&c) {
                     return self.step_error(&c.title, &c.action, c.row, error);
                 }
+                // Its dialog closed without OK: cancelled, as above.
                 if c.dialog && !c.committed {
+                    if batch {
+                        return self.cancel_batch();
+                    }
                     self.status.set(t!("actions-status-stopped", name = c.action.as_str()));
                     return self.stop_playing();
                 }
@@ -1157,9 +1279,11 @@ impl AtelierApp {
                 anchor,
                 extension,
             } => {
+                // As the dialog allows (a file may say anything).
+                let max = i64::from(crate::document::MAX_DIMENSION);
                 let d = CanvasSizeDialog {
-                    width: *width,
-                    height: *height,
+                    width: (*width).clamp(-max, max),
+                    height: (*height).clamp(-max, max),
                     relative: *relative,
                     anchor: (anchor[0].min(2), anchor[1].min(2)),
                     extension: extension.map(fill_content),
@@ -1191,7 +1315,12 @@ impl AtelierApp {
                 if *w <= 0 || *h <= 0 {
                     return Err(t!("status-nothing-to-crop"));
                 }
-                // From a file: nothing it says may allocate without limit.
+                // From a file: nothing it says may allocate without limit,
+                // nor lie far outside any canvas.
+                let far = 4 * u64::from(crate::document::MAX_DIMENSION);
+                if x.unsigned_abs() > far || y.unsigned_abs() > far {
+                    return Err(t!("file-error-damaged"));
+                }
                 let side = |v: i64| u32::try_from(v).unwrap_or(u32::MAX);
                 crate::document::check_size(side(*w), side(*h)).map_err(|e| e.to_string())?;
                 if let Some((width, height)) = size {
@@ -1307,6 +1436,16 @@ impl AtelierApp {
                 }
                 self.play_path_step(command);
             }
+            Recorded::ColorRange {
+                samples,
+                fuzziness,
+                invert,
+            } => self.play_color_range(samples, *fuzziness, *invert, dialog),
+            Recorded::LayerLook { opacity, mode } => {
+                let blend = mode.as_deref().map(fade_stroke::blend_named);
+                // The locked layers say so (`step_failed` tells).
+                self.set_layers_look(opacity.map(|o| bounded(o, 0.0..=1.0, 1.0)), blend);
+            }
             Recorded::Fade { opacity, mode } => {
                 if locked {
                     return Err(lock_error());
@@ -1325,10 +1464,10 @@ impl AtelierApp {
                     let Some(d) = &mut self.filters.fade else {
                         return Err(t!("adjust9-why-no-fade"));
                     };
-                    d.fade.opacity = *opacity;
+                    d.fade.opacity = bounded(*opacity, 0.0..=1.0, 1.0);
                     d.fade.mode = mode;
                 } else {
-                    self.fade_with(*opacity, mode)?;
+                    self.fade_with(bounded(*opacity, 0.0..=1.0, 1.0), mode)?;
                 }
             }
             Recorded::Stroke {
@@ -1432,7 +1571,7 @@ impl AtelierApp {
                 let d = FillDialog {
                     content: fill_content(*contents),
                     color: Color32::from_rgb(color[0], color[1], color[2]),
-                    opacity: opacity.clamp(0.0, 1.0),
+                    opacity: bounded(*opacity, 0.0..=1.0, 1.0),
                     preserve_transparency: *preserve_transparency,
                     adapt: true,
                     pattern: pattern.unwrap_or(0),
@@ -1457,6 +1596,11 @@ impl AtelierApp {
                 } else {
                     *rect
                 };
+                // From a file: far outside any canvas is damaged.
+                let far = f64::from(crate::document::MAX_DIMENSION) * 4.0;
+                if !r.iter().all(|v| v.abs() <= far) {
+                    return Err(t!("file-error-damaged"));
+                }
                 let r = PixelRect {
                     x: r[0].round() as i64,
                     y: r[1].round() as i64,
@@ -1472,7 +1616,9 @@ impl AtelierApp {
                     SelectMode::Replace
                 };
                 let ellipse = *shape == Shape::Ellipse;
-                self.select_shape(r, ellipse, mode, feather.max(0.0), *anti_alias);
+                // As the options bar allows.
+                let feather = bounded(*feather, 0.0..=1000.0, 0.0);
+                self.select_shape(r, ellipse, mode, feather, *anti_alias);
             }
             Recorded::SelectAll => self.run(Action::SelectAll),
             Recorded::Deselect => self.run(Action::Deselect),
@@ -1486,10 +1632,16 @@ impl AtelierApp {
                 if !has_selection {
                     return Err(t!("actions-error-no-selection"));
                 }
+                if !amount.is_finite() {
+                    return Err(t!("file-error-damaged"));
+                }
                 self.modify_selection_step(modify_kind(*modify), *amount, *at_bounds, dialog);
             }
-            Recorded::Transform { corners } => {
-                if !self.play_transform(*corners, dialog) {
+            Recorded::Transform { corners, frame } => {
+                if !corners.iter().flatten().all(|v| v.is_finite()) {
+                    return Err(t!("file-error-damaged"));
+                }
+                if !self.play_transform(*corners, *frame, dialog) {
                     return Err(self.status.to_string());
                 }
             }
@@ -1498,6 +1650,9 @@ impl AtelierApp {
                 linked,
                 corners,
             } => {
+                if !corners.iter().flatten().all(|v| v.is_finite()) {
+                    return Err(t!("file-error-damaged"));
+                }
                 self.place_path(path, *linked);
                 if !self.transform_pending() || !self.set_transform_frame(*corners) {
                     return Err(self.status.to_string());
@@ -1526,6 +1681,10 @@ impl AtelierApp {
                 if dialog {
                     self.open_export(options.clone());
                 } else {
+                    // During a batch, next to its other files.
+                    let folder = folder.clone().or_else(|| {
+                        self.automate.export_folder().map(Path::to_path_buf)
+                    });
                     self.export_into(options, folder.as_deref())?;
                 }
             }
@@ -1568,6 +1727,7 @@ impl AtelierApp {
             }
             Recorded::Grayscale => self.grayscale_mode(dialog),
             Recorded::Stop { .. } => unreachable!("shown above"),
+            Recorded::Unknown(_) if command.damaged() => return Err(t!("batch14-error-damaged")),
             Recorded::Unknown(_) => return Err(t!("actions-error-unknown")),
         }
         Ok(())
@@ -1902,9 +2062,9 @@ impl AtelierApp {
             t!("actions-menu-load")
         };
         let filter = t!("actions-file-filter");
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = file_dialog::new()
             .set_title(title)
-            .add_filter(filter, &["json"])
+            .filter(filter, &["json"])
             .pick_file()
         else {
             return;
@@ -1913,13 +2073,17 @@ impl AtelierApp {
             Ok(sets) => {
                 let a = &mut self.actions;
                 if replace {
-                    a.library.sets = sets;
+                    a.library.sets.clear();
                     a.recording = None;
-                } else {
-                    a.library.sets.extend(sets);
                 }
+                let dropped = a.library.add_sets(sets);
                 a.changed();
-                self.status.set(t!("actions-status-loaded", path = path.display().to_string()));
+                let path = path.display().to_string();
+                self.status.set(if dropped > 0 {
+                    t!("batch14-status-loaded-keys", path = path, count = dropped as u32)
+                } else {
+                    t!("actions-status-loaded", path = path)
+                });
             }
             Err(e) => self.report_error(tm!("actions-status-load-failed", error = crate::i18n::Message::of(|| e.to_string()))),
         }
@@ -1946,9 +2110,9 @@ impl AtelierApp {
             _ => t!("actions-title"),
         };
         let filter = t!("actions-file-filter");
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = file_dialog::new()
             .set_title(t!("actions-menu-save"))
-            .add_filter(filter, &["json"])
+            .filter(filter, &["json"])
             .set_file_name(format!("{name}.json"))
             .save_file()
         else {
@@ -2005,6 +2169,11 @@ impl AtelierApp {
         if out.ok && can_continue {
             self.actions.message = None;
         } else if out.ok || out.other || out.cancel {
+            // Stopped during a batch: the batch stops, the document left
+            // as it is (not saved).
+            if self.actions.player.as_ref().is_some_and(|p| p.batch) {
+                return self.cancel_batch();
+            }
             // Stopped: Play goes on from the next step.
             let next = self
                 .actions
@@ -2928,6 +3097,9 @@ pub(super) fn step_title(r: &Recorded) -> String {
             }
         }
         Recorded::Menu { item } => item.label(),
+        Recorded::ColorRange { .. } => t!("sel-menu-color-range"),
+        Recorded::LayerLook { opacity: Some(_), .. } => t!("xchg-hist-opacity"),
+        Recorded::LayerLook { .. } => t!("xchg-hist-blending"),
         Recorded::Export { .. } => t!("actions-step-export"),
         Recorded::Liquify { .. } => t!("liquify-title"),
         Recorded::ConvertToProfile { .. } => t!("color-convert-title"),
@@ -3024,6 +3196,23 @@ pub(super) fn step_details(r: &Recorded) -> Vec<String> {
             lines
         }
         Recorded::Adjust { adjustment } => adjustment_details(adjustment),
+        Recorded::ColorRange {
+            fuzziness, invert, ..
+        } => vec![
+            line(&t!("sel-range-fuzziness"), i18n::short_decimal(f64::from(*fuzziness))),
+            line(&t!("sel-range-invert"), yes_no(*invert)),
+        ],
+        Recorded::LayerLook { opacity, mode } => {
+            let mut lines = Vec::new();
+            if let Some(o) = opacity {
+                lines.push(line(&t!("dialog-fill-opacity"), pct(f64::from(*o) * 100.0)));
+            }
+            if let Some(mode) = mode {
+                let label = fade_stroke::blend_named(mode).label().to_string();
+                lines.push(line(&t!("adjust8-mode"), label));
+            }
+            lines
+        }
         Recorded::Fade { opacity, mode } => vec![
             line(&t!("dialog-fill-opacity"), pct(f64::from(*opacity) * 100.0)),
             line(
@@ -3141,7 +3330,20 @@ pub(super) fn step_details(r: &Recorded) -> Vec<String> {
             px(i18n::short_decimal(f64::from(*amount))),
             line(&t!("sel-modify-at-bounds"), yes_no(*at_bounds)),
         ],
-        Recorded::Transform { corners } | Recorded::Place { corners, .. } => {
+        Recorded::Transform {
+            frame: Some(f), ..
+        } => {
+            let mut lines = vec![
+                line(&width, pct(f.scale[0] * 100.0)),
+                line(&height, pct(f.scale[1] * 100.0)),
+                line(&t!("dialog-rotate-angle"), deg(f.angle)),
+            ];
+            if f.skew.abs() > 1e-6 {
+                lines.push(line(&t!("xform-skew"), deg(f.skew)));
+            }
+            lines
+        }
+        Recorded::Transform { corners, .. } | Recorded::Place { corners, .. } => {
             let d = |a: [f64; 2], b: [f64; 2]| (b[0] - a[0]).hypot(b[1] - a[1]);
             let angle = (corners[1][1] - corners[0][1])
                 .atan2(corners[1][0] - corners[0][0])
@@ -3408,6 +3610,10 @@ impl AtelierApp {
 }
 
 #[cfg(test)]
+#[path = "actions14_tests.rs"]
+mod actions14_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::filters::{Filter, FilterKind};
@@ -3436,7 +3642,7 @@ mod tests {
 
     /// Runs frames until `done` (work in the background, steps played).
     fn settle(h: &mut Harness<'static, AtelierApp>, done: impl Fn(&AtelierApp) -> bool) {
-        for _ in 0..1000 {
+        for _ in crate::testing::patience() {
             h.run_steps(1);
             if done(h.state()) {
                 return;
@@ -3786,6 +3992,7 @@ mod tests {
                 saturation: -0.3,
                 lightness: 0.1,
                 colorize: false,
+                ranges: Default::default(),
             });
         a.run_steps(1);
         a.key_press(egui::Key::Enter);
@@ -3816,8 +4023,7 @@ mod tests {
         assert_eq!(expected.dimensions(), (60, 40));
 
         // Saved, read back, played on the same image.
-        let dir = std::env::temp_dir().join("atelier-actions-play");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("actions-play");
         let path = dir.join("recorded.json");
         act::write(&path, &a.state().actions.library.sets).unwrap();
         let mut b = app();
@@ -3978,7 +4184,7 @@ mod tests {
         a.state_mut().commit_pending();
         settle(&mut a, |app| !app.transform_busy());
         let steps = &a.state().actions.library.sets[0].actions[0].steps;
-        let Recorded::Transform { corners } = steps[0].command else {
+        let Recorded::Transform { corners, .. } = steps[0].command else {
             panic!("a transform");
         };
         assert_eq!(corners, [[0.0, 0.0], [0.5, 0.0], [0.5, 1.0], [0.0, 1.0]]);
@@ -4231,9 +4437,7 @@ mod tests {
     /// played as such (not a transform of whatever layer is active).
     #[test]
     fn a_placed_file_is_recorded_with_its_transform() {
-        let dir = std::env::temp_dir().join("atelier-actions-place");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("actions-place");
         let path = dir.join("logo.png");
         RgbaImage::from_pixel(20, 10, Rgba([0, 0, 255, 255]))
             .save(&path)

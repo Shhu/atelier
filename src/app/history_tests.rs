@@ -549,8 +549,7 @@ fn reordering_layers_with_an_empty_new_text_open() {
 /// change.
 #[test]
 fn a_layers_panel_change_while_placing_applies_the_place() {
-    let dir = std::env::temp_dir().join(format!("atelier-place-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("place");
     let file = dir.join("p.png");
     image::RgbaImage::from_pixel(40, 40, image::Rgba([255, 0, 0, 255]))
         .save(&file)

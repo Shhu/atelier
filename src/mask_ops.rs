@@ -261,7 +261,7 @@ fn feather(mask: &mut GrayImage, radius: f32) {
 /// Gaussian blur of standard deviation `sigma` of a `w` × `h` field: an
 /// exact kernel for small ones, three box blurs beyond. Edges repeat.
 pub fn gaussian(values: &mut [f32], w: usize, h: usize, sigma: f32) {
-    if sigma < 0.2 || w == 0 || h == 0 {
+    if sigma <= 0.0 || w == 0 || h == 0 {
         return;
     }
     let pass = Pass::new(sigma);
@@ -279,6 +279,15 @@ enum Pass {
 
 impl Pass {
     fn new(sigma: f32) -> Pass {
+        // Under half a pixel, the sampled curve has next to nothing on the
+        // neighbours: three taps whose variance shrinks with sigma² from
+        // the sampled kernel's at 0.5, so that a sub-pixel feather still
+        // softens the edge.
+        if sigma < 0.5 {
+            let tail = (-2.0f32).exp();
+            let side = tail / (1.0 + 2.0 * tail) * (2.0 * sigma).powi(2);
+            return Pass::Kernel(vec![side, 1.0 - 2.0 * side, side]);
+        }
         if sigma < 2.0 {
             let r = (3.0 * sigma).ceil() as i32;
             let mut k: Vec<f32> = (-r..=r)
@@ -415,11 +424,25 @@ pub fn grow(image: &RgbaImage, selected: &GrayImage, tolerance: u8, contiguous: 
         });
         return out;
     }
-    let mut stack: Vec<(u32, u32)> = selected
-        .enumerate_pixels()
-        .filter(|(_, _, s)| s.0[0] >= 128)
-        .map(|(x, y, _)| (x, y))
-        .collect();
+    // Seeds: the selected pixels next to an unselected one (inside, every
+    // neighbour is selected already), found on all the cores.
+    let (wu, raw) = (w as usize, selected.as_raw());
+    let on = |x: usize, y: usize| raw[y * wu + x] >= 128;
+    let mut stack: Vec<(u32, u32)> = par_collect(h as usize, |rows| {
+        let mut seeds = Vec::new();
+        for y in rows {
+            for x in 0..wu {
+                let edge = (x > 0 && !on(x - 1, y))
+                    || (x + 1 < wu && !on(x + 1, y))
+                    || (y > 0 && !on(x, y - 1))
+                    || (y + 1 < h as usize && !on(x, y + 1));
+                if on(x, y) && edge {
+                    seeds.push((x as u32, y as u32));
+                }
+            }
+        }
+        seeds
+    });
     while let Some((x, y)) = stack.pop() {
         let neighbours = [
             (x.wrapping_sub(1), y),
@@ -844,6 +867,25 @@ mod tests {
         let mut small = rect_mask(40, 40, 10, 10, 30, 30);
         modify(&mut small, Modify::Feather(1.0));
         assert!(at(&small, 9, 20) > 0 && at(&small, 9, 20) < 128);
+    }
+
+    /// Feathers under a pixel still soften the edge, more for larger radii,
+    /// and meet the exact kernel at 1 px.
+    #[test]
+    fn sub_pixel_feathers_soften_the_edge() {
+        let edge = |r: f32| {
+            let mut m = rect_mask(40, 40, 10, 10, 30, 30);
+            modify(&mut m, Modify::Feather(r));
+            (at(&m, 9, 20), at(&m, 10, 20))
+        };
+        let mut last = 0;
+        for r in [0.2, 0.3, 0.5, 0.8, 0.99] {
+            let (out, inside) = edge(r);
+            assert!(out > last, "radius {r}: {out} after {last}");
+            assert_eq!(u16::from(out) + u16::from(inside), 255, "radius {r}");
+            last = out;
+        }
+        assert!(edge(1.0).0 >= last);
     }
 
     #[test]

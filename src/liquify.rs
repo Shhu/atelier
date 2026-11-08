@@ -230,10 +230,14 @@ impl Mesh {
         {
             return None;
         }
-        let mut mesh = Mesh::with_spacing(width, height, spacing);
-        if mesh.offsets.len() > 4 * MAX_NODES {
+        // Counted before allocating; the compressed offsets must be able
+        // to hold them (deflate inflates at most 1032 times).
+        let count = nodes(width, spacing).saturating_mul(nodes(height, spacing));
+        let stored = bytes.len() - header.len();
+        if count > 4 * MAX_NODES || stored.saturating_mul(1032) < count * 8 {
             return None;
         }
+        let mut mesh = Mesh::with_spacing(width, height, spacing);
         let mut raw = Vec::with_capacity(mesh.offsets.len() * 8);
         flate2::read::DeflateDecoder::new(&bytes[header.len()..])
             .take(mesh.offsets.len() as u64 * 8 + 1)
@@ -1324,6 +1328,15 @@ mod tests {
         assert_eq!(Mesh::from_bytes(b"ATLQMESH"), None);
         assert_eq!(Mesh::from_bytes(&bytes[..bytes.len() - 10]), None);
         assert_eq!(Mesh::from_bytes(b"not a mesh at all, really not"), None);
+        // A header claiming 900 million nodes is refused before anything
+        // is allocated; the largest honest mesh, all zeros, still loads.
+        let mut bomb = MAGIC.to_vec();
+        for v in [VERSION, 30_000, 30_000, 1] {
+            bomb.extend(v.to_le_bytes());
+        }
+        assert_eq!(Mesh::from_bytes(&bomb), None);
+        let largest = Mesh::new(30_000, 30_000);
+        assert_eq!(Mesh::from_bytes(&largest.to_bytes()), Some(largest));
         // On an image twice as large: the same distortion, twice as large.
         let big = liquify.mesh.fitted(600, 400);
         let a = liquify.mesh.offset_at(170.0, 100.0);

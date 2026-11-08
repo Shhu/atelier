@@ -43,7 +43,7 @@ fn doc_mut<'a>(h: &'a mut Harness<'static, AtelierApp>) -> &'a mut Document {
 }
 
 fn settle(h: &mut Harness<'static, AtelierApp>, done: impl Fn(&AtelierApp) -> bool) {
-    for _ in 0..800 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if done(h.state()) {
             return;

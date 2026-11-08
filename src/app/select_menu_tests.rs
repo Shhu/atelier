@@ -886,12 +886,14 @@ fn a_selection_combined_with_a_pending_one_does_not_wait() {
     let mut h = app_with(Document::new(image::RgbaImage::new(2000, 1500), None));
     let steps = h.state().doc.as_ref().unwrap().history().0.len();
     let big = 1 << 24;
+    let (held, release) = std::sync::mpsc::channel::<()>();
     let app = h.state_mut();
     app.select_later(
         super::select_menu::Then::Select(SelectMode::Replace),
         big,
         move || {
-            std::thread::sleep(std::time::Duration::from_millis(600));
+            // Held by the test: a wait for it would last the whole 30 s.
+            let _ = release.recv_timeout(std::time::Duration::from_secs(30));
             Some(rect(0, 0, 100, 100).into())
         },
     );
@@ -901,11 +903,9 @@ fn a_selection_combined_with_a_pending_one_does_not_wait() {
         big,
         move || Some(rect(500, 500, 100, 100).into()),
     );
-    assert!(
-        start.elapsed().as_millis() < 300,
-        "waited for the first one"
-    );
+    assert!(start.elapsed().as_secs() < 20, "waited for the first one");
     assert!(app.select_busy());
+    let _ = held.send(());
     settle(&mut h);
     let sel = selection(&h);
     assert_eq!((sel.coverage(50, 50), sel.coverage(550, 550)), (255, 255));
@@ -988,4 +988,131 @@ fn a_tool_chosen_does_not_wait_for_a_selection_being_computed() {
         h.run_steps(1);
     }
     assert!(h.state().selection.is_some());
+}
+
+/// A layer smaller than the canvas (pasted, Layer via Copy) has no edge for
+/// the Magic Wand: the transparency around its pixels is selected up to the
+/// canvas edges, from inside its box or outside it; off the canvas, a
+/// click does nothing.
+#[test]
+fn the_wand_selects_transparency_up_to_the_canvas_edges() {
+    let mut doc = Document::new(
+        image::RgbaImage::from_pixel(100, 100, image::Rgba([9, 9, 9, 255])),
+        None,
+    );
+    let object = image::RgbaImage::from_fn(30, 30, |x, y| {
+        let inside = (10..20).contains(&x) && (10..20).contains(&y);
+        if inside { RED } else { image::Rgba([0, 0, 0, 0]) }
+    });
+    doc.add_layer("Pasted".into(), object, (40, 40));
+    let mut h = app_with(doc);
+    h.state_mut().tool = Tool::MagicWand;
+    h.run_steps(1);
+    for (x, y) in [(42.5, 42.5), (5.5, 5.5)] {
+        h.state_mut().selection = None;
+        let at = screen(&h, x, y);
+        click(&mut h, at, Modifiers::NONE);
+        settle(&mut h);
+        let sel = selection(&h);
+        assert_eq!((sel.coverage(5, 5), sel.coverage(95, 95)), (255, 255), "from {x}");
+        assert_eq!((sel.coverage(42, 42), sel.coverage(55, 55)), (255, 0), "from {x}");
+    }
+    // Off the canvas: no change, nothing refused.
+    let before = selection(&h);
+    let at = screen(&h, -20.5, 50.5);
+    click(&mut h, at, Modifiers::NONE);
+    settle(&mut h);
+    assert!(selection(&h).equal(&before));
+}
+
+/// Ctrl+click on a layer thumbnail loads a new selection whatever mode the
+/// options bar is in; Ctrl+Shift adds, Ctrl+Alt subtracts, all three
+/// intersect.
+#[test]
+fn ctrl_click_on_a_thumbnail_ignores_the_options_bar_mode() {
+    use super::right_panel::RowPart;
+    let mut doc = Document::new(
+        image::RgbaImage::from_pixel(100, 100, image::Rgba([9, 9, 9, 255])),
+        None,
+    );
+    let left = image::RgbaImage::from_fn(100, 100, |x, _| {
+        if x < 30 { RED } else { image::Rgba([0, 0, 0, 0]) }
+    });
+    doc.add_layer("Left".into(), left, (0, 0));
+    let mut h = app_with(doc);
+    let app = h.state_mut();
+    let ctrl = Modifiers::COMMAND;
+    let all = rect(0, 0, 100, 100);
+    for mode in [SelectMode::Subtract, SelectMode::Intersect, SelectMode::Add] {
+        app.select_mode = mode;
+        app.selection = Some(rect(50, 0, 50, 100).into());
+        app.click_row(1, RowPart::Thumbnail, ctrl);
+        let sel = app.selection.clone().expect("loaded");
+        assert_eq!(sel.bounds(all), Some(rect(0, 0, 30, 100)), "{mode:?}");
+        assert_eq!(sel.coverage(70, 50), 0, "{mode:?}");
+    }
+    app.select_mode = SelectMode::Replace;
+    app.selection = Some(rect(50, 0, 10, 100).into());
+    app.click_row(1, RowPart::Thumbnail, ctrl | Modifiers::SHIFT);
+    let sel = app.selection.clone().unwrap();
+    assert_eq!((sel.coverage(10, 5), sel.coverage(55, 5)), (255, 255));
+    app.selection = Some(all.into());
+    app.click_row(1, RowPart::Thumbnail, ctrl | Modifiers::ALT);
+    assert_eq!(app.selection.clone().unwrap().bounds(all), Some(rect(30, 0, 70, 100)));
+    app.selection = Some(rect(20, 0, 80, 100).into());
+    app.click_row(1, RowPart::Thumbnail, ctrl | Modifiers::SHIFT | Modifiers::ALT);
+    assert_eq!(app.selection.clone().unwrap().bounds(all), Some(rect(20, 0, 10, 100)));
+    h.run_steps(1);
+}
+
+/// An inverted selection moved with the arrows moves as a whole: what it
+/// uncovers is no longer selected, the hole moves with it.
+#[test]
+fn an_inverted_selection_moves_as_a_whole() {
+    let mut h = app_with(halves());
+    h.state_mut().tool = Tool::Select;
+    h.state_mut().selection = Some(Selection {
+        inverted: true,
+        ..rect(80, 80, 40, 40).into()
+    });
+    h.run_steps(1);
+    let canvas = screen(&h, 150.0, 20.0);
+    h.hover_at(canvas);
+    h.run_steps(1);
+    for _ in 0..10 {
+        key(&mut h, Key::ArrowRight, Modifiers::SHIFT);
+    }
+    settle(&mut h);
+    let sel = selection(&h);
+    // 100 px to the right: the left half is out, the hole is at 180.
+    assert_eq!((sel.coverage(50, 50), sel.coverage(150, 50)), (0, 255));
+    assert_eq!((sel.coverage(190, 100), sel.coverage(150, 100)), (0, 255));
+}
+
+/// Esc stops the subject search: its result is ignored, the selection
+/// stays as it was, and the command is available again.
+#[test]
+fn esc_stops_the_subject_search() {
+    let mut h = app_with(halves());
+    let before: Selection = rect(10, 10, 20, 20).into();
+    h.state_mut().selection = Some(before.clone());
+    for remove_background in [false, true] {
+        let send = h.state_mut().fake_subject_job(remove_background);
+        h.run_steps(2);
+        assert!(h.state().subject_searching());
+        key(&mut h, Key::Escape, Modifiers::NONE);
+        assert!(h.state().subject_job.is_none());
+        let shown = h.state().status.to_string();
+        let want = if remove_background {
+            t!("selection14-remove-background-stopped")
+        } else {
+            t!("selection14-subject-stopped")
+        };
+        assert_eq!(shown, want);
+        // A late result changes nothing.
+        let _ = send.send((image::GrayImage::from_pixel(200, 200, image::Luma([255])), None));
+        h.run_steps(2);
+        assert!(selection(&h).equal(&before));
+        assert!(h.state().doc.as_ref().unwrap().active_layer().mask.is_none());
+    }
 }

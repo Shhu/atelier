@@ -541,7 +541,7 @@ fn align_in_quick_mask_moves_the_mask() {
 /// and without a selection): `cargo test qm_move_timings -- --ignored
 /// --nocapture`.
 #[test]
-#[ignore]
+#[ignore = "timing"]
 fn qm_move_timings() {
     use std::time::Instant;
     let mut h = app_with(Document::new(image::RgbaImage::new(6000, 4000), None));

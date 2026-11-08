@@ -1,20 +1,24 @@
 //! Swatches and recent colors, kept in the settings folder
-//! (`swatches.json`).
+//! (`swatches.json`, shared with the other windows: see `store`).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::color::{self, Hsb};
 use crate::config;
+use crate::store::{self, Found, Store};
 
 /// Recent colors kept, most recent first.
 const MAX_RECENT: usize = 12;
 
-#[derive(Clone, Debug, PartialEq)]
 pub struct Swatches {
     pub colors: Vec<[u8; 3]>,
     pub recent: Vec<[u8; 3]>,
+    /// The file (none in tests).
+    store: Option<Store>,
+    /// What the user must know about the file, once.
+    pub notice: Option<String>,
 }
 
 /// File contents: colors as hex codes.
@@ -30,6 +34,8 @@ impl Default for Swatches {
         Self {
             colors: default_colors(),
             recent: Vec::new(),
+            store: None,
+            notice: None,
         }
     }
 }
@@ -41,33 +47,69 @@ impl Swatches {
         if cfg!(test) {
             return Self::default();
         }
-        Self::load_from(&file()).unwrap_or_default()
+        Self::load_from(file())
     }
 
-    fn load_from(path: &Path) -> Option<Self> {
-        let saved: Saved = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    /// A file that can't be read is set aside (or, unreadable, never
+    /// written): the defaults come instead.
+    fn load_from(path: PathBuf) -> Self {
+        let mut store = Store::new(path, store::JSON).tidying(|v| {
+            if let Some(recent) = v.get_mut("recent").and_then(|r| r.as_array_mut()) {
+                recent.truncate(MAX_RECENT);
+            }
+        });
+        let mut found = store.read();
+        let mut saved = None;
+        if let Found::Value(v) = &found {
+            match serde_json::from_value::<Saved>(v.clone()) {
+                Ok(s) => saved = Some(s),
+                // Not swatches: set aside too.
+                Err(_) => found = store.set_aside(),
+            }
+        }
+        let mut swatches = saved.map_or_else(Self::default, Self::from_saved);
+        if let Found::SetAside(backup) = found {
+            let backup = backup.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            swatches.notice = Some(crate::i18n::t!("safety14-swatches-damaged", backup = backup));
+        }
+        // What this window's changes are made from, as it writes it.
+        if let Ok(value) = serde_json::to_value(swatches.saved()) {
+            store.adopt(&value);
+        }
+        swatches.store = Some(store);
+        swatches
+    }
+
+    fn from_saved(saved: Saved) -> Self {
         let parse = |codes: Vec<String>| codes.iter().filter_map(|c| color::parse_hex(c)).collect();
-        Some(Self {
+        Self {
             colors: parse(saved.swatches),
             recent: parse(saved.recent),
-        })
-    }
-
-    fn save(&self) {
-        if !cfg!(test) {
-            self.save_to(&file());
+            store: None,
+            notice: None,
         }
     }
 
-    fn save_to(&self, path: &Path) {
+    fn saved(&self) -> Saved {
         let hex = |colors: &[[u8; 3]]| colors.iter().map(|&c| color::hex(c)).collect();
-        let saved = Saved {
+        Saved {
             swatches: hex(&self.colors),
             recent: hex(&self.recent),
+        }
+    }
+
+    /// Saved, merged with what another window saved meanwhile, which
+    /// then shows here too.
+    fn save(&mut self) {
+        let Ok(mine) = serde_json::to_value(self.saved()) else {
+            return;
         };
-        if let (Some(dir), Ok(json)) = (path.parent(), serde_json::to_vec_pretty(&saved)) {
-            let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(path, json);
+        let Some(store) = &mut self.store else { return };
+        let Ok(merged) = store.save(mine) else { return };
+        if let Ok(saved) = serde_json::from_value::<Saved>(merged.clone()) {
+            store.adopt(&merged);
+            let Self { colors, recent, .. } = Self::from_saved(saved);
+            (self.colors, self.recent) = (colors, recent);
         }
     }
 
@@ -124,18 +166,50 @@ fn default_colors() -> Vec<[u8; 3]> {
 mod tests {
     use super::*;
 
+    fn folder(name: &str) -> PathBuf {
+        crate::testing::test_dir(&format!("swatches-{name}"))
+    }
+
     #[test]
     fn saved_and_loaded_back() {
-        let path = std::env::temp_dir()
-            .join(format!("atelier-swatches-{}", std::process::id()))
-            .join("swatches.json");
-        let s = Swatches {
-            colors: vec![[1, 2, 3], [255, 136, 0]],
-            recent: vec![[9, 9, 9]],
-        };
-        s.save_to(&path);
-        assert_eq!(Swatches::load_from(&path), Some(s));
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let dir = folder("saved");
+        let path = dir.join("swatches.json");
+        let mut s = Swatches::load_from(path.clone());
+        s.colors = vec![[1, 2, 3]];
+        s.add([255, 136, 0]);
+        s.use_color([9, 9, 9]);
+        let back = Swatches::load_from(path);
+        assert_eq!(back.colors, vec![[1, 2, 3], [255, 136, 0]]);
+        assert_eq!(back.recent, vec![[9, 9, 9]]);
+    }
+
+    /// Two windows: the swatch one adds stays when the other picks a color;
+    /// a damaged file is set aside, not overwritten.
+    #[test]
+    fn two_windows_and_damaged_files_keep_the_swatches() {
+        let dir = folder("two-windows");
+        let path = dir.join("swatches.json");
+        let mut a = Swatches::load_from(path.clone());
+        let mut b = Swatches::load_from(path.clone());
+        a.add([1, 1, 1]);
+        b.use_color([2, 2, 2]);
+        assert_eq!(b.colors.last(), Some(&[1, 1, 1]));
+        b.delete(0);
+        a.use_color([3, 3, 3]);
+        let back = Swatches::load_from(path.clone());
+        assert_eq!(back.recent, vec![[3, 3, 3], [2, 2, 2]]);
+        assert_eq!(back.colors.len(), default_colors().len());
+        assert_eq!(back.colors.last(), Some(&[1, 1, 1]));
+        assert_ne!(back.colors[0], default_colors()[0]);
+        std::fs::write(&path, b"{\"swatches\": [\"#0").unwrap();
+        let mut c = Swatches::load_from(path.clone());
+        assert_eq!(c.colors, default_colors());
+        assert!(c.notice.is_some());
+        c.use_color([4, 4, 4]);
+        assert_eq!(
+            std::fs::read(dir.join("swatches.json.bak")).unwrap(),
+            b"{\"swatches\": [\"#0"
+        );
     }
 
     #[test]

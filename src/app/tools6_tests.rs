@@ -138,7 +138,7 @@ fn key(h: &mut Harness<'_, AtelierApp>, key: Key, modifiers: Modifiers) {
 }
 
 fn wait_for_fill(h: &mut Harness<'static, AtelierApp>) {
-    for _ in 0..3000 {
+    for _ in crate::testing::patience() {
         if !h.state().retouch.busy() {
             return;
         }

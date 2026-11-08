@@ -1426,7 +1426,7 @@ impl AtelierApp {
         let (area, offset) = match mode {
             PatchMode::Source => (Some(selection.clone()), (dx, dy)),
             PatchMode::Destination => (
-                selection.clone().translate(dx, dy).within(canvas),
+                selection.moved(dx, dy, canvas),
                 (-dx, -dy),
             ),
         };

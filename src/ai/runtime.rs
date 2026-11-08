@@ -3,7 +3,7 @@
 //! sessions: loaded on first use, freed when unused.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,8 @@ pub struct Slot {
     state: Mutex<SlotState>,
     /// Where it last ran (0: not yet), readable while it runs.
     device: AtomicU8,
+    /// Runs started and not ended (waiting for the session included).
+    running: AtomicUsize,
 }
 
 struct SlotState {
@@ -78,7 +80,13 @@ impl Slot {
                 reaping: false,
             }),
             device: AtomicU8::new(0),
+            running: AtomicUsize::new(0),
         }
+    }
+
+    /// Is a run in progress or waiting for one (its files must stay)?
+    pub fn busy(&self) -> bool {
+        self.running.load(Ordering::Acquire) > 0
     }
 
     fn lock(&self) -> MutexGuard<'_, SlotState> {
@@ -97,6 +105,14 @@ impl Slot {
         &'static self,
         mut f: impl FnMut(&mut Session, Loaded) -> ort::Result<R>,
     ) -> Result<R, super::Error> {
+        struct Running<'a>(&'a AtomicUsize);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.running.fetch_add(1, Ordering::AcqRel);
+        let _running = Running(&self.running);
         init()?;
         let mut state = self.lock();
         let result = self.run_locked(&mut state, &mut f);
@@ -283,6 +299,7 @@ mod windows {
     unsafe extern "system" {
         fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
         fn SetDllDirectoryW(path: *const u16) -> i32;
+        fn AddDllDirectory(path: *const u16) -> *mut core::ffi::c_void;
     }
 
     fn wide(path: &Path) -> Vec<u16> {
@@ -311,8 +328,9 @@ mod windows {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         for (name, bytes) in FILES {
             let path = dir.join(name);
-            let present = std::fs::metadata(&path).is_ok_and(|m| m.len() == bytes.len() as u64);
-            if !present {
+            // Compared byte for byte: a damaged copy of the same size (disk
+            // error, antivirus restore) is written again.
+            if !super::super::same_contents(&path, bytes) {
                 // Written alongside (a name of its own per process) then
                 // renamed: never a half-written DLL.
                 let partial = dir.join(format!("{name}.{}.part", std::process::id()));
@@ -324,10 +342,12 @@ mod windows {
                 }
             }
         }
-        // Dependencies are loaded from this directory, not from the system.
+        // Dependencies are loaded from this directory, not from the system
+        // (also with the search restricted at startup, see main.rs).
         // SAFETY: zero-terminated paths, valid during the call.
         unsafe {
             SetDllDirectoryW(wide(&dir).as_ptr());
+            AddDllDirectory(wide(&dir).as_ptr());
             for (name, _) in &FILES[..FILES.len() - 1] {
                 if LoadLibraryW(wide(&dir.join(name)).as_ptr()).is_null() {
                     return Err(super::super::Error::of(|| {

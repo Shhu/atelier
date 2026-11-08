@@ -734,14 +734,19 @@ impl AtelierApp {
         if cfg!(test) {
             return;
         }
-        let saved = std::fs::read(settings_file())
+        self.read_session(&settings_file());
+        self.session_saved = Some(self.session_settings());
+        self.load_patterns();
+    }
+
+    /// The settings of `file`, if it can be read.
+    fn read_session(&mut self, file: &std::path::Path) {
+        let saved = std::fs::read(file)
             .ok()
             .and_then(|json| serde_json::from_slice::<Value>(&json).ok());
         if let Some(saved) = saved {
             self.restore_session(&saved);
         }
-        self.session_saved = Some(self.session_settings());
-        self.load_patterns();
     }
 
     /// Writes the settings when they changed, once the pointer is up (not
@@ -750,17 +755,19 @@ impl AtelierApp {
         if cfg!(test) || ctx.input(|i| i.pointer.any_down()) {
             return;
         }
+        self.write_session(&settings_file());
+    }
+
+    /// Writes the settings to `file` when they changed since last written.
+    fn write_session(&mut self, file: &std::path::Path) {
         let now = self.session_settings();
         if self.session_saved.as_ref() == Some(&now) {
             return;
         }
         if let Ok(json) = serde_json::to_vec_pretty(&now) {
-            let _ = std::fs::create_dir_all(crate::config::dir());
-            // Whole or not at all: a crash midway leaves the last one.
-            let temp = settings_file().with_extension("json.tmp");
-            if std::fs::write(&temp, json).is_ok() {
-                let _ = std::fs::rename(&temp, settings_file());
-            }
+            // Whole or not at all, through a temporary file of this
+            // window's own: a crash midway leaves the last one.
+            let _ = crate::store::write(file, &json);
         }
         self.session_saved = Some(now);
     }
@@ -815,6 +822,43 @@ mod tests {
         assert_eq!((b.brush_size, b.hardness), (80.0, 0.25));
         b.set_tool(Tool::Eraser);
         assert_eq!(b.brush_size, 30.0);
+    }
+
+    /// Through the file itself: written whole (no temporary left), read
+    /// back at the next start; a damaged one leaves the defaults.
+    #[test]
+    fn the_settings_file_round_trips_and_a_damaged_one_is_ignored() {
+        let file = crate::testing::test_dir("session-file").join("tools.json");
+        let mut h = app();
+        let a = h.state_mut();
+        a.set_tool(Tool::Gradient);
+        a.primary = Color32::from_rgb(1, 2, 3);
+        a.wand_tolerance = 0.25;
+        a.write_session(&file);
+        assert!(file.exists());
+        assert!(!file.with_extension("json.tmp").exists());
+        // Unchanged: not written again.
+        std::fs::remove_file(&file).unwrap();
+        a.write_session(&file);
+        assert!(!file.exists());
+        a.session_saved = None;
+        a.write_session(&file);
+
+        let mut next = app();
+        let b = next.state_mut();
+        b.read_session(&file);
+        assert_eq!((b.tool, b.primary, b.wand_tolerance), (Tool::Gradient, Color32::from_rgb(1, 2, 3), 0.25));
+
+        let defaults = app();
+        let fresh = defaults.state();
+        let damaged: [&[u8]; 4] = [b"{\"tool\": ", b"\xff\xfe", b"[1, 2]", b""];
+        for damaged in damaged {
+            std::fs::write(&file, damaged).unwrap();
+            let mut other = app();
+            let c = other.state_mut();
+            c.read_session(&file);
+            assert_eq!((c.tool, c.primary, c.wand_tolerance), (fresh.tool, fresh.primary, fresh.wand_tolerance));
+        }
     }
 
     #[test]

@@ -29,6 +29,9 @@ pub(super) struct Navigator {
     /// image isn't shown in this one's shape.
     shown_doc: u64,
     job_doc: u64,
+    /// The thumbnail whose job failed (a panic): not made again until
+    /// the image changes.
+    failed: Option<u64>,
     settle: histogram_panel::Settle,
     /// A drag of the view box: from the view's center, in image pixels.
     grab: Option<Vec2>,
@@ -141,17 +144,20 @@ impl AtelierApp {
         let key = hash_of((self.composite_key(), lut_key));
         let held = self.edit_held(ctx);
         let nav = &mut self.navigator;
-        if let Some((made_for, job)) = nav.job.take_if(|(_, j)| j.is_finished())
-            && let Ok(mut image) = job.join()
-        {
-            color_ui::show_through(lut.as_deref(), image.as_mut(), false);
-            let size = [image.width() as usize, image.height() as usize];
-            let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-            let texture = ctx.load_texture("navigator", color, TextureOptions::LINEAR);
-            nav.shown = Some((made_for, texture));
-            nav.shown_doc = nav.job_doc;
+        if let Some((made_for, job)) = nav.job.take_if(|(_, j)| j.is_finished()) {
+            match job.join() {
+                Ok(mut image) => {
+                    color_ui::show_through(lut.as_deref(), image.as_mut(), false);
+                    let size = [image.width() as usize, image.height() as usize];
+                    let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+                    let texture = ctx.load_texture("navigator", color, TextureOptions::LINEAR);
+                    nav.shown = Some((made_for, texture));
+                    nav.shown_doc = nav.job_doc;
+                }
+                Err(_) => nav.failed = Some(made_for),
+            }
         }
-        if nav.shown.as_ref().is_some_and(|s| s.0 == key) {
+        if nav.shown.as_ref().is_some_and(|s| s.0 == key) || nav.failed == Some(key) {
             return;
         }
         ctx.request_repaint_after(POLL);

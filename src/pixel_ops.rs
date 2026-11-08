@@ -1018,6 +1018,9 @@ pub struct HueSaturation {
     pub lightness: f32,
     /// A single hue for the whole layer (tinted monochrome image).
     pub colorize: bool,
+    /// Edits of the colors of six hue ranges (Reds to Magentas), besides
+    /// those of all of them above (not in colorize mode).
+    pub ranges: HueRanges,
 }
 
 /// Initial saturation of colorize mode (25, like Photoshop).
@@ -1025,7 +1028,73 @@ pub const COLORIZE_SATURATION: f32 = 0.25;
 
 impl HueSaturation {
     pub fn is_neutral(&self) -> bool {
-        !self.colorize && self.hue == 0.0 && self.saturation == 0.0 && self.lightness == 0.0
+        !self.colorize
+            && self.hue == 0.0
+            && self.saturation == 0.0
+            && self.lightness == 0.0
+            && self.ranges.is_neutral()
+    }
+}
+
+/// The edit of the colors of a hue range: its hue rotation, saturation and
+/// lightness (as the master's), over hues weighted by its bounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HueRange {
+    /// Degrees (0..360, wrapping): where the range starts fading in, where
+    /// it is whole from, until, and where it has faded out.
+    pub bounds: [f32; 4],
+    pub hue: f32,
+    pub saturation: f32,
+    pub lightness: f32,
+}
+
+impl HueRange {
+    pub fn is_neutral(&self) -> bool {
+        self.hue == 0.0 && self.saturation == 0.0 && self.lightness == 0.0
+    }
+
+    /// How much hue `h` (degrees) is in the range, 0 to 1.
+    pub fn weight(&self, h: f32) -> f32 {
+        let [a, b, c, d] = self.bounds;
+        let rel = |v: f32| (v - a).rem_euclid(360.0);
+        let x = rel(h);
+        let full = rel(b);
+        let end = rel(c).max(full);
+        let out = rel(d).max(end);
+        if x < full {
+            x / full
+        } else if x <= end {
+            1.0
+        } else if x < out {
+            (out - x) / (out - end)
+        } else {
+            0.0
+        }
+    }
+}
+
+/// The six ranges of Hue/Saturation: reds, yellows, greens, cyans, blues,
+/// magentas, each 60° wide with 30° of fading on both sides by default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HueRanges(pub [HueRange; 6]);
+
+impl Default for HueRanges {
+    fn default() -> Self {
+        Self(std::array::from_fn(|k| {
+            let start = (315.0 + 60.0 * k as f32).rem_euclid(360.0);
+            HueRange {
+                bounds: [0.0, 30.0, 60.0, 90.0].map(|o| (start + o).rem_euclid(360.0)),
+                hue: 0.0,
+                saturation: 0.0,
+                lightness: 0.0,
+            }
+        }))
+    }
+}
+
+impl HueRanges {
+    pub fn is_neutral(&self) -> bool {
+        self.0.iter().all(HueRange::is_neutral)
     }
 }
 
@@ -1039,26 +1108,44 @@ pub fn hue_saturation(image: &mut RgbaImage, hs: &HueSaturation) {
     }
     let sat = hs.saturation.clamp(-1.0, 1.0);
     let light = hs.lightness.clamp(-1.0, 1.0);
+    let ranged = !hs.colorize && !hs.ranges.is_neutral();
+    let lighten = |out: [f32; 3], light: f32| {
+        if light == 0.0 {
+            return out;
+        }
+        out.map(|v| {
+            if light < 0.0 {
+                v * (1.0 + light)
+            } else {
+                v + (1.0 - v) * light
+            }
+        })
+    };
     par_pixels(image, |p| {
         let rgb = [p[0], p[1], p[2]].map(|v| v as f32 / 255.0);
         let (h, s, l) = rgb_to_hsl(rgb);
+        // A hue range's edit, by how much the pixel's hue is in it (a gray
+        // has none), then the master's.
+        let mut range = [0.0f32; 3];
+        if ranged && s > 0.0 {
+            for r in &hs.ranges.0 {
+                let w = r.weight(h);
+                if w > 0.0 {
+                    range[0] += w * r.hue;
+                    range[1] += w * r.saturation;
+                    range[2] += w * r.lightness;
+                }
+            }
+        }
         let (h, s) = if hs.colorize {
             (hs.hue.rem_euclid(360.0), sat.clamp(0.0, 1.0))
         } else {
             // Multiplicative: a gray (zero saturation) stays gray.
-            let s = s * (1.0 + sat);
-            ((h + hs.hue).rem_euclid(360.0), s.clamp(0.0, 1.0))
+            let s = s * (1.0 + range[1].clamp(-1.0, 1.0)) * (1.0 + sat);
+            ((h + range[0] + hs.hue).rem_euclid(360.0), s.clamp(0.0, 1.0))
         };
-        let mut out = hsl_to_rgb(h, s, l);
-        if light != 0.0 {
-            out = out.map(|v| {
-                if light < 0.0 {
-                    v * (1.0 + light)
-                } else {
-                    v + (1.0 - v) * light
-                }
-            });
-        }
+        let out = lighten(hsl_to_rgb(h, s, l), range[2].clamp(-1.0, 1.0));
+        let out = lighten(out, light);
         for (channel, v) in p.iter_mut().zip(out) {
             *channel = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
         }
@@ -1164,6 +1251,24 @@ pub enum AdjustKind {
 }
 
 impl AdjustKind {
+    pub const ALL: [AdjustKind; 15] = [
+        AdjustKind::BrightnessContrast,
+        AdjustKind::Levels,
+        AdjustKind::Curves,
+        AdjustKind::Exposure,
+        AdjustKind::Vibrance,
+        AdjustKind::HueSaturation,
+        AdjustKind::ColorBalance,
+        AdjustKind::BlackWhite,
+        AdjustKind::PhotoFilter,
+        AdjustKind::ChannelMixer,
+        AdjustKind::Invert,
+        AdjustKind::Posterize,
+        AdjustKind::Threshold,
+        AdjustKind::GradientMap,
+        AdjustKind::SelectiveColor,
+    ];
+
     pub fn title(self) -> String {
         match self {
             AdjustKind::BrightnessContrast => t!("adjust-brightness-contrast"),

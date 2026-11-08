@@ -29,7 +29,27 @@ impl Default for GradientFill {
     }
 }
 
+/// `degrees` brought into (-180, 180], the range of the Angle field.
+pub fn normal_angle(degrees: f32) -> f32 {
+    180.0 - (180.0 - degrees).rem_euclid(360.0)
+}
+
 impl GradientFill {
+    /// The gradient turned with the image by `degrees` clockwise: it keeps
+    /// its direction on the image.
+    pub fn turned(&mut self, degrees: f32) {
+        self.angle = normal_angle(self.angle - degrees);
+    }
+
+    /// The gradient seen in a mirror (a flip of the canvas). An Angle
+    /// gradient also sweeps the other way round.
+    pub fn mirrored(&mut self, horizontal: bool) {
+        self.angle = normal_angle(if horizontal { 180.0 - self.angle } else { -self.angle });
+        if self.style == Shape::Angle {
+            self.reverse = !self.reverse;
+        }
+    }
+
     /// Position (0..1) in the gradient of point (x, y), for a gradient
     /// centered on the box `[x, y, w, h]`.
     pub fn t(&self, x: f32, y: f32, [bx, by, bw, bh]: [f32; 4]) -> f32 {

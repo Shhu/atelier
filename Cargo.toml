@@ -23,6 +23,9 @@ zip = { version = "8.6", default-features = false, features = ["deflate-flate2"]
 # PSD files: their ZIP-compressed channels (flate2 is already built for zip).
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 rfd = { version = "0.17.2", default-features = false, features = ["gtk3"] }
+# Atelier's window as the parent of its file dialogs (already built for
+# eframe and rfd).
+raw-window-handle = "0.6.2"
 # Downloads the model on first use.
 ureq = "3.4.2"
 # Path rasterization (exact-area anti-aliasing, strokes with caps, joins
@@ -50,6 +53,14 @@ rayon = "1.12"
 # The monitor's profile, published by the desktop on the X root window.
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = "0.13"
+
+# macOS: the app menu, files sent by the Finder, Quit from the Dock (the
+# versions winit is built with).
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = { version = "0.30.13", default-features = false }
+objc2 = "0.5.2"
+objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSEnumerator", "NSNotification", "NSString", "NSThread", "NSURL"] }
+objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder"] }
 
 # Batch's dates in the local time zone (already built for the other crates).
 [target.'cfg(unix)'.dependencies]

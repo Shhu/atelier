@@ -2,6 +2,7 @@
 //! documents, every layer kept), drag and drop, the clipboard, and what
 //! counts as unsaved. Export As is in `export_as`.
 
+use super::file_dialog::Filter as _;
 use super::*;
 use crate::document::is_native;
 
@@ -11,11 +12,20 @@ pub(super) const OPEN_EXTENSIONS: &[&str] = &[
     "tiff", "tga", "ico", "qoi",
 ];
 
+/// A save as a Photoshop document that can't hold everything: asked first.
+pub(super) struct PsdAsk {
+    path: PathBuf,
+    /// What it would lose.
+    notes: String,
+    /// The close that asked for the save, to go on once saved.
+    pub(super) then: Option<Confirm>,
+}
+
 /// A file whose opening needs more memory than is free: asked first.
 pub(super) struct OpenAnyway {
-    path: PathBuf,
+    pub(super) path: PathBuf,
     /// What is free, in bytes.
-    free: u64,
+    pub(super) free: u64,
 }
 
 impl AtelierApp {
@@ -37,7 +47,7 @@ impl AtelierApp {
         }
         // A camera RAW file opens in Camera Raw first.
         if crate::camera_raw::raw::is_raw(path) {
-            self.open_raw(path);
+            self.open_raw(path, memory);
             return;
         }
         let shown = path.display().to_string();
@@ -57,12 +67,23 @@ impl AtelierApp {
                     t!("file-status-opened-first-frame", path = shown)
                 } else if !opened.notes.is_empty() {
                     let notes = opened.notes.join(" · ");
-                    crate::diag::warn(tm!(
-                        "xchg-status-opened-simplified",
-                        path = file_name(path),
-                        notes = notes.clone()
-                    ));
-                    t!("xchg-status-opened-simplified", path = shown, notes = notes)
+                    let name = file_name(path);
+                    // A Photoshop file says now that Save won't replace it.
+                    let (logged, shown) = if crate::document::is_psd(path) {
+                        let note = notes.clone();
+                        (
+                            tm!("psd14-status-opened-psd-simplified", path = name, notes = note),
+                            t!("psd14-status-opened-psd-simplified", path = shown, notes = notes),
+                        )
+                    } else {
+                        let note = notes.clone();
+                        (
+                            tm!("xchg-status-opened-simplified", path = name, notes = note),
+                            t!("xchg-status-opened-simplified", path = shown, notes = notes),
+                        )
+                    };
+                    crate::diag::warn(logged);
+                    shown
                 } else {
                     t!("status-opened", path = shown)
                 });
@@ -123,14 +144,14 @@ impl AtelierApp {
     /// Adds the image as a layer, or opens it if there is no document yet.
     pub(super) fn pick_image(&self, title: &str) -> Option<PathBuf> {
         use crate::camera_raw::raw::EXTENSIONS as RAW;
-        let mut dialog = rfd::FileDialog::new()
+        let mut dialog = file_dialog::new()
             .set_title(title)
-            .add_filter(
+            .filter(
                 t!("file-filter-supported"),
                 &[OPEN_EXTENSIONS, RAW].concat(),
             )
-            .add_filter(t!("raw-file-filter"), RAW)
-            .add_filter(t!("app-file-filter-all"), &["*"]);
+            .filter(t!("raw-file-filter"), RAW)
+            .filter(t!("app-file-filter-all"), &["*"]);
         if let Some(dir) = self.current_dir() {
             dialog = dialog.set_directory(dir);
         }
@@ -150,7 +171,7 @@ impl AtelierApp {
         let Some(doc) = &self.doc else { return };
         match doc.path.clone() {
             Some(path) if is_native(&path) => self.save_to(&path),
-            Some(path) if has_extension(&path, "psd") => {
+            Some(path) if crate::document::is_psd(&path) => {
                 let losses = doc.psd_losses();
                 if losses.is_empty() {
                     self.save_to(&path);
@@ -177,7 +198,7 @@ impl AtelierApp {
     /// [`Self::save_as_dialog`]; whether a file was chosen.
     fn save_as_asked(&mut self) -> bool {
         let Some(doc) = &self.doc else { return false };
-        let lossy = doc.path.as_deref().is_some_and(|p| has_extension(p, "psd"))
+        let lossy = doc.path.as_deref().is_some_and(crate::document::is_psd)
             && !doc.psd_losses().is_empty();
         let title = if lossy {
             t!("files3-dialog-save-as-lossy")
@@ -188,16 +209,17 @@ impl AtelierApp {
         let atelier = (atelier.as_str(), &["atelier"][..]);
         let psd_filter = t!("xchg-file-filter-psd");
         let photoshop = (psd_filter.as_str(), &["psd"][..]);
-        let psd = !lossy
-            && self
-                .doc
-                .as_ref()
-                .and_then(|d| d.path.as_deref())
-                .is_some_and(|p| has_extension(p, "psd"));
+        let psb_filter = t!("psd14-file-filter-psb");
+        let large = (psb_filter.as_str(), &["psb"][..]);
+        let path = self.doc.as_ref().and_then(|d| d.path.as_deref());
+        let psd = !lossy && path.is_some_and(|p| has_extension(p, "psd"));
+        let psb = !lossy && path.is_some_and(|p| has_extension(p, "psb"));
         let filters = if psd {
-            [photoshop, atelier]
+            [photoshop, large, atelier]
+        } else if psb {
+            [large, photoshop, atelier]
         } else {
-            [atelier, photoshop]
+            [atelier, photoshop, large]
         };
         let stem = self.file_stem();
         match ask_save_path(&title, &filters, self.current_dir(), &stem) {
@@ -209,8 +231,109 @@ impl AtelierApp {
         }
     }
 
+    /// Saves to `path`; as a Photoshop file that can't hold everything,
+    /// asked first (see [`Self::psd_ask_window`]).
     pub(super) fn save_to(&mut self, path: &Path) {
         self.commit_pending();
+        if self.psd_asks(path) {
+            return;
+        }
+        self.write_to(path);
+    }
+
+    /// Whether saving to `path` loses something and is asked first.
+    fn psd_asks(&mut self, path: &Path) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        // Batch refuses lossy saves by itself.
+        if !crate::document::is_psd(path) || self.automate.running() {
+            return false;
+        }
+        let mut losses = doc.psd_losses();
+        // What opening left out matters only over the file it came from.
+        if doc.path.as_deref() != Some(path) {
+            losses.retain(|n| !doc.file_notes.contains(n));
+        }
+        if losses.is_empty() {
+            return false;
+        }
+        self.psd_ask = Some(PsdAsk {
+            path: path.to_path_buf(),
+            notes: losses.join(" · "),
+            then: None,
+        });
+        true
+    }
+
+    /// "Save as a Photoshop document anyway?", with what it would lose.
+    /// Saving anyway keeps the document modified (the file holds less);
+    /// the close that asked for the save goes on.
+    pub(super) fn psd_ask_window(&mut self, ctx: &egui::Context) {
+        let Some(ask) = &self.psd_ask else { return };
+        let name = file_name(&ask.path);
+        let center = ctx.content_rect().center();
+        let out = dialogs::floating_dialog(
+            ctx,
+            dialogs::DialogSpec {
+                pivot: egui::Align2::CENTER_CENTER,
+                width: 440.0,
+                ok: t!("safety14-psd-save-anyway"),
+                other: Some(format!("{}…", t!("safety14-psd-save-atelier"))),
+                first_field: false,
+                ..dialogs::DialogSpec::new("psd_ask", t!("safety14-psd-title"), center)
+            },
+            |ui| {
+                ui.label(t!(
+                    "safety14-psd-text",
+                    name = name.as_str(),
+                    notes = ask.notes.as_str()
+                ));
+                dialogs::gap_between_blocks(ui);
+                dialogs::help(ui, &t!("safety14-psd-hint"));
+            },
+        );
+        if !out.ok && !out.other && !out.cancel {
+            return;
+        }
+        let Some(ask) = self.psd_ask.take() else { return };
+        if out.cancel {
+            self.status.set(t!("safety14-status-psd-not-saved", name = name.as_str()));
+            return;
+        }
+        let uid = self.doc.as_ref().map(Document::uid);
+        let saved = if out.ok {
+            self.write_to(&ask.path)
+        } else {
+            self.save_as_dialog();
+            match &mut self.psd_ask {
+                // A Photoshop file chosen again: asked again.
+                Some(again) => {
+                    again.then = ask.then;
+                    false
+                }
+                None => self.doc.as_ref().is_some_and(|d| !d.modified),
+            }
+        };
+        // The close that asked for the save goes on, for that document.
+        if let Some(then) = ask.then
+            && saved
+            && self.doc.as_ref().map(Document::uid) == uid
+        {
+            self.close_after_save(then);
+        }
+    }
+
+    /// The document was saved for `then`: it closes (the window's close
+    /// then goes on with the next unsaved document, if any).
+    pub(super) fn close_after_save(&mut self, then: Confirm) {
+        self.close_document();
+        if let Confirm::Close = then {
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// [`Self::save_to`], what a Photoshop file loses accepted. Whether
+    /// the file was written.
+    fn write_to(&mut self, path: &Path) -> bool {
         // Photoshop refuses too: the other tab would show a file that is
         // no longer its own, and its Save would overwrite this one.
         if self.tab_of(path).is_some_and(|i| i != self.active_tab) {
@@ -218,9 +341,9 @@ impl AtelierApp {
                 "file-status-open-in-another-tab",
                 name = file_name(path)
             ));
-            return;
+            return false;
         }
-        let Some(doc) = &mut self.doc else { return };
+        let Some(doc) = &mut self.doc else { return false };
         let started = std::time::Instant::now();
         let saved = doc.save(path);
         crate::diag::record(format!("Save: {}", format_of(path)), started.elapsed());
@@ -262,7 +385,9 @@ impl AtelierApp {
         // Not saved: said where it can't be missed.
         if let Some(message) = failed {
             self.report_error(message);
+            return false;
         }
+        true
     }
 
     /// Name of the document without its extension, for the file dialogs.
@@ -291,7 +416,9 @@ impl AtelierApp {
     }
 
     /// Copies the visible pixels of the active layer (its targeted mask,
-    /// in gray) to the clipboard. Returns whether they are on it.
+    /// in gray) to the clipboard. Returns whether they go to it (a
+    /// clipboard that refuses them is said later: a Cut is then undone
+    /// with Undo, like any other).
     pub(super) fn copy_to_clipboard(&mut self) -> bool {
         let Some(doc) = &self.doc else { return false };
         let Some((image, rect)) = doc.copied(self.selection.as_ref()) else {
@@ -312,24 +439,20 @@ impl AtelierApp {
         self.put_on_clipboard(image, rect, t!("files3-status-copied-merged"))
     }
 
-    /// Puts `image`, from `rect` of the canvas, on the clipboard.
+    /// Puts `image`, from `rect` of the canvas, on the clipboard (aside:
+    /// a failure is said by [`Self::poll_clipboard`]).
     fn put_on_clipboard(&mut self, image: image::RgbaImage, rect: PixelRect, done: String) -> bool {
-        let copied = CopiedFrom::new(&image, (rect.x, rect.y));
-        let data = arboard::ImageData {
-            width: image.width() as usize,
-            height: image.height() as usize,
-            bytes: std::borrow::Cow::Owned(image.into_raw()),
-        };
-        match arboard::Clipboard::new().and_then(|mut c| c.set_image(data)) {
-            Ok(()) => {
-                self.last_copy = Some(copied);
-                self.status.set(done);
-                true
-            }
-            Err(e) => {
-                self.status_failed(tm!("status-copy-failed", error = crate::i18n::Message::of(|| e.to_string())));
-                false
-            }
+        self.last_copy = Some(CopiedFrom::new(&image, (rect.x, rect.y)));
+        super::clipboard::set_image(image, &self.ctx);
+        self.status.set(done);
+        true
+    }
+
+    /// A copy the clipboard refused, said when known.
+    pub(super) fn poll_clipboard(&mut self) {
+        if let Some(e) = super::clipboard::failure() {
+            self.last_copy = None;
+            self.status_failed(tm!("status-copy-failed", error = crate::i18n::Message::of(move || e.clone())));
         }
     }
 
@@ -337,25 +460,14 @@ impl AtelierApp {
     /// document, unsaved, when none is open.
     pub(super) fn paste_from_clipboard(&mut self, mode: PasteMode) {
         // Files copied in the file manager: placed, like Photoshop.
-        let files = arboard::Clipboard::new()
-            .and_then(|mut c| c.get().file_list())
-            .unwrap_or_default();
+        let files = super::clipboard::files();
         if !files.is_empty() && self.doc.is_some() {
             for path in files {
                 self.place_path(&path, false);
             }
             return;
         }
-        let image = arboard::Clipboard::new()
-            .and_then(|mut c| c.get_image())
-            .ok()
-            .and_then(|data| {
-                image::RgbaImage::from_raw(
-                    data.width as u32,
-                    data.height as u32,
-                    data.bytes.into_owned(),
-                )
-            });
+        let image = super::clipboard::image();
         match image {
             Some(image) => self.paste_image(image, mode),
             None => self.status_cannot(t!("status-clipboard-no-image")),
@@ -467,6 +579,19 @@ impl AtelierApp {
             } else {
                 self.place_path(&path, false);
             }
+        }
+    }
+
+    /// Files the system asks to open (the Finder, the Dock icon), opened as
+    /// tabs once no dialog is up; and Quit asked from outside the window.
+    pub(super) fn handle_system_requests(&mut self) {
+        if !self.modal_open() {
+            for path in crate::system::take_open() {
+                self.open_path(&path);
+            }
+        }
+        if crate::system::take_quit() {
+            self.run(Action::Quit);
         }
     }
 
@@ -605,9 +730,9 @@ fn system_save_dialog(
     let extensions: Vec<&str> = filters.iter().flat_map(|f| f.1.iter().copied()).collect();
     let mut name = format!("{stem}.{}", extensions[0]);
     loop {
-        let mut dialog = rfd::FileDialog::new().set_title(title).set_file_name(&name);
+        let mut dialog = file_dialog::new().set_title(title).set_file_name(&name);
         for (filter, exts) in filters {
-            dialog = dialog.add_filter(*filter, exts);
+            dialog = dialog.filter(*filter, exts);
         }
         if let Some(dir) = &dir {
             dialog = dialog.set_directory(dir);
@@ -723,10 +848,7 @@ mod tests {
     }
 
     fn folder(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("atelier-files-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testing::test_dir(&format!("files-{name}"))
     }
 
     fn image(color: [u8; 4]) -> image::RgbaImage {
@@ -744,6 +866,46 @@ mod tests {
             .or_default()
             .events
             .push(egui::ViewportEvent::Close);
+    }
+
+    /// Files the system sends (the Finder, the Dock icon, the files after
+    /// the first on the command line) open as tabs, also those sent before
+    /// the window was up; a dialog open keeps them waiting.
+    #[test]
+    fn files_the_system_sends_open_as_tabs() {
+        let dir = folder("system-open");
+        let (a, b) = (dir.join("a.png"), dir.join("b.png"));
+        image([255, 0, 0, 255]).save(&a).unwrap();
+        image([0, 0, 255, 255]).save(&b).unwrap();
+        crate::system::open([a.clone()]);
+        let mut harness = harness(Vec::new());
+        assert_eq!(harness.state().tab_count(), 1);
+        harness.state_mut().open_anyway = Some(OpenAnyway {
+            path: dir.join("other.png"),
+            free: 1,
+        });
+        crate::system::open([b.clone()]);
+        harness.run_steps(2);
+        assert_eq!(harness.state().tab_count(), 1);
+        harness.state_mut().open_anyway = None;
+        harness.run_steps(2);
+        assert_eq!(harness.state().tab_count(), 2);
+        assert!(harness.state().tab_of(&a).is_some() && harness.state().tab_of(&b).is_some());
+    }
+
+    /// Quit from outside the window (macOS: Cmd+Q, the Dock, a logout)
+    /// closes the window the way its close button does, asking first.
+    #[test]
+    fn quit_from_the_system_closes_like_the_window() {
+        let mut harness = harness(vec![Document::new(image([9, 9, 9, 255]), None)]);
+        crate::system::quit();
+        harness.step();
+        let closes = harness.output().viewport_output.values().any(|v| {
+            v.commands
+                .iter()
+                .any(|c| matches!(c, egui::ViewportCommand::Close))
+        });
+        assert!(closes);
     }
 
     #[test]

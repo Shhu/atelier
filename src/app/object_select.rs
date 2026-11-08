@@ -705,7 +705,7 @@ pub(super) fn demo_photo() -> image::RgbaImage {
 /// masks), for captures and tests.
 #[cfg(test)]
 pub(super) fn settle(harness: &mut egui_kittest::Harness<'_, AtelierApp>) {
-    for _ in 0..500 {
+    for _ in crate::testing::patience() {
         harness.run_steps(1);
         let app = harness.state();
         let os = &app.object_select;

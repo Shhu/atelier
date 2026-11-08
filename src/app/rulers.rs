@@ -104,8 +104,7 @@ impl ViewSettings {
             return;
         }
         if let Ok(json) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::create_dir_all(crate::config::dir());
-            let _ = std::fs::write(settings_file(), json);
+            let _ = crate::store::write(&settings_file(), &json);
         }
     }
 

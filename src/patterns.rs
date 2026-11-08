@@ -283,9 +283,7 @@ impl Library {
             }
         }
         let json = serde_json::to_vec_pretty(&entries)?;
-        let temp = folder.join("index.json.tmp");
-        std::fs::write(&temp, json)?;
-        std::fs::rename(&temp, folder.join("index.json"))?;
+        crate::store::write(&folder.join("index.json"), &json)?;
         for file in removed {
             // Only a file's name: the index may have been edited.
             if Path::new(&file).file_name().is_some_and(|n| *n == *file) {
@@ -306,7 +304,10 @@ impl Library {
                 entries
             }
             Err(e) => {
-                crate::diag::warn(format!("pattern library not read: {e}"));
+                crate::diag::warn(crate::i18n::tm!(
+                    "words14-log-pattern-library-not-read",
+                    error = crate::i18n::Message::of(|| crate::i18n::io_error(&e))
+                ));
                 out.left_out = 1;
                 return out;
             }
@@ -398,7 +399,7 @@ fn load_index(folder: &Path) -> std::io::Result<(Vec<serde_json::Value>, Option<
     if let Ok(serde_json::Value::Array(entries)) = serde_json::from_slice(&json) {
         return Ok((entries, None));
     }
-    let backup = crate::actions::set_aside(&path).ok_or_else(|| {
+    let backup = crate::store::set_aside(&path).ok_or_else(|| {
         std::io::Error::other("the damaged index of the pattern library can't be set aside")
     })?;
     let name = backup.file_name().unwrap_or_default();
@@ -421,7 +422,9 @@ fn read_tile(folder: &Path, file: &str, memory: &mut u64) -> Option<RgbaImage> {
         .with_guessed_format()
         .ok()?;
     reader.limits(limits);
-    let image = reader.decode().ok()?.into_rgba8();
+    // A damaged tile may make a decoder panic: it is then missing.
+    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reader.decode()));
+    let image = decoded.ok()?.ok()?.into_rgba8();
     let (w, h) = image.dimensions();
     // The tile and its smaller versions.
     *memory = memory.saturating_sub(w as u64 * h as u64 * 6);
@@ -436,14 +439,19 @@ fn write_tile(path: &Path, image: &RgbaImage) -> std::io::Result<()> {
         if tile_there(path, image) != Some(false) {
             return Ok(());
         }
-        crate::actions::set_aside(path)
+        crate::store::set_aside(path)
             .ok_or_else(|| std::io::Error::other("a damaged pattern can't be set aside"))?;
     }
-    let temp = path.with_extension("png.tmp");
-    image
-        .save_with_format(&temp, image::ImageFormat::Png)
-        .map_err(std::io::Error::other)?;
-    std::fs::rename(&temp, path)
+    // Synced before it is renamed: never an empty tile after a power cut.
+    let written = crate::document::write_atomic(path, |out| {
+        image
+            .write_to(out, image::ImageFormat::Png)
+            .map_err(crate::document::FileError::Image)
+    });
+    written.map_err(|e| match e {
+        crate::document::FileError::Io(e) => e,
+        e => std::io::Error::other(e.to_string()),
+    })
 }
 
 /// Whether the file at `path` holds `image`; `None` when that can't be told
@@ -551,7 +559,7 @@ fn save_changes(folder: &Path, changes: &Receiver<Change>, report: &Sender<Strin
         match Library::apply(folder, &waiting) {
             Ok(()) => waiting.clear(),
             Err(e) => {
-                crate::diag::warn(format!("pattern library not saved: {e}"));
+                crate::diag::warn(not_saved(&e));
                 // In the interface's language where it has words for it.
                 let _ = report.send(crate::document::FileError::Io(e).to_string());
             }
@@ -560,8 +568,16 @@ fn save_changes(folder: &Path, changes: &Receiver<Change>, report: &Sender<Strin
     if !waiting.is_empty()
         && let Err(e) = Library::apply(folder, &waiting)
     {
-        crate::diag::warn(format!("pattern library not saved: {e}"));
+        crate::diag::warn(not_saved(&e));
     }
+}
+
+/// The log line for a library that could not be saved.
+fn not_saved(e: &std::io::Error) -> crate::i18n::Message {
+    crate::i18n::tm!(
+        "words14-log-pattern-library-not-saved",
+        error = crate::i18n::Message::of(|| crate::i18n::io_error(e))
+    )
 }
 
 /// Folder of the library in the settings.
@@ -579,8 +595,7 @@ mod tests {
     }
 
     fn folder(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("atelier-patterns-{name}-{}", std::process::id()));
+        let dir = crate::testing::root().join(format!("patterns-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -799,7 +814,7 @@ mod tests {
         let (a, b) = (Pattern::new("A", tile(1)), Pattern::new("B", tile(2)));
         saver.send(add(&a));
         let mut error = None;
-        for _ in 0..500 {
+        for _ in crate::testing::patience() {
             error = saver.error();
             if error.is_some() {
                 break;

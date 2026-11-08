@@ -287,7 +287,7 @@ impl AtelierApp {
             // Ctrl + click: as the selection (Shift adds, Alt subtracts,
             // both intersect).
             Click::Row(row, m) if m.command => {
-                let mode = self.selection_mode(m.shift, m.alt);
+                let mode = self.load_mode(m.shift, m.alt);
                 let Some(doc) = &self.doc else { return };
                 let found = match row {
                     Some(ChannelRow::Alpha(i)) => doc.channel_selection(i),
@@ -390,7 +390,7 @@ impl AtelierApp {
             .collect();
         // The composite as the canvas shows it (display profile, proof).
         let (lut_key, lut) = self.color.shown();
-        let key = hash_of((doc.uid(), format!("{sigs:?}"), alphas, lut_key));
+        let key = hash_of((doc.uid(), &sigs, alphas, lut_key));
         let now = ctx.input(|i| i.time);
         if let Some((k, at, _)) = &self.channels.thumbs {
             if *k == key {
@@ -558,8 +558,9 @@ fn channel_key(ctx: &egui::Context, n: usize) -> String {
 
 /// The `n`-th channel shortcut pressed this frame (exactly Ctrl+2…9, the
 /// digit row by its place: see `shortcut_key`), among the `rows` channels
-/// shown, if any. The others are left to the shortcuts of what the key types
-/// (Ctrl+6 on an AZERTY keyboard, without alpha channels: Ctrl+−).
+/// shown, if any. The others are left to the shortcuts of what the key types.
+/// A key that types "−" is always Zoom Out (the 6 key of an AZERTY keyboard),
+/// whatever the document's channels.
 pub(super) fn channel_shortcut(input: &mut egui::InputState, rows: usize) -> Option<usize> {
     const DIGITS: [Key; 8] = [
         Key::Num2,
@@ -571,10 +572,18 @@ pub(super) fn channel_shortcut(input: &mut egui::InputState, rows: usize) -> Opt
         Key::Num8,
         Key::Num9,
     ];
-    DIGITS
-        .iter()
-        .take(rows)
-        .position(|&k| consume_exact(input, KeyboardShortcut::new(Modifiers::COMMAND, k)))
+    let minus = input.events.iter().find_map(|e| match e {
+        egui::Event::Key {
+            key: Key::Minus,
+            physical_key,
+            pressed: true,
+            ..
+        } => *physical_key,
+        _ => None,
+    });
+    DIGITS.iter().take(rows).position(|&k| {
+        Some(k) != minus && consume_exact(input, KeyboardShortcut::new(Modifiers::COMMAND, k))
+    })
 }
 
 /// A row's responses: the row, and whether its eye was clicked.

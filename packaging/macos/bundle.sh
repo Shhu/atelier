@@ -16,6 +16,9 @@ app="$work/Atelier/Atelier.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$binary" "$app/Contents/MacOS/atelier"
 sed "s/VERSION/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+# Declared languages (CFBundleLocalizations), so that the system's panels
+# follow the user's: English and French.
+mkdir "$app/Contents/Resources/en.lproj" "$app/Contents/Resources/fr.lproj"
 
 # Icon: every size of an .iconset, from the 1024 px PNG.
 set_dir="$work/AppIcon.iconset"
@@ -27,6 +30,6 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$set_dir" -o "$app/Contents/Resources/AppIcon.icns"
 
-codesign --force --deep --sign - "$app"
+codesign --force --sign - "$app"
 ln -s /Applications "$work/Atelier/Applications"
 hdiutil create -volname Atelier -srcfolder "$work/Atelier" -ov -format UDZO "$dmg"

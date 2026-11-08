@@ -3,6 +3,7 @@
 //! adjustment layers, the Layer Style window.
 
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 use image::{Rgba, RgbaImage};
 
 use super::right_panel::RowPart;
@@ -221,4 +222,39 @@ fn layer_style_window_cancels_or_records_one_step() {
     assert!(h.state_mut().doc.as_mut().unwrap().undo());
     assert_eq!(doc(&h).active_layer().opacity, 1.0);
     assert_eq!(doc(&h).layers.len(), 2);
+}
+
+#[test]
+fn layer_style_menu_item_turns_its_style_on() {
+    let mut h = app();
+    // The whole Layer menu in view.
+    h.set_size(Vec2::new(1400.0, 1600.0));
+    h.run_steps(2);
+    let open = |h: &mut Harness<'static, AtelierApp>| {
+        h.get_by_label(&t!("menu-layer")).click();
+        h.run_steps(2);
+        h.get_by_label(&format!("{} ⏵", t!("core-menu-layer-style")))
+            .hover();
+        h.run_steps(3);
+        h.get_by_label(&format!("{}…", Style::DropShadow.label()))
+            .click();
+        h.run_steps(3);
+        assert!(h.state().layer_style.is_some());
+    };
+    open(&mut h);
+    assert!(doc(&h).active_layer().effects.shadow.enabled, "on while open");
+    // Cancel: off again, no step.
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert!(h.state().layer_style.is_none());
+    assert!(!doc(&h).active_layer().effects.shadow.enabled);
+    // OK, untouched: the shadow, in one step.
+    open(&mut h);
+    h.get_by_label(&t!("dialog-ok")).click();
+    h.run_steps(3);
+    assert!(h.state().layer_style.is_none());
+    assert!(doc(&h).active_layer().effects.shadow.enabled, "kept on OK");
+    assert!(h.state_mut().doc.as_mut().unwrap().undo());
+    assert!(!doc(&h).active_layer().effects.shadow.enabled);
+    assert_eq!(doc(&h).layers.len(), 2, "one step");
 }

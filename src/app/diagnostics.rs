@@ -132,8 +132,18 @@ impl Names {
         }
         let filter =
             |k: &str| filters_ui::kind_named(k).map_or_else(|| k.to_owned(), filters_ui::title);
-        if let Some(k) = name.strip_prefix("Filter dialog preview: ") {
+        if let Some(k) = name
+            .strip_prefix("Filter dialog preview: ")
+            .or_else(|| name.strip_prefix("Filter canvas preview: "))
+        {
             return t!("ui4-op-filter-preview", name = filter(k));
+        }
+        if let Some(k) = name.strip_prefix("Adjustment preview: ") {
+            let kind = crate::pixel_ops::AdjustKind::ALL
+                .into_iter()
+                .find(|a| format!("{a:?}") == k);
+            let name = kind.map_or_else(|| k.to_owned(), |a| a.title());
+            return t!("words14-op-adjust-preview", name = name);
         }
         if let Some(k) = name.strip_prefix("Filter: ") {
             return t!("ui4-op-filter", name = filter(k));
@@ -204,6 +214,10 @@ pub(super) fn static_operation(name: &str) -> Option<String> {
         "Object Selection: image analysis" => t!("ui4-op-objsel-analysis"),
         "Smart object rendering" => t!("ui5-op-smart-render"),
         "Smart filter preview" => t!("ui5-op-smart-preview"),
+        "Layer preview" => t!("words14-op-layer-preview"),
+        "Fade preview" => t!("words14-op-fade-preview"),
+        "Make Transparent preview" => t!("words14-op-transparent-preview"),
+        "Linked file: look" => t!("words14-op-linked-look"),
         // F and Shift+F, not in a menu.
         "Workspace(CycleScreenMode(false))" | "Workspace(CycleScreenMode(true))" => {
             t!("panels8-menu-screen-mode")
@@ -689,7 +703,7 @@ impl AtelierApp {
             ctx.open_url(egui::OpenUrl::new_tab(workspace::ISSUES_URL));
         }
         if open_logs && let Err(e) = models_window::open_folder(&diag::log_dir()) {
-            self.status_failed(tm!("diag-open-logs-failed", error = crate::i18n::Message::of(|| e.to_string())));
+            self.status_failed(tm!("diag-open-logs-failed", error = crate::i18n::Message::of(|| crate::i18n::io_error(&e))));
         }
         if clear {
             diag::clear();
@@ -1883,8 +1897,7 @@ mod tests {
     fn a_french_failure_is_english_in_the_report() {
         let mut h = app(Some(PathBuf::from("logo.png")));
         i18n::set_lang(Lang::Fr);
-        let dir = std::env::temp_dir().join("atelier-words5-report");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testing::test_dir("words5-report");
         let app = h.state_mut();
         app.open_path(&dir.join("absent-words5.psd"));
         app.save_to(&dir.join("missing-folder").join("x-words5.atelier"));
@@ -2023,6 +2036,36 @@ mod tests {
         assert!(report.contains("| New Layer (`NewLayer`)"), "{report}");
         assert!(report.contains("Could not open plage.psd"), "{report}");
         assert!(!report.contains(" 1 warnings") && !report.contains(" 1 errors"));
+    }
+
+    /// The preview jobs measured on every adjustment or filter preview are
+    /// named in French in the window, never by their English or `Debug`
+    /// names (the job names given in `filters_ui` and `smart_ui`).
+    #[test]
+    fn preview_jobs_are_named_in_the_language() {
+        i18n::set_lang(Lang::Fr);
+        let names = Names::default();
+        let jobs = [
+            "Adjustment preview: Levels",
+            "Filter canvas preview: GaussianBlur",
+            "Filter dialog preview: GaussianBlur",
+            "Layer preview",
+            "Fade preview",
+            "Make Transparent preview",
+            "Linked file: look",
+        ];
+        let shown: Vec<String> = jobs.iter().map(|j| names.operation(j)).collect();
+        let english: Vec<String> =
+            i18n::in_lang(Lang::En, || jobs.iter().map(|j| names.operation(j)).collect());
+        i18n::set_lang(Lang::En);
+        for ((job, fr), en) in jobs.iter().zip(&shown).zip(&english) {
+            assert_ne!(fr, job, "{job}");
+            assert_ne!(fr, en, "{job}");
+            assert!(!fr.contains("words14-"), "{job}: {fr}");
+        }
+        assert!(shown[0].contains("Niveaux"), "{}", shown[0]);
+        assert!(shown[1].contains("Flou gaussien"), "{}", shown[1]);
+        assert!(english[0].contains("Levels") && !english[1].contains("GaussianBlur"));
     }
 
     /// Commands are measured by `run`, under their name.

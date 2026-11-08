@@ -5,6 +5,7 @@ mod artboard_tool;
 mod batch;
 mod camera_raw_ui;
 mod canvas;
+mod clipboard;
 mod crop_tool;
 mod channels_panel;
 mod color_picker;
@@ -21,8 +22,13 @@ mod fade_stroke_tests;
 mod adjust11_tests;
 mod downloads;
 #[cfg(test)]
+mod events14_tests;
+#[cfg(test)]
+mod safety14_tests;
+#[cfg(test)]
 mod exchange_tests;
 mod export_as;
+mod file_dialog;
 mod files;
 mod filters_ui;
 mod gradient_editor;
@@ -57,14 +63,19 @@ mod options_bar;
 mod patterns_ui;
 #[cfg(test)]
 mod paint_tests;
+#[cfg(test)]
+mod perf14_tests;
 mod paint_tools;
 mod palette;
 mod paths_panel;
 #[cfg(test)]
 mod picker_tests;
 mod quick_mask;
+mod recovery_ui;
 #[cfg(test)]
 mod quick_mask_tests;
+#[cfg(test)]
+mod memory14_tests;
 mod render;
 #[cfg(test)]
 mod render_tests;
@@ -84,6 +95,10 @@ mod select_menu_tests;
 mod select_tests;
 mod select_tools;
 mod session;
+#[cfg(test)]
+mod history14_tests;
+#[cfg(test)]
+mod readers14_tests;
 #[cfg(test)]
 mod smart_tests;
 mod smart_ui;
@@ -197,6 +212,10 @@ const SHORTCUT_REDO: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Z);
 const SHORTCUT_QUIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Q);
 const SHORTCUT_CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
+/// Next / previous document: the Control key on every system.
+const SHORTCUT_NEXT_DOCUMENT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Tab);
+const SHORTCUT_PREVIOUS_DOCUMENT: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Tab);
 // Free Transform: Ctrl+T, like Photoshop.
 const SHORTCUT_FREE_TRANSFORM: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::T);
 // Display only: egui-winit passes it on as a copy (see `clipboard_action`).
@@ -244,6 +263,13 @@ const SHORTCUT_HUE_SATURATION: KeyboardShortcut = KeyboardShortcut::new(Modifier
 const SHORTCUT_DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::J);
 const SHORTCUT_NEW_LAYER: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::N);
+/// Photoshop's "new layer without its dialog" (Atelier never shows one).
+const SHORTCUT_NEW_LAYER_ALT: KeyboardShortcut = KeyboardShortcut::new(
+    Modifiers::COMMAND
+        .plus(Modifiers::SHIFT)
+        .plus(Modifiers::ALT),
+    Key::N,
+);
 const SHORTCUT_MERGE_DOWN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::E);
 /// Layer › Hide Layers / Show Layers.
 const SHORTCUT_HIDE_LAYERS: KeyboardShortcut =
@@ -260,6 +286,9 @@ const SHORTCUT_LAYER_VIA_CUT: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::J);
 const SHORTCUT_TOGGLE_LOCK: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND, Key::Slash);
+/// Ctrl+/ where "/" is typed with Shift (AZERTY: Shift and the ":" key).
+const SHORTCUT_TOGGLE_LOCK_SHIFTED: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Slash);
 const SHORTCUT_DESATURATE: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::U);
 // Layer order: Ctrl+[ ] one step, with Shift all the way down / up.
@@ -292,6 +321,15 @@ const SHORTCUT_BLACK_WHITE: KeyboardShortcut = KeyboardShortcut::new(
         .plus(Modifiers::ALT),
     Key::B,
 );
+
+/// The fills, with Delete or Backspace.
+const FILL_SHORTCUTS: [(KeyboardShortcut, Action); 5] = [
+    (SHORTCUT_FILL_PRIMARY, Action::FillPrimary),
+    (SHORTCUT_FILL_SECONDARY, Action::FillSecondary),
+    (SHORTCUT_FILL_PRIMARY_KEEP, Action::FillPrimaryKeep),
+    (SHORTCUT_FILL_SECONDARY_KEEP, Action::FillSecondaryKeep),
+    (SHORTCUT_FILL_DIALOG_ALT, Action::FillDialog),
+];
 
 /// Shortcuts that also work while typing in a text field.
 const FILE_SHORTCUTS: [(KeyboardShortcut, Action); 7] = [
@@ -842,6 +880,9 @@ pub struct AtelierApp {
     /// Thumbnails of the Layers panel: (layer id, mask) → fingerprint of
     /// what they show, texture.
     thumbs: HashMap<(u64, bool), (u64, f64, TextureHandle)>,
+    /// Part of the Layers panel's list in view at the last frame (list
+    /// coordinates, top and bottom): its rows only are laid out.
+    layer_list_view: (f32, f32),
     /// Area of the active layer changed by the brush, to composite again.
     stroke_dirty: Option<DirtyRect>,
 
@@ -1025,6 +1066,8 @@ pub struct AtelierApp {
     liquify: liquify_ui::LiquifyState,
     /// Histograms of the active layer, for levels and curves: (layer, revision).
     histogram: Option<((u64, u64), Histograms)>,
+    /// Those being counted on a worker thread, and for what.
+    histogram_job: Option<((u64, u64), std::thread::JoinHandle<Histograms>)>,
     /// Histograms of what the active adjustment layer adjusts (Levels,
     /// Curves in Properties).
     below_histogram: right_panel::BelowHistogram,
@@ -1032,6 +1075,8 @@ pub struct AtelierApp {
     preview_shown: Option<ShownPreview>,
     /// Confirmation asked before losing changes.
     confirm: Option<Confirm>,
+    /// A save as a Photoshop document that would lose something, asked.
+    psd_ask: Option<files::PsdAsk>,
     /// A file needing more memory than is free: "Open anyway?".
     open_anyway: Option<files::OpenAnyway>,
     /// "Discard hidden layers?" before Flatten Image.
@@ -1112,6 +1157,8 @@ pub struct AtelierApp {
     workspace: workspace::Workspace,
     /// Help › Diagnostics.
     diagnostics: diagnostics::Diagnostics,
+    /// Crash recovery files, and the close waiting for work under way.
+    recovery: recovery_ui::Recovery,
 }
 
 /// Processing previewed on a layer while a window is open.
@@ -1267,6 +1314,8 @@ struct SelectMove {
     floating: Option<(u64, (i64, i64))>,
     /// The pointer went further than for a click.
     moved: bool,
+    /// Offset of the selection shown.
+    by: (i64, i64),
 }
 
 /// Settings of "Make a color transparent".
@@ -1571,6 +1620,8 @@ enum Confirm {
 impl AtelierApp {
     pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
         ui_kit::install(&cc.egui_ctx);
+        file_dialog::set_parent(cc);
+        crate::system::set_context(&cc.egui_ctx);
         let mut app = Self {
             ctx: cc.egui_ctx.clone(),
             doc: None,
@@ -1578,6 +1629,7 @@ impl AtelierApp {
             downloads: downloads::Downloads::default(),
             active_tab: 0,
             thumbs: HashMap::new(),
+            layer_list_view: (0.0, 0.0),
             stroke_dirty: None,
             tool: Tool::Transform,
             primary: Color32::BLACK,
@@ -1663,6 +1715,7 @@ impl AtelierApp {
             menu_layers: Vec::new(),
             prop_session: None,
             confirm: None,
+            psd_ask: None,
             open_anyway: None,
             flatten_confirm: false,
             palette: Default::default(),
@@ -1677,6 +1730,7 @@ impl AtelierApp {
             liquify: Default::default(),
             preview_shown: None,
             histogram: None,
+            histogram_job: None,
             below_histogram: Default::default(),
             text_engine: None,
             type_tool: Default::default(),
@@ -1707,6 +1761,11 @@ impl AtelierApp {
             new_doc: Default::default(),
             workspace: Default::default(),
             diagnostics: Default::default(),
+            // Tests never write recovery files (unless one asks).
+            recovery: match cfg!(test) {
+                true => Default::default(),
+                false => recovery_ui::Recovery::start(&crate::document::recovery::root()),
+            },
             history: Default::default(),
             measure: Default::default(),
             info: Default::default(),
@@ -1715,6 +1774,10 @@ impl AtelierApp {
             channels: Default::default(),
         };
         app.load_session();
+        if let Some(notice) = app.colors.swatches.notice.take() {
+            app.report_warning(notice);
+        }
+        app.color.watch_monitor(file_dialog::hwnd(), &cc.egui_ctx);
         if let Some(path) = path {
             app.open_path(&path);
         }
@@ -2061,7 +2124,7 @@ impl AtelierApp {
         let Some(canvas) = self.doc.as_ref().map(Document::full_rect) else {
             return;
         };
-        let Some(moved) = selection.clone().translate(d.0, d.1).within(canvas) else {
+        let Some(moved) = selection.moved(d.0, d.1, canvas) else {
             return;
         };
         if !self.can_lift() {
@@ -2152,8 +2215,8 @@ impl AtelierApp {
     }
 
     /// Selects the visible pixels of a layer (Ctrl + click on its thumbnail).
-    /// Shift: add to the selection, Alt: subtract.
-    fn select_layer_pixels(&mut self, i: usize) {
+    /// Shift: add to the selection, Alt: subtract, both: intersect.
+    fn select_layer_pixels(&mut self, i: usize, modifiers: Modifiers) {
         let Some(doc) = &self.doc else { return };
         let layer = &doc.layers[i];
         let alpha =
@@ -2166,8 +2229,7 @@ impl AtelierApp {
             self.status_cannot(t!("status-no-visible-pixel"));
             return;
         }
-        let (shift, alt) = self.ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
-        let mode = self.selection_mode(shift, alt);
+        let mode = self.load_mode(modifiers.shift, modifiers.alt);
         self.sel.step_name = Some(select_menu::step_label(t!("sel-menu-load")));
         self.apply_selection(found, mode);
     }
@@ -2373,6 +2435,7 @@ impl AtelierApp {
     /// Ends the stroke in progress (the previous state was recorded at its
     /// start; a stroke that painted nothing gives that step up).
     fn finish_stroke(&mut self) {
+        self.forget_stroke_copy();
         let Some(stroke) = self.stroke.take() else {
             return;
         };
@@ -2510,12 +2573,12 @@ impl AtelierApp {
                     } else {
                         Action::ClearSelection
                     };
-                    let before = self.doc.as_ref().map(Document::history_step);
+                    let mark = self.doc.as_ref().map(Document::history_mark);
                     self.muted(|app| app.run(clear));
                     // It stays a Cut in the history, whatever took the place.
                     if let Some(doc) = &mut self.doc
-                        && alpha
-                        && before != Some(doc.history_step())
+                        && let Some(mark) = mark
+                        && doc.steps_since(mark) > 0
                     {
                         doc.rename_last_step(t!("menu-edit-cut"));
                     }
@@ -2562,6 +2625,7 @@ impl AtelierApp {
                 }
             }
             Action::Desaturate if self.smart_filters_apply() => self.refuse_on_smart(),
+            Action::Desaturate | Action::Adjust(_) if self.refuse_empty_layer() => {}
             Action::Desaturate => {
                 let selection = self.selection.as_ref();
                 let gray = Adjustment::HueSaturation(HueSaturation {
@@ -2569,6 +2633,7 @@ impl AtelierApp {
                     saturation: -1.0,
                     lightness: 0.0,
                     colorize: false,
+                    ranges: Default::default(),
                 });
                 if let Some(doc) = &mut self.doc
                     && doc.adjust_active(&gray, selection)
@@ -3054,6 +3119,8 @@ impl AtelierApp {
             || self.transform_busy()
             || self.confirm.is_some()
             || self.open_anyway.is_some()
+            || self.recovery.asking()
+            || self.psd_ask.is_some()
             || self.flatten_confirm
             || self.paint.rasterize_confirm.is_some()
             || self.crop_confirm.is_some()
@@ -3152,13 +3219,13 @@ impl AtelierApp {
             return;
         }
         // Ctrl+Tab / Ctrl+Shift+Tab: next / previous document, like Photoshop.
+        // The Control key on macOS too (Cmd+Tab is the system's).
         let n = self.tab_count();
         if n > 1 {
-            let back = Modifiers::COMMAND.plus(Modifiers::SHIFT);
             let step = ctx.input_mut(|i| {
-                if i.consume_key(back, Key::Tab) {
+                if consume_exact(i, SHORTCUT_PREVIOUS_DOCUMENT) {
                     Some(n - 1)
-                } else if i.consume_key(Modifiers::COMMAND, Key::Tab) {
+                } else if consume_exact(i, SHORTCUT_NEXT_DOCUMENT) {
                     Some(1)
                 } else {
                     None
@@ -3170,65 +3237,7 @@ impl AtelierApp {
             }
         }
         let action = ctx.input_mut(|i| {
-            let document = [
-                (SHORTCUT_CLOSE, Action::CloseDocument),
-                (SHORTCUT_REDO, Action::Redo),
-                (SHORTCUT_UNDO, Action::Undo),
-                (
-                    transform::SHORTCUT_AGAIN,
-                    Action::Transform(transform::Command::Again),
-                ),
-                (
-                    SHORTCUT_FREE_TRANSFORM,
-                    Action::Transform(transform::Command::Free),
-                ),
-                (SHORTCUT_DUPLICATE, Action::LayerFromSelection),
-                (SHORTCUT_LAYER_VIA_CUT, Action::LayerViaCut),
-                (SHORTCUT_STAMP_VISIBLE, Action::StampVisible),
-                (SHORTCUT_TOGGLE_LOCK, Action::ToggleLock),
-                (SHORTCUT_DESATURATE, Action::Desaturate),
-                (fade_stroke::SHORTCUT_FADE, Action::Fade),
-                (
-                    fade_stroke::SHORTCUT_AUTO_CONTRAST,
-                    Action::AutoAdjust(crate::pixel_ops::AutoMode::Contrast),
-                ),
-                (
-                    fade_stroke::SHORTCUT_AUTO_TONE,
-                    Action::AutoAdjust(crate::pixel_ops::AutoMode::Tone),
-                ),
-                (
-                    fade_stroke::SHORTCUT_AUTO_COLOR,
-                    Action::AutoAdjust(crate::pixel_ops::AutoMode::Color),
-                ),
-                (SHORTCUT_NEW_LAYER, Action::NewLayer),
-                (SHORTCUT_MERGE_VISIBLE, Action::MergeVisible),
-                (SHORTCUT_MERGE_DOWN, Action::MergeDown),
-                (SHORTCUT_HIDE_LAYERS, Action::ToggleVisibility),
-                (SHORTCUT_RESELECT, Action::Reselect),
-                (SHORTCUT_INVERT_SELECTION, Action::InvertSelection),
-                (SHORTCUT_IMAGE_SIZE, Action::ImageSize),
-                (SHORTCUT_FILL_DIALOG, Action::FillDialog),
-                (SHORTCUT_DESELECT, Action::Deselect),
-                (SHORTCUT_SELECT_ALL, Action::SelectAll),
-                (filters_ui::SHORTCUT_LAST_FILTER, Action::LastFilter),
-                (camera_raw_ui::SHORTCUT_CAMERA_RAW, Action::CameraRawFilter),
-                (liquify_ui::SHORTCUT_LIQUIFY, Action::Liquify),
-                (SHORTCUT_GROUP, Action::GroupLayers),
-                (SHORTCUT_UNGROUP, Action::Ungroup),
-                (SHORTCUT_CLIPPING, Action::ToggleClipping),
-                (
-                    actions_panel::SHORTCUT_ACTIONS,
-                    Action::Automate(actions_panel::Command::Panel),
-                ),
-                (
-                    workspace::SHORTCUT_INFO,
-                    Action::Workspace(workspace::Command::Info),
-                ),
-                (
-                    export_as::SHORTCUT_QUICK_EXPORT,
-                    Action::Automate(actions_panel::Command::QuickExport),
-                ),
-            ];
+            let document = document_shortcuts();
             let adjustments = ADJUSTMENTS
                 .iter()
                 .filter_map(|a| Some((*a.shortcut?, Action::Adjust(a.kind))));
@@ -3246,23 +3255,23 @@ impl AtelierApp {
                 .or_else(|| clipboard_action(i, paste))
         });
         if let Some(action) = action {
-            // An action given F8 keeps it over the Info panel.
-            if matches!(action, Action::Workspace(workspace::Command::Info))
-                && self.f8_has_action()
-            {
-                self.play_key(crate::actions::FnKey {
-                    number: 8,
+            // An action given F7 or F8 keeps it over the panel.
+            let panel_key = match action {
+                Action::Workspace(workspace::Command::ToggleSidePanel) => Some(7),
+                Action::Workspace(workspace::Command::Info) => Some(8),
+                _ => None,
+            };
+            match panel_key.filter(|&n| self.fn_key_has_action(n)) {
+                Some(number) => self.play_key(crate::actions::FnKey {
+                    number,
                     shift: false,
                     ctrl: false,
-                });
-            } else {
-                self.run(action);
+                }),
+                None => self.run(action),
             }
         }
-        if let Some(action) = ctx.input(|i| self.blend_shortcut(i)) {
-            self.run(action);
-        }
-        if let Some(key) = ctx.input_mut(actions_panel::fn_key_press) {
+        self.blend_shortcut(ctx);
+        if let Some(key) = ctx.input(actions_panel::fn_key_press) {
             self.play_key(key);
         }
 
@@ -3308,16 +3317,9 @@ impl AtelierApp {
         // Fills, like Photoshop, with Backspace or Delete. (On Windows,
         // egui-winit turns Shift+Delete into a cut: see `clipboard_action`.)
         let fill = ctx.input_mut(|i| {
-            let fills = [
-                (SHORTCUT_FILL_PRIMARY, Action::FillPrimary),
-                (SHORTCUT_FILL_SECONDARY, Action::FillSecondary),
-                (SHORTCUT_FILL_PRIMARY_KEEP, Action::FillPrimaryKeep),
-                (SHORTCUT_FILL_SECONDARY_KEEP, Action::FillSecondaryKeep),
-                (SHORTCUT_FILL_DIALOG_ALT, Action::FillDialog),
-            ];
             take_shortcut(
                 i,
-                fills.into_iter().flat_map(|(s, action)| {
+                FILL_SHORTCUTS.into_iter().flat_map(|(s, action)| {
                     [Key::Delete, Key::Backspace]
                         .map(|key| (KeyboardShortcut::new(s.modifiers, key), action))
                 }),
@@ -3374,6 +3376,15 @@ impl AtelierApp {
         if let Some((up, modifiers)) = bracket {
             self.bracket(up, modifiers);
         }
+        // Alt+. / Alt+,: the top / bottom layer.
+        let edge = ctx.input(|i| {
+            [(Key::Period, true), (Key::Comma, false)]
+                .into_iter()
+                .find_map(|(k, top)| key_typed(i, Modifiers::ALT, k).then_some(top))
+        });
+        if let Some(top) = edge {
+            self.select_edge_layer(top);
+        }
         if let Some(digit) = digit {
             let now = ctx.input(|i| i.time);
             self.opacity_digit(digit, now);
@@ -3400,6 +3411,8 @@ impl AtelierApp {
             Some(ToolWindow::ColorRange) => self.close_color_range(enter),
             Some(ToolWindow::SelectMask) => self.close_select_mask(enter),
             None if enter => self.apply_pending(false),
+            // The subject search of this document stops first.
+            None if self.subject_searching() => self.cancel_subject(),
             // Nothing being prepared: Esc leaves Full Screen.
             None if self.esc_leaves_full_screen() => {
                 self.run(Action::Workspace(workspace::Command::ScreenMode(
@@ -3567,11 +3580,7 @@ impl AtelierApp {
             } else {
                 doc.active.wrapping_sub(1)
             };
-            if target < doc.layers.len() {
-                let id = doc.layers[target].id;
-                self.layer_set = vec![id];
-                self.select_layer(target);
-            }
+            self.select_only_layer(target);
         } else if m.shift {
             let step = if up { 0.25 } else { -0.25 };
             self.hardness = (self.hardness + step).clamp(0.0, 1.0);
@@ -3585,6 +3594,22 @@ impl AtelierApp {
                 "status-brush-size",
                 value = format!("{:.0}", self.brush_size)
             ));
+        }
+    }
+
+    /// Alt+. / Alt+,: the top (`true`) or bottom layer, alone selected.
+    fn select_edge_layer(&mut self, top: bool) {
+        let Some(doc) = &self.doc else { return };
+        let target = if top { doc.layers.len().wrapping_sub(1) } else { 0 };
+        self.select_only_layer(target);
+    }
+
+    /// Layer `index` (if any) active and alone selected.
+    fn select_only_layer(&mut self, index: usize) {
+        let Some(doc) = &self.doc else { return };
+        if let Some(layer) = doc.layers.get(index) {
+            self.layer_set = vec![layer.id];
+            self.select_layer(index);
         }
     }
 
@@ -3675,6 +3700,7 @@ impl AtelierApp {
                 layer.blend = b;
             }
         }
+        self.record_layer_look(opacity, blend);
         Some((free, locked.len()))
     }
 
@@ -3700,6 +3726,9 @@ impl AtelierApp {
 /// Shift+[ gives "{" on a QWERTY keyboard: both are accepted.
 fn bracket_press(input: &egui::InputState) -> Option<(bool, Modifiers)> {
     input.events.iter().find_map(|e| match e {
+        // Ctrl+Alt is AltGr on Windows: typing a bracket, not a shortcut
+        // (AZERTY: Ctrl+Alt+5 types "[").
+        egui::Event::Key { modifiers, .. } if modifiers.command && modifiers.alt => None,
         egui::Event::Key {
             key,
             pressed: true,
@@ -4027,6 +4056,109 @@ fn clipboard_action(input: &egui::InputState, paste: Option<Modifiers>) -> Optio
 /// match exactly: Ctrl+Shift+U (Photoshop: Desaturate) is not Ctrl+U. A key
 /// held down repeats only the actions made for it (`repeats`): a toggle
 /// held a little long mustn't flicker.
+/// The document's shortcuts (the menus' and their twins), matched with
+/// exactly their modifiers.
+fn document_shortcuts() -> Vec<(KeyboardShortcut, Action)> {
+    vec![
+        (SHORTCUT_CLOSE, Action::CloseDocument),
+        (SHORTCUT_REDO, Action::Redo),
+        (SHORTCUT_UNDO, Action::Undo),
+        (
+            transform::SHORTCUT_AGAIN,
+            Action::Transform(transform::Command::Again),
+        ),
+        (
+            SHORTCUT_FREE_TRANSFORM,
+            Action::Transform(transform::Command::Free),
+        ),
+        (SHORTCUT_DUPLICATE, Action::LayerFromSelection),
+        (SHORTCUT_LAYER_VIA_CUT, Action::LayerViaCut),
+        (SHORTCUT_STAMP_VISIBLE, Action::StampVisible),
+        (SHORTCUT_TOGGLE_LOCK, Action::ToggleLock),
+        (SHORTCUT_DESATURATE, Action::Desaturate),
+        (fade_stroke::SHORTCUT_FADE, Action::Fade),
+        (
+            fade_stroke::SHORTCUT_AUTO_CONTRAST,
+            Action::AutoAdjust(crate::pixel_ops::AutoMode::Contrast),
+        ),
+        (
+            fade_stroke::SHORTCUT_AUTO_TONE,
+            Action::AutoAdjust(crate::pixel_ops::AutoMode::Tone),
+        ),
+        (
+            fade_stroke::SHORTCUT_AUTO_COLOR,
+            Action::AutoAdjust(crate::pixel_ops::AutoMode::Color),
+        ),
+        (SHORTCUT_NEW_LAYER, Action::NewLayer),
+        (SHORTCUT_MERGE_VISIBLE, Action::MergeVisible),
+        (SHORTCUT_MERGE_DOWN, Action::MergeDown),
+        (SHORTCUT_HIDE_LAYERS, Action::ToggleVisibility),
+        (SHORTCUT_RESELECT, Action::Reselect),
+        (SHORTCUT_INVERT_SELECTION, Action::InvertSelection),
+        (SHORTCUT_IMAGE_SIZE, Action::ImageSize),
+        (SHORTCUT_FILL_DIALOG, Action::FillDialog),
+        (SHORTCUT_DESELECT, Action::Deselect),
+        (SHORTCUT_SELECT_ALL, Action::SelectAll),
+        (filters_ui::SHORTCUT_LAST_FILTER, Action::LastFilter),
+        (camera_raw_ui::SHORTCUT_CAMERA_RAW, Action::CameraRawFilter),
+        (liquify_ui::SHORTCUT_LIQUIFY, Action::Liquify),
+        (SHORTCUT_GROUP, Action::GroupLayers),
+        (SHORTCUT_UNGROUP, Action::Ungroup),
+        (SHORTCUT_CLIPPING, Action::ToggleClipping),
+        (
+            actions_panel::SHORTCUT_ACTIONS,
+            Action::Automate(actions_panel::Command::Panel),
+        ),
+        (
+            workspace::SHORTCUT_INFO,
+            Action::Workspace(workspace::Command::Info),
+        ),
+        (
+            export_as::SHORTCUT_QUICK_EXPORT,
+            Action::Automate(actions_panel::Command::QuickExport),
+        ),
+        // AZERTY: "/" is typed with Shift.
+        (SHORTCUT_TOGGLE_LOCK_SHIFTED, Action::ToggleLock),
+        (SHORTCUT_NEW_LAYER_ALT, Action::NewLayer),
+        (
+            workspace::SHORTCUT_LAYERS,
+            Action::Workspace(workspace::Command::ToggleSidePanel),
+        ),
+        (
+            workspace::SHORTCUT_SHORTCUTS,
+            Action::Workspace(workspace::Command::Shortcuts),
+        ),
+    ]
+}
+
+impl AtelierApp {
+    /// The other keys that do what menu shortcut `s` does (Help › Shortcuts
+    /// lists them with it).
+    pub(super) fn shortcut_twins(&self, s: &KeyboardShortcut) -> Vec<KeyboardShortcut> {
+        let mut twins = Vec::new();
+        // Each fill: Delete or Backspace.
+        if FILL_SHORTCUTS.iter().any(|(f, _)| f.modifiers == s.modifiers)
+            && s.logical_key == Key::Delete
+        {
+            twins.push(KeyboardShortcut::new(s.modifiers, Key::Backspace));
+        }
+        if *s == SHORTCUT_FILL_DIALOG {
+            twins.push(SHORTCUT_FILL_DIALOG_ALT);
+        }
+        if *s == SHORTCUT_ZOOM_IN {
+            twins.push(SHORTCUT_ZOOM_IN_ALT);
+        }
+        if *s == SHORTCUT_NEW_LAYER {
+            twins.push(SHORTCUT_NEW_LAYER_ALT);
+        }
+        // F7, unless an action has it.
+        if *s == workspace::SHORTCUT_SIDE_PANEL && !self.fn_key_has_action(7) {
+            twins.push(workspace::SHORTCUT_LAYERS);
+        }
+        twins
+    }
+}
+
 fn take_shortcut(
     input: &mut egui::InputState,
     shortcuts: impl IntoIterator<Item = (KeyboardShortcut, Action)>,
@@ -4097,8 +4229,7 @@ fn shortcut_key(key: Key, physical: Option<Key>) -> Key {
 
 /// Does a key event match a shortcut on `wanted`? Digit shortcuts by the
 /// key's place (`shortcut_key`), the others by what the key types: on an
-/// AZERTY keyboard the 6 key is Ctrl+6 for an alpha channel (consumed
-/// first, see `channel_shortcut`), else Ctrl+− (Zoom Out).
+/// AZERTY keyboard the 6 key is Ctrl+− (Zoom Out, see `channel_shortcut`).
 fn shortcut_matches(wanted: Key, key: Key, physical: Option<Key>) -> bool {
     if DIGIT_KEYS.contains(&wanted) {
         shortcut_key(key, physical) == wanted
@@ -4294,12 +4425,16 @@ impl AtelierApp {
         self.wait_stroke_job(&ctx);
         self.wait_transform_for_input(&ctx);
         self.handle_dropped_files(&ctx);
+        self.poll_clipboard();
+        self.color.poll_monitor();
+        self.handle_system_requests();
         self.poll_subject(&ctx);
         self.poll_select_job();
         self.wait_output_on_input(&ctx);
         self.poll_downloads(&ctx);
         self.poll_object_select();
         self.play_actions();
+        self.watch_unrecorded();
         self.run_batch();
         self.poll_smart(&ctx);
         self.handle_shortcuts(&ctx);
@@ -4390,7 +4525,13 @@ impl AtelierApp {
         // one after the other (see `confirm_window`). A change computed
         // aside lands first (the document isn't modified before), then the
         // close goes on as Quit does; cancelled, the window stays.
-        if ctx.input(|i| i.viewport().close_requested()) && self.transform_busy() {
+        // A workspace holding work found nowhere else refuses it; work
+        // under way that hasn't landed yet is waited for.
+        if ctx.input(|i| i.viewport().close_requested())
+            && (self.close_refused() || self.close_waits())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        } else if ctx.input(|i| i.viewport().close_requested()) && self.transform_busy() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_after_job();
         } else if ctx.input(|i| i.viewport().close_requested())
@@ -4425,6 +4566,8 @@ impl AtelierApp {
         self.model_prompt_window(&ctx);
         self.export_window(&ctx);
         self.confirm_window(&ctx);
+        self.recovery_window(&ctx);
+        self.psd_ask_window(&ctx);
         self.open_anyway_window(&ctx);
         self.flatten_confirm_window(&ctx);
         self.rasterize_confirm_window(&ctx);
@@ -4454,6 +4597,7 @@ impl AtelierApp {
         self.keep_focus_on_text(&ctx);
         self.settle_selection();
         self.trim_histories();
+        self.recovery_frame(&ctx);
         self.save_session(&ctx);
     }
 }
@@ -4828,8 +4972,7 @@ mod tests {
 
     /// Two small images written to the temporary folder, as recent files.
     fn demo_recent_files() -> crate::recent::Recent {
-        let dir = std::env::temp_dir().join("atelier-capture");
-        std::fs::create_dir_all(&dir).expect("temporary folder");
+        let dir = crate::testing::test_dir("capture");
         let mut paths = Vec::new();
         for (name, (w, h), color) in [
             ("LOGO-VTL.png", (792, 261), [4, 49, 59]),

@@ -342,9 +342,7 @@ mod tests {
 
     #[test]
     fn paths_and_shapes_survive_a_round_trip() {
-        let dir = std::env::temp_dir().join("atelier-native-vectors");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::test_dir("native-vectors");
         let file = dir.join("doc.atelier");
 
         let mut doc = Document::new(RgbaImage::from_pixel(60, 40, Rgba([255; 4])), None);

@@ -210,6 +210,16 @@ impl Model {
         }
     }
 
+    /// Is one of its sessions running (or about to)? Its files must stay:
+    /// [`Self::delete`] would wait for the run.
+    pub fn running(self) -> bool {
+        match self {
+            Model::Subject => super::subject::SESSION.busy(),
+            Model::Objects => super::objects::ENCODER.busy() || super::objects::DECODER.busy(),
+            Model::Inpaint => super::inpaint::SESSION.busy(),
+        }
+    }
+
     /// Where its sessions ran in this session of the program (each one
     /// once), if they have run.
     pub fn devices(self) -> Vec<Device> {
@@ -296,7 +306,7 @@ fn failed(e: std::io::Error) -> DownloadError {
                 folder = root().display().to_string()
             )
         }
-        _ => t!("fx3-ai-error-write", error = e.to_string()),
+        _ => t!("fx3-ai-error-write", error = crate::i18n::io_error(&e)),
     })
 }
 
@@ -645,7 +655,7 @@ fn download_file(
     Ok(())
 }
 
-/// Models folder: `%LOCALAPPDATA%\Atelier\modeles` on Windows,
+/// Models folder: `%LOCALAPPDATA%\Atelier\models` on Windows,
 /// `~/.cache/atelier` elsewhere.
 pub fn root() -> PathBuf {
     // Tests never see (or change) the user's models: only those of
@@ -653,12 +663,20 @@ pub fn root() -> PathBuf {
     #[cfg(test)]
     {
         let cache = std::env::var_os("XDG_CACHE_HOME")
-            .map_or_else(|| std::env::temp_dir().join("atelier-tests"), PathBuf::from);
+            .map_or_else(|| crate::testing::root().join("models"), PathBuf::from);
         return cache.join("atelier");
     }
     #[allow(unreachable_code)]
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(local).join("Atelier").join("modeles");
+        let atelier = PathBuf::from(local).join("Atelier");
+        let models = atelier.join("models");
+        // Up to 0.5 the folder had a French name: moved once (kept where it
+        // is while another Atelier holds a model open).
+        let old = atelier.join("modeles");
+        if !models.exists() && old.exists() && std::fs::rename(&old, &models).is_err() {
+            return old;
+        }
+        return models;
     }
     if let Some(cache) = std::env::var_os("XDG_CACHE_HOME") {
         return PathBuf::from(cache).join("atelier");
@@ -755,10 +773,7 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("atelier-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testing::test_dir(&format!("models-{name}"))
     }
 
     fn file(url: &'static str, size: usize, sha256: &'static str) -> ModelFile {

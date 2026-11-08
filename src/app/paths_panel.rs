@@ -591,7 +591,7 @@ impl AtelierApp {
                         .as_ref()
                         .map(Document::full_rect)
                         .expect("document");
-                    let mode = self.selection_mode(m.shift, m.alt);
+                    let mode = self.load_mode(m.shift, m.alt);
                     let pixels = path.bounds().map_or(0, |b| (b.width() * b.height()) as u64);
                     self.sel.step_name = Some(t!("hist3-make-selection"));
                     self.select_later(Then::Select(mode), pixels, move || {

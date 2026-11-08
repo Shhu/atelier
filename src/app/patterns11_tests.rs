@@ -129,8 +129,7 @@ fn worst(a: &RgbaImage, b: &RgbaImage) -> u8 {
 
 #[test]
 fn a_group_overlay_keeps_its_place_in_both_formats() {
-    let dir = std::env::temp_dir().join(format!("atelier-pattern11-group-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("pattern11-group");
     let (mut doc, group) = group_doc();
     // Moved, then a layer of it painted beyond: its frame and what it holds
     // part.
@@ -211,7 +210,7 @@ fn free_transform_reaches_a_lone_pattern_fill_layer() {
 }
 
 fn finish(h: &mut Harness<'static, AtelierApp>) {
-    for _ in 0..400 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if !h.state().transform_busy() {
             break;
@@ -337,8 +336,7 @@ fn image_size_keeps_the_tile_scale_beyond_the_fields() {
     assert!((fill_of(&doc, i).scale - 0.5).abs() < 1e-4);
     // Kept by the files.
     doc.resize_image(300, 300, image::imageops::FilterType::Triangle);
-    let dir = std::env::temp_dir().join(format!("atelier-pattern11-scale-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("pattern11-scale");
     for file in ["s.atelier", "s.psd"] {
         let path = dir.join(file);
         doc.save(&path).unwrap();
@@ -364,8 +362,7 @@ fn a_pattern_fill_record_with_a_box_starts_its_tile_there() {
     doc.add_fill_layer(Fill::Pattern(PatternFill::of(asym())), None);
     doc.layers.remove(0);
     doc.active = 0;
-    let dir = std::env::temp_dir().join(format!("atelier-pattern11-rect-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("pattern11-rect");
     let path = dir.join("rect.psd");
     doc.save(&path).unwrap();
     let mut data = std::fs::read(&path).unwrap();
@@ -416,8 +413,7 @@ fn a_long_pattern_name_is_cut_and_leaves_the_dialog_as_it_was() {
 #[test]
 fn a_tile_that_cannot_be_read_for_now_is_kept() {
     use crate::patterns::{Change, Library};
-    let dir = std::env::temp_dir().join(format!("atelier-pattern11-lib-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::testing::test_dir("pattern11-lib");
     let p = Pattern::new("t", RgbaImage::from_fn(64, 64, |x, y| Rgba([x as u8, y as u8, 1, 255])));
     let file = format!("{:016x}.png", p.id);
     let add = || Change::Add {
@@ -452,9 +448,7 @@ fn a_tile_that_cannot_be_read_for_now_is_kept() {
 #[test]
 fn taken_in_tiles_keep_their_names_or_get_new_ones() {
     use crate::patterns::Library;
-    let dir = std::env::temp_dir().join(format!("atelier-pattern11-names-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::testing::test_dir("pattern11-names");
     let png = |name: &str, v: u8| {
         RgbaImage::from_pixel(2, 2, Rgba([v, v, v, 255]))
             .save_with_format(dir.join(name), image::ImageFormat::Png)

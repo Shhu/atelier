@@ -602,9 +602,7 @@ fn the_pen_and_path_selection_land_on_the_image_on_a_turned_or_flipped_view() {
 fn the_type_tool_lands_on_the_image_on_a_turned_or_flipped_view() {
     for (angle, flipped) in TURNS {
         let mut h = turned(Tool::Text, angle, flipped);
-        if h.state_mut().text_engine().families().is_empty() {
-            return;
-        }
+        assert!(!h.state_mut().text_engine().families().is_empty());
         let what = format!("{angle} {flipped}");
         let tolerance = 1.5 / h.state().last_view.expect("canvas").zoom + 0.5;
         let at = screen(&h, 120.0, 150.0);
@@ -692,7 +690,7 @@ fn every_brush_tool_strokes_only_along_the_pointer_on_a_turned_view() {
             let (sa, sb) = (screen(&h, a.x, a.y), screen(&h, b.x, b.y));
             drag(&mut h, sa, sb);
             // Healing lands from its job.
-            for _ in 0..400 {
+            for _ in crate::testing::patience() {
                 if !h.state().retouch_running() {
                     break;
                 }
@@ -1220,7 +1218,7 @@ fn an_artboard_name_stays_outside_its_board_on_a_turned_view() {
 }
 /// Frame cost while the view turns or pans, with and without Quick Mask.
 #[test]
-#[ignore]
+#[ignore = "timing"]
 fn timing_turn_and_pan_with_quick_mask() {
     for quick in [false, true] {
         let mut h = app(Tool::Hand);

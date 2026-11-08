@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use image::RgbaImage;
 
+use crate::compose::blend::BlendMode;
 use crate::pixel_ops::{Clip, over};
 pub use tips::{Preset, Tip};
 pub use tone::ToneRange;
@@ -57,6 +58,33 @@ impl StrokeMode {
     }
 }
 
+/// Pixel `s` (a gradient's, a brush's) over pixel `d` in `mode` (Dissolve:
+/// at pixel (x, y)).
+pub fn blend_pixel(d: [u8; 4], s: [u8; 4], mode: BlendMode, x: i64, y: i64) -> [u8; 4] {
+    use crate::compose::blend;
+    let da = d[3] as f32 / 255.0;
+    let c = |i: usize| d[i] as f32 / 255.0 * da;
+    let mut px = [c(0), c(1), c(2), da];
+    let mut a = s[3] as f32 / 255.0;
+    let mode = if mode == BlendMode::Dissolve {
+        a = blend::dissolve(a, x, y);
+        BlendMode::Normal
+    } else {
+        mode
+    };
+    blend::over(&mut px, [0, 1, 2].map(|i| s[i] as f32 / 255.0), a, mode);
+    if px[3] <= 0.0 {
+        return [0, 0, 0, 0];
+    }
+    let c = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    [
+        c(px[0] / px[3]),
+        c(px[1] / px[3]),
+        c(px[2] / px[3]),
+        c(px[3]),
+    ]
+}
+
 /// Brush tip and painting settings.
 #[derive(Clone)]
 pub struct BrushSettings {
@@ -80,6 +108,8 @@ pub struct BrushSettings {
     /// Pen pressure scales the diameter, the opacity.
     pub pressure_size: bool,
     pub pressure_opacity: bool,
+    /// How the paint blends with the pixels (`StrokeMode::Paint`).
+    pub mode: BlendMode,
 }
 
 impl BrushSettings {
@@ -97,6 +127,7 @@ impl BrushSettings {
             flow: 1.0,
             pressure_size: false,
             pressure_opacity: false,
+            mode: BlendMode::Normal,
         }
     }
 
@@ -521,6 +552,8 @@ impl Stroke {
     /// Recomposites area `r` from the original pixels and the mask.
     fn composite(&self, image: &mut RgbaImage, r: DirtyRect) {
         let w = self.base.width() as usize;
+        let mode = self.settings.mode;
+        let normal = mode == BlendMode::Normal;
         let [cr, cg, cb, _] = self.settings.color;
         let ca = self.settings.color[3] as f32 / 255.0;
         let base = self.base.as_raw();
@@ -564,7 +597,8 @@ impl Stroke {
                                 }
                                 None => b,
                             },
-                            _ => over(b, [cr, cg, cb, to_u8(ca * k)]),
+                            _ if normal => over(b, [cr, cg, cb, to_u8(ca * k)]),
+                            _ => blend_pixel(b, [cr, cg, cb, to_u8(ca * k)], mode, x, y as i64),
                         }
                     };
                     d.copy_from_slice(&px);

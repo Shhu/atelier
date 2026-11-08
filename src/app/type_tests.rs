@@ -112,9 +112,7 @@ fn selection(h: &Harness<'static, AtelierApp>) -> std::ops::Range<usize> {
 #[test]
 fn a_click_types_a_point_text_that_esc_commits() {
     let mut h = app();
-    if !has_fonts(&mut h) {
-        return;
-    }
+    assert!(has_fonts(&mut h), "the bundled font at least");
     click(&mut h, 50.0, 100.0);
     assert_eq!(doc(&h).layers.len(), 2, "a text layer");
     assert!(h.state().typing_on_canvas());
@@ -147,9 +145,7 @@ fn a_click_types_a_point_text_that_esc_commits() {
 #[test]
 fn an_empty_text_is_dropped_on_commit() {
     let mut h = app();
-    if !has_fonts(&mut h) {
-        return;
-    }
+    assert!(has_fonts(&mut h), "the bundled font at least");
     click(&mut h, 50.0, 100.0);
     assert_eq!(doc(&h).layers.len(), 2);
     key(&mut h, Key::Enter, Modifiers::COMMAND);
@@ -161,9 +157,7 @@ fn an_empty_text_is_dropped_on_commit() {
 #[test]
 fn caret_moves_selects_and_replaces() {
     let mut h = app();
-    if !has_fonts(&mut h) {
-        return;
-    }
+    assert!(has_fonts(&mut h), "the bundled font at least");
     click(&mut h, 50.0, 100.0);
     type_str(&mut h, "Hello world");
     key(&mut h, Key::ArrowLeft, Modifiers::COMMAND);
@@ -195,9 +189,7 @@ fn caret_moves_selects_and_replaces() {
 #[test]
 fn styles_apply_to_the_selection_or_to_what_is_typed_next() {
     let mut h = app();
-    if !has_fonts(&mut h) {
-        return;
-    }
+    assert!(has_fonts(&mut h), "the bundled font at least");
     click(&mut h, 50.0, 100.0);
     type_str(&mut h, "ab");
     key(&mut h, Key::ArrowLeft, Modifiers::SHIFT);
@@ -247,9 +239,7 @@ fn styles_apply_to_the_selection_or_to_what_is_typed_next() {
 #[test]
 fn a_drag_draws_a_paragraph_box_that_wraps_and_resizes() {
     let mut h = app();
-    if !has_fonts(&mut h) {
-        return;
-    }
+    assert!(has_fonts(&mut h), "the bundled font at least");
     h.state_mut().type_tool.style.size = 20.0;
     drag(&mut h, (20.0, 30.0), (140.0, 230.0));
     let layer = doc(&h).active_layer();
@@ -289,9 +279,7 @@ fn a_drag_draws_a_paragraph_box_that_wraps_and_resizes() {
 #[test]
 fn clicking_a_text_edits_it_where_clicked_and_cancel_reverts() {
     let mut h = app();
-    if !has_fonts(&mut h) {
-        return;
-    }
+    assert!(has_fonts(&mut h), "the bundled font at least");
     click(&mut h, 50.0, 100.0);
     type_str(&mut h, "Hello");
     key(&mut h, Key::Escape, Modifiers::NONE);
@@ -322,9 +310,7 @@ fn clicking_a_text_edits_it_where_clicked_and_cancel_reverts() {
 #[test]
 fn another_tool_commits_the_text() {
     let mut h = app();
-    if !has_fonts(&mut h) {
-        return;
-    }
+    assert!(has_fonts(&mut h), "the bundled font at least");
     click(&mut h, 50.0, 100.0);
     type_str(&mut h, "Hi");
     h.state_mut().set_tool(Tool::Transform);
@@ -338,9 +324,7 @@ fn another_tool_commits_the_text() {
 #[test]
 fn texts_stay_editable_through_image_rotation_and_flips() {
     let mut h = app();
-    if !has_fonts(&mut h) {
-        return;
-    }
+    assert!(has_fonts(&mut h), "the bundled font at least");
     click(&mut h, 50.0, 100.0);
     type_str(&mut h, "Hello");
     key(&mut h, Key::Escape, Modifiers::NONE);
@@ -375,9 +359,7 @@ fn texts_stay_editable_through_image_rotation_and_flips() {
 #[test]
 fn image_size_scales_texts_that_stay_sharp() {
     let mut h = app();
-    if !has_fonts(&mut h) {
-        return;
-    }
+    assert!(has_fonts(&mut h), "the bundled font at least");
     h.state_mut().type_tool.style.size = 20.0;
     drag(&mut h, (20.0, 30.0), (140.0, 130.0));
     type_str(&mut h, "Hello");

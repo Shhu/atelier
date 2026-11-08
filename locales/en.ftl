@@ -351,7 +351,6 @@ dialog-curves-output = Output
 
 ## Selection tools
 
-select-wand-outside-layer = Click on the pixels of the active layer.
 select-ai-unavailable = AI unavailable: { $error }; non-AI method used.
 select-subject-searching = Finding subject…
 select-subject-failed = The subject search failed.
@@ -1609,7 +1608,7 @@ xchg-psd-mode-duotone = Duotone
 xchg-psd-mode-lab = Lab
 xchg-psd-note-depth = the { $bits }-bit depth (8 bits per channel here)
 xchg-psd-note-mode = the { $mode } mode (RGB here)
-xchg-psd-note-text = the editable type of { $names }
+xchg-psd-note-text = the editable type of { $names } (opened as pixels)
 xchg-psd-note-smart = smart objects as pixels: { $names }
 xchg-psd-note-vector = the vector masks of { $names }
 xchg-psd-note-shapes = the shape strokes of { $names }
@@ -2422,7 +2421,6 @@ ui3-shortcuts-title = Keyboard Shortcuts
 ui3-shortcuts-filter = Search
 ui3-shortcuts-other = Other keys
 ui3-shortcuts-palette = Search commands
-ui3-shortcuts-hide-side = Hide the side panel
 ui3-shortcuts-brush-size = Brush size (smaller / larger)
 ui3-shortcuts-pan = Pan the view (hold)
 
@@ -3389,3 +3387,146 @@ ui11-menu-more = More menus
 histogram12-source-adjustment = Adjustment Composite
 ## Crop tool: Overlay menu, golden rectangle squares and spiral (Shift+O turns it)
 histogram12-spiral-overlay = Golden Spiral
+
+## Actions panel menu › Load Actions: loaded, and some loaded actions lost a function key already used by another action
+batch14-status-loaded-keys = Actions loaded from { $path }. { $count ->
+    [one] { $count } function key was already in use: that action has none now.
+   *[other] { $count } function keys were already in use: those actions have none now.
+}
+## Playing an action: the step names a known command but its settings can't be read (hand-edited or damaged file)
+batch14-error-damaged = this step's settings could not be read.
+
+## Help › Keyboard Shortcuts, other keys: Shift+[ ]
+input14-shortcuts-hardness = Brush hardness (softer / harder)
+## Help › Keyboard Shortcuts, other keys: Alt + right-drag on the canvas
+input14-shortcuts-brush-drag = Brush size (left / right) and hardness (up / down)
+## Help › Keyboard Shortcuts: the gesture written after a modifier ("Alt+Right-drag")
+input14-key-right-drag = Right-drag
+## Help › Keyboard Shortcuts, other keys: the digits
+input14-shortcuts-opacity = Opacity of the tool or the layer (two digits quickly: the exact value)
+## Help › Keyboard Shortcuts, other keys: Shift + the digits
+input14-shortcuts-flow = Flow of the tool
+## Help › Keyboard Shortcuts, other keys: Alt+[ ]
+input14-shortcuts-layer-step = Select the layer below / above
+## Help › Keyboard Shortcuts, other keys: Alt+, and Alt+.
+input14-shortcuts-layer-edge = Select the bottom / top layer
+## Help › Keyboard Shortcuts, other keys: Shift++ and Shift+−
+input14-shortcuts-blend-step = Next / previous blend mode (of the painting tool or the layer)
+## Help › Keyboard Shortcuts, other keys: Alt+Shift+letter
+input14-shortcuts-blend-letter = A blend mode by its letter (of the painting tool or the layer)
+## Help › Keyboard Shortcuts: the key written after modifiers ("Alt+Shift+letter")
+input14-key-letter = letter
+## Help › Keyboard Shortcuts, other keys: Ctrl+2 to Ctrl+9
+input14-shortcuts-channels = Channels (composite, colors, alpha channels)
+## Help › Keyboard Shortcuts, other keys: Ctrl+Tab and Shift+Ctrl+Tab
+input14-shortcuts-documents = Next / previous document
+## Help › Keyboard Shortcuts, other keys: the arrow keys, alone and with Shift
+input14-shortcuts-nudge = Move by 1 px / 10 px
+## Help › Keyboard Shortcuts: the arrow keys, as a key name
+input14-key-arrows = Arrows
+## Help › Keyboard Shortcuts, other keys: Delete and Backspace
+input14-shortcuts-delete = Clear the selection (without one: delete the layer)
+## Help › Keyboard Shortcuts, other keys: Alt+Shift+Backspace and Shift+Ctrl+Backspace
+input14-shortcuts-fill-keep = Fill with the foreground / background color, preserving transparency
+## Help › Keyboard Shortcuts, other keys: Ctrl+Space+Click and Alt+Space+Click
+input14-shortcuts-click-zoom = Zoom in / out where clicked
+## Help › Keyboard Shortcuts, other keys: Alt + mouse wheel
+input14-shortcuts-wheel-zoom = Zoom
+## Help › Keyboard Shortcuts, other keys: Enter and Esc
+input14-shortcuts-apply = Apply / cancel what is being prepared
+## Help › Keyboard Shortcuts: section of the keys found elsewhere on a French keyboard
+input14-shortcuts-azerty = AZERTY keyboard
+## Status bar: Shift++ or Alt+Shift+letter changed the painting tool's blend mode
+input14-status-tool-blend = Mode: { $mode }
+
+## Saving: why it failed, after "could not save …:" (Windows: another program, a viewer or an antivirus, holds the file open)
+platforms14-file-error-in-use = the file is in use by another program; close it and try again
+## Start: the window couldn't be made (most often the graphics card or its driver); written to the log and shown in a message box on Windows
+platforms14-startup-failed = Atelier could not start: { $error }. Updating the graphics driver may help. Details are in { $log }.
+## Start: title of that message box
+platforms14-startup-failed-title = Atelier could not start
+## macOS app menu (the menu named after the app, left of File)
+platforms14-mac-about = About Atelier
+## macOS app menu: hide Atelier's windows (Cmd+H)
+platforms14-mac-hide = Hide Atelier
+## macOS app menu: hide the other apps' windows (Option+Cmd+H)
+platforms14-mac-hide-others = Hide Others
+## macOS app menu: show every app's windows again
+platforms14-mac-show-all = Show All
+## macOS app menu: quit (Cmd+Q), asking for unsaved documents first
+platforms14-mac-quit = Quit Atelier
+
+## PSD: what opening or saving leaves out
+psd14-psd-note-settings = settings this app doesn't have, of { $names }
+psd14-psd-note-legacy-brightness = the legacy algorithm of Brightness/Contrast of { $names } (opened with the current one)
+psd14-psd-note-cropped = the parts of { $names } beyond { $max } px per side (a .psb file keeps them whole)
+## PSD: opening a file that lost something
+psd14-status-opened-psd-simplified = Opened: { $path } — not kept: { $notes }. Save will ask for a new file, so that this one isn't replaced by less.
+## PSD: saving
+psd14-error-psd-over-4gb = the layers take more than 4 GB, which a PSD file can't hold: save as a .psb or Atelier document
+## Hue/Saturation: the colors edited
+psd14-hue-master = Master
+## Save As: the file types offered
+psd14-file-filter-psb = PSB document (large)
+
+## Opening or saving a document: smart objects inside smart objects, more levels than Atelier reads (a sentence fragment after "could not open/save …:")
+readers14-error-nested = smart objects are nested more than { $max } levels deep
+
+## Crash recovery: at start, the documents a window that ended without closing them left (a crash, a kill, a logout)
+safety14-recovery-title = Recover Documents
+safety14-recovery-text = { $count ->
+    [one] Atelier closed without saving this document. Open it again with its unsaved changes?
+   *[other] Atelier closed without saving these { $count } documents. Open them again with their unsaved changes?
+}
+safety14-recovery-hint = Discard deletes them for good. Cancel asks again at the next start.
+safety14-recovery-open = Recover
+safety14-recovery-discard = Discard
+safety14-status-recovered = { $count ->
+    [one] Document recovered: save it to keep it.
+   *[other] { $count } documents recovered: save them to keep them.
+}
+## Crash recovery: the copies of the modified documents can't be written (log)
+safety14-recovery-failed = Recovery files can't be written: { $error }
+## Closing the window while a workspace is open, or while work is under way
+safety14-close-liquify-open = Liquify is open: click OK or Cancel in it before closing the window.
+safety14-close-camera-raw-open = Camera Raw is open: click OK or Cancel in it before closing the window.
+safety14-status-close-waits = The window will close once the work under way is done.
+## Camera Raw presets: their file can't be read
+safety14-raw-presets-damaged = The Camera Raw presets could not be read: the file was kept as { $backup }, and the presets saved from now on go to a new one.
+safety14-raw-presets-unreadable = The Camera Raw presets could not be read ({ $error }): presets saved in this session are not kept.
+## Swatches: their file can't be read
+safety14-swatches-damaged = The saved swatches could not be read: the default swatches are shown, and the file was kept as { $backup }.
+## Save As a PSD file that can't hold everything: asked before writing
+safety14-psd-title = Save as PSD?
+safety14-psd-text = A PSD file can't hold everything in this document: "{ $name }" would lose { $notes }.
+safety14-psd-hint = An Atelier document keeps everything. Saved anyway, the document stays marked as having unsaved changes.
+safety14-psd-save-anyway = Save Anyway
+safety14-psd-save-atelier = Save as Atelier Document
+safety14-status-psd-not-saved = Not saved: { $name }
+
+## Select Subject and Remove Background: Esc stops the search
+selection14-hint-stop-search = Stop the search
+selection14-subject-stopped = Subject search stopped
+selection14-remove-background-stopped = Remove Background stopped
+
+## Diagnostics: operation names for the preview jobs
+words14-op-adjust-preview = Adjustment preview: { $name }
+## Diagnostics: a filter dialog's result shown on the layer
+words14-op-layer-preview = Filter preview on the layer
+## Diagnostics: the Fade dialog's preview
+words14-op-fade-preview = Fade: preview
+## Diagnostics: the Make a Color Transparent dialog's preview
+words14-op-transparent-preview = Make a Color Transparent: preview
+## Diagnostics: checking whether a linked file is back
+words14-op-linked-look = Linked files: looking for a file
+## Log: the pattern library's index could not be read and was renamed
+words14-log-pattern-index-damaged = Pattern library index damaged, set aside as { $backup }
+## Log: patterns of the library that could not be read
+words14-log-patterns-left-out = { $count ->
+    [one] { $count } pattern of the library could not be read
+   *[other] { $count } patterns of the library could not be read
+}
+## Log: the pattern library could not be read at all
+words14-log-pattern-library-not-read = Pattern library not read: { $error }
+## Log: changes to the pattern library could not be saved
+words14-log-pattern-library-not-saved = Pattern library not saved: { $error }

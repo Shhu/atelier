@@ -325,9 +325,7 @@ fn remove_background_adds_a_mask_and_keeps_a_text() {
         RgbaImage::from_pixel(200, 100, Rgba(WHITE)),
         None,
     ));
-    if h.state_mut().text_engine().families().is_empty() {
-        return;
-    }
+    assert!(!h.state_mut().text_engine().families().is_empty());
     h.state_mut().set_tool(Tool::Text);
     h.state_mut().create_text(pos2(20.0, 50.0), None);
     h.state_mut().type_text("Hi");
@@ -354,9 +352,7 @@ fn remove_background_adds_a_mask_and_keeps_a_text() {
 #[test]
 fn scaling_a_group_keeps_its_text_editable() {
     let mut h = app_doc(Document::new(RgbaImage::from_pixel(400, 300, RED), None));
-    if h.state_mut().text_engine().families().is_empty() {
-        return;
-    }
+    assert!(!h.state_mut().text_engine().families().is_empty());
     h.state_mut().set_tool(Tool::Text);
     h.state_mut().create_text(pos2(50.0, 80.0), None);
     h.state_mut().type_text("Hello");
@@ -466,7 +462,7 @@ fn leaving_warp_on_a_large_layer_stays_in_free_transform() {
     h.state_mut().set_warp_style((WarpStyle::Arc, 50.0, false));
     h.run_steps(1);
     h.state_mut().transform_command(Command::Mode(Mode::Scale));
-    for _ in 0..1500 {
+    for _ in crate::testing::patience() {
         h.run_steps(1);
         if !h.state().transform_busy() {
             break;
@@ -556,9 +552,7 @@ fn deleting_the_pens_only_anchor_removes_its_shape_layer() {
 #[test]
 fn ctrl_z_while_typing_undoes_the_last_word() {
     let mut h = app_doc(Document::new(RgbaImage::from_pixel(400, 300, RED), None));
-    if h.state_mut().text_engine().families().is_empty() {
-        return;
-    }
+    assert!(!h.state_mut().text_engine().families().is_empty());
     h.state_mut().set_tool(Tool::Text);
     h.run_steps(1);
     let n = doc(&h).layers.len();

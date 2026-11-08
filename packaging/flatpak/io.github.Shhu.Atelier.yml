@@ -57,6 +57,7 @@ modules:
       - cargo --offline build --release --verbose
       - install -Dm755 target/release/atelier /app/bin/atelier
       - install -Dm644 packaging/flatpak/io.github.Shhu.Atelier.desktop /app/share/applications/io.github.Shhu.Atelier.desktop
+      - install -Dm644 packaging/flatpak/io.github.Shhu.Atelier.xml /app/share/mime/packages/io.github.Shhu.Atelier.xml
       - install -Dm644 assets/icon.svg /app/share/icons/hicolor/scalable/apps/io.github.Shhu.Atelier.svg
       - install -Dm644 packaging/flatpak/io.github.Shhu.Atelier.metainfo.xml /app/share/metainfo/io.github.Shhu.Atelier.metainfo.xml
       - install -Dm644 -t /app/share/licenses/io.github.Shhu.Atelier LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md

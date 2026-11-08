@@ -8,6 +8,7 @@ use image::metadata::Orientation;
 use image::{ImageDecoder, ImageFormat, ImageReader, RgbaImage};
 
 use super::tiff::Tiff;
+use crate::document::{Budget, FileError};
 
 /// Where a JPEG may start (SOI, then a marker), and its size.
 fn candidates(data: &[u8]) -> Vec<(usize, (u32, u32))> {
@@ -38,9 +39,19 @@ pub fn size(data: &[u8]) -> Option<(u32, u32)> {
     Some(if turned { (size.1, size.0) } else { size })
 }
 
-/// The largest preview, the right way up.
-pub fn largest(data: &[u8]) -> Option<RgbaImage> {
-    for (at, _) in candidates(data) {
+/// Bytes per pixel decoding a preview takes at once: the JPEG's colors,
+/// then them with opacity, turned.
+const DECODE_BYTES_PER_PIXEL: u64 = 3 + 4 + 4;
+
+/// The largest preview, the right way up, its decoding taken from
+/// `budget` (`Ok(None)`: none decodes).
+pub fn largest(data: &[u8], budget: &mut Budget) -> Result<Option<RgbaImage>, FileError> {
+    let candidates = candidates(data);
+    // One at a time: the largest's room serves the others.
+    if let Some(&(_, (w, h))) = candidates.first() {
+        budget.take(w, h, DECODE_BYTES_PER_PIXEL)?;
+    }
+    for (at, _) in candidates {
         let reader = ImageReader::with_format(Cursor::new(&data[at..]), ImageFormat::Jpeg);
         let Ok(decoder) = reader.into_decoder() else {
             continue;
@@ -49,9 +60,9 @@ pub fn largest(data: &[u8]) -> Option<RgbaImage> {
             continue;
         };
         image.apply_orientation(orientation_at(data, at));
-        return Some(image.into_rgba8());
+        return Ok(Some(image.into_rgba8()));
     }
-    None
+    Ok(None)
 }
 
 /// Orientation of the preview at `at`: its own EXIF's, else the RAW
@@ -108,11 +119,16 @@ mod tests {
         file.extend(jpeg(32, 24, [200, 0, 0]));
         file.extend((0..5000u32).map(|i| (i * 31 % 251) as u8));
         file.extend(jpeg(64, 48, [0, 0, 200]));
-        let image = largest(&file).expect("preview");
+        let budget = || Budget::of(1 << 30);
+        let image = largest(&file, &mut budget()).unwrap().expect("preview");
         assert_eq!(image.dimensions(), (48, 64));
         let p = image.get_pixel(10, 10).0;
         assert!(p[2] > 150 && p[0] < 50, "{p:?}");
         assert_eq!(size(&file), Some((48, 64)));
-        assert!(largest(&file[..100]).is_none());
+        assert!(largest(&file[..100], &mut budget()).unwrap().is_none());
+        assert!(matches!(
+            largest(&file, &mut Budget::of(1000)),
+            Err(FileError::OutOfMemory(_))
+        ));
     }
 }

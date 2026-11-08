@@ -1054,10 +1054,7 @@ mod tests {
     }
 
     fn temp(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("atelier-metadata-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testing::test_dir(&format!("metadata-{name}"))
     }
 
     fn resource(id: u16, data: &[u8]) -> Vec<u8> {

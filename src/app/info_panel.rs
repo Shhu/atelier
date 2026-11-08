@@ -74,7 +74,7 @@ impl AtelierApp {
             ..Default::default()
         };
         let sigs = crate::compose::signatures(&layers, &opts);
-        hash_of((doc.uid(), format!("{sigs:?}"), doc.width(), doc.height()))
+        hash_of((doc.uid(), &sigs, doc.width(), doc.height()))
     }
 
     fn reading_at(&self, pixel: (i64, i64), radius: i64) -> Option<Reading> {
