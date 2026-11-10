@@ -32,4 +32,7 @@ iconutil -c icns "$set_dir" -o "$app/Contents/Resources/AppIcon.icns"
 
 codesign --force --sign - "$app"
 ln -s /Applications "$work/Atelier/Applications"
-hdiutil create -volname Atelier -srcfolder "$work/Atelier" -ov -format UDZO "$dmg"
+# The image's size is given: hdiutil's own estimate can fall short of the
+# app ("No space left on device").
+size_mb=$(( $(du -sk "$work/Atelier" | cut -f1) / 1024 * 5 / 4 + 32 ))
+hdiutil create -volname Atelier -srcfolder "$work/Atelier" -size "${size_mb}m" -ov -format UDZO "$dmg"
