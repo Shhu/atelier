@@ -60,6 +60,8 @@ impl egui::DroppedFile for Dropped {
 /// window without a document, then on a document: said damaged, and the
 /// document is still there, as it was.
 #[test]
+// This file makes the decoder panic on its x86 code paths only.
+#[cfg_attr(not(target_arch = "x86_64"), ignore = "the decoder panics on x86 only")]
 fn a_damaged_image_dropped_takes_nothing_down() {
     let dir = crate::testing::test_dir("readers14-dropped");
     let path = dir.join("broken.jpg");

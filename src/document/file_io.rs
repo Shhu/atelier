@@ -1741,6 +1741,8 @@ mod tests {
     /// opening, placing or dropping one says it is damaged, the
     /// application stays.
     #[test]
+    // These files make the decoder panic on its x86 code paths only.
+    #[cfg_attr(not(target_arch = "x86_64"), ignore = "the decoder panics on x86 only")]
     fn a_decoder_panic_is_a_damaged_file() {
         let dir = dir("decoder-panic");
         let files: [(&str, &[u8]); 3] = [

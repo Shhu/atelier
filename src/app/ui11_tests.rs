@@ -57,6 +57,7 @@ fn menu_titles(h: &H) -> Vec<(String, Rect)> {
 /// with room to drag the window by; the last one opens where it is clicked.
 /// What doesn't fit goes into "»", which opens the menus it holds.
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "macOS draws its own window buttons")]
 fn the_menus_stay_clear_of_the_window_buttons() {
     for lang in [Lang::Fr, Lang::En] {
         for width in [660.0, 690.0, 700.0, 1024.0] {
@@ -98,6 +99,7 @@ fn the_menus_stay_clear_of_the_window_buttons() {
 /// Menus that don't fit (here with larger titles) go into "»", which
 /// opens them.
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "macOS draws its own window buttons")]
 fn menus_that_dont_fit_go_into_more() {
     let mut h = window(660.0, 500.0, Lang::Fr);
     h.ctx.all_styles_mut(|s| {
